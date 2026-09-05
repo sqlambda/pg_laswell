@@ -3,7 +3,7 @@
 ## 0.1.0 (unreleased)
 
 The whole path works: repository, signing, planning, dry run, paced execution,
-ledger. 193 tests green on GCC 14.2 and Clang 22, under AddressSanitizer/UBSan
+ledger. 222 tests green on GCC 14.2 and Clang 22, under AddressSanitizer/UBSan
 and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
 `--call` contract test.
 
@@ -140,10 +140,19 @@ and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
   durable answer to the pinned-snapshot idea: a snapshot lets you *look* at old
   values while blocking vacuum throughout; this *keeps* them and doubles as the
   revert path. Verified exact on 3000 rows.
-- No `drop_constraint`, deliberately: it would emit exactly one possible
-  statement whatever the database looked like, and an intent kind here has to
-  justify itself by the decision its planner makes. The measured hazard is
-  documented instead — dropping a foreign key takes `AccessExclusiveLock` on
-  the referenced table too.
+- **`drop_constraint`**, which the one-possible-statement rule initially kept
+  out and should not have. That rule exists to stop `psql` wrappers, but a
+  migration *repository* has a second requirement it does not cover: a change
+  made outside the tool is unsigned, unrecorded and missing from the dependency
+  graph, so the repository ends up describing a database that does not exist.
+  The decision it makes is not which statement to emit but whether the drop can
+  succeed. A unique constraint whose index backs a foreign key elsewhere is
+  **refused before anything runs**, naming the dependent — PostgreSQL only
+  reports it at execution time, and suggests `CASCADE`. There is no `cascade`
+  key: it would drop objects the spec never named. The plan also states what
+  goes with the constraint — a foreign key locks the referenced table with
+  `AccessExclusiveLock` the statement never names, a unique or exclusion
+  constraint takes its index with it, and a NOT NULL constraint leaves the
+  column nullable again.
 - `cpp/test/spikes/` — the Phase 0 experiments that settled the design against
   PostgreSQL 18.6. Four of them changed it.

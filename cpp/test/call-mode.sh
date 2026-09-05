@@ -20,7 +20,6 @@ fail=0
 check() {  # check <expected exit> <description> -- <args...>
   local want="$1" desc="$2"; shift 3
   local got=0
-  "$BIN" ${CONN:+--} ${CONN:+"$CONN"} >/dev/null 2>&1 <<<"" || true
   set +e
   if [ -n "$CONN" ]; then
     "$BIN" "$@" "$CONN" >/dev/null 2>&1
@@ -58,6 +57,17 @@ if [ -z "$CONN" ]; then
   echo "$pass passed, $fail failed"
   [ "$fail" = 0 ] || exit 1
   exit 0
+fi
+
+# Prove the database is reachable BEFORE running checks that expect failure.
+# Without this, every "check 1" is satisfied by a connection error and the
+# script reports 15 passes against a database that is not there -- which is
+# exactly what it did while the conninfo was frozen at configure time.
+if ! "$BIN" --call checkPrivileges "$CONN" >/dev/null 2>&1; then
+  echo "  FAIL cannot reach the database, so no exit code below means anything"
+  echo "       conninfo: $CONN"
+  "$BIN" --call checkPrivileges "$CONN" 2>&1 | sed 's/^/       /' | head -3
+  exit 1
 fi
 
 echo "--- exit codes that a pipeline gates on ---"

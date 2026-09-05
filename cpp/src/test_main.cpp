@@ -846,7 +846,9 @@ TEST(Spec, KnownKindsAreExactlyTheImplementedKinds) {
                         "references_schema":"s","references_table":"p",
                         "references_columns":["id"]},
     "add_check_constraint": {"kind":"add_check_constraint","schema":"s",
-                             "table":"t","name":"ck","expression":"v > 0"}
+                             "table":"t","name":"ck","expression":"v > 0"},
+    "drop_constraint": {"kind":"drop_constraint","schema":"s","table":"t",
+                        "name":"ck"}
   })");
   for (const auto& [name, kind] : pglaswell::intent_kinds()) {
     (void)kind;
@@ -3766,6 +3768,183 @@ TEST(Planner, DroppingAnAbsentIndexIsSatisfied) {
   EXPECT_EQ(steps_of(plan, "drop_index")[0]->action, pglaswell::Action::kSatisfied);
 }
 
+// --- drop_constraint --------------------------------------------------------
+//
+// The statement never varies, so for a while this kind looked like a psql
+// wrapper and was left out. What it plans is not the statement: it is whether
+// the drop can succeed, what it takes with it, and where the lock lands.
+
+// A helper: a table carrying one constraint of the given shape.
+static pglaswell::Observations with_constraint(const std::string& name,
+                                               const json& body) {
+  auto obs = observations(1024, 10);
+  obs.tables["shop.orders"]["constraints"][name] = body;
+  return obs;
+}
+
+static pglaswell::Spec drop_constraint_spec(const std::string& name) {
+  return spec_of(json::array({json{{"kind", "drop_constraint"},
+                                   {"schema", "shop"},
+                                   {"table", "orders"},
+                                   {"name", name}}}));
+}
+
+TEST(Planner, DroppingAnAbsentConstraintIsSatisfied) {
+  const auto plan = pglaswell::plan_migration(
+      drop_constraint_spec("never_existed"), observations(1024, 10), {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto s = steps_of(plan, "drop_constraint");
+  ASSERT_EQ(s.size(), 1u);
+  EXPECT_EQ(s[0]->action, pglaswell::Action::kSatisfied);
+  EXPECT_TRUE(s[0]->sql.empty());
+}
+
+TEST(Planner, DroppingAForeignKeyNamesTheLockOnTheParentTable) {
+  // Measured on 18.6: ALTER TABLE c DROP CONSTRAINT c_fk takes
+  // AccessExclusiveLock on the referenced table too -- a table the statement
+  // never mentions, and a STRONGER lock than adding the constraint takes.
+  // Naming only the child's lock would understate the blast radius on exactly
+  // the table most likely to be hot.
+  const auto plan = pglaswell::plan_migration(
+      drop_constraint_spec("orders_warehouse_fk"),
+      with_constraint("orders_warehouse_fk",
+                      json{{"type", "f"},
+                           {"has_index", false},
+                           {"references", "shop.warehouse"},
+                           {"depended_on_by", json::array()}}),
+      {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto s = steps_of(plan, "drop_constraint");
+  ASSERT_EQ(s.size(), 1u);
+  EXPECT_NE(all_sql(*s[0]).find(
+                "ALTER TABLE shop.orders DROP CONSTRAINT orders_warehouse_fk"),
+            std::string::npos);
+  EXPECT_NE(s[0]->lock.find("shop.warehouse"), std::string::npos)
+      << "the parent's lock was not named: " << s[0]->lock;
+  EXPECT_NE(s[0]->lock.find("never names"), std::string::npos) << s[0]->lock;
+}
+
+TEST(Planner, AConstraintAnotherConstraintDependsOnIsRefusedNotAttempted) {
+  // PostgreSQL refuses this at execution with a message that suggests CASCADE.
+  // The dependency is visible in the catalog beforehand -- both constraints
+  // share one index -- so the planner can refuse precisely, name the dependent,
+  // and say what to do instead.
+  const auto plan = pglaswell::plan_migration(
+      drop_constraint_spec("orders_code_uq"),
+      with_constraint("orders_code_uq",
+                      json{{"type", "u"},
+                           {"has_index", true},
+                           {"index", "shop.orders_code_uq"},
+                           {"depended_on_by",
+                            json::array({"lines_code_fk on shop.order_lines"})}}),
+      {});
+  EXPECT_FALSE(plan.ok) << plan.render();
+  ASSERT_FALSE(plan.conflicts.empty());
+  EXPECT_NE(plan.conflicts[0].find("lines_code_fk on shop.order_lines"),
+            std::string::npos)
+      << "the refusal must name the dependent: " << plan.conflicts[0];
+  EXPECT_NE(plan.conflicts[0].find("CASCADE"), std::string::npos)
+      << "and must say why CASCADE is not the answer: " << plan.conflicts[0];
+  EXPECT_TRUE(steps_of(plan, "drop_constraint")[0]->sql.empty())
+      << "a refused drop must not carry a statement";
+}
+
+TEST(Planner, DroppingAUniqueConstraintWarnsThatItsIndexGoesWithIt) {
+  // The statement says DROP CONSTRAINT and the index disappears too. That is
+  // the part an author is most likely not to have priced in.
+  const auto plan = pglaswell::plan_migration(
+      drop_constraint_spec("orders_code_uq"),
+      with_constraint("orders_code_uq", json{{"type", "u"},
+                                             {"has_index", true},
+                                             {"index", "shop.orders_code_uq"},
+                                             {"depended_on_by", json::array()}}),
+      {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("also drops its index") != std::string::npos &&
+        w.find("shop.orders_code_uq") != std::string::npos) {
+      warned = true;
+      EXPECT_NE(w.find("evaluateIndex"), std::string::npos)
+          << "the warning should name the sibling tool that answers it: " << w;
+    }
+  }
+  EXPECT_TRUE(warned) << plan.render();
+}
+
+TEST(Planner, DroppingANotNullConstraintWarnsTheColumnBecomesNullable) {
+  // PG17+ names NOT NULL constraints, so they can be dropped by name like any
+  // other. The effect is not "less enforcement" but a change to what the data
+  // may contain, which is a different conversation.
+  const auto plan = pglaswell::plan_migration(
+      drop_constraint_spec("orders_region_not_null"),
+      with_constraint("orders_region_not_null",
+                      json{{"type", "n"},
+                           {"has_index", false},
+                           {"column", "fulfilment_region"},
+                           {"depended_on_by", json::array()}}),
+      {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("nullable again") != std::string::npos &&
+        w.find("fulfilment_region") != std::string::npos)
+      warned = true;
+  }
+  EXPECT_TRUE(warned) << plan.render();
+}
+
+TEST(Planner, ADroppedConstraintIsGoneForLaterIntentsInTheSameSpec) {
+  // Projection: dropping a unique constraint and then re-adding a check by the
+  // same name in one spec must not read as a conflict. Without projection the
+  // second intent would see the constraint the first one removes.
+  auto obs = with_constraint("orders_code_uq",
+                             json{{"type", "u"},
+                                  {"has_index", true},
+                                  {"index", "shop.orders_code_uq"},
+                                  {"depended_on_by", json::array()}});
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "drop_constraint"},
+                                {"schema", "shop"},
+                                {"table", "orders"},
+                                {"name", "orders_code_uq"}},
+                           json{{"kind", "drop_constraint"},
+                                {"schema", "shop"},
+                                {"table", "orders"},
+                                {"name", "orders_code_uq"}}})),
+      obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto s = steps_of(plan, "drop_constraint");
+  ASSERT_EQ(s.size(), 2u);
+  EXPECT_EQ(s[0]->action, pglaswell::Action::kApply);
+  EXPECT_EQ(s[1]->action, pglaswell::Action::kSatisfied)
+      << "the second drop did not see the first one: " << plan.render();
+}
+
+TEST(Planner, DroppingAConstraintOnAnAbsentTableIsAConflict) {
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "drop_constraint"},
+                                {"schema", "shop"},
+                                {"table", "no_such_table"},
+                                {"name", "ck"}}})),
+      observations(1024, 10), {});
+  EXPECT_FALSE(plan.ok) << plan.render();
+}
+
+TEST(Spec, DropConstraintHasNoCascadeKey) {
+  // CASCADE drops objects the spec never named, which is precisely what a
+  // signed change must not do. The refusal has to be at parse time: accepting
+  // and ignoring the key would apply a materially different change.
+  json doc = minimal_spec();
+  doc["intents"] = json::array({json{{"kind", "drop_constraint"},
+                                     {"schema", "s"},
+                                     {"table", "t"},
+                                     {"name", "ck"},
+                                     {"cascade", true}}});
+  const auto err = spec_error(doc);
+  EXPECT_NE(err.find("cascade"), std::string::npos) << err;
+}
+
 TEST(Planner, SetNotNullUsesTheFourStepRecipeInSeparateTransactions) {
   // The recipe only works if each step COMMITS before the next runs: if the
   // NOT VALID add and the VALIDATE shared a transaction, the stronger lock
@@ -3885,6 +4064,115 @@ TEST(Spec, AnUnknownReferentialActionIsRefusedWithTheList) {
       {"on_delete", "cascade"}}});  // lower case: PostgreSQL spells it upper
   const auto err = spec_error(doc);
   EXPECT_NE(err.find("CASCADE"), std::string::npos) << err;
+}
+
+TEST_F(DatabaseTest, ConstraintObservationsMatchWhatPostgresqlActuallyRefuses) {
+  // The drop_constraint refusal rests entirely on one catalog reading:
+  // "another constraint shares my index." If that reading is wrong the planner
+  // either refuses a drop that would have worked or waves through one that
+  // fails at execution. Both halves are asserted here against a live catalog,
+  // and the second half is asserted by MAKING POSTGRESQL REFUSE IT -- a test
+  // that only checked our own JSON would agree with itself forever.
+  pglaswell::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = url_;
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/constraints");
+    w.txn().exec("DROP TABLE IF EXISTS laswell_c CASCADE");
+    w.txn().exec("DROP TABLE IF EXISTS laswell_p CASCADE");
+    w.txn().exec("CREATE TABLE laswell_p(id bigint PRIMARY KEY,"
+                 " code text NOT NULL CONSTRAINT laswell_p_code_uq UNIQUE)");
+    w.txn().exec("CREATE TABLE laswell_c(id bigint PRIMARY KEY,"
+                 " code text, v int CONSTRAINT laswell_c_v_ck CHECK (v > 0),"
+                 " CONSTRAINT laswell_c_fk FOREIGN KEY (code)"
+                 "   REFERENCES laswell_p(code))");
+    w.commit();
+  }
+
+  pglaswell::Catalog cat(cfg);
+  const auto obs =
+      cat.observe({"public", "public"}, {"laswell_p", "laswell_c"});
+  const auto& p = obs.table("public.laswell_p");
+  const auto& c = obs.table("public.laswell_c");
+
+  // Every contype we plan for is seen, and typed.
+  EXPECT_EQ(c["constraints"]["laswell_c_v_ck"]["type"], "c");
+  EXPECT_EQ(c["constraints"]["laswell_c_fk"]["type"], "f");
+  EXPECT_EQ(c["constraints"]["laswell_c_fk"]["references"], "laswell_p");
+  EXPECT_EQ(p["constraints"]["laswell_p_code_uq"]["type"], "u");
+  EXPECT_EQ(p["constraints"]["laswell_p_code_uq"]["has_index"], true);
+
+  // The dependency, seen from the side that cannot be dropped.
+  const auto dependents =
+      p["constraints"]["laswell_p_code_uq"]["depended_on_by"];
+  ASSERT_EQ(dependents.size(), 1u) << p["constraints"].dump(2);
+  EXPECT_NE(dependents[0].get<std::string>().find("laswell_c_fk"),
+            std::string::npos);
+  // ... and absent from constraints nothing depends on, so the refusal does
+  // not fire on every drop.
+  EXPECT_TRUE(c["constraints"]["laswell_c_v_ck"]["depended_on_by"].empty());
+  EXPECT_TRUE(c["constraints"]["laswell_c_fk"]["depended_on_by"].empty());
+
+  auto drop = [&](const char* table, const char* name) {
+    json d = minimal_spec();
+    d["intents"] = json::array({json{{"kind", "drop_constraint"},
+                                     {"schema", "public"},
+                                     {"table", table},
+                                     {"name", name}}});
+    return pglaswell::plan_migration(pglaswell::parse_spec(d), obs, {});
+  };
+
+  // The planner refuses the unique constraint...
+  const auto refused = drop("laswell_p", "laswell_p_code_uq");
+  EXPECT_FALSE(refused.ok) << refused.render();
+
+  // ... and PostgreSQL agrees. This is the assertion that keeps the reading
+  // honest: if PostgreSQL ever allowed it, the refusal would be inventing a
+  // restriction rather than reporting one.
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/constraints-refute");
+    EXPECT_THROW(w.txn().exec("ALTER TABLE laswell_p DROP CONSTRAINT"
+                              " laswell_p_code_uq"),
+                 pqxx::sql_error)
+        << "PostgreSQL allowed a drop the planner refuses";
+  }
+
+  // The check constraint has no dependents, so it plans and applies.
+  const auto allowed = drop("laswell_c", "laswell_c_v_ck");
+  ASSERT_TRUE(allowed.ok) << allowed.render();
+  const auto steps = steps_of(allowed, "drop_constraint");
+  ASSERT_EQ(steps.size(), 1u);
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/constraints-apply");
+    const std::string stmt = steps[0]->sql[0];
+    w.txn().exec(stmt.substr(0, stmt.size() - 1));
+    w.commit();
+  }
+  const auto after = cat.observe({"public"}, {"laswell_c"});
+  EXPECT_FALSE(after.table("public.laswell_c")["constraints"].contains(
+      "laswell_c_v_ck"));
+  // Re-planning against the new reading is satisfied, not a second attempt.
+  {
+    json d = minimal_spec();
+    d["intents"] = json::array({json{{"kind", "drop_constraint"},
+                                     {"schema", "public"},
+                                     {"table", "laswell_c"},
+                                     {"name", "laswell_c_v_ck"}}});
+    const auto again =
+        pglaswell::plan_migration(pglaswell::parse_spec(d), after, {});
+    ASSERT_TRUE(again.ok);
+    EXPECT_EQ(steps_of(again, "drop_constraint")[0]->action,
+              pglaswell::Action::kSatisfied);
+  }
+
+  pglaswell::WriteSession w(cfg);
+  w.begin("pg_laswell/test/constraints-cleanup");
+  w.txn().exec("DROP TABLE laswell_c");
+  w.txn().exec("DROP TABLE laswell_p");
+  w.commit();
 }
 
 TEST_F(DatabaseTest, TheNotNullRecipeLeavesPostgresqlsOwnConstraintName) {

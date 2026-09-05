@@ -327,9 +327,10 @@ This build implements
 .Cm create_index ,
 .Cm drop_index ,
 .Cm set_not_null ,
-.Cm add_foreign_key
+.Cm add_foreign_key ,
+.Cm add_check_constraint
 and
-.Cm add_check_constraint .
+.Cm drop_constraint .
 .Pp
 An intent that creates an object must carry a
 .Va comment ,
@@ -512,26 +513,61 @@ transaction block, so the attaches that follow have nothing to attach.
 Those steps are reported as
 .Em unverified ,
 never as wrong.
-.Ss What is deliberately absent
-There is no
-.Cm drop_constraint .
-It would emit exactly one possible statement whatever the database looked like:
-there is no concurrent variant of
-.Ic ALTER TABLE ... DROP CONSTRAINT ,
+.Pp
+.Cm drop_constraint
+emits one statement whatever the database looks like -- there is no concurrent
+variant of
+.Ic ALTER TABLE ... DROP CONSTRAINT
 and the lock is
 .Va AccessExclusiveLock
-in every case.
-An intent kind here has to justify itself by the decision its planner makes,
-and a kind with no decision is a wrapper around
+in every case -- so by the rule that an intent kind must justify itself by its
+planner's decision, it looks like a wrapper around
 .Xr psql 1 .
+It is not, for two reasons.
+A repository has to be able to express the whole change: a constraint dropped
+outside
+.Nm
+is unsigned, absent from the ledger and missing from the dependency graph, so
+the repository then describes a database that does not exist.
+And the decision is not which statement to emit but whether the drop can
+succeed at all, what it takes with it, and how far the lock reaches.
 .Pp
-One measured fact worth carrying if you do it by hand: dropping a
+It refuses, before anything runs, a constraint another constraint depends on --
+a unique constraint whose index backs a foreign key elsewhere.
+PostgreSQL reports this at execution time and suggests
+.Ic CASCADE ;
+the dependency is visible in the catalog beforehand, through the shared
+.Va conindid ,
+so the plan names the dependent constraint and the table it sits on instead.
+There is no
+.Va cascade
+key and there will not be one:
+.Ic CASCADE
+drops objects the specification never named, which is exactly what a signed
+change must not do.
+Drop the dependents in their own intents, where they are visible and
+reviewable.
+.Pp
+It also says what goes with the constraint, rather than leaving it to be
+discovered.
+Dropping a
 .Em foreign key
 takes
 .Va AccessExclusiveLock
 on the referenced table as well, which the statement never names -- a stronger
-lock on the parent than adding the constraint takes.
-Dropping a unique constraint also drops its index.
+lock on the parent than adding the constraint takes, and often the busier
+table.
+Dropping a unique or exclusion constraint drops its index, so every lookup that
+index served becomes a scan; the plan names the index and points at pg_licht
+.Cm evaluateIndex
+with
+.Va hide
+for what still plans against it.
+Dropping a NOT NULL constraint makes the column nullable again, which is a
+change to what the data may contain and not merely to what is enforced.
+A constraint that is already absent is
+.Em satisfied ,
+not an error.
 .Sh SIGNING
 .Nm
 verifies; it never signs.

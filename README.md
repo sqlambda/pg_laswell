@@ -11,7 +11,7 @@ says so plainly where it can prove nothing. It converges databases that have
 drifted. And it never states a number it cannot derive.
 
 **Status: pre-0.1.0.** The whole path works — repository, signing, planning,
-dry run, paced execution, ledger — with 193 tests green on GCC and Clang, under
+dry run, paced execution, ledger — with 222 tests green on GCC and Clang, under
 AddressSanitizer/UBSan and ThreadSanitizer. Not yet packaged, and the manual is
 still a stub.
 
@@ -82,6 +82,10 @@ replication lag. Those are pg_licht's readings.
   may run concurrently. It also flags a spec that was **edited after it was
   applied** — the database no longer matches the file that claims to describe
   it.
+- **Constraints as first-class changes.** `add_foreign_key`,
+  `add_check_constraint` and `set_not_null` plan as `NOT VALID` + `VALIDATE` in
+  separate transactions; `drop_constraint` refuses, before anything runs, a
+  drop PostgreSQL would reject at execution — and never emits `CASCADE`.
 - **Convergence.** The same spec creates an index where it is missing and
   renames one that was built by hand under a different name, so a repository
   drives every database to the same state rather than only the clean ones.

@@ -103,6 +103,28 @@ SELECT COALESCE(
                    JOIN pg_am am ON am.oid = ic.relam
                   WHERE i.indrelid = t.oid),
                  '{}'::jsonb),
+     -- Constraints, with what would break if one were dropped. PostgreSQL
+     -- refuses to drop a unique constraint a foreign key depends on, and the
+     -- dependency is visible beforehand through the shared index: refusing in
+     -- the planner beats failing at execution.
+     'constraints', COALESCE((SELECT JSONB_OBJECT_AGG(k.conname, JSONB_BUILD_OBJECT(
+                       'type', k.contype::text,
+                       'has_index', k.conindid <> 0,
+                       'index', CASE WHEN k.conindid <> 0
+                                     THEN k.conindid::regclass::text END,
+                       'references', CASE WHEN k.contype = 'f'
+                                          THEN k.confrelid::regclass::text END,
+                       'column', (SELECT a.attname FROM pg_attribute a
+                                   WHERE a.attrelid = t.oid
+                                     AND a.attnum = k.conkey[1]),
+                       'depended_on_by', COALESCE((
+                          SELECT JSONB_AGG(d.conname || ' on ' ||
+                                           d.conrelid::regclass::text)
+                            FROM pg_constraint d
+                           WHERE d.contype = 'f' AND k.conindid <> 0
+                             AND d.conindid = k.conindid
+                             AND d.oid <> k.oid), '[]'::jsonb)))
+                       FROM pg_constraint k WHERE k.conrelid = t.oid), '{}'::jsonb),
      'lock_waiters', (SELECT COUNT(*) FROM pg_locks l
                        WHERE l.relation = t.oid AND NOT l.granted),
      -- Direct partitions, in name order so a plan is stable across runs.

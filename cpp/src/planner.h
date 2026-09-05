@@ -319,6 +319,9 @@ inline void project(const Intent& in, const Step& step, Observations& projected)
       }
       return;
     }
+    case IntentKind::kDropConstraint:
+      projected.tables[qualified]["constraints"].erase(in.body.value("name", ""));
+      return;
     case IntentKind::kAddForeignKey:
     case IntentKind::kAddCheckConstraint:
       // A constraint, not a relation or a column: nothing a later intent in
@@ -1080,6 +1083,114 @@ inline void plan_add_check_constraint(const Intent& in, const Observations& obs,
   out.push_back(std::move(validate));
 }
 
+// --- drop_constraint -------------------------------------------------------
+//
+// The statement is always the same -- there is no concurrent variant and the
+// lock is AccessExclusiveLock in every case -- and for a while that argued this
+// kind did not belong here at all.
+//
+// That was wrong, for two reasons. A repository has to be able to express the
+// whole change: a constraint dropped OUTSIDE pg_laswell is unsigned, absent
+// from the ledger and missing from the dependency graph, so the repository then
+// describes a database that does not exist. And there IS a decision, just not
+// about which statement to emit -- whether the drop can succeed at all, what
+// else it takes with it, and how far the lock reaches.
+inline void plan_drop_constraint(const Intent& in, const Observations& obs,
+                                 Plan& plan, std::vector<Step>& out) {
+  Step step;
+  step.kind = in.kind_name;
+  struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
+
+  const auto qualified = in.qualified_table();
+  const auto& t = obs.table(qualified);
+  const auto name = in.body.value("name", "");
+
+  if (!t.value("exists", false)) {
+    step.action = Action::kConflict;
+    step.why = qualified + " does not exist";
+    plan.conflicts.push_back(step.why);
+    return;
+  }
+
+  const json constraints = t.value("constraints", json::object());
+  if (!constraints.contains(name)) {
+    step.action = Action::kSatisfied;
+    step.why = "no constraint named " + name + " on " + qualified;
+    return;
+  }
+  const auto& c = constraints[name];
+  const auto type = c.value("type", "");
+
+  // PostgreSQL refuses to drop a unique constraint a foreign key depends on,
+  // and the dependency is visible here through the shared index. Refusing in
+  // the planner, naming the dependent, beats failing at execution with a
+  // message that suggests CASCADE.
+  const auto dependents = c.value("depended_on_by", json::array());
+  if (!dependents.empty()) {
+    std::vector<std::string> names;
+    for (const auto& d : dependents) names.push_back(d.get<std::string>());
+    step.action = Action::kConflict;
+    step.why = name + " is depended on by " + detail::join(names, ", ");
+    plan.conflicts.push_back(
+        "\"" + name + "\" on " + qualified + " cannot be dropped: " +
+        detail::join(names, ", ") +
+        " depends on its index. Drop the dependent constraint first, in an "
+        "earlier intent. pg_laswell will not emit CASCADE, because CASCADE "
+        "drops objects the spec never named and a signed change must not do "
+        "that.");
+    return;
+  }
+
+  step.txn_class = TxnClass::kRequired;
+  step.sql.push_back("ALTER TABLE " + qualified + " DROP CONSTRAINT " + name + ";");
+
+  // The lock reaches further than the statement reads. Measured on 18.6:
+  // dropping a foreign key takes AccessExclusiveLock on the REFERENCED table
+  // too -- a stronger lock on the parent than adding the constraint takes, and
+  // on a table the statement never names.
+  if (type == "f") {
+    const auto parent = c.value("references", "");
+    step.lock = "AccessExclusiveLock on " + qualified + " AND on " + parent +
+                ", which this statement never names";
+    step.why = "dropping a foreign key; note the second lock -- it is stronger "
+               "on the parent than ADDING the constraint takes, and " + parent +
+               " may be the busier table";
+  } else {
+    step.lock = "AccessExclusiveLock on " + qualified;
+    step.why = "dropping a " + std::string(
+                   type == "c" ? "check" : type == "u" ? "unique" :
+                   type == "x" ? "exclusion" : type == "n" ? "not-null" :
+                   type == "p" ? "primary key" : "") +
+               " constraint; there is no concurrent variant, so the lock is "
+               "brief but exclusive";
+  }
+
+  // What goes with it, said before rather than discovered after.
+  if (c.value("has_index", false)) {
+    plan.warnings.push_back(
+        "dropping \"" + name + "\" also drops its index " +
+        c.value("index", std::string("(unnamed)")) +
+        ", so every lookup that index served becomes a scan. pg_licht "
+        "evaluateIndex with hide will say what still plans against it.");
+  }
+  if (type == "n") {
+    plan.warnings.push_back(
+        "\"" + name + "\" is a NOT NULL constraint: dropping it makes " +
+        qualified + "." + c.value("column", std::string("that column")) +
+        " nullable again, which is a change to what the data may contain and "
+        "not merely to what is enforced.");
+  }
+  if (type == "p") {
+    plan.warnings.push_back(
+        "\"" + name + "\" is the PRIMARY KEY of " + qualified +
+        ". Dropping it removes the row identity anything else may rely on, "
+        "including a backfill's keyset walk.");
+  }
+
+  step.detail["constraint"] = name;
+  step.detail["constraint_type"] = type;
+}
+
 // --- drop_index ------------------------------------------------------------
 //
 // A drop is fast whatever else is true -- a catalog change and a file unlink.
@@ -1425,6 +1536,8 @@ inline Plan plan_migration(const Spec& spec, const Observations& obs,
       case IntentKind::kAddForeignKey: plan_add_foreign_key(in, projected, plan, emitted); break;
       case IntentKind::kAddCheckConstraint:
         plan_add_check_constraint(in, projected, plan, emitted); break;
+      case IntentKind::kDropConstraint:
+        plan_drop_constraint(in, projected, plan, emitted); break;
     }
     if (!emitted.empty()) project(in, emitted.front(), projected);
 

@@ -93,9 +93,16 @@ if(BUILD_TESTING)
     # point of that mode and gtest cannot see it: the suite observes return
     # values, not process status. Runs without a database too, covering the
     # flags that need none.
+    # DATABASE_URL is read by the script at RUN time, not baked in here.
+    # $ENV{} is evaluated during configure, so a conninfo captured then
+    # outlives the database it names: the suite went on "passing" against a
+    # dropped spike database because every check that expects a non-zero exit
+    # is satisfied by a connection failure. ctest passes its own environment
+    # through, so late binding costs nothing and the script tests what the
+    # operator actually pointed it at.
     add_test(NAME call_mode
              COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/call-mode.sh
-                     $<TARGET_FILE:pg_laswell_mcp> "$ENV{DATABASE_URL}")
+                     $<TARGET_FILE:pg_laswell_mcp>)
 endif()
 
 message(STATUS "Using compiler: ${CMAKE_CXX_COMPILER} (${CMAKE_CXX_COMPILER_ID})")
