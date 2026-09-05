@@ -36,7 +36,8 @@ enum class IntentKind { kAddColumn, kBackfill, kCreateIndex, kDropIndex,
                         kSetNotNull, kAddForeignKey, kAddCheckConstraint,
                         kDropConstraint, kAlterColumnType, kDropColumn,
                         kReplaceView, kAddUniqueConstraint,
-                        kAddPrimaryKey };
+                        kAddPrimaryKey, kAttachPartition,
+                        kDetachPartition };
 
 inline const std::map<std::string, IntentKind>& intent_kinds() {
   static const std::map<std::string, IntentKind> kKinds = {
@@ -53,6 +54,8 @@ inline const std::map<std::string, IntentKind>& intent_kinds() {
       {"replace_view", IntentKind::kReplaceView},
       {"add_unique_constraint", IntentKind::kAddUniqueConstraint},
       {"add_primary_key", IntentKind::kAddPrimaryKey},
+      {"attach_partition", IntentKind::kAttachPartition},
+      {"detach_partition", IntentKind::kDetachPartition},
   };
   return kKinds;
 }
@@ -421,6 +424,58 @@ inline void parse_add_check_constraint(Intent& in) {
 // model exists to avoid, so the definition is written as SQL and signed as SQL.
 // add_unique_constraint and add_primary_key take the same body: both are
 // backed by a unique index, and both are planned through it.
+// Bounds are STRUCTURED rather than a raw FOR VALUES clause, which is a
+// departure from how backfill takes SQL -- and the reason is that pg_laswell
+// has to render the bounds TWICE, in two different syntaxes: once as FOR VALUES
+// for the attach, and once as a CHECK constraint, which is what turns the
+// attach from a full scan into a catalog change. A raw clause could be copied
+// into the first and not derived for the second.
+inline void parse_attach_partition(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(
+      in.body, {"kind", "schema", "table", "partition", "from", "to", "values",
+                "default"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "partition", at),
+                             "partition", in.ordinal);
+  const bool range = in.body.contains("from") || in.body.contains("to");
+  const bool list = in.body.contains("values");
+  const bool deflt = in.body.value("default", false);
+  if (range + list + deflt != 1) {
+    detail::fail(at + " must state exactly one kind of bound",
+                 "Use \"from\" and \"to\" for a range partition, \"values\" "
+                 "for a list partition, or \"default\": true. They are "
+                 "mutually exclusive, and one is required.");
+  }
+  if (range) {
+    detail::require_string(in.body, "from", at);
+    detail::require_string(in.body, "to", at);
+  }
+  if (list) {
+    if (!in.body["values"].is_array() || in.body["values"].empty()) {
+      detail::fail(at + ".values must be a non-empty array",
+                   "List the key values this partition accepts.");
+    }
+    for (const auto& v : in.body["values"]) {
+      if (!v.is_string()) {
+        detail::fail(at + ".values must be strings",
+                     "Write each value as it would appear in SQL, quotes "
+                     "included, so the spec is what is executed.");
+      }
+    }
+  }
+}
+
+inline void parse_detach_partition(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(in.body, {"kind", "schema", "table", "partition"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "partition", at),
+                             "partition", in.ordinal);
+}
+
 inline void parse_unique_like(Intent& in) {
   const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
   detail::reject_unknown_keys(in.body, {"kind", "schema", "table", "name", "columns"}, at);
@@ -630,6 +685,8 @@ inline Spec parse_spec(const json& doc) {
     case IntentKind::kReplaceView: parse_replace_view(in); break;
     case IntentKind::kAddUniqueConstraint:
     case IntentKind::kAddPrimaryKey: parse_unique_like(in); break;
+    case IntentKind::kAttachPartition: parse_attach_partition(in); break;
+    case IntentKind::kDetachPartition: parse_detach_partition(in); break;
     }
     s.intents.push_back(std::move(in));
     ++ordinal;

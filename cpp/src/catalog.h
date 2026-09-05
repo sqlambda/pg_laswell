@@ -228,7 +228,41 @@ SELECT COALESCE(
                                FROM pg_inherits pi
                                JOIN pg_class pc ON pc.oid = pi.inhrelid
                                JOIN pg_namespace pn ON pn.oid = pc.relnamespace
-                              WHERE pi.inhparent = t.oid), '[]'::jsonb)
+                              WHERE pi.inhparent = t.oid), '[]'::jsonb),
+     -- Partition-key text, e.g. "RANGE (at)". The planner needs the key COLUMN
+     -- to render the CHECK constraint that turns an ATTACH from a full scan
+     -- into a catalog change (measured: 98ms vs 0.9ms on 2M rows).
+     'partition_key', CASE WHEN t.relkind = 'p'
+                           THEN PG_GET_PARTKEYDEF(t.oid) END,
+     -- A DEFAULT partition has to be scanned on every ATTACH, to prove it
+     -- holds no row belonging to the new bounds. That cost belongs to the
+     -- DEFAULT, not to the candidate, so no CHECK on the candidate avoids it:
+     -- measured at 165ms with a 2M-row default, against 0.9ms without one.
+     'default_partition', (SELECT pn.nspname || '.' || pc.relname
+                             FROM pg_inherits pi
+                             JOIN pg_class pc ON pc.oid = pi.inhrelid
+                             JOIN pg_namespace pn ON pn.oid = pc.relnamespace
+                            WHERE pi.inhparent = t.oid
+                              AND PG_GET_EXPR(pc.relpartbound, pc.oid) = 'DEFAULT'),
+     -- A partition left half-detached by an interrupted DETACH CONCURRENTLY.
+     -- It is still in pg_inherits, still reports relispartition, and only this
+     -- flag says the cluster is mid-operation and needs FINALIZE.
+     'detach_pending', COALESCE((SELECT JSONB_AGG(pn.nspname || '.' || pc.relname)
+                               FROM pg_inherits pi
+                               JOIN pg_class pc ON pc.oid = pi.inhrelid
+                               JOIN pg_namespace pn ON pn.oid = pc.relnamespace
+                              WHERE pi.inhparent = t.oid
+                                AND pi.inhdetachpending), '[]'::jsonb),
+     -- The parent's partitioned indexes. Anything here without a match on the
+     -- candidate is BUILT during ATTACH, under AccessExclusiveLock on the
+     -- candidate -- which is what made the first measurement of this recipe
+     -- read as though a CHECK constraint bought nothing.
+     'partitioned_indexes', COALESCE((
+        SELECT JSONB_OBJECT_AGG(ic.relname,
+                 PG_GET_INDEXDEF(i.indexrelid))
+          FROM pg_index i
+          JOIN pg_class ic ON ic.oid = i.indexrelid
+         WHERE i.indrelid = t.oid AND ic.relkind = 'I'), '{}'::jsonb)
    ) FROM target t),
   JSONB_BUILD_OBJECT('exists', false))
 )SQL";

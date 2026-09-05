@@ -3,7 +3,7 @@
 ## 0.1.0 (unreleased)
 
 The whole path works: repository, signing, planning, dry run, paced execution,
-ledger. 248 tests green on GCC 14.2 and Clang 22, under AddressSanitizer/UBSan
+ledger. 260 tests green on GCC 14.2 and Clang 22, under AddressSanitizer/UBSan
 and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
 `--call` contract test.
 
@@ -207,6 +207,21 @@ and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
   one rewrites. `text`→`varchar(200)` rewrites; `varchar(50)`→`text` does not.
   Anything unproven is reported as a rewrite, because a cautious plan costs
   less than an unplanned outage.
+- **`attach_partition` and `detach_partition`** — partition rotation, which is
+  how time-series data is actually retired. `ATTACH` validates the candidate
+  unless a CHECK already proves the bounds: **98.393 ms vs 0.914 ms on 2M
+  rows**. So the plan adds the CHECK `NOT VALID`, validates it under
+  `ShareUpdateExclusiveLock`, attaches, then drops it — the partition bound now
+  enforces the same thing, and a leftover CHECK costs time on every insert.
+  Two costs it cannot remove, both stated: an unmatched parent index is *built*
+  during the attach under `AccessExclusiveLock` (build it first — a matching
+  one is attached, not rebuilt), and a `DEFAULT` partition is scanned on every
+  attach whatever the candidate proves (**165 ms** with a 2M-row default).
+  A plain `DETACH` takes `AccessExclusiveLock` on the **parent**, blocking every
+  partition; `CONCURRENTLY` does not and cannot run in a transaction block. An
+  interrupted concurrent detach leaves the partition half-detached with only
+  `pg_inherits.inhdetachpending` to say so — re-running the intent emits
+  `FINALIZE`, the only legal move from there.
 - **`add_unique_constraint` and `add_primary_key`**, planned through the index
   that backs them. A plain `ADD CONSTRAINT … UNIQUE` takes `AccessExclusiveLock`
   *and* `ShareLock` and builds the index under them; `CREATE UNIQUE INDEX

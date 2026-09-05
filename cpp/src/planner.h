@@ -368,6 +368,19 @@ inline void project(const Intent& in, const Step& step, Observations& projected)
     case IntentKind::kDropColumn:
       projected.tables[qualified]["columns"].erase(in.body.value("column", ""));
       return;
+    case IntentKind::kAttachPartition: {
+      const auto ch = in.body.value("schema", "") + "." + in.body.value("partition", "");
+      projected.tables[qualified]["partitions"].push_back(ch);
+      return;
+    }
+    case IntentKind::kDetachPartition: {
+      const auto ch = in.body.value("schema", "") + "." + in.body.value("partition", "");
+      auto& parts = projected.tables[qualified]["partitions"];
+      for (auto it = parts.begin(); it != parts.end(); ++it) {
+        if (it->get<std::string>() == ch) { parts.erase(it); break; }
+      }
+      return;
+    }
     case IntentKind::kAddUniqueConstraint:
     case IntentKind::kAddPrimaryKey:
       projected.tables[qualified]["constraints"][in.body.value("name", "")] =
@@ -1377,6 +1390,339 @@ inline void warn_about_rebuild(
 }
 
 }  // namespace detail
+
+// --- attach_partition / detach_partition -----------------------------------
+//
+// Partition rotation is how time-series data is actually retired, and both
+// halves carry a trap (spike S16, 18.6).
+//
+// ATTACH validates the candidate against the new bounds unless an existing
+// CHECK constraint already proves it cannot violate them. Measured on 2M rows
+// with the index build taken out of the comparison: 98.393 ms without a
+// matching CHECK, 0.914 ms with one. 108x, and it scales with the partition.
+//
+// The index build is the reason that comparison needs care: any of the parent's
+// partitioned indexes without a match on the candidate is BUILT during ATTACH,
+// under AccessExclusiveLock on the candidate. A first measurement that left
+// that in read as though the CHECK bought nothing.
+//
+// And a DEFAULT partition must be scanned on every ATTACH, to prove it holds no
+// row belonging to the new bounds. That cost belongs to the default, so no
+// CHECK on the candidate can avoid it: 165 ms with a 2M-row default present.
+namespace detail {
+
+// The same bounds rendered as a CHECK. This is the entire reason bounds are
+// structured in the spec rather than given as a raw FOR VALUES clause: they
+// have to come out in two syntaxes, and deriving the second from the first
+// would mean parsing SQL in a header that must stay pure.
+inline std::string bounds_as_check(const Intent& in, const std::string& key) {
+  if (in.body.contains("from")) {
+    return key + " >= " + in.body.value("from", "") + " AND " + key + " < " +
+           in.body.value("to", "");
+  }
+  if (in.body.contains("values")) {
+    std::vector<std::string> vs;
+    for (const auto& v : in.body["values"]) vs.push_back(v.get<std::string>());
+    return key + " IN (" + join(vs, ", ") + ")";
+  }
+  return {};  // DEFAULT has no bound to prove
+}
+
+inline std::string bounds_as_for_values(const Intent& in) {
+  if (in.body.contains("from")) {
+    return "FOR VALUES FROM (" + in.body.value("from", "") + ") TO (" +
+           in.body.value("to", "") + ")";
+  }
+  if (in.body.contains("values")) {
+    std::vector<std::string> vs;
+    for (const auto& v : in.body["values"]) vs.push_back(v.get<std::string>());
+    return "FOR VALUES IN (" + join(vs, ", ") + ")";
+  }
+  return "DEFAULT";
+}
+
+// "RANGE (at)" -> "at". Only a single-column key is handled; a composite one is
+// refused rather than half-understood, because a CHECK derived from the first
+// column alone would not prove what ATTACH needs and the scan would happen
+// anyway -- silently, which is the worst of both.
+inline std::string single_partition_key(const std::string& partkeydef) {
+  const auto open = partkeydef.find('(');
+  const auto close = partkeydef.rfind(')');
+  if (open == std::string::npos || close == std::string::npos || close < open) {
+    return {};
+  }
+  const std::string inner = partkeydef.substr(open + 1, close - open - 1);
+  if (inner.find(',') != std::string::npos) return {};
+  return inner;
+}
+
+}  // namespace detail
+
+inline void plan_attach_partition(const Intent& in, const Observations& obs,
+                                  Plan& plan, std::vector<Step>& out) {
+  const auto parent = in.qualified_table();
+  const auto& p = obs.table(parent);
+  const auto child =
+      in.body.value("schema", "") + "." + in.body.value("partition", "");
+  const auto& c = obs.table(child);
+
+  auto fail = [&](const std::string& why, const std::string& detail) {
+    Step s;
+    s.kind = in.kind_name;
+    s.action = Action::kConflict;
+    s.why = why;
+    plan.conflicts.push_back(detail);
+    out.push_back(std::move(s));
+  };
+
+  if (!p.value("exists", false)) {
+    fail(parent + " does not exist", parent + " does not exist");
+    return;
+  }
+  if (p.value("kind", "") != "partitioned_table") {
+    fail(parent + " is not partitioned",
+         parent + " is a " + p.value("kind", std::string("relation")) +
+             ", not a partitioned table, so nothing can be attached to it.");
+    return;
+  }
+  if (!c.value("exists", false)) {
+    fail(child + " does not exist",
+         child + " does not exist. attach_partition adopts an existing table; "
+                 "create it in an earlier intent.");
+    return;
+  }
+  for (const auto& already : p.value("partitions", json::array())) {
+    if (already.get<std::string>() == child) {
+      Step s;
+      s.kind = in.kind_name;
+      s.action = Action::kSatisfied;
+      s.why = child + " is already a partition of " + parent;
+      out.push_back(std::move(s));
+      return;
+    }
+  }
+
+  const auto key = detail::single_partition_key(p.value("partition_key", ""));
+  const auto check_expr = key.empty() ? std::string()
+                                      : detail::bounds_as_check(in, key);
+  const auto check_name = in.body.value("partition", "") + "_laswell_bound";
+
+  auto emit = [&](TxnClass klass, std::string sql, const std::string& lock,
+                  const std::string& why, bool own) {
+    Step s;
+    s.kind = in.kind_name;
+    s.txn_class = klass;
+    s.sql.push_back(std::move(sql));
+    s.lock = lock;
+    s.why = why;
+    s.own_transaction = own;
+    out.push_back(std::move(s));
+  };
+
+  // Step 0: the parent's partitioned indexes the candidate does not match.
+  //
+  // ATTACH builds one on the candidate for each unmatched parent index, under
+  // AccessExclusiveLock on the candidate -- and a pre-existing MATCHING index
+  // is attached to the parent's instead, costing nothing. Measured: leaving
+  // this in a comparison made a validated CHECK look like it bought nothing,
+  // because the index build was the whole cost.
+  //
+  // Matched structurally -- method, columns, uniqueness, predicate -- not by
+  // name and not by presence. A child index over the wrong columns satisfies
+  // nothing, and reporting it as a match would be worse than saying nothing.
+  auto shape_of = [](const json& ix) {
+    std::vector<std::string> cols;
+    for (const auto& col : ix.value("columns", json::array())) {
+      cols.push_back(col.get<std::string>());
+    }
+    return ix.value("method", std::string("btree")) + "(" + detail::join(cols, ",") +
+           ")" + (ix.value("is_unique", false) ? " unique" : "") +
+           " where " + ix.value("predicate", std::string());
+  };
+  const json parent_indexes = p.value("indexes", json::object());
+  const json child_indexes = c.value("indexes", json::object());
+  std::set<std::string> child_shapes;
+  for (const auto& [cname, cix] : child_indexes.items()) {
+    (void)cname;
+    child_shapes.insert(shape_of(cix));
+  }
+  std::vector<std::string> unmatched;
+  for (const auto& [iname, pix] : parent_indexes.items()) {
+    if (child_shapes.count(shape_of(pix)) == 0) unmatched.push_back(iname);
+  }
+  if (!unmatched.empty()) {
+    plan.warnings.push_back(
+        child + " has no index matching " + std::to_string(unmatched.size()) +
+        " of " + parent + "'s partitioned index(es): " +
+        detail::join(unmatched, ", ") +
+        ". ATTACH builds each one on the candidate under AccessExclusiveLock, "
+        "and on a large partition that is the dominant cost of the whole "
+        "operation. Build them first with create_index intents on " + child +
+        ": a matching index is ATTACHED to the parent's rather than rebuilt.");
+  }
+
+  // Steps 1 and 2: prove the bounds before ATTACH has to.
+  if (key.empty()) {
+    plan.warnings.push_back(
+        parent + " has a composite or expression partition key (" +
+        p.value("partition_key", std::string("unknown")) +
+        "), which pg_laswell will not reduce to a CHECK. ATTACH therefore "
+        "scans " + child +
+        " in full under AccessExclusiveLock. Refusing to guess here is "
+        "deliberate: a CHECK over part of the key would not prove what ATTACH "
+        "needs, and the scan would happen anyway without anyone being told.");
+  } else if (!check_expr.empty()) {
+    emit(TxnClass::kRequired,
+         "ALTER TABLE " + child + " ADD CONSTRAINT " + check_name + " CHECK (" +
+             check_expr + ") NOT VALID;",
+         "ShareRowExclusiveLock on " + child + ", briefly; NOT VALID means no scan",
+         "step 1 of 4: the CHECK is what lets ATTACH skip its scan, and adding "
+         "it NOT VALID costs nothing",
+         /*own=*/true);
+    emit(TxnClass::kRequired,
+         "ALTER TABLE " + child + " VALIDATE CONSTRAINT " + check_name + ";",
+         "ShareUpdateExclusiveLock on " + child + " -- does NOT block reads or writes",
+         "step 2 of 4: the scan happens here instead, under a lock the "
+         "application survives. Measured: ATTACH without this took 98ms on 2M "
+         "rows against 0.9ms with it",
+         /*own=*/true);
+  }
+
+  emit(TxnClass::kRequired,
+       "ALTER TABLE " + parent + " ATTACH PARTITION " + child + " " +
+           detail::bounds_as_for_values(in) + ";",
+       "ShareUpdateExclusiveLock on " + parent +
+           " -- other partitions keep serving -- and AccessExclusiveLock on " +
+           child,
+       check_expr.empty()
+           ? "step 3 of 4: attaching, with a full validation scan under the lock"
+           : "step 3 of 4: attaching, now a catalog change because the "
+             "validated CHECK already proves the bounds",
+       /*own=*/true);
+
+  // Step 4: the CHECK is redundant once the partition bound enforces the same
+  // thing, and a redundant constraint costs time on every insert forever.
+  if (!check_expr.empty()) {
+    emit(TxnClass::kRequired,
+         "ALTER TABLE " + child + " DROP CONSTRAINT " + check_name + ";",
+         "AccessExclusiveLock on " + child + ", briefly",
+         "step 4 of 4: the partition bound now enforces what the CHECK did, "
+         "and PostgreSQL evaluates both on every insert if it is left behind",
+         /*own=*/true);
+  }
+
+  const auto deflt = p.value("default_partition", json());
+  if (deflt.is_string()) {
+    plan.warnings.push_back(
+        parent + " has a DEFAULT partition (" + deflt.get<std::string>() +
+        "), which ATTACH scans in full to prove it holds no row belonging to "
+        "the new bounds. No CHECK on " + child +
+        " avoids that -- the cost belongs to the default. Measured at 165ms "
+        "with a 2M-row default against 0.9ms without one, and it grows with "
+        "the default's size.");
+  }
+}
+
+inline void plan_detach_partition(const Intent& in, const Observations& obs,
+                                  Plan& plan, std::vector<Step>& out) {
+  Step step;
+  step.kind = in.kind_name;
+  struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
+
+  const auto parent = in.qualified_table();
+  const auto& p = obs.table(parent);
+  const auto child =
+      in.body.value("schema", "") + "." + in.body.value("partition", "");
+
+  if (!p.value("exists", false)) {
+    step.action = Action::kConflict;
+    step.why = parent + " does not exist";
+    plan.conflicts.push_back(step.why);
+    return;
+  }
+
+  // A partition left half-detached by an interrupted DETACH CONCURRENTLY is
+  // still in pg_inherits and still reports relispartition; only
+  // inhdetachpending says the cluster is mid-operation. Finishing it is the
+  // only legal next move -- a fresh DETACH is refused.
+  for (const auto& pending : p.value("detach_pending", json::array())) {
+    if (pending.get<std::string>() != child) continue;
+    step.txn_class = TxnClass::kForbidden;
+    step.own_transaction = true;
+    step.sql.push_back("ALTER TABLE " + parent + " DETACH PARTITION " + child +
+                       " FINALIZE;");
+    step.lock = "ShareUpdateExclusiveLock on " + parent;
+    step.why =
+        child + " is mid-detach: a previous DETACH CONCURRENTLY was "
+                "interrupted, leaving it in pg_inherits with inhdetachpending "
+                "set. FINALIZE is the only legal next step; a fresh DETACH is "
+                "refused";
+    step.detail["method"] = "finalize";
+    return;
+  }
+
+  bool attached = false;
+  for (const auto& already : p.value("partitions", json::array())) {
+    if (already.get<std::string>() == child) attached = true;
+  }
+  if (!attached) {
+    step.action = Action::kSatisfied;
+    step.why = child + " is not a partition of " + parent;
+    return;
+  }
+
+  const long long size = obs.table(child).value("size_estimate", 0LL);
+  const int waiters = p.value("lock_waiters", 0);
+  const bool concurrent_available = obs.server_version >= 140000;
+  const bool small_and_quiet = size < (64LL << 20) && waiters == 0;
+
+  if (concurrent_available && !small_and_quiet) {
+    step.txn_class = TxnClass::kForbidden;
+    step.own_transaction = true;
+    step.sql.push_back("ALTER TABLE " + parent + " DETACH PARTITION " + child +
+                       " CONCURRENTLY;");
+    step.lock = "ShareUpdateExclusiveLock on " + parent +
+                ", so the rest of the table keeps serving";
+    step.why =
+        "size " + detail::human_bytes(size) +
+        (waiters > 0 ? " with " + std::to_string(waiters) + " lock waiter(s)"
+                     : "") +
+        ": a plain DETACH takes AccessExclusiveLock on the PARENT as well as "
+        "the partition, which blocks every query against every partition. "
+        "CONCURRENTLY does not -- and it cannot run inside a transaction "
+        "block, which is why this step owns its own";
+    step.detail["method"] = "concurrent";
+    plan.warnings.push_back(
+        "DETACH ... CONCURRENTLY on " + child +
+        " cannot be rolled back with the rest of a transaction, and an "
+        "interruption leaves the partition half-detached (inhdetachpending). "
+        "That state is recoverable -- re-running this intent emits FINALIZE -- "
+        "but until it is finished the partition is neither in nor out.");
+    return;
+  }
+
+  step.txn_class = TxnClass::kRequired;
+  step.own_transaction = true;
+  step.sql.push_back("ALTER TABLE " + parent + " DETACH PARTITION " + child + ";");
+  step.lock = "AccessExclusiveLock on " + parent + " AND on " + child;
+  step.why =
+      concurrent_available
+          ? "size " + detail::human_bytes(size) +
+                " < 64 MiB and nothing queued: a plain detach is a brief "
+                "catalog change, and CONCURRENTLY costs an extra transaction "
+                "and a recoverable-but-awkward intermediate state for nothing"
+          : "PostgreSQL " + std::to_string(obs.server_version) +
+                " has no DETACH ... CONCURRENTLY (it arrived in 14), so the "
+                "exclusive lock on the parent is unavoidable -- it blocks "
+                "every query against every partition while it is held";
+  step.detail["method"] = "plain";
+  if (!concurrent_available) {
+    plan.warnings.push_back(
+        "this server is older than PostgreSQL 14, so detaching " + child +
+        " takes AccessExclusiveLock on " + parent +
+        " and blocks queries against EVERY partition, not just this one.");
+  }
+}
 
 // --- add_unique_constraint / add_primary_key -------------------------------
 //
@@ -2397,6 +2743,10 @@ inline Plan plan_migration(const Spec& spec, const Observations& obs,
       case IntentKind::kAddUniqueConstraint:
       case IntentKind::kAddPrimaryKey:
         plan_unique_like(in, projected, plan, emitted); break;
+      case IntentKind::kAttachPartition:
+        plan_attach_partition(in, projected, plan, emitted); break;
+      case IntentKind::kDetachPartition:
+        plan_detach_partition(in, projected, plan, emitted); break;
     }
     if (!emitted.empty()) project(in, emitted.front(), projected);
 

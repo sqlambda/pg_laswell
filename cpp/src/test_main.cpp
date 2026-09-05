@@ -857,7 +857,12 @@ TEST(Spec, KnownKindsAreExactlyTheImplementedKinds) {
     "add_unique_constraint": {"kind":"add_unique_constraint","schema":"s",
                               "table":"t","name":"t_uq","columns":["c"]},
     "add_primary_key": {"kind":"add_primary_key","schema":"s","table":"t",
-                        "name":"t_pkey","columns":["c"]}
+                        "name":"t_pkey","columns":["c"]},
+    "attach_partition": {"kind":"attach_partition","schema":"s","table":"t",
+                         "partition":"t_2025","from":"'2025-01-01'",
+                         "to":"'2026-01-01'"},
+    "detach_partition": {"kind":"detach_partition","schema":"s","table":"t",
+                         "partition":"t_2025"}
   })");
   for (const auto& [name, kind] : pglaswell::intent_kinds()) {
     (void)kind;
@@ -3780,6 +3785,249 @@ TEST(Planner, DroppingAnAbsentIndexIsSatisfied) {
 
 
 
+
+// --- attach_partition / detach_partition -----------------------------------
+
+static pglaswell::Observations obs_partitioned(bool with_default = false,
+                                               bool child_indexed = true) {
+  auto obs = observations(1024, 10);
+  obs.tables["shop.events"] =
+      json{{"exists", true}, {"kind", "partitioned_table"},
+           {"partition_key", "RANGE (at)"},
+           {"partitions", json::array({"shop.events_2025"})},
+           {"detach_pending", json::array()},
+           {"lock_waiters", 0}, {"size_estimate", 0},
+           {"indexes", json{{"events_at",
+                             {{"is_valid", true}, {"is_unique", false},
+                              {"method", "btree"}, {"predicate", ""},
+                              {"columns", json::array({"at"})}}}}},
+           {"columns", json::object()}, {"constraints", json::object()}};
+  if (with_default) obs.tables["shop.events"]["default_partition"] = "shop.events_def";
+  obs.tables["shop.events_2026"] =
+      json{{"exists", true}, {"kind", "table"}, {"size_estimate", 2LL << 30},
+           {"columns", json::object()}, {"constraints", json::object()},
+           {"indexes", child_indexed
+                           ? json{{"events_2026_at",
+                                   {{"is_valid", true}, {"is_unique", false},
+                                    {"method", "btree"}, {"predicate", ""},
+                                    {"columns", json::array({"at"})}}}}
+                           : json::object()}};
+  obs.tables["shop.events_2025"] =
+      json{{"exists", true}, {"kind", "table"}, {"size_estimate", 2LL << 30},
+           {"columns", json::object()}, {"constraints", json::object()},
+           {"indexes", json::object()}};
+  return obs;
+}
+
+static pglaswell::Spec attach_spec() {
+  return spec_of(json::array({json{{"kind", "attach_partition"},
+                                   {"schema", "shop"}, {"table", "events"},
+                                   {"partition", "events_2026"},
+                                   {"from", "'2026-01-01'"},
+                                   {"to", "'2027-01-01'"}}}));
+}
+
+TEST(Planner, AttachProvesTheBoundsFirstSoTheAttachItselfIsCatalogOnly) {
+  // Measured (S16), index build excluded from the comparison: ATTACH without a
+  // matching CHECK took 98.393ms on 2M rows; with a validated CHECK, 0.914ms.
+  // The recipe moves that scan to a VALIDATE, which runs under
+  // ShareUpdateExclusiveLock instead of AccessExclusiveLock.
+  const auto plan = pglaswell::plan_migration(attach_spec(), obs_partitioned(), {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto s = steps_of(plan, "attach_partition");
+  ASSERT_EQ(s.size(), 4u) << plan.render();
+
+  EXPECT_NE(all_sql(*s[0]).find(
+                "CHECK (at >= '2026-01-01' AND at < '2027-01-01') NOT VALID"),
+            std::string::npos) << all_sql(*s[0]);
+  EXPECT_NE(all_sql(*s[1]).find("VALIDATE CONSTRAINT"), std::string::npos);
+  EXPECT_NE(all_sql(*s[2]).find(
+                "ATTACH PARTITION shop.events_2026 FOR VALUES FROM "
+                "('2026-01-01') TO ('2027-01-01')"),
+            std::string::npos) << all_sql(*s[2]);
+  // The CHECK is dropped afterwards: the partition bound now enforces it, and
+  // PostgreSQL would evaluate both on every insert forever.
+  EXPECT_NE(all_sql(*s[3]).find("DROP CONSTRAINT"), std::string::npos);
+
+  // The scan step must not share a transaction with the NOT VALID add, or the
+  // stronger lock is held across it and the recipe buys nothing.
+  for (const auto* step : s) EXPECT_TRUE(step->own_transaction) << step->why;
+  EXPECT_NE(s[1]->lock.find("ShareUpdateExclusiveLock"), std::string::npos);
+  // The parent keeps serving its other partitions throughout.
+  EXPECT_NE(s[2]->lock.find("ShareUpdateExclusiveLock on shop.events"),
+            std::string::npos) << s[2]->lock;
+}
+
+TEST(Planner, AttachWarnsAboutIndexesTheCandidateDoesNotMatch) {
+  // The cost that made the first measurement of this recipe read wrong: an
+  // unmatched parent index is BUILT during ATTACH under AccessExclusiveLock.
+  const auto plan = pglaswell::plan_migration(
+      attach_spec(), obs_partitioned(false, /*child_indexed=*/false), {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("events_at") != std::string::npos &&
+        w.find("create_index") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned) << plan.render();
+
+  // A candidate whose index matches structurally draws no warning.
+  const auto matched = pglaswell::plan_migration(
+      attach_spec(), obs_partitioned(false, /*child_indexed=*/true), {});
+  for (const auto& w : matched.warnings) {
+    EXPECT_EQ(w.find("no index matching"), std::string::npos) << w;
+  }
+}
+
+TEST(Planner, AttachWarnsAboutTheDefaultPartitionScanNoCheckCanAvoid) {
+  // 165ms with a 2M-row default present, against 0.9ms without one. The cost
+  // belongs to the DEFAULT, so no CHECK on the candidate removes it -- which
+  // is exactly why it needs saying rather than being assumed away.
+  const auto plan = pglaswell::plan_migration(
+      attach_spec(), obs_partitioned(/*with_default=*/true), {});
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("DEFAULT partition") != std::string::npos &&
+        w.find("shop.events_def") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned) << plan.render();
+
+  const auto none = pglaswell::plan_migration(attach_spec(), obs_partitioned(), {});
+  for (const auto& w : none.warnings) {
+    EXPECT_EQ(w.find("DEFAULT partition"), std::string::npos) << w;
+  }
+}
+
+TEST(Planner, ACompositePartitionKeyIsNotReducedToAHalfCheck) {
+  // A CHECK over the first column of a composite key would not prove what
+  // ATTACH needs, so the scan would happen anyway -- silently. Saying so beats
+  // emitting a constraint that looks like it helps.
+  auto obs = obs_partitioned();
+  obs.tables["shop.events"]["partition_key"] = "RANGE (tenant_id, at)";
+  const auto plan = pglaswell::plan_migration(attach_spec(), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto s = steps_of(plan, "attach_partition");
+  ASSERT_EQ(s.size(), 1u) << "no CHECK recipe for a key we cannot reduce:\n"
+                          << plan.render();
+  EXPECT_NE(all_sql(*s[0]).find("ATTACH PARTITION"), std::string::npos);
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("composite or expression partition key") != std::string::npos)
+      warned = true;
+  }
+  EXPECT_TRUE(warned) << plan.render();
+}
+
+TEST(Planner, AnAlreadyAttachedPartitionIsSatisfied) {
+  auto obs = obs_partitioned();
+  obs.tables["shop.events"]["partitions"].push_back("shop.events_2026");
+  const auto plan = pglaswell::plan_migration(attach_spec(), obs, {});
+  ASSERT_TRUE(plan.ok);
+  EXPECT_EQ(steps_of(plan, "attach_partition")[0]->action,
+            pglaswell::Action::kSatisfied);
+}
+
+TEST(Planner, AttachingToSomethingUnpartitionedIsRefused) {
+  auto obs = obs_partitioned();
+  obs.tables["shop.events"]["kind"] = "table";
+  const auto plan = pglaswell::plan_migration(attach_spec(), obs, {});
+  EXPECT_FALSE(plan.ok) << plan.render();
+  EXPECT_NE(plan.conflicts[0].find("not a partitioned table"), std::string::npos);
+}
+
+static pglaswell::Spec detach_spec() {
+  return spec_of(json::array({json{{"kind", "detach_partition"},
+                                   {"schema", "shop"}, {"table", "events"},
+                                   {"partition", "events_2025"}}}));
+}
+
+TEST(Planner, DetachingALargePartitionUsesConcurrentlyOutsideATransaction) {
+  // A plain DETACH takes AccessExclusiveLock on the PARENT, which blocks every
+  // query against every partition -- not just the one leaving.
+  auto obs = obs_partitioned();
+  obs.server_version = 180006;
+  const auto plan = pglaswell::plan_migration(detach_spec(), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto* step = steps_of(plan, "detach_partition")[0];
+  EXPECT_NE(all_sql(*step).find("DETACH PARTITION shop.events_2025 CONCURRENTLY"),
+            std::string::npos) << all_sql(*step);
+  // Measured: it cannot run inside a transaction block.
+  EXPECT_EQ(step->txn_class, pglaswell::TxnClass::kForbidden);
+  EXPECT_NE(step->lock.find("ShareUpdateExclusiveLock"), std::string::npos);
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("half-detached") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned) << "the recoverable-but-awkward state must be stated: "
+                      << plan.render();
+}
+
+TEST(Planner, ASmallQuietPartitionIsDetachedPlainly) {
+  auto obs = obs_partitioned();
+  obs.server_version = 180006;
+  obs.tables["shop.events_2025"]["size_estimate"] = 1024;
+  const auto plan = pglaswell::plan_migration(detach_spec(), obs, {});
+  const auto* step = steps_of(plan, "detach_partition")[0];
+  EXPECT_EQ(all_sql(*step).find("CONCURRENTLY"), std::string::npos)
+      << all_sql(*step);
+  EXPECT_EQ(step->detail.value("method", ""), "plain");
+}
+
+TEST(Planner, OnPg13TheExclusiveLockIsUnavoidableAndSaidSo) {
+  auto obs = obs_partitioned();
+  obs.server_version = 130010;
+  // The shared fixture spec declares min_server_version 150000, which the
+  // planner refuses outright on a 13 -- correctly, but it means the plan has no
+  // steps at all and this test would assert nothing. Indexing that empty vector
+  // read past the end and "passed"; only the hardened standard library under
+  // Valgrind turned it into the abort it always was.
+  json doc = minimal_spec();
+  doc["target"].erase("min_server_version");
+  doc["intents"] = json::array({json{{"kind", "detach_partition"},
+                                     {"schema", "shop"}, {"table", "events"},
+                                     {"partition", "events_2025"}}});
+  const auto plan =
+      pglaswell::plan_migration(pglaswell::parse_spec(doc), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto steps = steps_of(plan, "detach_partition");
+  ASSERT_EQ(steps.size(), 1u) << plan.render();
+  const auto* step = steps[0];
+  EXPECT_EQ(all_sql(*step).find("CONCURRENTLY"), std::string::npos);
+  EXPECT_NE(step->lock.find("AccessExclusiveLock on shop.events AND"),
+            std::string::npos) << step->lock;
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("older than PostgreSQL 14") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned) << plan.render();
+}
+
+TEST(Planner, APartitionStuckMidDetachIsFinalizedNotDetachedAgain) {
+  // An interrupted DETACH CONCURRENTLY leaves the partition in pg_inherits,
+  // still reporting relispartition, with only inhdetachpending to say the
+  // cluster is mid-operation. FINALIZE is the only legal move; a fresh DETACH
+  // is refused by PostgreSQL.
+  auto obs = obs_partitioned();
+  obs.server_version = 180006;
+  obs.tables["shop.events"]["detach_pending"] =
+      json::array({"shop.events_2025"});
+  const auto plan = pglaswell::plan_migration(detach_spec(), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto* step = steps_of(plan, "detach_partition")[0];
+  EXPECT_NE(all_sql(*step).find("DETACH PARTITION shop.events_2025 FINALIZE"),
+            std::string::npos) << all_sql(*step);
+  EXPECT_EQ(step->detail.value("method", ""), "finalize");
+}
+
+TEST(Planner, DetachingSomethingNotAttachedIsSatisfied) {
+  auto obs = obs_partitioned();
+  obs.tables["shop.events"]["partitions"] = json::array();
+  const auto plan = pglaswell::plan_migration(detach_spec(), obs, {});
+  ASSERT_TRUE(plan.ok);
+  EXPECT_EQ(steps_of(plan, "detach_partition")[0]->action,
+            pglaswell::Action::kSatisfied);
+}
+
 // --- add_unique_constraint / add_primary_key -------------------------------
 
 static pglaswell::Spec unique_spec(const char* kind, const char* name,
@@ -5231,6 +5479,146 @@ TEST_F(DatabaseTest, TheUniqueAndPrimaryKeyRecipesRunAndLeaveTheRightCatalog) {
   w.begin("pg_laswell/test/uq-cleanup");
   w.txn().exec("DROP TABLE laswell_uq CASCADE");
   w.txn().exec("DROP TABLE laswell_uq_dup");
+  w.commit();
+}
+
+TEST_F(DatabaseTest, ThePartitionRecipesRunAndTheCheckReallyRemovesTheScan) {
+  // The claim this whole recipe rests on is a TIMING one, so the test measures
+  // it rather than asserting the SQL. An attach whose bounds are already proven
+  // must be dramatically faster than one that has to verify them -- if it is
+  // not, the four-step recipe is pure overhead and should be deleted.
+  pglaswell::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = url_;
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/part");
+    w.txn().exec("DROP TABLE IF EXISTS laswell_ev CASCADE");
+    w.txn().exec("DROP TABLE IF EXISTS laswell_ev_a CASCADE");
+    w.txn().exec("DROP TABLE IF EXISTS laswell_ev_b CASCADE");
+    w.txn().exec("CREATE TABLE laswell_ev(id bigint, at timestamptz NOT NULL)"
+                 " PARTITION BY RANGE (at)");
+    w.txn().exec("CREATE TABLE laswell_ev_2025 PARTITION OF laswell_ev"
+                 " FOR VALUES FROM ('2025-01-01') TO ('2026-01-01')");
+    for (const char* n : {"laswell_ev_a", "laswell_ev_b"}) {
+      w.txn().exec(std::string("CREATE TABLE ") + n +
+                   "(id bigint, at timestamptz NOT NULL)");
+    }
+    w.txn().exec("INSERT INTO laswell_ev_a SELECT g,"
+                 " '2026-06-01'::timestamptz + (g||' seconds')::interval"
+                 " FROM generate_series(1,400000) g");
+    w.txn().exec("INSERT INTO laswell_ev_b SELECT g,"
+                 " '2027-06-01'::timestamptz + (g||' seconds')::interval"
+                 " FROM generate_series(1,400000) g");
+    w.commit();
+  }
+
+  auto attach_ms = [&](const json& intent, const char* child) {
+    pglaswell::Catalog cat(cfg);
+    const auto obs = cat.observe({"public", "public"}, {"laswell_ev", child});
+    json doc = minimal_spec();
+    doc["intents"] = json::array({intent});
+    const auto plan =
+        pglaswell::plan_migration(pglaswell::parse_spec(doc), obs, {});
+    EXPECT_TRUE(plan.ok) << plan.render();
+    double attach_only = 0;
+    for (const auto& step : plan.steps) {
+      for (const auto& q : step.sql) {
+        const std::string stmt = q;
+        const bool is_attach = stmt.find("ATTACH PARTITION") != std::string::npos;
+        const auto t0 = std::chrono::steady_clock::now();
+        pglaswell::WriteSession w(cfg);
+        w.begin("pg_laswell/test/part-apply");
+        w.txn().exec(stmt.substr(0, stmt.size() - 1));
+        w.commit();
+        if (is_attach) {
+          attach_only = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t0).count();
+        }
+      }
+    }
+    return attach_only;
+  };
+
+  // With the recipe: the CHECK is added NOT VALID, validated under a lock that
+  // does not block, and only then is the partition attached.
+  const double with_check = attach_ms(
+      json{{"kind", "attach_partition"}, {"schema", "public"},
+           {"table", "laswell_ev"}, {"partition", "laswell_ev_a"},
+           {"from", "'2026-01-01'"}, {"to", "'2027-01-01'"}},
+      "laswell_ev_a");
+
+  // Without it: attach directly, and let PostgreSQL verify every row.
+  double without_check = 0;
+  {
+    const auto t0 = std::chrono::steady_clock::now();
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/part-bare");
+    w.txn().exec("ALTER TABLE laswell_ev ATTACH PARTITION laswell_ev_b"
+                 " FOR VALUES FROM ('2027-01-01') TO ('2028-01-01')");
+    w.commit();
+    without_check = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0).count();
+  }
+
+  // A loaded CI box can make any single timing meaningless, so this is a
+  // bounded claim: the proven attach must be clearly cheaper, not merely
+  // faster by a hair. If it is not, the recipe is not earning its four steps.
+  if (without_check < 5.0) {
+    GTEST_SKIP() << "the unproven attach was too fast to compare ("
+                 << without_check << "ms); the machine is faster than the "
+                                     "measurement needs";
+  }
+  EXPECT_LT(with_check * 3, without_check)
+      << "attach with a validated CHECK took " << with_check
+      << "ms, without took " << without_check
+      << "ms -- the CHECK is supposed to remove the scan entirely";
+
+  {
+    pglaswell::ReadSession r(cfg);
+    // Both attached, and the temporary CHECK cleaned up rather than left to
+    // cost time on every insert forever.
+    EXPECT_EQ(r.txn()
+                  .exec("SELECT count(*) FROM pg_inherits WHERE inhparent="
+                        "'laswell_ev'::regclass")[0][0]
+                  .as<int>(),
+              3);
+    EXPECT_EQ(r.txn()
+                  .exec("SELECT count(*) FROM pg_constraint WHERE conrelid="
+                        "'laswell_ev_a'::regclass AND contype='c'")[0][0]
+                  .as<int>(),
+              0)
+        << "the bound-proving CHECK must be dropped once the partition bound "
+           "enforces the same thing";
+  }
+
+  // DETACH CONCURRENTLY, which measurably cannot run in a transaction block.
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/part-detach-txn");
+    EXPECT_THROW(w.txn().exec("ALTER TABLE laswell_ev DETACH PARTITION"
+                              " laswell_ev_a CONCURRENTLY"),
+                 pqxx::sql_error)
+        << "if this ever succeeds, the txn_class on the step is wrong";
+  }
+  {
+    pglaswell::WriteSession w(cfg);
+    w.exec_nontransactional("ALTER TABLE laswell_ev DETACH PARTITION"
+                            " laswell_ev_a CONCURRENTLY");
+  }
+  {
+    pglaswell::ReadSession r(cfg);
+    EXPECT_EQ(r.txn()
+                  .exec("SELECT count(*) FROM pg_inherits WHERE inhparent="
+                        "'laswell_ev'::regclass")[0][0]
+                  .as<int>(),
+              2);
+  }
+
+  pglaswell::WriteSession w(cfg);
+  w.begin("pg_laswell/test/part-cleanup");
+  w.txn().exec("DROP TABLE laswell_ev CASCADE");
+  w.txn().exec("DROP TABLE laswell_ev_a");
   w.commit();
 }
 

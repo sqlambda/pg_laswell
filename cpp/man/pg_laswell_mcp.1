@@ -333,9 +333,11 @@ This build implements
 .Cm alter_column_type ,
 .Cm drop_column ,
 .Cm replace_view ,
-.Cm add_unique_constraint
+.Cm add_unique_constraint ,
+.Cm add_primary_key ,
+.Cm attach_partition
 and
-.Cm add_primary_key .
+.Cm detach_partition .
 .Pp
 An intent that creates an object must carry a
 .Va comment ,
@@ -627,6 +629,66 @@ There is no
 measured on 18.6, a cascading drop under a three-level stack left
 .Em zero
 views standing.
+.Ss Partitions
+.Ic ATTACH
+validates the candidate against the new bounds unless a CHECK constraint
+already proves it cannot violate them.
+Measured on two million rows with the index build taken out of the comparison:
+98.393ms without a matching CHECK against 0.914ms with one.
+.Nm
+therefore adds the CHECK
+.Ic NOT VALID ,
+validates it under
+.Va ShareUpdateExclusiveLock
+-- which does not block the application -- attaches, and then drops the CHECK,
+since the partition bound now enforces the same thing and PostgreSQL would
+otherwise evaluate both on every insert.
+Bounds are given structurally, as
+.Va from Ns / Ns Va to ,
+.Va values ,
+or
+.Va default ,
+because they must be rendered twice: once as
+.Ic FOR VALUES
+and once as that CHECK.
+.Pp
+Two costs the recipe cannot remove, both stated rather than discovered.
+Any of the parent's partitioned indexes the candidate does not match is
+.Em built
+during the attach, under
+.Va AccessExclusiveLock
+on the candidate -- so build them first, and a matching index is attached to
+the parent's rather than rebuilt.
+And a
+.Ic DEFAULT
+partition is scanned on every attach, to prove it holds no row belonging to the
+new bounds; no CHECK on the candidate avoids that, because the cost belongs to
+the default.
+Measured at 165ms with a two-million-row default present.
+.Pp
+A plain
+.Ic DETACH
+takes
+.Va AccessExclusiveLock
+on the
+.Em parent
+as well as the partition, blocking every query against every partition -- not
+only the one leaving.
+.Ic DETACH ... CONCURRENTLY
+does not, and cannot run inside a transaction block, so it owns its own.
+Its risk is stated too: an interruption leaves the partition half-detached,
+still in
+.Va pg_inherits
+and still reporting
+.Va relispartition ,
+with only
+.Va inhdetachpending
+to say so.
+Re-running the intent then emits
+.Ic FINALIZE ,
+which is the only legal move from that state.
+On a server older than 14 there is no concurrent form and the plan says the
+exclusive lock is unavoidable.
 .Ss Unique constraints and primary keys
 Both are backed by a unique index, so both are planned through one.
 A plain
