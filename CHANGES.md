@@ -3,7 +3,7 @@
 ## 0.1.0 (unreleased)
 
 The whole path works: repository, signing, planning, dry run, paced execution,
-ledger. 222 tests green on GCC 14.2 and Clang 22, under AddressSanitizer/UBSan
+ledger. 232 tests green on GCC 14.2 and Clang 22, under AddressSanitizer/UBSan
 and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
 `--call` contract test.
 
@@ -190,5 +190,25 @@ and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
   without a conninfo made that impossible. Tools that do need a connection say
   so, through a typed `ConfigError` whose hint names the configuration rather
   than a server log for a statement that never ran.
+- **Dependent views are observed, and rebuilt around a change.** PostgreSQL
+  refuses `ALTER COLUMN … TYPE` and `DROP COLUMN` whenever a view reads the
+  column — and refuses them regardless of cost: `varchar(50)`→`varchar(100)`
+  rewrites nothing, is still refused, and succeeds once the view is dropped.
+  pg_laswell walks the graph transitively, drops deepest-first, changes,
+  recreates shallowest-first, in one transaction. A view on a *different*
+  column is left alone.
+  The rebuild is the easy half. A hand rebuild silently loses **eight** things,
+  all measured: comment, per-column comments, grants, **column-level** grants,
+  `security_barrier`, `INSTEAD OF` triggers, a matview's indexes (and with them
+  `REFRESH … CONCURRENTLY`), and the owner. All eight are restored — owner
+  before grants, so each records the right grantor.
+- **`alter_column_type`**, with rewrite classification measured by relfilenode
+  rather than assumed: relaxing a type modifier is free, adding or tightening
+  one rewrites. `text`→`varchar(200)` rewrites; `varchar(50)`→`text` does not.
+  Anything unproven is reported as a rewrite, because a cautious plan costs
+  less than an unplanned outage.
+- **`drop_column`**, which refuses when a view reads the column rather than
+  guessing at a rewritten view body, and warns that the values are gone at
+  commit.
 - `cpp/test/spikes/` — the Phase 0 experiments that settled the design against
   PostgreSQL 18.6. Four of them changed it.

@@ -103,6 +103,93 @@ SELECT COALESCE(
                    JOIN pg_am am ON am.oid = ic.relam
                   WHERE i.indrelid = t.oid),
                  '{}'::jsonb),
+     -- Views that read this table, transitively, with everything a rebuild
+     -- has to put back.
+     --
+     -- This is an OBSERVATION rather than an intent kind because PostgreSQL
+     -- refuses any type change on a column a view reads -- measured on 18.6,
+     -- text -> varchar(200) is refused even though it rewrites nothing -- so a
+     -- planner that cannot see the stack cannot plan the change at all.
+     --
+     -- Every field beyond 'definition' exists because dropping and recreating
+     -- loses it silently. Measured, all eight: comment, per-column comments,
+     -- grants, COLUMN-level grants, reloptions (security_barrier /
+     -- security_invoker), INSTEAD OF triggers, a materialized view's indexes,
+     -- and the owner. The rebuild is the easy half; the restore is the work.
+     --
+     -- 'level' is the depth: drop highest first, recreate in reverse.
+     'dependent_views', COALESCE((
+        WITH RECURSIVE deps AS (
+          SELECT DISTINCT r.ev_class AS oid, 1 AS level
+            FROM pg_depend d
+            JOIN pg_rewrite r ON r.oid = d.objid AND r.ev_class <> d.refobjid
+           WHERE d.refobjid = t.oid AND d.classid = 'pg_rewrite'::regclass
+          UNION ALL
+          SELECT DISTINCT r.ev_class, deps.level + 1
+            FROM deps
+            JOIN pg_depend d ON d.refobjid = deps.oid
+                            AND d.classid = 'pg_rewrite'::regclass
+            JOIN pg_rewrite r ON r.oid = d.objid AND r.ev_class <> d.refobjid
+           WHERE deps.level < 32   -- a cycle is impossible, but a bound is cheap
+        ), ranked AS (
+          SELECT oid, MAX(level) AS level FROM deps GROUP BY oid
+        )
+        SELECT JSONB_OBJECT_AGG(vn.nspname || '.' || vc.relname, JSONB_BUILD_OBJECT(
+          -- Always schema-qualified and quoted. oid::regclass::text omits the
+          -- schema when it is on search_path, which reads fine in psql and is
+          -- wrong the moment the text is used to GENERATE DDL: the recreate
+          -- would land wherever search_path pointed at execution time.
+          'name', FORMAT('%I.%I', vn.nspname, vc.relname),
+          'level', ranked.level,
+          'kind', CASE vc.relkind WHEN 'm' THEN 'materialized' ELSE 'view' END,
+          'definition', PG_GET_VIEWDEF(vc.oid, true),
+          'owner', PG_GET_USERBYID(vc.relowner),
+          'comment', OBJ_DESCRIPTION(vc.oid, 'pg_class'),
+          'reloptions', COALESCE(TO_JSONB(vc.reloptions), '[]'::jsonb),
+          -- Columns this view reads FROM THE TARGET TABLE. A view touching a
+          -- column nobody is changing does not need rebuilding, and rebuilding
+          -- it anyway would widen the blast radius for nothing.
+          'uses_columns', COALESCE((
+             SELECT JSONB_AGG(DISTINCT a.attname)
+               FROM pg_depend dd
+               JOIN pg_rewrite rr ON rr.oid = dd.objid AND rr.ev_class = vc.oid
+               JOIN pg_attribute a ON a.attrelid = dd.refobjid
+                                  AND a.attnum = dd.refobjsubid
+              WHERE dd.refobjid = t.oid AND dd.refobjsubid > 0), '[]'::jsonb),
+          -- Which OTHER dependent views this one reads directly.
+          --
+          -- Depth alone cannot answer "does this view come down with that
+          -- one": two views can sit at the same level and be entirely
+          -- unrelated, and rebuilding the innocent one widens the blast radius
+          -- for nothing. The planner needs real edges to walk, so it gets them.
+          'depends_on', COALESCE((
+             SELECT JSONB_AGG(DISTINCT rn.nspname || '.' || rc.relname)
+               FROM pg_depend dd
+               JOIN pg_rewrite rr ON rr.oid = dd.objid AND rr.ev_class = vc.oid
+               JOIN pg_class rc ON rc.oid = dd.refobjid
+                                AND rc.relkind IN ('v', 'm')
+               JOIN pg_namespace rn ON rn.oid = rc.relnamespace
+              WHERE dd.refobjid <> vc.oid), '[]'::jsonb),
+          'column_comments', COALESCE((
+             SELECT JSONB_OBJECT_AGG(a.attname, col_description(vc.oid, a.attnum))
+               FROM pg_attribute a
+              WHERE a.attrelid = vc.oid AND a.attnum > 0 AND NOT a.attisdropped
+                AND col_description(vc.oid, a.attnum) IS NOT NULL), '{}'::jsonb),
+          'grants', COALESCE(TO_JSONB(vc.relacl::text[]), '[]'::jsonb),
+          'column_grants', COALESCE((
+             SELECT JSONB_AGG(DISTINCT JSONB_BUILD_OBJECT(
+                      'column', a.attname, 'acl', a.attacl::text[]))
+               FROM pg_attribute a
+              WHERE a.attrelid = vc.oid AND a.attacl IS NOT NULL), '[]'::jsonb),
+          'triggers', COALESCE((
+             SELECT JSONB_AGG(PG_GET_TRIGGERDEF(tg.oid))
+               FROM pg_trigger tg
+              WHERE tg.tgrelid = vc.oid AND NOT tg.tgisinternal), '[]'::jsonb),
+          'indexes', COALESCE((
+             SELECT JSONB_AGG(PG_GET_INDEXDEF(ix.indexrelid))
+               FROM pg_index ix WHERE ix.indrelid = vc.oid), '[]'::jsonb)))
+          FROM ranked JOIN pg_class vc ON vc.oid = ranked.oid
+               JOIN pg_namespace vn ON vn.oid = vc.relnamespace), '{}'::jsonb),
      -- Constraints, with what would break if one were dropped. PostgreSQL
      -- refuses to drop a unique constraint a foreign key depends on, and the
      -- dependency is visible beforehand through the shared index: refusing in

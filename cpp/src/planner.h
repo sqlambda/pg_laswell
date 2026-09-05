@@ -144,6 +144,22 @@ inline std::string quote_literal(const std::string& s) {
   return out;
 }
 
+// Always quotes, rather than quoting only when it looks necessary.
+//
+// A role or column named "user", "order" or "Select" is a reserved word or is
+// case-folded, and deciding case by case needs PostgreSQL's own keyword list.
+// Unconditional quoting is correct for every identifier PostgreSQL will hand
+// back to us, because what comes out of the catalog is the real name.
+inline std::string quote_identifier(const std::string& s) {
+  std::string out = "\"";
+  for (const char c : s) {
+    if (c == '"') out += '"';
+    out += c;
+  }
+  out += "\"";
+  return out;
+}
+
 inline std::string join(const std::vector<std::string>& v, const char* sep) {
   std::string out;
   for (std::size_t i = 0; i < v.size(); ++i) {
@@ -321,6 +337,13 @@ inline void project(const Intent& in, const Step& step, Observations& projected)
     }
     case IntentKind::kDropConstraint:
       projected.tables[qualified]["constraints"].erase(in.body.value("name", ""));
+      return;
+    case IntentKind::kAlterColumnType:
+      projected.tables[qualified]["columns"][in.body.value("column", "")]["type"] =
+          in.body.value("type", "");
+      return;
+    case IntentKind::kDropColumn:
+      projected.tables[qualified]["columns"].erase(in.body.value("column", ""));
       return;
     case IntentKind::kAddForeignKey:
     case IntentKind::kAddCheckConstraint:
@@ -1083,6 +1106,459 @@ inline void plan_add_check_constraint(const Intent& in, const Observations& obs,
   out.push_back(std::move(validate));
 }
 
+// --- the dependent-view rebuild --------------------------------------------
+//
+// Shared by alter_column_type and drop_column, which are the two changes
+// PostgreSQL refuses outright when a view reads the column.
+//
+// Measured on 18.6 (spike S13), and both halves matter:
+//
+//   ALTER TABLE vt ALTER COLUMN a TYPE varchar(100)   -- from varchar(50)
+//   ERROR: cannot alter type of a column used by a view or rule
+//
+// That change is measured as NO rewrite (relfilenode unchanged) and is still
+// refused; it succeeds the moment the view is dropped. So the rebuild is not a
+// consequence of the change being expensive -- it is a consequence of a view
+// existing, and the size reasoning that decides a rewrite does not decide it.
+//
+// And a naive drop/recreate loses eight things silently -- comment, per-column
+// comments, grants, COLUMN-level grants, reloptions, INSTEAD OF triggers, a
+// materialized view's indexes, and the owner. The recreate succeeds, nothing
+// errors, and an application loses SELECT. That is what makes this painful by
+// hand, and it is the whole reason these steps exist.
+namespace detail {
+
+// Renders one aclitem -- "grantee=privs/grantor" -- as GRANT statements.
+//
+// PostgreSQL has no statement that restores an ACL, so the privileges have to
+// be reconstructed one letter at a time. An empty grantee is PUBLIC, which is
+// the entry most likely to be lost and least likely to be noticed.
+// `column` renders a COLUMN-level grant, whose syntax is not the table form
+// with a column list appended: it is GRANT <priv> (col) ON <rel> TO <role>, the
+// list going after the PRIVILEGE. Getting that backwards produces a syntax
+// error that no string comparison against our own output would have caught --
+// only running it against PostgreSQL did.
+inline std::vector<std::string> grants_from_aclitem(const std::string& item,
+                                                    const std::string& on,
+                                                    const std::string& column = "") {
+  const auto eq = item.find('=');
+  if (eq == std::string::npos) return {};
+  const auto slash = item.find('/', eq);
+  const std::string grantee = item.substr(0, eq);
+  const std::string privs =
+      item.substr(eq + 1, slash == std::string::npos ? std::string::npos
+                                                     : slash - eq - 1);
+  static const std::map<char, const char*> kPriv = {
+      {'r', "SELECT"},     {'w', "UPDATE"},  {'a', "INSERT"},
+      {'d', "DELETE"},     {'D', "TRUNCATE"},{'x', "REFERENCES"},
+      {'t', "TRIGGER"}};
+  std::vector<std::string> out;
+  const std::string who = grantee.empty() ? "PUBLIC" : quote_identifier(grantee);
+  for (std::size_t i = 0; i < privs.size(); ++i) {
+    const auto it = kPriv.find(privs[i]);
+    if (it == kPriv.end()) continue;
+    const bool with_grant = i + 1 < privs.size() && privs[i + 1] == '*';
+    out.push_back(std::string("GRANT ") + it->second +
+                  (column.empty() ? "" : " (" + quote_identifier(column) + ")") +
+                  " ON " + on + " TO " + who +
+                  (with_grant ? " WITH GRANT OPTION;" : ";"));
+  }
+  return out;
+}
+
+// The views that must be rebuilt for a change to `column`, deepest first.
+//
+// A view reading a DIFFERENT column of the same table is left alone: it does
+// not block the change, and rebuilding it would widen the blast radius for
+// nothing. A view that reaches the table only through another view carries no
+// column list of its own -- it is dragged in by its parent, which is why the
+// level walk exists rather than a single-level lookup.
+inline std::vector<std::pair<int, std::string>> views_to_rebuild(
+    const json& dependent_views, const std::string& column) {
+  // First pass: the views that read the column directly.
+  std::set<std::string> affected;
+  for (const auto& [name, v] : dependent_views.items()) {
+    for (const auto& c : v.value("uses_columns", json::array())) {
+      if (c.get<std::string>() == column) affected.insert(name);
+    }
+  }
+  if (affected.empty()) return {};
+  // Second pass: close over the view -> view edges. Anything reading something
+  // already condemned comes down with it.
+  //
+  // An earlier version used depth as a proxy -- "anything at or below the
+  // shallowest affected level" -- which is wrong, and its own test caught it:
+  // two views can share a level and be entirely unrelated, so a view on a
+  // column nobody is touching was being dropped and recreated for nothing.
+  // Depth orders the rebuild; it does not decide membership.
+  for (bool grew = true; grew;) {
+    grew = false;
+    for (const auto& [name, v] : dependent_views.items()) {
+      if (affected.count(name) != 0) continue;
+      for (const auto& d : v.value("depends_on", json::array())) {
+        if (affected.count(d.get<std::string>()) != 0) {
+          affected.insert(name);
+          grew = true;
+          break;
+        }
+      }
+    }
+  }
+  std::vector<std::pair<int, std::string>> out;
+  for (const auto& name : affected) {
+    out.emplace_back(dependent_views[name].value("level", 1), name);
+  }
+  std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) {
+    if (a.first != b.first) return a.first > b.first;  // deepest first
+    return a.second < b.second;                        // then stable by name
+  });
+  return out;
+}
+
+// DROP statements for the stack, deepest first.
+inline void emit_view_drops(const json& views,
+                            const std::vector<std::pair<int, std::string>>& order,
+                            Step& step) {
+  for (const auto& [level, name] : order) {
+    (void)level;
+    const auto& v = views[name];
+    const bool matview = v.value("kind", "") == "materialized";
+    step.sql.push_back(std::string("DROP ") + (matview ? "MATERIALIZED VIEW " : "VIEW ") +
+                       v.value("name", name) + ";");
+  }
+}
+
+// CREATE statements plus every restore, shallowest first.
+inline void emit_view_recreates(
+    const json& views, const std::vector<std::pair<int, std::string>>& order,
+    Step& step) {
+  for (auto it = order.rbegin(); it != order.rend(); ++it) {
+    const auto& v = views[it->second];
+    const std::string name = v.value("name", it->second);
+    const bool matview = v.value("kind", "") == "materialized";
+    std::string def = v.value("definition", "");
+    // pg_get_viewdef ends the body with a semicolon; keeping it would produce
+    // "... ; ;" and, with reloptions, put them after the terminator.
+    while (!def.empty() && (def.back() == ';' || def.back() == '\n' ||
+                            def.back() == ' ')) {
+      def.pop_back();
+    }
+
+    std::string opts;
+    const auto reloptions = v.value("reloptions", json::array());
+    if (!reloptions.empty()) {
+      std::vector<std::string> o;
+      for (const auto& r : reloptions) o.push_back(r.get<std::string>());
+      opts = " WITH (" + join(o, ", ") + ")";
+    }
+    step.sql.push_back(std::string("CREATE ") +
+                       (matview ? "MATERIALIZED VIEW " : "VIEW ") + name +
+                       opts + " AS " + def + ";");
+
+    // The owner first: every GRANT below is recorded as granted BY the owner,
+    // and restoring privileges before ownership records the wrong grantor.
+    const auto owner = v.value("owner", "");
+    if (!owner.empty()) {
+      step.sql.push_back(std::string("ALTER ") +
+                         (matview ? "MATERIALIZED VIEW " : "VIEW ") + name +
+                         " OWNER TO " + quote_identifier(owner) + ";");
+    }
+    // A materialized view's indexes are dropped with it, and the unique one
+    // among them is what REFRESH ... CONCURRENTLY requires -- so losing it
+    // silently converts every future refresh into a blocking one.
+    for (const auto& ix : v.value("indexes", json::array())) {
+      step.sql.push_back(ix.get<std::string>() + ";");
+    }
+    const auto comment = v.value("comment", json());
+    if (comment.is_string()) {
+      step.sql.push_back(std::string("COMMENT ON ") +
+                         (matview ? "MATERIALIZED VIEW " : "VIEW ") + name +
+                         " IS " + quote_literal(comment.get<std::string>()) + ";");
+    }
+    // Bound to a local first. `v.value(...)` returns a TEMPORARY json, and
+    // .items() holds a reference into it that dies at the end of the full
+    // expression -- the fourth time this exact shape has appeared in this
+    // project, and the only reason it is caught is -Wdangling-reference.
+    const json column_comments = v.value("column_comments", json::object());
+    for (const auto& [col, text] : column_comments.items()) {
+      if (!text.is_string()) continue;
+      step.sql.push_back("COMMENT ON COLUMN " + name + "." +
+                         quote_identifier(col) + " IS " +
+                         quote_literal(text.get<std::string>()) + ";");
+    }
+    for (const auto& acl : v.value("grants", json::array())) {
+      for (const auto& g : grants_from_aclitem(acl.get<std::string>(), name)) {
+        step.sql.push_back(g);
+      }
+    }
+    for (const auto& cg : v.value("column_grants", json::array())) {
+      const auto col = cg.value("column", "");
+      for (const auto& acl : cg.value("acl", json::array())) {
+        for (const auto& g :
+             grants_from_aclitem(acl.get<std::string>(), name, col)) {
+          step.sql.push_back(g);
+        }
+      }
+    }
+    // An INSTEAD OF trigger is how writes reach a view at all. Losing one does
+    // not error on read, so it is found by an INSERT failing in production.
+    for (const auto& tg : v.value("triggers", json::array())) {
+      step.sql.push_back(tg.get<std::string>() + ";");
+    }
+  }
+}
+
+// Everything the rebuild cannot carry, said before it runs rather than found
+// afterwards. Silence here would be the same failure as a hand rebuild.
+inline void warn_about_rebuild(
+    const json& views, const std::vector<std::pair<int, std::string>>& order,
+    const std::string& qualified, Plan& plan) {
+  std::vector<std::string> names, matviews;
+  for (const auto& [level, name] : order) {
+    (void)level;
+    names.push_back(name);
+    if (views[name].value("kind", "") == "materialized") matviews.push_back(name);
+  }
+  plan.warnings.push_back(
+      "changing " + qualified + " rebuilds " + std::to_string(names.size()) +
+      " dependent view(s): " + join(names, ", ") +
+      ". They are dropped and recreated in one transaction, so no reader sees "
+      "them missing -- but the table holds AccessExclusiveLock for the whole "
+      "of it, including any rewrite.");
+  if (!matviews.empty()) {
+    plan.warnings.push_back(
+        "materialized view(s) " + join(matviews, ", ") +
+        " are rebuilt WITH DATA, so the transaction also re-runs their queries "
+        "in full. On a large one that is the dominant cost of this migration, "
+        "and it is paid while the lock is held.");
+  }
+}
+
+}  // namespace detail
+
+// --- alter_column_type / drop_column ---------------------------------------
+
+namespace detail {
+
+// Splits "character varying(50)" into {"character varying", 50, -1}.
+struct TypeShape {
+  std::string base;
+  long first = -1;   // length, or numeric precision
+  long second = -1;  // numeric scale
+};
+
+inline TypeShape type_shape(const std::string& t) {
+  TypeShape out;
+  const auto open = t.find('(');
+  if (open == std::string::npos) {
+    out.base = t;
+    return out;
+  }
+  out.base = t.substr(0, open);
+  while (!out.base.empty() && out.base.back() == ' ') out.base.pop_back();
+  const auto close = t.find(')', open);
+  const std::string mods =
+      t.substr(open + 1, close == std::string::npos ? std::string::npos
+                                                    : close - open - 1);
+  const auto comma = mods.find(',');
+  try {
+    out.first = std::stol(mods.substr(0, comma));
+    if (comma != std::string::npos) out.second = std::stol(mods.substr(comma + 1));
+  } catch (const std::exception&) {
+    out.first = -1;  // a type modifier we do not understand is not a claim
+  }
+  return out;
+}
+
+// Whether the change provably avoids rewriting the table.
+//
+// Only the cases MEASURED on 18.6 return true; everything else is treated as a
+// rewrite. The asymmetry is the whole rule: relaxing or dropping a type
+// modifier is free, adding or tightening one rewrites, because every existing
+// value must be checked against the new limit. So varchar(50) -> varchar(100)
+// and varchar(50) -> text are free, and text -> varchar(200) is not -- which is
+// the pair that makes a "same family, therefore cheap" shortcut wrong.
+//
+// Erring towards "rewrite" is deliberate. Reporting a rewrite that does not
+// happen costs a cautious plan; reporting none where one occurs is an
+// unplanned outage under AccessExclusiveLock.
+inline bool provably_no_rewrite(const std::string& from, const std::string& to) {
+  const auto a = type_shape(from), b = type_shape(to);
+  // Dropping a length limit: varchar(n) -> text.
+  if ((a.base == "character varying" || a.base == "character") &&
+      b.base == "text") {
+    return true;
+  }
+  if (a.base != b.base) return false;
+  if (b.first == -1) return a.first != -1;   // dropping the modifier entirely
+  if (a.first == -1) return false;           // adding one: every value checked
+  if (a.second != b.second) return false;    // a scale change re-encodes
+  return b.first >= a.first;                 // widening only
+}
+
+}  // namespace detail
+
+// The change PostgreSQL refuses outright when a view reads the column, so the
+// planner's job is the rebuild around it rather than the statement itself.
+inline void plan_alter_column_type(const Intent& in, const Observations& obs,
+                                   Plan& plan, std::vector<Step>& out) {
+  Step step;
+  step.kind = in.kind_name;
+  struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
+
+  const auto qualified = in.qualified_table();
+  const auto& t = obs.table(qualified);
+  const auto column = in.body.value("column", "");
+  const auto target = in.body.value("type", "");
+
+  if (!t.value("exists", false)) {
+    step.action = Action::kConflict;
+    step.why = qualified + " does not exist";
+    plan.conflicts.push_back(step.why);
+    return;
+  }
+  const json columns = t.value("columns", json::object());
+  if (!columns.contains(column)) {
+    step.action = Action::kConflict;
+    step.why = qualified + "." + column + " does not exist";
+    plan.conflicts.push_back(
+        step.why + ". A type change names a column that must already be there; "
+                   "add_column is the intent for one that is not.");
+    return;
+  }
+  const auto current = columns[column].value("type", "");
+  if (current == target) {
+    step.action = Action::kSatisfied;
+    step.why = qualified + "." + column + " is already " + target;
+    return;
+  }
+
+  const json views = t.value("dependent_views", json::object());
+  const auto rebuild = detail::views_to_rebuild(views, column);
+  const bool free_change = detail::provably_no_rewrite(current, target);
+
+  step.txn_class = TxnClass::kRequired;
+  // Its own transaction, always. The drops, the change and the recreates have
+  // to commit together or a reader finds the views missing -- and a plan that
+  // let them merge into a neighbouring group would make that window depend on
+  // what happened to be next in the spec.
+  step.own_transaction = true;
+
+  detail::emit_view_drops(views, rebuild, step);
+  step.sql.push_back("ALTER TABLE " + qualified + " ALTER COLUMN " +
+                     detail::quote_identifier(column) + " TYPE " + target +
+                     (in.body.contains("using")
+                          ? " USING " + in.body.value("using", "")
+                          : "") +
+                     ";");
+  detail::emit_view_recreates(views, rebuild, step);
+
+  step.lock = "AccessExclusiveLock on " + qualified +
+              (rebuild.empty() ? "" : " and on every view rebuilt with it");
+  if (free_change) {
+    step.why = current + " -> " + target +
+               " relaxes the type modifier, which PostgreSQL applies without "
+               "rewriting the table (measured on 18.6 by relfilenode)";
+  } else {
+    step.why = current + " -> " + target +
+               " is not a provable widening, so assume PostgreSQL rewrites the "
+               "whole table: " + detail::human_bytes(t.value("size_estimate", 0LL)) +
+               " under AccessExclusiveLock, during which every reader and "
+               "writer queues";
+    plan.warnings.push_back(
+        "alter_column_type on " + qualified + "." + column + " (" + current +
+        " -> " + target +
+        ") is assumed to rewrite the table. Only a relaxed type modifier is "
+        "provably free; this project measures rather than guesses, and the "
+        "measured no-rewrite cases are varchar(n)->varchar(m>n), "
+        "varchar(n)->text, numeric(p,s)->numeric(p2>=p,s) and a widened "
+        "timestamp precision.");
+  }
+  if (!rebuild.empty()) {
+    detail::warn_about_rebuild(views, rebuild, qualified + "." + column, plan);
+    step.why += "; " + std::to_string(rebuild.size()) +
+                " dependent view(s) block the change and are rebuilt around it";
+  }
+  step.detail["column"] = column;
+  step.detail["from"] = current;
+  step.detail["to"] = target;
+  step.detail["rewrite"] = free_change ? "no" : "assumed";
+  json rebuilt = json::array();
+  for (const auto& [level, name] : rebuild) {
+    rebuilt.push_back(json{{"view", name}, {"level", level}});
+  }
+  step.detail["views_rebuilt"] = rebuilt;
+}
+
+// Catalog-only in PostgreSQL and therefore fast -- and irreversible, which is
+// the part worth saying out loud.
+inline void plan_drop_column(const Intent& in, const Observations& obs,
+                             Plan& plan, std::vector<Step>& out) {
+  Step step;
+  step.kind = in.kind_name;
+  struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
+
+  const auto qualified = in.qualified_table();
+  const auto& t = obs.table(qualified);
+  const auto column = in.body.value("column", "");
+
+  if (!t.value("exists", false)) {
+    step.action = Action::kConflict;
+    step.why = qualified + " does not exist";
+    plan.conflicts.push_back(step.why);
+    return;
+  }
+  const json columns = t.value("columns", json::object());
+  if (!columns.contains(column)) {
+    step.action = Action::kSatisfied;
+    step.why = "no column " + column + " on " + qualified;
+    return;
+  }
+
+  const json views = t.value("dependent_views", json::object());
+  const auto rebuild = detail::views_to_rebuild(views, column);
+
+  step.txn_class = TxnClass::kRequired;
+  step.own_transaction = true;
+  detail::emit_view_drops(views, rebuild, step);
+  step.sql.push_back("ALTER TABLE " + qualified + " DROP COLUMN " +
+                     detail::quote_identifier(column) + ";");
+  detail::emit_view_recreates(views, rebuild, step);
+
+  step.lock = "AccessExclusiveLock on " + qualified;
+  step.why =
+      "dropping a column is catalog-only in PostgreSQL -- the data is not "
+      "reclaimed, the attribute is marked dropped -- so the statement is fast "
+      "whatever the table's size";
+  if (!rebuild.empty()) {
+    // The views must be rebuilt WITHOUT the column, and their stored
+    // definitions still name it. This is the one case the recipe cannot carry.
+    step.action = Action::kConflict;
+    std::vector<std::string> names;
+    for (const auto& [level, name] : rebuild) { (void)level; names.push_back(name); }
+    step.why = column + " is read by " + detail::join(names, ", ");
+    plan.conflicts.push_back(
+        "cannot drop " + qualified + "." + column + ": it is read by " +
+        detail::join(names, ", ") +
+        ". Unlike a type change, the recorded view definitions cannot be "
+        "replayed here -- they still select the column being removed, so "
+        "recreating them verbatim would fail. Change or drop those views in "
+        "earlier intents, where the new definition is written down and "
+        "reviewable. pg_laswell will not guess at a rewritten view body, and "
+        "will not emit CASCADE: measured on 18.6, DROP ... CASCADE under a "
+        "three-level stack left zero views standing.");
+    step.sql.clear();
+    return;
+  }
+  plan.warnings.push_back(
+      "dropping " + qualified + "." + column +
+      " is irreversible: the values are gone at commit and no revert can "
+      "recover them. If they may be needed, capture them in an earlier intent "
+      "first.");
+  step.detail["column"] = column;
+  step.detail["type"] = columns[column].value("type", "");
+}
+
 // --- drop_constraint -------------------------------------------------------
 //
 // The statement is always the same -- there is no concurrent variant and the
@@ -1538,6 +2014,10 @@ inline Plan plan_migration(const Spec& spec, const Observations& obs,
         plan_add_check_constraint(in, projected, plan, emitted); break;
       case IntentKind::kDropConstraint:
         plan_drop_constraint(in, projected, plan, emitted); break;
+      case IntentKind::kAlterColumnType:
+        plan_alter_column_type(in, projected, plan, emitted); break;
+      case IntentKind::kDropColumn:
+        plan_drop_column(in, projected, plan, emitted); break;
     }
     if (!emitted.empty()) project(in, emitted.front(), projected);
 

@@ -328,9 +328,11 @@ This build implements
 .Cm drop_index ,
 .Cm set_not_null ,
 .Cm add_foreign_key ,
-.Cm add_check_constraint
+.Cm add_check_constraint ,
+.Cm drop_constraint ,
+.Cm alter_column_type
 and
-.Cm drop_constraint .
+.Cm drop_column .
 .Pp
 An intent that creates an object must carry a
 .Va comment ,
@@ -568,6 +570,76 @@ change to what the data may contain and not merely to what is enforced.
 A constraint that is already absent is
 .Em satisfied ,
 not an error.
+.Ss Dependent views
+PostgreSQL refuses
+.Ic ALTER COLUMN ... TYPE
+and
+.Ic DROP COLUMN
+outright when a view reads the column, and it refuses them whatever the change
+costs: measured on 18.6,
+.Li varchar(50)
+to
+.Li varchar(100)
+rewrites nothing and is still refused, then succeeds the moment the view is
+dropped.
+So the view stack is not a consequence of an expensive change; it is a
+consequence of a view existing.
+.Pp
+.Nm
+walks the dependency graph transitively, drops the affected views deepest
+first, applies the change, and recreates them shallowest first, all in one
+transaction so no reader ever finds them missing.
+A view reading a
+.Em different
+column of the same table is left alone: it does not block the change, and
+rebuilding it would widen the blast radius for nothing.
+.Pp
+The rebuild is the easy half.
+A hand-written drop and recreate silently loses eight things, every one
+measured: the view's comment, its per-column comments, its grants, its
+.Em column-level
+grants, its reloptions such as
+.Va security_barrier ,
+its
+.Ic INSTEAD OF
+triggers, a materialized view's indexes -- and with them
+.Ic REFRESH ... CONCURRENTLY ,
+which requires a unique one -- and its owner, which reverts to whoever ran the
+migration.
+Nothing errors; an application simply loses
+.Ic SELECT .
+.Nm
+restores all eight, and restores the owner before the grants so each is
+recorded with the right grantor.
+.Pp
+.Cm drop_column
+is the one case that is refused rather than planned.
+The recorded view definitions still select the column being removed, so
+replaying them verbatim would fail, and rewriting a view body is a judgement
+about what that view should now mean.
+Change or drop those views in earlier intents, where the new definition is
+written down and reviewable.
+There is no
+.Ic CASCADE :
+measured on 18.6, a cascading drop under a three-level stack left
+.Em zero
+views standing.
+.Pp
+Which type changes rewrite the table is measured, not assumed.
+Relaxing or dropping a type modifier is free; adding or tightening one rewrites,
+because every existing value must be checked.
+.Nm
+classifies only the measured cases --
+.Li varchar(n)
+to a wider
+.Li varchar
+or to
+.Li text ,
+.Li numeric(p,s)
+to a wider precision at the same scale, and a widened timestamp precision --
+and assumes a rewrite otherwise, because reporting one that does not happen
+costs a cautious plan while missing one is an unplanned outage under
+.Va AccessExclusiveLock .
 .Sh SIGNING
 .Nm
 verifies; it never signs.

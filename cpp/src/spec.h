@@ -34,7 +34,7 @@ inline constexpr int kSpecVersion = 1;
 
 enum class IntentKind { kAddColumn, kBackfill, kCreateIndex, kDropIndex,
                         kSetNotNull, kAddForeignKey, kAddCheckConstraint,
-                        kDropConstraint };
+                        kDropConstraint, kAlterColumnType, kDropColumn };
 
 inline const std::map<std::string, IntentKind>& intent_kinds() {
   static const std::map<std::string, IntentKind> kKinds = {
@@ -46,6 +46,8 @@ inline const std::map<std::string, IntentKind>& intent_kinds() {
       {"add_foreign_key", IntentKind::kAddForeignKey},
       {"add_check_constraint", IntentKind::kAddCheckConstraint},
       {"drop_constraint", IntentKind::kDropConstraint},
+      {"alter_column_type", IntentKind::kAlterColumnType},
+      {"drop_column", IntentKind::kDropColumn},
   };
   return kKinds;
 }
@@ -409,6 +411,35 @@ inline void parse_add_check_constraint(Intent& in) {
   (void)detail::require_string(in.body, "expression", at);
 }
 
+inline void parse_alter_column_type(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(
+      in.body, {"kind", "schema", "table", "column", "type", "using"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "column", at), "column", in.ordinal);
+  detail::require_string(in.body, "type", at);
+  // "using" is optional and carries SQL, like backfill's set/where. It is the
+  // only way to express a conversion PostgreSQL has no cast for, and refusing
+  // it would push those changes out of the repository entirely -- which is the
+  // failure mode drop_constraint was reinstated to avoid.
+  if (in.body.contains("using") && !in.body["using"].is_string()) {
+    throw std::runtime_error(at + ".using must be a string");
+  }
+}
+
+inline void parse_drop_column(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(in.body, {"kind", "schema", "table", "column"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "column", at), "column", in.ordinal);
+  // No CASCADE, for the same reason drop_constraint has none, and with sharper
+  // consequences here: measured on 18.6, DROP ... CASCADE on a table under a
+  // three-level view stack left ZERO views standing. The dependent views are
+  // rebuilt and restored instead.
+}
+
 inline void parse_drop_constraint(Intent& in) {
   const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
   detail::reject_unknown_keys(in.body, {"kind", "schema", "table", "name"}, at);
@@ -537,6 +568,8 @@ inline Spec parse_spec(const json& doc) {
       case IntentKind::kAddForeignKey: parse_add_foreign_key(in); break;
       case IntentKind::kAddCheckConstraint: parse_add_check_constraint(in); break;
       case IntentKind::kDropConstraint: parse_drop_constraint(in); break;
+    case IntentKind::kAlterColumnType: parse_alter_column_type(in); break;
+    case IntentKind::kDropColumn: parse_drop_column(in); break;
     }
     s.intents.push_back(std::move(in));
     ++ordinal;

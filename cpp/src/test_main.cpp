@@ -848,7 +848,10 @@ TEST(Spec, KnownKindsAreExactlyTheImplementedKinds) {
     "add_check_constraint": {"kind":"add_check_constraint","schema":"s",
                              "table":"t","name":"ck","expression":"v > 0"},
     "drop_constraint": {"kind":"drop_constraint","schema":"s","table":"t",
-                        "name":"ck"}
+                        "name":"ck"},
+    "alter_column_type": {"kind":"alter_column_type","schema":"s","table":"t",
+                          "column":"c","type":"bigint"},
+    "drop_column": {"kind":"drop_column","schema":"s","table":"t","column":"c"}
   })");
   for (const auto& [name, kind] : pglaswell::intent_kinds()) {
     (void)kind;
@@ -3768,6 +3771,243 @@ TEST(Planner, DroppingAnAbsentIndexIsSatisfied) {
   EXPECT_EQ(steps_of(plan, "drop_index")[0]->action, pglaswell::Action::kSatisfied);
 }
 
+
+// --- alter_column_type / drop_column, and the view rebuild ------------------
+
+static json view_stack() {
+  // v1 reads amount; v2 sits on v1; vother reads a different column entirely.
+  return json{
+      {"public.v1", {{"name", "public.v1"}, {"level", 1}, {"kind", "view"},
+                     {"definition", " SELECT id, amount FROM shop.orders;"},
+                     {"depends_on", json::array()},
+                     {"owner", "app"}, {"comment", "v1 doc"},
+                     {"reloptions", json::array({"security_barrier=true"})},
+                     {"uses_columns", json::array({"amount"})},
+                     {"column_comments", {{"amount", "amount doc"}}},
+                     {"grants", json::array({"app=arwdDxt/app", "=r/app"})},
+                     {"column_grants", json::array({json{{"column", "id"},
+                                                         {"acl", json::array({"reader=r/app"})}}})},
+                     {"triggers", json::array({"CREATE TRIGGER v1_ins INSTEAD OF INSERT ON public.v1 FOR EACH ROW EXECUTE FUNCTION noop()"})},
+                     {"indexes", json::array()}}},
+      {"public.v2", {{"name", "public.v2"}, {"level", 2}, {"kind", "view"},
+                     {"definition", " SELECT id FROM public.v1;"},
+                     {"depends_on", json::array({"public.v1"})},
+                     {"owner", "app"}, {"comment", nullptr},
+                     {"reloptions", json::array()},
+                     {"uses_columns", json::array()},
+                     {"column_comments", json::object()},
+                     {"grants", json::array()},
+                     {"column_grants", json::array()},
+                     {"triggers", json::array()}, {"indexes", json::array()}}},
+      {"public.mv1", {{"name", "public.mv1"}, {"level", 2}, {"kind", "materialized"},
+                     {"definition", " SELECT id FROM public.v1;"},
+                     {"depends_on", json::array({"public.v1"})},
+                     {"owner", "app"}, {"comment", nullptr},
+                     {"reloptions", json::array()},
+                     {"uses_columns", json::array()},
+                     {"column_comments", json::object()},
+                     {"grants", json::array()}, {"column_grants", json::array()},
+                     {"triggers", json::array()},
+                     {"indexes", json::array({"CREATE UNIQUE INDEX mv1_id ON public.mv1 USING btree (id)"})}}},
+      {"public.vother", {{"name", "public.vother"}, {"level", 1}, {"kind", "view"},
+                     {"definition", " SELECT id, status FROM shop.orders;"},
+                     {"depends_on", json::array()},
+                     {"owner", "app"}, {"comment", nullptr},
+                     {"reloptions", json::array()},
+                     {"uses_columns", json::array({"status"})},
+                     {"column_comments", json::object()},
+                     {"grants", json::array()}, {"column_grants", json::array()},
+                     {"triggers", json::array()}, {"indexes", json::array()}}}};
+}
+
+static pglaswell::Observations obs_with_views(const char* col_type = "integer") {
+  auto obs = observations(2LL << 30, 8000000);
+  obs.tables["shop.orders"]["columns"]["amount"] =
+      json{{"type", col_type}, {"not_null", false}};
+  obs.tables["shop.orders"]["columns"]["status"] =
+      json{{"type", "text"}, {"not_null", false}};
+  obs.tables["shop.orders"]["dependent_views"] = view_stack();
+  return obs;
+}
+
+static pglaswell::Spec alter_spec(const char* type) {
+  return spec_of(json::array({json{{"kind", "alter_column_type"},
+                                   {"schema", "shop"}, {"table", "orders"},
+                                   {"column", "amount"}, {"type", type}}}));
+}
+
+TEST(Planner, AlterColumnTypeRebuildsOnlyTheViewsThatBlockIt) {
+  const auto plan = pglaswell::plan_migration(alter_spec("bigint"),
+                                              obs_with_views(), {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto s = steps_of(plan, "alter_column_type");
+  ASSERT_EQ(s.size(), 1u);
+  const auto sql = all_sql(*s[0]);
+
+  // vother reads a different column: it neither blocks the change nor gets
+  // dragged into the rebuild. Widening the blast radius is its own harm.
+  EXPECT_EQ(sql.find("vother"), std::string::npos)
+      << "a view on an unrelated column was rebuilt:\n" << sql;
+
+  // Deepest first on the way down...
+  const auto drop_v2 = sql.find("DROP VIEW public.v2");
+  const auto drop_mv = sql.find("DROP MATERIALIZED VIEW public.mv1");
+  const auto drop_v1 = sql.find("DROP VIEW public.v1");
+  const auto alter   = sql.find("ALTER TABLE shop.orders ALTER COLUMN");
+  const auto make_v1 = sql.find("CREATE VIEW public.v1");
+  const auto make_v2 = sql.find("CREATE VIEW public.v2");
+  for (auto pos : {drop_v2, drop_mv, drop_v1, alter, make_v1, make_v2}) {
+    ASSERT_NE(pos, std::string::npos) << sql;
+  }
+  EXPECT_LT(drop_v2, drop_v1) << "v2 sits on v1 and must come down first";
+  EXPECT_LT(drop_mv, drop_v1);
+  EXPECT_LT(drop_v1, alter);
+  // ... and shallowest first on the way back up.
+  EXPECT_LT(alter, make_v1);
+  EXPECT_LT(make_v1, make_v2) << "v2 cannot be created before v1 exists";
+
+  // One transaction, or a reader finds the views missing.
+  EXPECT_EQ(s[0]->txn_class, pglaswell::TxnClass::kRequired);
+  EXPECT_TRUE(s[0]->own_transaction);
+}
+
+TEST(Planner, TheViewRebuildRestoresAllEightThingsAHandRebuildLoses) {
+  // Spike S13 measured every one of these as ** GONE ** after a naive drop and
+  // recreate. A rebuild that does not put them back is not a fix; it is the
+  // same bug with a tool's name on it.
+  const auto plan = pglaswell::plan_migration(alter_spec("bigint"),
+                                              obs_with_views(), {});
+  const auto sql = all_sql(*steps_of(plan, "alter_column_type")[0]);
+
+  EXPECT_NE(sql.find("COMMENT ON VIEW public.v1 IS 'v1 doc'"), std::string::npos) << sql;
+  EXPECT_NE(sql.find("COMMENT ON COLUMN public.v1.\"amount\" IS 'amount doc'"),
+            std::string::npos) << sql;
+  EXPECT_NE(sql.find("ALTER VIEW public.v1 OWNER TO \"app\""), std::string::npos) << sql;
+  EXPECT_NE(sql.find("security_barrier=true"), std::string::npos) << sql;
+  EXPECT_NE(sql.find("INSTEAD OF INSERT"), std::string::npos) << sql;
+  EXPECT_NE(sql.find("CREATE UNIQUE INDEX mv1_id"), std::string::npos)
+      << "a matview's unique index is what REFRESH CONCURRENTLY needs:\n" << sql;
+  // Table grants, including the PUBLIC entry, whose grantee is empty.
+  EXPECT_NE(sql.find("GRANT SELECT ON public.v1 TO \"app\""), std::string::npos) << sql;
+  EXPECT_NE(sql.find("GRANT SELECT ON public.v1 TO PUBLIC"), std::string::npos)
+      << "an empty grantee is PUBLIC, and it is the entry least likely to be "
+         "noticed missing:\n" << sql;
+  // Column-level grants.
+  // The column list goes after the PRIVILEGE, not after the relation. The
+  // other order is a syntax error, and asserting it here would only have
+  // agreed with our own output -- the end-to-end test is what found it.
+  EXPECT_NE(sql.find("GRANT SELECT (\"id\") ON public.v1 TO \"reader\""),
+            std::string::npos) << sql;
+
+  // The owner is restored BEFORE the grants, or every grant records the wrong
+  // grantor.
+  EXPECT_LT(sql.find("OWNER TO \"app\""), sql.find("GRANT SELECT ON public.v1 TO"));
+}
+
+TEST(Planner, AProvableWideningIsNotReportedAsARewrite) {
+  // Measured on 18.6 by relfilenode: relaxing a type modifier is free, adding
+  // or tightening one rewrites. Both directions asserted, because a rule that
+  // only ever says "rewrite" would pass a one-sided test.
+  struct Case { const char* from; const char* to; bool free_change; };
+  const Case cases[] = {
+      {"character varying(50)", "character varying(100)", true},
+      {"character varying(50)", "text", true},
+      {"numeric(10,2)", "numeric(12,2)", true},
+      {"timestamp(0) without time zone", "timestamp(3) without time zone", true},
+      {"text", "character varying(200)", false},   // adds a limit: every row checked
+      {"integer", "bigint", false},
+      {"integer", "text", false},
+      {"numeric(10,2)", "numeric(12,3)", false},   // a scale change re-encodes
+      {"character varying(100)", "character varying(50)", false},  // narrowing
+  };
+  for (const auto& c : cases) {
+    const auto plan = pglaswell::plan_migration(alter_spec(c.to),
+                                                obs_with_views(c.from), {});
+    ASSERT_TRUE(plan.ok) << plan.render();
+    const auto* step = steps_of(plan, "alter_column_type")[0];
+    EXPECT_EQ(step->detail.value("rewrite", ""), c.free_change ? "no" : "assumed")
+        << c.from << " -> " << c.to << ": " << step->why;
+  }
+}
+
+TEST(Planner, AlterColumnTypeToTheTypeItAlreadyHasIsSatisfied) {
+  const auto plan = pglaswell::plan_migration(alter_spec("integer"),
+                                              obs_with_views("integer"), {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto* step = steps_of(plan, "alter_column_type")[0];
+  EXPECT_EQ(step->action, pglaswell::Action::kSatisfied);
+  EXPECT_TRUE(step->sql.empty()) << "a satisfied step must not rebuild views";
+}
+
+TEST(Planner, AlterColumnTypeWithNoViewsEmitsJustTheAlter) {
+  auto obs = observations(1024, 10);
+  obs.tables["shop.orders"]["columns"]["amount"] =
+      json{{"type", "integer"}, {"not_null", false}};
+  const auto plan = pglaswell::plan_migration(alter_spec("bigint"), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto sql = all_sql(*steps_of(plan, "alter_column_type")[0]);
+  EXPECT_EQ(sql.find("DROP VIEW"), std::string::npos) << sql;
+  EXPECT_NE(sql.find("ALTER TABLE shop.orders ALTER COLUMN \"amount\" TYPE bigint"),
+            std::string::npos) << sql;
+}
+
+TEST(Planner, DroppingAColumnAViewReadsIsRefusedRatherThanGuessedAt) {
+  // The difference from alter_column_type, and the reason this is a refusal
+  // instead of a recipe: the recorded view definitions still SELECT the column
+  // being removed, so replaying them verbatim would fail. Rewriting them is a
+  // judgement about what the view should now mean, which belongs in a spec
+  // somebody reviewed.
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "drop_column"}, {"schema", "shop"},
+                                {"table", "orders"}, {"column", "amount"}}})),
+      obs_with_views(), {});
+  EXPECT_FALSE(plan.ok) << plan.render();
+  ASSERT_FALSE(plan.conflicts.empty());
+  EXPECT_NE(plan.conflicts[0].find("public.v1"), std::string::npos)
+      << plan.conflicts[0];
+  EXPECT_NE(plan.conflicts[0].find("CASCADE"), std::string::npos)
+      << "the refusal must say why CASCADE is not the way out: "
+      << plan.conflicts[0];
+  EXPECT_TRUE(steps_of(plan, "drop_column")[0]->sql.empty());
+}
+
+TEST(Planner, DroppingAnUnreferencedColumnWarnsThatItIsIrreversible) {
+  auto obs = obs_with_views();
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "drop_column"}, {"schema", "shop"},
+                                {"table", "orders"}, {"column", "status"}}})),
+      obs, {});
+  // status is read by vother, so this is still refused -- which is the point:
+  // the check is on the column, not on whether any view exists at all.
+  EXPECT_FALSE(plan.ok) << plan.render();
+
+  // A column nothing reads goes through, with the warning that matters.
+  auto quiet = observations(1024, 10);
+  quiet.tables["shop.orders"]["columns"]["scratch"] =
+      json{{"type", "text"}, {"not_null", false}};
+  const auto ok = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "drop_column"}, {"schema", "shop"},
+                                {"table", "orders"}, {"column", "scratch"}}})),
+      quiet, {});
+  ASSERT_TRUE(ok.ok) << ok.render();
+  bool warned = false;
+  for (const auto& w : ok.warnings) {
+    if (w.find("irreversible") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned) << ok.render();
+  EXPECT_NE(all_sql(*steps_of(ok, "drop_column")[0]).find("DROP COLUMN \"scratch\""),
+            std::string::npos);
+}
+
+TEST(Planner, DroppingAnAbsentColumnIsSatisfied) {
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "drop_column"}, {"schema", "shop"},
+                                {"table", "orders"}, {"column", "never"}}})),
+      observations(1024, 10), {});
+  ASSERT_TRUE(plan.ok);
+  EXPECT_EQ(steps_of(plan, "drop_column")[0]->action, pglaswell::Action::kSatisfied);
+}
+
 // --- drop_constraint --------------------------------------------------------
 //
 // The statement never varies, so for a while this kind looked like a psql
@@ -4064,6 +4304,261 @@ TEST(Spec, AnUnknownReferentialActionIsRefusedWithTheList) {
       {"on_delete", "cascade"}}});  // lower case: PostgreSQL spells it upper
   const auto err = spec_error(doc);
   EXPECT_NE(err.find("CASCADE"), std::string::npos) << err;
+}
+
+TEST_F(DatabaseTest, DependentViewsAreObservedWithEverythingARebuildMustRestore) {
+  // Measured on 18.6 (spike S13): PostgreSQL refuses ANY type change on a
+  // column a view reads -- text -> varchar(200) is refused although it rewrites
+  // nothing -- so a planner blind to the view stack cannot plan the change at
+  // all. And a naive drop/recreate loses eight things silently. Each field
+  // asserted here corresponds to one of them; a missing field is not a cosmetic
+  // gap, it is an application losing SELECT or writes through a view.
+  pglaswell::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = url_;
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/views");
+    w.txn().exec("DROP TABLE IF EXISTS laswell_vbase CASCADE");
+    w.txn().exec("CREATE TABLE laswell_vbase(id bigint PRIMARY KEY,"
+                 " amount int, note text)");
+    // A three-level stack: a view, a view on that view, and a materialized
+    // view. Plus one view that reads a DIFFERENT column, which must not be
+    // dragged into a rebuild it does not need.
+    w.txn().exec("CREATE VIEW laswell_v1 AS"
+                 " SELECT id, amount, note FROM laswell_vbase");
+    w.txn().exec("CREATE VIEW laswell_v2 AS"
+                 " SELECT id, amount * 2 AS doubled FROM laswell_v1");
+    w.txn().exec("CREATE MATERIALIZED VIEW laswell_mv1 AS"
+                 " SELECT id, amount FROM laswell_v1");
+    w.txn().exec("CREATE UNIQUE INDEX laswell_mv1_id ON laswell_mv1(id)");
+    w.txn().exec("CREATE VIEW laswell_vother AS"
+                 " SELECT id, note FROM laswell_vbase");
+    w.txn().exec("COMMENT ON VIEW laswell_v1 IS 'the comment on v1'");
+    w.txn().exec("COMMENT ON COLUMN laswell_v1.amount IS 'amount doc'");
+    w.txn().exec("ALTER VIEW laswell_v1 SET (security_barrier = true)");
+    w.txn().exec("CREATE OR REPLACE FUNCTION laswell_noop() RETURNS trigger"
+                 " LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$");
+    w.txn().exec("CREATE TRIGGER laswell_v1_ins INSTEAD OF INSERT ON laswell_v1"
+                 " FOR EACH ROW EXECUTE FUNCTION laswell_noop()");
+    w.commit();
+  }
+
+  pglaswell::Catalog cat(cfg);
+  const auto obs = cat.observe({"public"}, {"laswell_vbase"});
+  const auto& views = obs.table("public.laswell_vbase")["dependent_views"];
+
+  // Transitive: v2 and mv1 read the base table only THROUGH v1, and would be
+  // invisible to a single-level pg_depend lookup.
+  ASSERT_EQ(views.size(), 4u) << views.dump(2);
+  for (const char* n : {"public.laswell_v1", "public.laswell_v2", "public.laswell_mv1",
+                        "public.laswell_vother"}) {
+    EXPECT_TRUE(views.contains(n)) << n << " missing from " << views.dump(2);
+  }
+
+  // Depth decides the order: drop the deepest first, recreate in reverse.
+  EXPECT_EQ(views["public.laswell_v1"]["level"], 1);
+  EXPECT_GT(views["public.laswell_v2"]["level"].get<int>(),
+            views["public.laswell_v1"]["level"].get<int>());
+  EXPECT_GT(views["public.laswell_mv1"]["level"].get<int>(),
+            views["public.laswell_v1"]["level"].get<int>());
+
+  // A materialized view is not a view: it holds data, its indexes go with it,
+  // and it needs a REFRESH after a rebuild.
+  EXPECT_EQ(views["public.laswell_mv1"]["kind"], "materialized");
+  EXPECT_EQ(views["public.laswell_v1"]["kind"], "view");
+
+  // The eight things a hand rebuild loses.
+  const auto& v1 = views["public.laswell_v1"];
+  EXPECT_FALSE(v1["definition"].get<std::string>().empty());
+  EXPECT_EQ(v1["comment"], "the comment on v1");
+  EXPECT_EQ(v1["column_comments"]["amount"], "amount doc");
+  EXPECT_FALSE(v1["owner"].get<std::string>().empty());
+  EXPECT_NE(v1["reloptions"].dump().find("security_barrier"), std::string::npos)
+      << v1["reloptions"].dump();
+  ASSERT_EQ(v1["triggers"].size(), 1u) << v1["triggers"].dump();
+  EXPECT_NE(v1["triggers"][0].get<std::string>().find("INSTEAD OF INSERT"),
+            std::string::npos);
+  EXPECT_EQ(views["public.laswell_mv1"]["indexes"].size(), 1u)
+      << "a materialized view's index is dropped with it and must be restored";
+
+  // Which columns each view actually reads. A view on a column nobody is
+  // changing must not be rebuilt: widening the blast radius for nothing is its
+  // own harm, and the whole point is to touch as little as possible.
+  const auto uses = [&](const char* v) {
+    std::set<std::string> out;
+    for (const auto& c : views[v]["uses_columns"]) out.insert(c.get<std::string>());
+    return out;
+  };
+  EXPECT_EQ(uses("public.laswell_vother"), (std::set<std::string>{"id", "note"}))
+      << "vother reads note, not amount";
+  EXPECT_EQ(uses("public.laswell_vother").count("amount"), 0u)
+      << "a change to amount must not drag vother into the rebuild";
+
+  // v2 and mv1 read the base table only through v1, so their own column list
+  // is empty -- their dependency is on v1, and rebuilding v1 is what forces
+  // them. Asserted so the emptiness is understood rather than mistaken for a
+  // gap in the query.
+  EXPECT_TRUE(uses("public.laswell_v2").empty()) << views["public.laswell_v2"].dump();
+
+  // And the refusal that makes all of this necessary, from PostgreSQL itself.
+  // Without this the test would only be agreeing with our own JSON.
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/views-refute");
+    EXPECT_THROW(w.txn().exec("ALTER TABLE laswell_vbase"
+                              " ALTER COLUMN note TYPE varchar(200)"),
+                 pqxx::sql_error)
+        << "a type change needing no rewrite was allowed under a view";
+  }
+
+  // A table with no views on it reports an empty object, not a missing key.
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/views-none");
+    w.txn().exec("DROP TABLE IF EXISTS laswell_vplain");
+    w.txn().exec("CREATE TABLE laswell_vplain(id bigint PRIMARY KEY)");
+    w.commit();
+  }
+  const auto plain = cat.observe({"public"}, {"laswell_vplain"});
+  EXPECT_TRUE(plain.table("public.laswell_vplain")["dependent_views"].empty());
+
+  pglaswell::WriteSession w(cfg);
+  w.begin("pg_laswell/test/views-cleanup");
+  w.txn().exec("DROP TABLE laswell_vbase CASCADE");
+  w.txn().exec("DROP TABLE laswell_vplain");
+  w.commit();
+}
+
+TEST_F(DatabaseTest, TheGeneratedViewRebuildActuallyRunsAndRestoresEverything) {
+  // The end-to-end claim. Everything else asserts the SQL we generate; this
+  // runs it against PostgreSQL and then re-reads the catalog, because a recipe
+  // that is right in a string comparison and wrong in a database is worth
+  // nothing. Each check corresponds to one of the eight losses S13 measured.
+  pglaswell::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = url_;
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/rebuild");
+    // Cleanup first, and in this order. A role cannot be dropped while any
+    // object still grants to it, so the grants have to go before the role --
+    // and the objects before the grants. A previous failing run leaves exactly
+    // this state behind, and the next run then fails for a reason that has
+    // nothing to do with what it is testing.
+    w.txn().exec("DROP TABLE IF EXISTS laswell_rb CASCADE");
+    w.txn().exec("DO $$BEGIN"
+                 "  IF EXISTS (SELECT 1 FROM pg_roles"
+                 "              WHERE rolname='laswell_rb_reader') THEN"
+                 "    EXECUTE 'DROP OWNED BY laswell_rb_reader';"
+                 "    EXECUTE 'DROP ROLE laswell_rb_reader';"
+                 "  END IF;"
+                 "END$$");
+    w.txn().exec("CREATE ROLE laswell_rb_reader");
+    w.txn().exec("CREATE TABLE laswell_rb(id bigint PRIMARY KEY,"
+                 " amount integer, note text)");
+    w.txn().exec("INSERT INTO laswell_rb SELECT g, g, 'n'||g"
+                 " FROM generate_series(1,50) g");
+    w.txn().exec("CREATE VIEW laswell_rb_v1 AS"
+                 " SELECT id, amount, note FROM laswell_rb");
+    w.txn().exec("CREATE VIEW laswell_rb_v2 AS"
+                 " SELECT id, amount * 2 AS doubled FROM laswell_rb_v1");
+    w.txn().exec("CREATE MATERIALIZED VIEW laswell_rb_mv AS"
+                 " SELECT id, amount FROM laswell_rb_v1");
+    w.txn().exec("CREATE UNIQUE INDEX laswell_rb_mv_id ON laswell_rb_mv(id)");
+    w.txn().exec("CREATE VIEW laswell_rb_other AS"
+                 " SELECT id, note FROM laswell_rb");
+    w.txn().exec("COMMENT ON VIEW laswell_rb_v1 IS 'v1 doc'");
+    w.txn().exec("COMMENT ON COLUMN laswell_rb_v1.amount IS 'amount doc'");
+    w.txn().exec("ALTER VIEW laswell_rb_v1 SET (security_barrier = true)");
+    w.txn().exec("GRANT SELECT ON laswell_rb_v1 TO laswell_rb_reader");
+    w.txn().exec("GRANT SELECT ON laswell_rb_v1 TO PUBLIC");
+    w.txn().exec("GRANT SELECT (id) ON laswell_rb_v2 TO laswell_rb_reader");
+    w.txn().exec("CREATE OR REPLACE FUNCTION laswell_rb_noop() RETURNS trigger"
+                 " LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$");
+    w.txn().exec("CREATE TRIGGER laswell_rb_ins INSTEAD OF INSERT ON"
+                 " laswell_rb_v1 FOR EACH ROW EXECUTE FUNCTION laswell_rb_noop()");
+    w.commit();
+  }
+
+  pglaswell::Catalog cat(cfg);
+  const auto obs = cat.observe({"public"}, {"laswell_rb"});
+  json doc = minimal_spec();
+  doc["intents"] = json::array({json{{"kind", "alter_column_type"},
+                                     {"schema", "public"},
+                                     {"table", "laswell_rb"},
+                                     {"column", "amount"},
+                                     {"type", "bigint"}}});
+  const auto plan =
+      pglaswell::plan_migration(pglaswell::parse_spec(doc), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto steps = steps_of(plan, "alter_column_type");
+  ASSERT_EQ(steps.size(), 1u);
+
+  // One transaction, exactly as the plan says: no reader may find the views
+  // missing. If the recipe is wrong, this throws and nothing is left behind.
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/rebuild-apply");
+    for (const auto& q : steps[0]->sql) {
+      const std::string stmt = q;
+      w.txn().exec(stmt.substr(0, stmt.size() - 1));
+    }
+    w.commit();
+  }
+
+  // Scoped, because the reads below hold AccessShareLock for as long as the
+  // session lives, and the cleanup DROP needs AccessExclusiveLock. Leaving
+  // it open made the teardown time out on a lock while every assertion had
+  // already passed -- which is precisely the hazard this tool exists to
+  // reason about, arriving in its own test suite.
+  {
+    pglaswell::ReadSession r(cfg);
+    auto scalar = [&](const std::string& q) {
+      return r.txn().exec(q)[0][0].as<std::string>();
+    };
+    // The change itself.
+    EXPECT_EQ(scalar("SELECT format_type(atttypid, atttypmod) FROM pg_attribute"
+                     " WHERE attrelid='laswell_rb'::regclass AND attname='amount'"),
+              "bigint");
+    // ... and all four views still there, the unrelated one never touched.
+    EXPECT_EQ(scalar("SELECT count(*)::text FROM pg_class WHERE relkind IN ('v','m')"
+                     " AND relname LIKE 'laswell_rb%'"), "4");
+    // The eight.
+    EXPECT_EQ(scalar("SELECT coalesce(obj_description('laswell_rb_v1'::regclass),"
+                     "'** GONE **')"), "v1 doc");
+    EXPECT_EQ(scalar("SELECT coalesce(col_description('laswell_rb_v1'::regclass,2),"
+                     "'** GONE **')"), "amount doc");
+    EXPECT_NE(scalar("SELECT coalesce(array_to_string(reloptions,','),'** GONE **')"
+                     " FROM pg_class WHERE oid='laswell_rb_v1'::regclass")
+                  .find("security_barrier"), std::string::npos);
+    EXPECT_EQ(scalar("SELECT coalesce(string_agg(tgname,','),'** GONE **')"
+                     " FROM pg_trigger WHERE tgrelid='laswell_rb_v1'::regclass"
+                     " AND NOT tgisinternal"), "laswell_rb_ins");
+    EXPECT_EQ(scalar("SELECT count(*)::text FROM pg_index"
+                     " WHERE indrelid='laswell_rb_mv'::regclass"), "1");
+    EXPECT_EQ(scalar("SELECT has_table_privilege('laswell_rb_reader',"
+                     " 'laswell_rb_v1','SELECT')::text"), "true");
+    EXPECT_EQ(scalar("SELECT has_table_privilege('public',"
+                     " 'laswell_rb_v1','SELECT')::text"), "true")
+        << "the PUBLIC grant is the one nobody notices missing";
+    EXPECT_EQ(scalar("SELECT has_column_privilege('laswell_rb_reader',"
+                     " 'laswell_rb_v2','id','SELECT')::text"), "true")
+        << "column-level grants are lost by a hand rebuild";
+    // The materialized view holds data again, not an empty shell.
+    EXPECT_EQ(scalar("SELECT count(*)::text FROM laswell_rb_mv"), "50");
+    // And the views still answer.
+    EXPECT_EQ(scalar("SELECT sum(doubled)::text FROM laswell_rb_v2"),
+              std::to_string(50 * 51));
+  }
+
+  pglaswell::WriteSession w(cfg);
+  w.begin("pg_laswell/test/rebuild-cleanup");
+  w.txn().exec("DROP TABLE laswell_rb CASCADE");
+  w.txn().exec("DROP FUNCTION laswell_rb_noop()");
+  w.txn().exec("DROP OWNED BY laswell_rb_reader");
+  w.txn().exec("DROP ROLE laswell_rb_reader");
+  w.commit();
 }
 
 TEST_F(DatabaseTest, ConstraintObservationsMatchWhatPostgresqlActuallyRefuses) {
