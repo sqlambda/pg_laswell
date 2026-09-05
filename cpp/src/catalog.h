@@ -37,7 +37,7 @@ namespace detail {
 inline const char* kTableObservationSql = R"SQL(
 WITH target AS (
   SELECT c.oid, c.relname, c.relkind, c.relispartition, c.reltuples, c.relpages,
-         n.nspname
+         c.reloptions, c.relowner, n.nspname
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
    WHERE n.nspname = $1 AND c.relname = $2
@@ -50,6 +50,12 @@ SELECT COALESCE(
                             WHEN 'm' THEN 'materialized_view'
                             WHEN 'v' THEN 'view'
                             ELSE t.relkind::text END,
+     -- Only meaningful when 'kind' is view or materialized_view, and needed
+     -- because replace_view must restore what CREATE OR REPLACE resets.
+     'view_definition', CASE WHEN t.relkind IN ('v','m')
+                             THEN PG_GET_VIEWDEF(t.oid, true) END,
+     'reloptions', COALESCE(TO_JSONB(t.reloptions), '[]'::jsonb),
+     'owner', PG_GET_USERBYID(t.relowner),
      'is_partition', t.relispartition,
      'reltuples', GREATEST(t.reltuples, 0)::bigint,
      'size_estimate', (t.relpages::bigint * 8192),

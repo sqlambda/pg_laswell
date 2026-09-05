@@ -330,9 +330,10 @@ This build implements
 .Cm add_foreign_key ,
 .Cm add_check_constraint ,
 .Cm drop_constraint ,
-.Cm alter_column_type
+.Cm alter_column_type ,
+.Cm drop_column
 and
-.Cm drop_column .
+.Cm replace_view .
 .Pp
 An intent that creates an object must carry a
 .Va comment ,
@@ -624,6 +625,47 @@ There is no
 measured on 18.6, a cascading drop under a three-level stack left
 .Em zero
 views standing.
+.Ss Adding a column is the opposite case
+.Cm add_column
+is never blocked by a view -- only a type change and a drop are -- so nothing
+is rebuilt for it.
+What is worth knowing is the reverse: the new column reaches
+.Em none
+of the existing views, including any written
+.Ic SELECT * .
+A view stores its column list when it is created and the star is expanded then
+and there, so a later
+.Ic ADD COLUMN
+never arrives.
+Nothing errors; the column is simply absent for anything reading through the
+view, which is why the plan says so rather than leaving it to be discovered.
+.Pp
+.Cm replace_view
+is how a column is exposed, and it takes the view's
+.Em query
+rather than a
+.Ic CREATE
+statement, because choosing the mechanism is the only decision it makes.
+For a plain view that is
+.Ic CREATE OR REPLACE ,
+which costs one loss instead of eight: the comment, per-column comments,
+grants, column-level grants,
+.Ic INSTEAD OF
+triggers, the owner and every dependent object all survive.
+The single casualty is the view's options -- the
+.Ic WITH
+clause replaces the list wholesale, so a view silently stops being a
+.Va security_barrier
+with no error at all -- and the plan re-applies them in the same transaction.
+.Pp
+.Ic CREATE OR REPLACE
+can only
+.Em append
+columns; reordering, removing, retyping or renaming one is refused.
+A materialized view has no replace form whatsoever, so it is dropped and
+recreated
+.Ic WITH DATA ,
+re-running its query in full while the lock is held.
 .Pp
 Which type changes rewrite the table is measured, not assumed.
 Relaxing or dropping a type modifier is free; adding or tightening one rewrites,

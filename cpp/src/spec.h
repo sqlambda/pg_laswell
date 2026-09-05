@@ -34,7 +34,8 @@ inline constexpr int kSpecVersion = 1;
 
 enum class IntentKind { kAddColumn, kBackfill, kCreateIndex, kDropIndex,
                         kSetNotNull, kAddForeignKey, kAddCheckConstraint,
-                        kDropConstraint, kAlterColumnType, kDropColumn };
+                        kDropConstraint, kAlterColumnType, kDropColumn,
+                        kReplaceView };
 
 inline const std::map<std::string, IntentKind>& intent_kinds() {
   static const std::map<std::string, IntentKind> kKinds = {
@@ -48,6 +49,7 @@ inline const std::map<std::string, IntentKind>& intent_kinds() {
       {"drop_constraint", IntentKind::kDropConstraint},
       {"alter_column_type", IntentKind::kAlterColumnType},
       {"drop_column", IntentKind::kDropColumn},
+      {"replace_view", IntentKind::kReplaceView},
   };
   return kKinds;
 }
@@ -411,6 +413,35 @@ inline void parse_add_check_constraint(Intent& in) {
   (void)detail::require_string(in.body, "expression", at);
 }
 
+// A view body is business logic, like backfill's set/where. Enumerating a
+// SELECT grammar as JSON keys is the unbounded-reimplementation trap the intent
+// model exists to avoid, so the definition is written as SQL and signed as SQL.
+inline void parse_replace_view(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(
+      in.body, {"kind", "schema", "name", "definition", "comment"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "name", at), "name", in.ordinal);
+  const auto def = detail::require_string(in.body, "definition", at);
+  if (def.empty()) {
+    detail::fail(at + ".definition must not be empty",
+                 "A view needs a query. To remove a view, use a drop intent "
+                 "rather than an empty definition.");
+  }
+  // The definition is a query, not a statement. Accepting "CREATE VIEW ..."
+  // here would mean the tool no longer chooses between CREATE OR REPLACE and a
+  // drop-and-rebuild -- which is the only decision this kind makes.
+  std::string head = def.substr(0, 6);
+  for (auto& c : head) c = static_cast<char>(std::tolower(c));
+  if (head == "create") {
+    detail::fail(
+        at + ".definition is the view's QUERY, not a CREATE statement",
+        "Give the SELECT alone. pg_laswell chooses between CREATE OR REPLACE "
+        "and a drop-and-rebuild by reading the catalog, and a definition that "
+        "already carries the statement takes that decision away from it.");
+  }
+}
+
 inline void parse_alter_column_type(Intent& in) {
   const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
   detail::reject_unknown_keys(
@@ -570,6 +601,7 @@ inline Spec parse_spec(const json& doc) {
       case IntentKind::kDropConstraint: parse_drop_constraint(in); break;
     case IntentKind::kAlterColumnType: parse_alter_column_type(in); break;
     case IntentKind::kDropColumn: parse_drop_column(in); break;
+    case IntentKind::kReplaceView: parse_replace_view(in); break;
     }
     s.intents.push_back(std::move(in));
     ++ordinal;

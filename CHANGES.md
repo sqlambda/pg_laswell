@@ -3,7 +3,7 @@
 ## 0.1.0 (unreleased)
 
 The whole path works: repository, signing, planning, dry run, paced execution,
-ledger. 232 tests green on GCC 14.2 and Clang 22, under AddressSanitizer/UBSan
+ledger. 239 tests green on GCC 14.2 and Clang 22, under AddressSanitizer/UBSan
 and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
 `--call` contract test.
 
@@ -207,6 +207,18 @@ and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
   one rewrites. `text`→`varchar(200)` rewrites; `varchar(50)`→`text` does not.
   Anything unproven is reported as a rewrite, because a cautious plan costs
   less than an unplanned outage.
+- **`replace_view`**, and the measured reason it exists. Adding a column is
+  never blocked by a view — but the new column reaches *no* existing view,
+  including one written `SELECT *`, because the star is expanded at creation
+  and the column list stored. Nothing errors; the column is just not there.
+  `add_column` now says so and names the intent that fixes it.
+  Exposing it via `CREATE OR REPLACE VIEW` costs **one** loss rather than
+  eight: comment, column comments, grants, column grants, `INSTEAD OF`
+  triggers, owner and dependent objects all survive. Only the view's options
+  are reset — so it silently stops being a `security_barrier`, with no error —
+  and the plan re-applies them. `CREATE OR REPLACE` can only *append* columns,
+  and a materialized view has no replace form at all, so that one falls back to
+  drop-and-recreate.
 - **`drop_column`**, which refuses when a view reads the column rather than
   guessing at a rewritten view body, and warns that the values are gone at
   commit.

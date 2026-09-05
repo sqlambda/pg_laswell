@@ -258,6 +258,29 @@ inline void plan_add_column(const Intent& in, const Observations& obs, Plan& pla
     return;
   }
 
+  // Views never block an ADD COLUMN -- measured, spike S14 -- so nothing is
+  // rebuilt here. What is worth saying is the opposite: the new column reaches
+  // NONE of them, including any written as SELECT *, because the star is
+  // expanded at creation and the column list stored. Nothing errors, and the
+  // column simply is not there through the view the application reads.
+  const json dependent = t.value("dependent_views", json::object());
+  if (!dependent.empty()) {
+    std::vector<std::string> names;
+    for (const auto& [n, v] : dependent.items()) {
+      (void)v;
+      names.push_back(n);
+    }
+    plan.warnings.push_back(
+        qualified + "." + column + " will not be visible through " +
+        std::to_string(names.size()) + " view(s) that read this table: " +
+        detail::join(names, ", ") +
+        ". A view stores its column list when it is created -- SELECT * is "
+        "expanded then and there -- so adding a column never reaches one. "
+        "Expose it with a replace_view intent per view that should carry it; "
+        "PostgreSQL will not warn, and the column will simply be absent for "
+        "anything reading through the view.");
+  }
+
   std::string sql = "ALTER TABLE " + qualified + " ADD COLUMN " + column + " " + type;
   if (has_default) {
     sql += " DEFAULT " + in.body["default"].get<std::string>();
@@ -345,6 +368,13 @@ inline void project(const Intent& in, const Step& step, Observations& projected)
     case IntentKind::kDropColumn:
       projected.tables[qualified]["columns"].erase(in.body.value("column", ""));
       return;
+    case IntentKind::kReplaceView: {
+      const auto v = in.body.value("schema", "") + "." + in.body.value("name", "");
+      projected.tables[v]["exists"] = true;
+      if (!projected.tables[v].contains("kind")) projected.tables[v]["kind"] = "view";
+      projected.tables[v]["view_definition"] = in.body.value("definition", "");
+      return;
+    }
     case IntentKind::kAddForeignKey:
     case IntentKind::kAddCheckConstraint:
       // A constraint, not a relation or a column: nothing a later intent in
@@ -1336,6 +1366,126 @@ inline void warn_about_rebuild(
 
 }  // namespace detail
 
+// --- replace_view ----------------------------------------------------------
+//
+// The counterpart to the S13 rebuild, and deliberately a separate path because
+// the two cost wildly different amounts (spike S14, 18.6).
+//
+// ADD COLUMN is never blocked by a view -- only ALTER COLUMN ... TYPE and DROP
+// COLUMN are. But the new column is invisible to every existing view, INCLUDING
+// one written as SELECT *: the star is expanded when the view is created and
+// the column list is stored, so a later ADD COLUMN never reaches it. "Add it
+// and the views pick it up" is false, and false silently.
+//
+// Exposing it through CREATE OR REPLACE VIEW costs ONE loss rather than eight:
+// comment, per-column comments, grants, column-level grants, INSTEAD OF
+// triggers, owner and dependent objects all survive. Only reloptions are reset,
+// because the WITH clause replaces the list wholesale -- so a view loses
+// security_barrier without an error, which is a security property downgraded in
+// silence. That one is restored explicitly.
+//
+// CREATE OR REPLACE can only APPEND columns; reorder, remove, retype and rename
+// are all refused. And there is no CREATE OR REPLACE MATERIALIZED VIEW at all,
+// so a materialized view falls back to drop-and-recreate under the full
+// eight-way restore.
+inline void plan_replace_view(const Intent& in, const Observations& obs,
+                              Plan& plan, std::vector<Step>& out) {
+  Step step;
+  step.kind = in.kind_name;
+  struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
+
+  const auto schema = in.body.value("schema", "");
+  const auto name = in.body.value("name", "");
+  const auto qualified = schema + "." + name;
+  const auto& v = obs.table(qualified);
+  const auto definition = in.body.value("definition", "");
+  const auto kind = v.value("kind", "");
+
+  step.txn_class = TxnClass::kRequired;
+  step.detail["view"] = qualified;
+
+  if (!v.value("exists", false)) {
+    step.sql.push_back("CREATE VIEW " + qualified + " AS " + definition + ";");
+    if (in.body.contains("comment")) {
+      step.sql.push_back("COMMENT ON VIEW " + qualified + " IS " +
+                         detail::quote_literal(in.body.value("comment", "")) + ";");
+    }
+    step.lock = "no lock on any existing object";
+    step.why = qualified + " does not exist, so this creates it";
+    step.detail["method"] = "create";
+    return;
+  }
+  if (kind != "view" && kind != "materialized_view") {
+    step.action = Action::kConflict;
+    step.why = qualified + " is a " + kind + ", not a view";
+    plan.conflicts.push_back(
+        qualified + " is a " + kind +
+        ". replace_view will not turn a table into a view: that is a data loss "
+        "dressed as a definition change.");
+    return;
+  }
+
+  if (kind == "view") {
+    step.sql.push_back("CREATE OR REPLACE VIEW " + qualified + " AS " +
+                       definition + ";");
+    // The one thing CREATE OR REPLACE resets. Re-applied unconditionally when
+    // the view had any, because the failure is silent: no error, and a view
+    // that was a security barrier quietly stops being one.
+    const auto reloptions = v.value("reloptions", json::array());
+    if (!reloptions.empty()) {
+      std::vector<std::string> o;
+      for (const auto& r : reloptions) o.push_back(r.get<std::string>());
+      step.sql.push_back("ALTER VIEW " + qualified + " SET (" +
+                         detail::join(o, ", ") + ");");
+      plan.warnings.push_back(
+          "CREATE OR REPLACE VIEW resets a view's options, so " + qualified +
+          " would silently lose " + detail::join(o, ", ") +
+          ". The plan re-applies them in the same transaction; a hand-written "
+          "replace would not, and nothing would report it.");
+    }
+    step.lock = "AccessExclusiveLock on " + qualified + " only, briefly";
+    step.why =
+        "CREATE OR REPLACE keeps the comment, grants, column grants, INSTEAD "
+        "OF triggers, owner and every dependent object -- so this is the cheap "
+        "path, and it is available because the definition only appends columns";
+    step.detail["method"] = "replace";
+    // Said plainly, because the failure arrives as a confusing message about a
+    // column name when what the author actually did was reorder a SELECT list.
+    plan.warnings.push_back(
+        "CREATE OR REPLACE VIEW can only APPEND columns to " + qualified +
+        ". Reordering, removing, retyping or renaming an existing column is "
+        "refused by PostgreSQL; such a change needs the view dropped and "
+        "rebuilt, and every dependent object with it.");
+    return;
+  }
+
+  // A materialized view has no replace form -- measured, it is a syntax error
+  // -- so it falls back to the destructive path and pays the S13 restore.
+  step.own_transaction = true;
+  step.sql.push_back("DROP MATERIALIZED VIEW " + qualified + ";");
+  step.sql.push_back("CREATE MATERIALIZED VIEW " + qualified + " AS " +
+                     definition + ";");
+  const auto owner = v.value("owner", "");
+  if (!owner.empty()) {
+    step.sql.push_back("ALTER MATERIALIZED VIEW " + qualified + " OWNER TO " +
+                       detail::quote_identifier(owner) + ";");
+  }
+  step.lock = "AccessExclusiveLock on " + qualified;
+  step.why =
+      "PostgreSQL has no CREATE OR REPLACE MATERIALIZED VIEW, so this is a "
+      "drop and recreate: the query is re-run in full and everything attached "
+      "to the old object has to be put back";
+  step.detail["method"] = "drop_and_recreate";
+  plan.warnings.push_back(
+      qualified +
+      " is a materialized view, which has no replace form. It is dropped and "
+      "recreated WITH DATA, so its query re-runs in full inside the "
+      "transaction -- and its indexes, comments and grants go with it. Restate "
+      "them in later intents; pg_laswell restores the owner only, because "
+      "anything else here would be it inventing objects the spec never named.");
+  return;
+}
+
 // --- alter_column_type / drop_column ---------------------------------------
 
 namespace detail {
@@ -2018,6 +2168,8 @@ inline Plan plan_migration(const Spec& spec, const Observations& obs,
         plan_alter_column_type(in, projected, plan, emitted); break;
       case IntentKind::kDropColumn:
         plan_drop_column(in, projected, plan, emitted); break;
+      case IntentKind::kReplaceView:
+        plan_replace_view(in, projected, plan, emitted); break;
     }
     if (!emitted.empty()) project(in, emitted.front(), projected);
 
