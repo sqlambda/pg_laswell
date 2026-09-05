@@ -323,6 +323,60 @@ inline void plan_add_column(const Intent& in, const Observations& obs, Plan& pla
 // REORDER intents; it only accounts for the order the author chose.
 inline void project(const Intent& in, const Step& step, Observations& projected) {
   if (step.action != Action::kApply) return;
+  // Non-relation objects are keyed by name, not by schema.table, and they are
+  // projected FIRST -- the tables guard below would return early for every one
+  // of them, which made all of this dead code until a test looked.
+  const auto object_key = object_key_for(in);
+  if (!object_key.empty()) {
+    const auto oq = in.body.value("schema", "") + "." + in.body.value("name", "");
+    switch (in.kind) {
+      case IntentKind::kCreateSchema:
+        projected.objects[object_key] =
+            json{{"exists", true}, {"kind", "schema"},
+                 {"contains", json::array()}, {"depended_on_by", json::array()}};
+        return;
+      case IntentKind::kCreateExtension:
+        projected.objects[object_key] =
+            json{{"exists", true}, {"kind", "extension"},
+                 {"depended_on_by", json::array()}};
+        return;
+      case IntentKind::kCreateType: {
+        json labels = json::array();
+        for (const auto& l : in.body.value("labels", json::array())) labels.push_back(l);
+        projected.objects[object_key] =
+            json{{"exists", true}, {"kind", "type"},
+                 {"type_kind", in.body.value("type_kind", "")},
+                 {"enum_labels", labels}, {"depended_on_by", json::array()}};
+        return;
+      }
+      case IntentKind::kAddEnumValue:
+        if (projected.objects.contains(object_key)) {
+          projected.objects[object_key]["enum_labels"].push_back(
+              in.body.value("value", ""));
+        }
+        return;
+      case IntentKind::kCreateFunction:
+        projected.objects[object_key] =
+            json{{"exists", true}, {"kind", "function"},
+                 {"returns", in.body.value("returns", "")},
+                 {"depended_on_by", json::array()}};
+        return;
+      case IntentKind::kCreateSequence:
+        projected.objects[object_key] =
+            json{{"exists", true}, {"kind", "sequence"},
+                 {"depended_on_by", json::array()}};
+        return;
+      case IntentKind::kDropSchema:
+      case IntentKind::kDropExtension:
+      case IntentKind::kDropType:
+      case IntentKind::kDropFunction:
+      case IntentKind::kDropSequence:
+        projected.objects[object_key] = json{{"exists", false}};
+        (void)oq;
+        return;
+      default: return;
+    }
+  }
   const auto qualified = in.qualified_table();
   if (!projected.tables.contains(qualified)) return;
 
@@ -406,6 +460,16 @@ inline void project(const Intent& in, const Step& step, Observations& projected)
     case IntentKind::kGrant:
     case IntentKind::kRevoke:
       return;  // privileges are not part of the shape later intents plan against
+    case IntentKind::kCreateTrigger:
+      projected.tables[qualified]["triggers"][in.body.value("name", "")] =
+          json{{"enabled", true}};
+      return;
+    case IntentKind::kDropTrigger:
+      projected.tables[qualified]["triggers"].erase(in.body.value("name", ""));
+      return;
+    case IntentKind::kDropView:
+      projected.tables[qualified] = json{{"exists", false}};
+      return;
     case IntentKind::kRenameTable: {
       const auto to = in.body.value("schema", "") + "." + in.body.value("to", "");
       projected.tables[to] = projected.tables[qualified];
@@ -430,6 +494,21 @@ inline void project(const Intent& in, const Step& step, Observations& projected)
       }
       return;
     }
+    // Handled above, before the tables guard: these are not relations, so
+    // schema.table is not their key. Listed so -Werror=switch keeps proving the
+    // set is complete.
+    case IntentKind::kCreateSchema:
+    case IntentKind::kDropSchema:
+    case IntentKind::kCreateExtension:
+    case IntentKind::kDropExtension:
+    case IntentKind::kCreateType:
+    case IntentKind::kDropType:
+    case IntentKind::kAddEnumValue:
+    case IntentKind::kCreateFunction:
+    case IntentKind::kDropFunction:
+    case IntentKind::kCreateSequence:
+    case IntentKind::kDropSequence:
+      return;
     case IntentKind::kAttachPartition: {
       const auto ch = in.body.value("schema", "") + "." + in.body.value("partition", "");
       projected.tables[qualified]["partitions"].push_back(ch);
@@ -1453,6 +1532,476 @@ inline void warn_about_rebuild(
 
 }  // namespace detail
 
+// --- schemas, extensions, types, functions, triggers, sequences ------------
+//
+// The object kinds that had no intent at all, so a repository could not
+// describe a database from nothing. Each carries the same safeguards as the
+// rest of the tool rather than being a thin wrapper (spike S18, 18.6):
+//
+//   * every drop refuses when something depends on the object, naming the
+//     dependant that PostgreSQL would have named, and never emits CASCADE;
+//   * ALTER TYPE ... ADD VALUE is IRREVERSIBLE -- "dropping an enum value is
+//     not implemented" -- and the new label cannot be USED until the adding
+//     transaction commits ("unsafe use of new value"), so the step forces a
+//     boundary;
+//   * CREATE OR REPLACE FUNCTION keeps the comment, grants, owner AND THE OID,
+//     so dependants survive -- but it cannot change the return type, and the
+//     drop-and-recreate that can loses all four;
+//   * CREATE TRIGGER takes ShareRowExclusiveLock: it blocks writes, not reads.
+namespace detail {
+
+// "public.f(integer, text)" from the structured arguments. A function's
+// identity is its argument types, so this is what DROP and REPLACE both need.
+inline std::string function_signature(const Intent& in) {
+  std::vector<std::string> types;
+  for (const auto& a : in.body.value("arguments", json::array())) {
+    types.push_back(a.value("type", ""));
+  }
+  return in.body.value("schema", "") + "." + in.body.value("name", "") + "(" +
+         join(types, ", ") + ")";
+}
+
+}  // namespace detail
+
+inline void plan_object(const Intent& in, const Observations& obs, Plan& plan,
+                        std::vector<Step>& out) {
+  Step step;
+  step.kind = in.kind_name;
+  struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
+  step.txn_class = TxnClass::kRequired;
+
+  const auto schema = in.body.value("schema", "");
+  const auto name = in.body.value("name", "");
+  const auto qualified = schema + "." + name;
+
+  // Every drop in this family shares one refusal, because PostgreSQL shares one
+  // behaviour: it names the dependants and stops. Doing the same beforehand
+  // turns a failed migration into a plan that was never started.
+  auto refuse_if_depended_on = [&](const json& o, const std::string& what) {
+    const auto deps = o.value("depended_on_by", json::array());
+    if (deps.empty()) return false;
+    std::vector<std::string> names;
+    for (const auto& d : deps) names.push_back(d.get<std::string>());
+    step.action = Action::kConflict;
+    step.why = what + " is depended on by " + std::to_string(names.size()) +
+               " object(s)";
+    plan.conflicts.push_back(
+        "cannot drop " + what + ": " + detail::join(names, ", ") +
+        " depend" + (names.size() == 1 ? "s" : "") +
+        " on it. PostgreSQL would refuse this and suggest CASCADE; pg_laswell "
+        "will not emit CASCADE, because it drops objects the spec never named. "
+        "Remove them in earlier intents.");
+    return true;
+  };
+
+  switch (in.kind) {
+    case IntentKind::kCreateSchema: {
+      const auto& o = obs.object("schema:" + schema);
+      if (o.value("exists", false)) {
+        step.action = Action::kSatisfied;
+        step.why = "schema " + schema + " already exists";
+        return;
+      }
+      step.sql.push_back("CREATE SCHEMA " + detail::quote_identifier(schema) + ";");
+      if (in.body.contains("owner")) {
+        step.sql.push_back("ALTER SCHEMA " + detail::quote_identifier(schema) +
+                           " OWNER TO " +
+                           detail::quote_identifier(in.body.value("owner", "")) + ";");
+      }
+      step.sql.push_back("COMMENT ON SCHEMA " + detail::quote_identifier(schema) +
+                         " IS " + detail::quote_literal(in.body.value("comment", "")) + ";");
+      step.lock = "no lock on any existing object";
+      step.why = "creating a schema locks nothing and is instant";
+      return;
+    }
+
+    case IntentKind::kDropSchema: {
+      const auto& o = obs.object("schema:" + schema);
+      if (!o.value("exists", false)) {
+        step.action = Action::kSatisfied;
+        step.why = "schema " + schema + " does not exist";
+        return;
+      }
+      const auto contains = o.value("contains", json::array());
+      if (!contains.empty()) {
+        std::vector<std::string> names;
+        for (const auto& c : contains) names.push_back(c.get<std::string>());
+        step.action = Action::kConflict;
+        step.why = "schema " + schema + " is not empty";
+        plan.conflicts.push_back(
+            "cannot drop schema " + schema + ": it still contains " +
+            std::to_string(names.size()) + " object(s) -- " +
+            detail::join(names, ", ") +
+            ". Dropping a schema with CASCADE is the widest blast radius in "
+            "this tool and pg_laswell will not do it; drop what is inside in "
+            "earlier intents, where each one is named and reviewed.");
+        return;
+      }
+      step.sql.push_back("DROP SCHEMA " + detail::quote_identifier(schema) + ";");
+      step.lock = "AccessExclusiveLock on the schema";
+      step.why = "the schema is empty, so this removes only the schema itself";
+      return;
+    }
+
+    case IntentKind::kCreateExtension: {
+      const auto ext = in.body.value("name", "");
+      const auto& o = obs.object("extension:" + ext);
+      if (o.value("exists", false)) {
+        step.action = Action::kSatisfied;
+        step.why = "extension " + ext + " is already installed" +
+                   (o.value("version", json()).is_string()
+                        ? " at version " + o.value("version", "")
+                        : "");
+        return;
+      }
+      // Refuse a name the server cannot satisfy, rather than emitting a
+      // statement that fails: the packages an extension needs are installed by
+      // an administrator on the host, not by a migration.
+      if (o.contains("available") && !o.value("available", true)) {
+        step.action = Action::kConflict;
+        step.why = ext + " is not available on this server";
+        plan.conflicts.push_back(
+            "extension \"" + ext + "\" is not in pg_available_extensions on "
+            "this server, so CREATE EXTENSION would fail. Its files are "
+            "installed on the host by a package, not by a migration -- this is "
+            "an infrastructure prerequisite, not something the spec can fix.");
+        return;
+      }
+      std::string sql = "CREATE EXTENSION " + detail::quote_identifier(ext);
+      if (in.body.contains("schema")) {
+        sql += " SCHEMA " + detail::quote_identifier(in.body.value("schema", ""));
+      }
+      if (in.body.contains("version")) {
+        sql += " VERSION " + detail::quote_literal(in.body.value("version", ""));
+      }
+      step.sql.push_back(sql + ";");
+      step.lock = "no lock on any existing object, but see the warning";
+      step.why = "installing an extension creates every object it defines, in "
+                 "one transaction";
+      if (!in.body.contains("schema")) {
+        plan.warnings.push_back(
+            "create_extension for \"" + ext +
+            "\" does not name a schema, so its objects land wherever "
+            "search_path points when this runs -- measured, that is public by "
+            "default. Where an extension lives affects every later query's "
+            "search_path and every dump and restore, and moving it afterwards "
+            "is far harder than choosing now. Name the schema.");
+      }
+      if (o.value("default_version", json()).is_string()) {
+        plan.warnings.push_back(
+            "this server would install \"" + ext + "\" at version " +
+            o.value("default_version", "") +
+            (in.body.contains("version") ? ", and the spec asks for " +
+                                               in.body.value("version", "")
+                                         : ", and the spec does not pin one") +
+            ". An unpinned version means two databases can end up with "
+            "different behaviour from the same repository.");
+      }
+      return;
+    }
+
+    case IntentKind::kDropExtension: {
+      const auto ext = in.body.value("name", "");
+      const auto& o = obs.object("extension:" + ext);
+      if (!o.value("exists", false)) {
+        step.action = Action::kSatisfied;
+        step.why = "extension " + ext + " is not installed";
+        return;
+      }
+      if (refuse_if_depended_on(o, "extension " + ext)) return;
+      step.sql.push_back("DROP EXTENSION " + detail::quote_identifier(ext) + ";");
+      step.lock = "AccessExclusiveLock on every object the extension owns";
+      step.why = "nothing outside the extension depends on it";
+      plan.warnings.push_back(
+          "dropping extension \"" + ext +
+          "\" removes every function, type, operator and index method it "
+          "defines. Any index using an operator class from it goes too, and "
+          "queries written against it stop parsing.");
+      return;
+    }
+
+    case IntentKind::kCreateType: {
+      const auto& o = obs.object("type:" + qualified);
+      const auto tk = in.body.value("type_kind", "");
+      if (o.value("exists", false)) {
+        step.action = Action::kSatisfied;
+        step.why = "type " + qualified + " already exists as a " +
+                   o.value("type_kind", std::string("type"));
+        if (o.value("type_kind", "") != tk) {
+          step.action = Action::kConflict;
+          plan.conflicts.push_back(
+              "type " + qualified + " exists as a " + o.value("type_kind", "") +
+              ", and the spec declares a " + tk + ". Those are different types "
+              "with one name; drop the existing one in an earlier intent if it "
+              "is really meant to be replaced.");
+        }
+        return;
+      }
+      if (tk == "enum") {
+        std::vector<std::string> labels;
+        for (const auto& l : in.body["labels"]) {
+          labels.push_back(detail::quote_literal(l.get<std::string>()));
+        }
+        step.sql.push_back("CREATE TYPE " + qualified + " AS ENUM (" +
+                           detail::join(labels, ", ") + ");");
+        plan.warnings.push_back(
+            "an enum's labels can be ADDED later but never removed -- measured: "
+            "\"dropping an enum value is not implemented\". Every label in " +
+            qualified + " is permanent for the life of the type, so a "
+            "misspelling is repaired only by recreating the type and every "
+            "column that uses it. A CHECK constraint over text is the "
+            "reversible alternative.");
+      } else if (tk == "domain") {
+        std::string sql = "CREATE DOMAIN " + qualified + " AS " +
+                          in.body.value("base", "");
+        if (in.body.value("not_null", false)) sql += " NOT NULL";
+        if (in.body.contains("check")) {
+          sql += " CHECK (" + in.body.value("check", "") + ")";
+        }
+        step.sql.push_back(sql + ";");
+      } else {
+        std::vector<std::string> attrs;
+        for (const auto& a : in.body["attributes"]) {
+          attrs.push_back(detail::quote_identifier(a.value("name", "")) + " " +
+                          a.value("type", ""));
+        }
+        step.sql.push_back("CREATE TYPE " + qualified + " AS (" +
+                           detail::join(attrs, ", ") + ");");
+      }
+      step.sql.push_back("COMMENT ON " +
+                         std::string(tk == "domain" ? "DOMAIN " : "TYPE ") +
+                         qualified + " IS " +
+                         detail::quote_literal(in.body.value("comment", "")) + ";");
+      step.lock = "no lock on any existing object";
+      step.why = "creating a type locks nothing";
+      return;
+    }
+
+    case IntentKind::kDropType: {
+      const auto& o = obs.object("type:" + qualified);
+      if (!o.value("exists", false)) {
+        step.action = Action::kSatisfied;
+        step.why = "type " + qualified + " does not exist";
+        return;
+      }
+      if (refuse_if_depended_on(o, "type " + qualified)) return;
+      step.sql.push_back("DROP TYPE " + qualified + ";");
+      step.lock = "AccessExclusiveLock on the type";
+      step.why = "nothing uses " + qualified;
+      return;
+    }
+
+    case IntentKind::kAddEnumValue: {
+      const auto& o = obs.object("type:" + qualified);
+      const auto value = in.body.value("value", "");
+      if (!o.value("exists", false)) {
+        step.action = Action::kConflict;
+        step.why = "type " + qualified + " does not exist";
+        plan.conflicts.push_back(step.why);
+        return;
+      }
+      for (const auto& l : o.value("enum_labels", json::array())) {
+        if (l.get<std::string>() == value) {
+          step.action = Action::kSatisfied;
+          step.why = qualified + " already has the label " + value;
+          return;
+        }
+      }
+      std::string sql = "ALTER TYPE " + qualified + " ADD VALUE " +
+                        detail::quote_literal(value);
+      if (in.body.contains("before")) {
+        sql += " BEFORE " + detail::quote_literal(in.body.value("before", ""));
+      } else if (in.body.contains("after")) {
+        sql += " AFTER " + detail::quote_literal(in.body.value("after", ""));
+      }
+      step.sql.push_back(sql + ";");
+      // Measured: the new label cannot be USED until this transaction commits
+      // -- "unsafe use of new value". Forcing the boundary here is what stops a
+      // later intent in the same group from failing on it.
+      step.own_transaction = true;
+      step.lock = "no table lock; the type's row is updated";
+      step.why =
+          "added in its own transaction because PostgreSQL refuses to USE a new "
+          "enum label until the transaction that added it has committed "
+          "(\"unsafe use of new value\") -- so anything backfilling with " +
+          value + " must come after this commits, which this boundary "
+          "guarantees";
+      plan.warnings.push_back(
+          "adding \"" + value + "\" to " + qualified +
+          " is IRREVERSIBLE: PostgreSQL has no way to remove an enum label "
+          "(\"dropping an enum value is not implemented\"). There is no revert "
+          "for this step, in this tool or by hand, short of recreating the type "
+          "and every column that uses it.");
+      return;
+    }
+
+    case IntentKind::kCreateFunction: {
+      const auto signature = detail::function_signature(in);
+      const auto& o = obs.object("function:" + qualified);
+      std::vector<std::string> args;
+      for (const auto& a : in.body.value("arguments", json::array())) {
+        args.push_back((a.contains("name")
+                            ? detail::quote_identifier(a.value("name", "")) + " "
+                            : "") + a.value("type", ""));
+      }
+      const auto returns = in.body.value("returns", "");
+      const bool exists = o.value("exists", false);
+      // CREATE OR REPLACE keeps the comment, grants, owner AND the OID, so
+      // dependent views survive -- measured. It cannot change the return type,
+      // which is the one case that forces the destructive path.
+      const bool return_changes =
+          exists && o.value("returns", "") != returns;
+      if (return_changes) {
+        step.action = Action::kConflict;
+        step.why = signature + " changes its return type from " +
+                   o.value("returns", "") + " to " + returns;
+        plan.conflicts.push_back(
+            "cannot replace " + signature + ": its return type would change "
+            "from " + o.value("returns", "") + " to " + returns +
+            ", and PostgreSQL refuses that (\"cannot change return type of "
+            "existing function\"). The only way through is DROP then CREATE, "
+            "which loses the function's comment, its grants and its owner, and "
+            "breaks every view that depends on it -- so it belongs in explicit "
+            "drop_function and create_function intents, not hidden inside a "
+            "replace.");
+        return;
+      }
+      std::string sql = "CREATE OR REPLACE FUNCTION " + qualified + "(" +
+                        detail::join(args, ", ") + ")\n  RETURNS " + returns +
+                        "\n  LANGUAGE " + in.body.value("language", "");
+      if (in.body.contains("volatility")) sql += "\n  " + in.body.value("volatility", "");
+      if (in.body.value("strict", false)) sql += "\n  STRICT";
+      if (in.body.value("security_definer", false)) sql += "\n  SECURITY DEFINER";
+      sql += "\nAS $laswell$" + in.body.value("body", "") + "$laswell$;";
+      step.sql.push_back(sql);
+      step.sql.push_back("COMMENT ON FUNCTION " + signature + " IS " +
+                         detail::quote_literal(in.body.value("comment", "")) + ";");
+      step.lock = "no lock on any table";
+      step.why = exists
+          ? "CREATE OR REPLACE keeps the comment, grants, owner and the "
+            "function's OID, so every dependent view survives -- measured; a "
+            "drop and recreate would lose all four"
+          : "creating a function locks nothing";
+      if (in.body.value("security_definer", false)) {
+        plan.warnings.push_back(
+            signature + " is SECURITY DEFINER: it runs with the OWNER's "
+            "privileges, not the caller's, so it bypasses whatever the caller "
+            "is otherwise denied -- including row-level security. Set an "
+            "explicit search_path inside the body, or a caller can change what "
+            "the function resolves.");
+      }
+      return;
+    }
+
+    case IntentKind::kDropFunction: {
+      const auto signature = detail::function_signature(in);
+      const auto& o = obs.object("function:" + qualified);
+      if (!o.value("exists", false)) {
+        step.action = Action::kSatisfied;
+        step.why = "no function " + signature;
+        return;
+      }
+      if (refuse_if_depended_on(o, "function " + signature)) return;
+      step.sql.push_back("DROP FUNCTION " + signature + ";");
+      step.lock = "AccessExclusiveLock on the function";
+      step.why = "nothing depends on " + signature;
+      return;
+    }
+
+    case IntentKind::kCreateSequence: {
+      const auto& o = obs.object("sequence:" + qualified);
+      if (o.value("exists", false)) {
+        step.action = Action::kSatisfied;
+        step.why = "sequence " + qualified + " already exists";
+        return;
+      }
+      std::string sql = "CREATE SEQUENCE " + qualified;
+      if (in.body.contains("increment")) {
+        sql += " INCREMENT BY " + std::to_string(in.body.value("increment", 1));
+      }
+      if (in.body.contains("start")) {
+        sql += " START WITH " + std::to_string(in.body.value("start", 1));
+      }
+      if (in.body.contains("owned_by")) {
+        sql += " OWNED BY " + in.body.value("owned_by", "");
+      }
+      step.sql.push_back(sql + ";");
+      step.sql.push_back("COMMENT ON SEQUENCE " + qualified + " IS " +
+                         detail::quote_literal(in.body.value("comment", "")) + ";");
+      step.lock = "no lock on any existing object";
+      step.why = "creating a sequence locks nothing";
+      if (!in.body.contains("owned_by")) {
+        plan.warnings.push_back(
+            "sequence " + qualified +
+            " is not OWNED BY a column, so it survives every table that uses "
+            "it and is not dropped with them. That is occasionally what is "
+            "wanted and usually an oversight.");
+      }
+      return;
+    }
+
+    case IntentKind::kDropSequence: {
+      const auto& o = obs.object("sequence:" + qualified);
+      if (!o.value("exists", false)) {
+        step.action = Action::kSatisfied;
+        step.why = "sequence " + qualified + " does not exist";
+        return;
+      }
+      if (refuse_if_depended_on(o, "sequence " + qualified)) return;
+      step.sql.push_back("DROP SEQUENCE " + qualified + ";");
+      step.lock = "AccessExclusiveLock on the sequence";
+      step.why = "nothing depends on " + qualified;
+      return;
+    }
+
+    case IntentKind::kDropView: {
+      const auto& t = obs.table(qualified);
+      if (!t.value("exists", false)) {
+        step.action = Action::kSatisfied;
+        step.why = qualified + " does not exist";
+        return;
+      }
+      const auto kind = t.value("kind", "");
+      if (kind != "view" && kind != "materialized_view") {
+        step.action = Action::kConflict;
+        step.why = qualified + " is a " + kind + ", not a view";
+        plan.conflicts.push_back(
+            qualified + " is a " + kind +
+            ". drop_view will not drop a table; drop_table is the intent that "
+            "says so out loud, and warns about the data.");
+        return;
+      }
+      const json dependent = t.value("dependent_views", json::object());
+      if (!dependent.empty()) {
+        std::vector<std::string> names;
+        for (const auto& [n, v] : dependent.items()) { (void)v; names.push_back(n); }
+        step.action = Action::kConflict;
+        step.why = qualified + " has views stacked on it";
+        plan.conflicts.push_back(
+            "cannot drop " + qualified + ": " + detail::join(names, ", ") +
+            " read it. Drop them first, in earlier intents. CASCADE would take "
+            "the whole stack, which is measured to leave zero views standing.");
+        return;
+      }
+      step.sql.push_back(std::string("DROP ") +
+                         (kind == "materialized_view" ? "MATERIALIZED VIEW "
+                                                      : "VIEW ") +
+                         qualified + ";");
+      step.lock = "AccessExclusiveLock on " + qualified;
+      step.why = "nothing reads " + qualified;
+      if (kind == "materialized_view") {
+        plan.warnings.push_back(
+            qualified +
+            " is a materialized view, so this discards its stored data as well "
+            "as its definition. Recreating it re-runs the query in full.");
+      }
+      return;
+    }
+
+    default: break;
+  }
+}
+
 // --- row security, policies, triggers, grants ------------------------------
 //
 // These emit one statement each, and they belong here by the second test: every
@@ -1639,6 +2188,62 @@ inline void plan_security(const Intent& in, const Observations& obs, Plan& plan,
             "and re-enabling does not backfill it. If rows change in between, "
             "they will need repairing explicitly.");
       }
+      return;
+    }
+
+    case IntentKind::kCreateTrigger: {
+      const auto name = in.body.value("name", "");
+      const json triggers = t.value("triggers", json::object());
+      if (triggers.contains(name)) {
+        step.action = Action::kSatisfied;
+        step.why = "trigger " + name + " already exists on " + qualified;
+        return;
+      }
+      std::vector<std::string> events;
+      for (const auto& e : in.body.value("events", json::array())) {
+        events.push_back(e.get<std::string>());
+      }
+      std::string sql = "CREATE TRIGGER " + detail::quote_identifier(name) +
+                        " " + in.body.value("timing", "") + " " +
+                        detail::join(events, " OR ") + " ON " + qualified +
+                        " FOR EACH " + in.body.value("for_each", "ROW");
+      if (in.body.contains("when")) sql += " WHEN (" + in.body.value("when", "") + ")";
+      sql += " EXECUTE FUNCTION " + in.body.value("function", "") + ";";
+      step.sql.push_back(sql);
+      // Measured: not AccessExclusiveLock. Readers are unaffected.
+      step.lock = "ShareRowExclusiveLock on " + qualified +
+                  " -- blocks writes, not reads";
+      step.why =
+          "creating a trigger takes ShareRowExclusiveLock rather than the "
+          "AccessExclusiveLock most ALTER TABLE forms need, so reads continue "
+          "throughout";
+      step.detail["trigger"] = name;
+      plan.warnings.push_back(
+          "trigger \"" + name + "\" starts firing at commit, for every row "
+          "changed from then on -- and for none of the rows already there. If "
+          "it maintains something derived, the existing rows need a backfill "
+          "intent to match.");
+      return;
+    }
+
+    case IntentKind::kDropTrigger: {
+      const auto name = in.body.value("name", "");
+      const json triggers = t.value("triggers", json::object());
+      if (!triggers.contains(name)) {
+        step.action = Action::kSatisfied;
+        step.why = "no trigger named " + name + " on " + qualified;
+        return;
+      }
+      step.sql.push_back("DROP TRIGGER " + detail::quote_identifier(name) +
+                         " ON " + qualified + ";");
+      step.lock = "AccessExclusiveLock on " + qualified;
+      step.why = "dropping a trigger is a catalog change";
+      step.detail["trigger"] = name;
+      plan.warnings.push_back(
+          "whatever trigger \"" + name + "\" maintained stops being "
+          "maintained at commit, permanently. Unlike disabling it, this cannot "
+          "be undone by re-enabling: the definition is gone and must be "
+          "recreated from the spec.");
       return;
     }
 
@@ -3437,6 +4042,21 @@ inline Plan plan_migration(const Spec& spec, const Observations& obs,
         plan_drop_table(in, projected, plan, emitted); break;
       case IntentKind::kDeleteRows:
         plan_delete_rows(in, projected, cfg, plan, emitted); break;
+      case IntentKind::kCreateSchema:
+      case IntentKind::kDropSchema:
+      case IntentKind::kCreateExtension:
+      case IntentKind::kDropExtension:
+      case IntentKind::kCreateType:
+      case IntentKind::kDropType:
+      case IntentKind::kAddEnumValue:
+      case IntentKind::kCreateFunction:
+      case IntentKind::kDropFunction:
+      case IntentKind::kCreateSequence:
+      case IntentKind::kDropSequence:
+      case IntentKind::kDropView:
+        plan_object(in, projected, plan, emitted); break;
+      case IntentKind::kCreateTrigger:
+      case IntentKind::kDropTrigger:
       case IntentKind::kSetRowSecurity:
       case IntentKind::kCreatePolicy:
       case IntentKind::kDropPolicy:

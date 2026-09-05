@@ -40,7 +40,12 @@ enum class IntentKind { kAddColumn, kBackfill, kCreateIndex, kDropIndex,
                         kDetachPartition, kRenameTable, kRenameColumn,
                         kRenameConstraint, kCreateTable, kDropTable,
                         kDeleteRows, kSetRowSecurity, kCreatePolicy,
-                        kDropPolicy, kSetTriggerState, kGrant, kRevoke };
+                        kDropPolicy, kSetTriggerState, kGrant, kRevoke,
+                        kCreateSchema, kDropSchema, kCreateExtension,
+                        kDropExtension, kCreateType, kDropType, kAddEnumValue,
+                        kCreateFunction, kDropFunction, kCreateTrigger,
+                        kDropTrigger, kCreateSequence, kDropSequence,
+                        kDropView };
 
 inline const std::map<std::string, IntentKind>& intent_kinds() {
   static const std::map<std::string, IntentKind> kKinds = {
@@ -71,6 +76,20 @@ inline const std::map<std::string, IntentKind>& intent_kinds() {
       {"set_trigger_state", IntentKind::kSetTriggerState},
       {"grant", IntentKind::kGrant},
       {"revoke", IntentKind::kRevoke},
+      {"create_schema", IntentKind::kCreateSchema},
+      {"drop_schema", IntentKind::kDropSchema},
+      {"create_extension", IntentKind::kCreateExtension},
+      {"drop_extension", IntentKind::kDropExtension},
+      {"create_type", IntentKind::kCreateType},
+      {"drop_type", IntentKind::kDropType},
+      {"add_enum_value", IntentKind::kAddEnumValue},
+      {"create_function", IntentKind::kCreateFunction},
+      {"drop_function", IntentKind::kDropFunction},
+      {"create_trigger", IntentKind::kCreateTrigger},
+      {"drop_trigger", IntentKind::kDropTrigger},
+      {"create_sequence", IntentKind::kCreateSequence},
+      {"drop_sequence", IntentKind::kDropSequence},
+      {"drop_view", IntentKind::kDropView},
   };
   return kKinds;
 }
@@ -94,6 +113,29 @@ struct Intent {
   std::string table() const { return body.value("table", ""); }
   std::string qualified_table() const { return schema() + "." + table(); }
 };
+
+// The non-relation object an intent needs measured, as "kind:schema.name" --
+// or "" for the intents that only touch tables. Declared once, here, so the
+// observation and the planner cannot disagree about the key: they did, briefly,
+// and every object read back as absent.
+inline std::string object_key_for(const Intent& in) {
+  const auto schema = in.body.value("schema", "");
+  const auto name = in.body.value("name", "");
+  switch (in.kind) {
+    case IntentKind::kCreateSchema:
+    case IntentKind::kDropSchema:      return "schema:" + schema;
+    case IntentKind::kCreateExtension:
+    case IntentKind::kDropExtension:   return "extension:" + name;
+    case IntentKind::kCreateType:
+    case IntentKind::kDropType:
+    case IntentKind::kAddEnumValue:    return "type:" + schema + "." + name;
+    case IntentKind::kCreateFunction:
+    case IntentKind::kDropFunction:    return "function:" + schema + "." + name;
+    case IntentKind::kCreateSequence:
+    case IntentKind::kDropSequence:    return "sequence:" + schema + "." + name;
+    default:                           return {};
+  }
+}
 
 struct Spec {
   json document;              // the whole file, as parsed
@@ -460,6 +502,179 @@ inline void parse_add_check_constraint(Intent& in) {
 // A retention purge is a migration by both tests: it changes state, and it is
 // applied once. It is paced exactly as a backfill is, because a single DELETE
 // over a retention window is the same outage a single UPDATE would be.
+// --- the non-relation object kinds -----------------------------------------
+
+inline void parse_schema_like(Intent& in, bool creating) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  std::set<std::string> allowed = {"kind", "schema"};
+  if (creating) { allowed.insert("comment"); allowed.insert("owner"); }
+  detail::reject_unknown_keys(in.body, allowed, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  if (creating) detail::require_string(in.body, "comment", at);
+}
+
+inline void parse_create_extension(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(in.body, {"kind", "name", "schema", "version"}, at);
+  detail::require_identifier(detail::require_string(in.body, "name", at), "name", in.ordinal);
+  // The schema is optional but strongly wanted, and the plan says why: an
+  // extension's objects land wherever search_path pointed at install time, and
+  // moving them afterwards is far harder than choosing now.
+  if (in.body.contains("schema")) {
+    detail::require_identifier(in.body.value("schema", ""), "schema", in.ordinal);
+  }
+  if (in.body.contains("version") && !in.body["version"].is_string()) {
+    detail::fail(at + ".version must be a string", "");
+  }
+}
+
+inline void parse_drop_extension(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(in.body, {"kind", "name"}, at);
+  detail::require_identifier(detail::require_string(in.body, "name", at), "name", in.ordinal);
+}
+
+// schema + name, for the drops that need nothing else.
+inline void parse_named_object(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(in.body, {"kind", "schema", "name"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "name", at), "name", in.ordinal);
+}
+
+inline void parse_create_type(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(
+      in.body, {"kind", "schema", "name", "type_kind", "labels", "base",
+                "check", "attributes", "comment", "not_null"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "name", at), "name", in.ordinal);
+  detail::require_string(in.body, "comment", at);
+  const auto tk = detail::require_string(in.body, "type_kind", at);
+  if (tk == "enum") {
+    if (!in.body.contains("labels") || !in.body["labels"].is_array() ||
+        in.body["labels"].empty()) {
+      detail::fail(at + ".labels must be a non-empty array for an enum",
+                   "List the values, in the order they should sort.");
+    }
+    for (const auto& l : in.body["labels"]) {
+      if (!l.is_string()) detail::fail(at + ".labels must be strings", "");
+    }
+  } else if (tk == "domain") {
+    detail::require_string(in.body, "base", at);
+  } else if (tk == "composite") {
+    if (!in.body.contains("attributes") || !in.body["attributes"].is_array() ||
+        in.body["attributes"].empty()) {
+      detail::fail(at + ".attributes must be a non-empty array for a composite",
+                   "Each entry needs name and type.");
+    }
+  } else {
+    detail::fail(at + ".type_kind must be enum, domain or composite",
+                 "Base types and ranges need C-level support or an operator "
+                 "class, which is not a migration this tool plans.");
+  }
+}
+
+inline void parse_add_enum_value(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(in.body, {"kind", "schema", "name", "value", "before", "after"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "name", at), "name", in.ordinal);
+  detail::require_string(in.body, "value", at);
+  if (in.body.contains("before") && in.body.contains("after")) {
+    detail::fail(at + " cannot state both \"before\" and \"after\"",
+                 "A new label goes in one place. Omit both to append.");
+  }
+}
+
+inline void parse_create_function(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(
+      in.body, {"kind", "schema", "name", "arguments", "returns", "language",
+                "body", "volatility", "strict", "security_definer", "comment"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "name", at), "name", in.ordinal);
+  detail::require_string(in.body, "returns", at);
+  detail::require_string(in.body, "language", at);
+  detail::require_string(in.body, "body", at);
+  detail::require_string(in.body, "comment", at);
+  // Arguments are structured because the SIGNATURE is the function's identity:
+  // the planner needs it to decide between CREATE OR REPLACE and a drop, and
+  // to emit a legal DROP later.
+  if (in.body.contains("arguments") && !in.body["arguments"].is_array()) {
+    detail::fail(at + ".arguments must be an array of {name, type}", "");
+  }
+  for (const auto& a : in.body.value("arguments", json::array())) {
+    if (!a.is_object() || !a.contains("type")) {
+      detail::fail(at + ".arguments entries need at least a type", "");
+    }
+  }
+}
+
+inline void parse_drop_function(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(in.body, {"kind", "schema", "name", "arguments"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "name", at), "name", in.ordinal);
+  if (!in.body.contains("arguments") || !in.body["arguments"].is_array()) {
+    detail::fail(at + ".arguments is required, even when empty",
+                 "A function is identified by its argument types, not its "
+                 "name: overloads share a name and DROP must say which one.");
+  }
+}
+
+inline void parse_create_trigger(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(
+      in.body, {"kind", "schema", "table", "name", "timing", "events",
+                "function", "for_each", "when"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "name", at), "name", in.ordinal);
+  detail::require_string(in.body, "function", at);
+  static const std::set<std::string> kTiming = {"BEFORE", "AFTER", "INSTEAD OF"};
+  if (kTiming.count(detail::require_string(in.body, "timing", at)) == 0) {
+    detail::fail(at + ".timing must be BEFORE, AFTER or INSTEAD OF", "");
+  }
+  if (!in.body.contains("events") || !in.body["events"].is_array() ||
+      in.body["events"].empty()) {
+    detail::fail(at + ".events must be a non-empty array",
+                 "INSERT, UPDATE, DELETE or TRUNCATE.");
+  }
+  static const std::set<std::string> kEvents = {"INSERT", "UPDATE", "DELETE", "TRUNCATE"};
+  for (const auto& e : in.body["events"]) {
+    if (!e.is_string() || kEvents.count(e.get<std::string>()) == 0) {
+      detail::fail(at + ".events has an unknown event: " + e.dump(),
+                   "One of INSERT, UPDATE, DELETE, TRUNCATE, upper case. Not "
+                   "passed through unchecked: a typo would reach the database "
+                   "as SQL.");
+    }
+  }
+}
+
+inline void parse_drop_trigger(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(in.body, {"kind", "schema", "table", "name"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "name", at), "name", in.ordinal);
+}
+
+inline void parse_create_sequence(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(
+      in.body, {"kind", "schema", "name", "comment", "start", "increment",
+                "owned_by"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "name", at), "name", in.ordinal);
+  detail::require_string(in.body, "comment", at);
+  for (const char* k : {"start", "increment"}) {
+    if (in.body.contains(k) && !in.body[k].is_number_integer()) {
+      detail::fail(std::string(at) + "." + k + " must be an integer", "");
+    }
+  }
+}
+
 inline void parse_set_row_security(Intent& in) {
   const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
   detail::reject_unknown_keys(in.body, {"kind", "schema", "table", "enabled", "force"}, at);
@@ -927,6 +1142,20 @@ inline Spec parse_spec(const json& doc) {
     case IntentKind::kSetTriggerState: parse_set_trigger_state(in); break;
     case IntentKind::kGrant:
     case IntentKind::kRevoke: parse_grant_like(in); break;
+    case IntentKind::kCreateSchema: parse_schema_like(in, true); break;
+    case IntentKind::kDropSchema: parse_schema_like(in, false); break;
+    case IntentKind::kCreateExtension: parse_create_extension(in); break;
+    case IntentKind::kDropExtension: parse_drop_extension(in); break;
+    case IntentKind::kCreateType: parse_create_type(in); break;
+    case IntentKind::kDropType: parse_named_object(in); break;
+    case IntentKind::kAddEnumValue: parse_add_enum_value(in); break;
+    case IntentKind::kCreateFunction: parse_create_function(in); break;
+    case IntentKind::kDropFunction: parse_drop_function(in); break;
+    case IntentKind::kCreateTrigger: parse_create_trigger(in); break;
+    case IntentKind::kDropTrigger: parse_drop_trigger(in); break;
+    case IntentKind::kCreateSequence: parse_create_sequence(in); break;
+    case IntentKind::kDropSequence: parse_named_object(in); break;
+    case IntentKind::kDropView: parse_named_object(in); break;
     }
     s.intents.push_back(std::move(in));
     ++ordinal;

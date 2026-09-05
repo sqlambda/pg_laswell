@@ -3,7 +3,7 @@
 ## 0.1.0 (unreleased)
 
 The whole path works: repository, signing, planning, dry run, paced execution,
-ledger. 274 tests green on GCC 14.2 and Clang 22, under AddressSanitizer/UBSan
+ledger. 287 tests green on GCC 14.2 and Clang 22, under AddressSanitizer/UBSan
 and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
 `--call` contract test.
 
@@ -207,6 +207,29 @@ and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
   one rewrites. `text`→`varchar(200)` rewrites; `varchar(50)`→`text` does not.
   Anything unproven is reported as a rewrite, because a cautious plan costs
   less than an unplanned outage.
+- **Fourteen object kinds, so a repository can describe a database from
+  nothing** — `create_schema`/`drop_schema`, `create_extension`/`drop_extension`,
+  `create_type`/`drop_type`/`add_enum_value`, `create_function`/`drop_function`,
+  `create_trigger`/`drop_trigger`, `create_sequence`/`drop_sequence`,
+  `drop_view`. Before these, no schema, extension, enum, function or trigger
+  could be expressed at all — the contents of a real first migration.
+  Each carries the tool's safeguards rather than being a wrapper.
+  **Every drop refuses when something depends on it**, naming the dependant
+  PostgreSQL would have named, and none emits `CASCADE`; a non-empty schema is
+  refused outright.
+  **`add_enum_value` is the sharpest.** Adding a label is *irreversible*
+  (`dropping an enum value is not implemented`) and the label cannot be *used*
+  until the adding transaction commits (`unsafe use of new value`) — so the step
+  takes its own transaction, or a backfill later in the same spec fails on the
+  label it just added.
+  **`create_function`** uses `CREATE OR REPLACE`, which keeps comment, grants,
+  owner *and the OID* so dependent views survive — but cannot change the return
+  type, and the drop that can loses all four. That change is **refused with what
+  the alternative costs** rather than quietly becoming a drop. `SECURITY
+  DEFINER` is flagged.
+  **`create_extension`** refuses a name the server does not have available — an
+  infrastructure prerequisite, not something a spec can fix — and warns when no
+  schema is named, since extension objects land wherever `search_path` points.
 - **Twelve more intent kinds**, closing the list of what a migration tool has
   to be able to say. `rename_table` / `rename_column` / `rename_constraint`;
   `create_table` / `drop_table`; `delete_rows`; and `set_row_security`,

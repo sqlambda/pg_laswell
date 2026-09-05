@@ -832,7 +832,11 @@ TEST(Spec, KnownKindsAreExactlyTheImplementedKinds) {
   // The governing invariant. Every kind in the table must parse a
   // representative body; a kind that is listed but unimplemented would be
   // accepted and then silently skipped.
-  const json bodies = json::parse(R"({
+  // R"JSON( ... )JSON" rather than R"( ... )": a representative body contains
+  // "s.f()", and the )" in that closes a default-delimited raw string early --
+  // producing a "missing terminating \" character" error pointing at a line
+  // several below the real cause.
+  const json bodies = json::parse(R"JSON({
     "add_column":   {"kind":"add_column","schema":"s","table":"t","column":"c",
                      "type":"text","nullable":true,"comment":"c"},
     "backfill":     {"kind":"backfill","schema":"s","table":"t","key":"id",
@@ -885,8 +889,32 @@ TEST(Spec, KnownKindsAreExactlyTheImplementedKinds) {
     "grant":  {"kind":"grant","schema":"s","table":"t",
                "privileges":["SELECT"],"to":["app"]},
     "revoke": {"kind":"revoke","schema":"s","table":"t",
-               "privileges":["SELECT"],"from":["app"]}
-  })");
+               "privileges":["SELECT"],"from":["app"]},
+    "create_schema": {"kind":"create_schema","schema":"rep","comment":"d"},
+    "drop_schema":   {"kind":"drop_schema","schema":"rep"},
+    "create_extension": {"kind":"create_extension","name":"pg_trgm",
+                         "schema":"public"},
+    "drop_extension":   {"kind":"drop_extension","name":"pg_trgm"},
+    "create_type": {"kind":"create_type","schema":"s","name":"mood",
+                    "type_kind":"enum","labels":["ok"],"comment":"d"},
+    "drop_type":   {"kind":"drop_type","schema":"s","name":"mood"},
+    "add_enum_value": {"kind":"add_enum_value","schema":"s","name":"mood",
+                       "value":"great"},
+    "create_function": {"kind":"create_function","schema":"s","name":"f",
+                        "arguments":[{"name":"a","type":"int"}],
+                        "returns":"int","language":"sql","body":"SELECT a",
+                        "comment":"d"},
+    "drop_function": {"kind":"drop_function","schema":"s","name":"f",
+                      "arguments":[{"type":"int"}]},
+    "create_trigger": {"kind":"create_trigger","schema":"s","table":"t",
+                       "name":"trg","timing":"AFTER","events":["INSERT"],
+                       "function":"s.f()"},
+    "drop_trigger": {"kind":"drop_trigger","schema":"s","table":"t","name":"trg"},
+    "create_sequence": {"kind":"create_sequence","schema":"s","name":"seq",
+                        "comment":"d"},
+    "drop_sequence": {"kind":"drop_sequence","schema":"s","name":"seq"},
+    "drop_view": {"kind":"drop_view","schema":"s","name":"v"}
+  })JSON");
   for (const auto& [name, kind] : pglaswell::intent_kinds()) {
     (void)kind;
     ASSERT_TRUE(bodies.contains(name))
@@ -3810,6 +3838,7 @@ TEST(Planner, DroppingAnAbsentIndexIsSatisfied) {
 
 
 
+
 // --- attach_partition / detach_partition -----------------------------------
 
 static pglaswell::Observations obs_partitioned(bool with_default = false,
@@ -5021,6 +5050,270 @@ TEST(Spec, APrivilegeTypoIsCaughtRatherThanSentToTheDatabase) {
   EXPECT_NE(err.find("unknown privilege"), std::string::npos) << err;
 }
 
+// --- the object kinds, and the safeguards on them --------------------------
+
+static pglaswell::Observations obs_objects() {
+  auto obs = observations(1024, 10);
+  obs.objects["type:shop.mood"] =
+      json{{"exists", true}, {"kind", "type"}, {"type_kind", "enum"},
+           {"enum_labels", json::array({"ok", "bad"})},
+           {"depended_on_by", json::array()}};
+  obs.objects["function:shop.f"] =
+      json{{"exists", true}, {"kind", "function"}, {"returns", "integer"},
+           {"signature", "shop.f(integer)"}, {"depended_on_by", json::array()}};
+  obs.objects["schema:reporting"] =
+      json{{"exists", true}, {"kind", "schema"}, {"contains", json::array()},
+           {"depended_on_by", json::array()}};
+  obs.objects["sequence:shop.seq"] =
+      json{{"exists", true}, {"kind", "sequence"}, {"depended_on_by", json::array()}};
+  obs.objects["extension:pg_trgm"] =
+      json{{"exists", false}, {"kind", "extension"}, {"available", true},
+           {"default_version", "1.6"}};
+  return obs;
+}
+
+TEST(Planner, EveryObjectDropRefusesWhenSomethingDependsOnIt) {
+  // The safeguard the whole family is built on. PostgreSQL refuses each of
+  // these and suggests CASCADE; pg_laswell refuses first, names the dependant,
+  // and never emits CASCADE.
+  struct Case { const char* kind; const char* key; const char* name; };
+  const Case cases[] = {
+      {"drop_type", "type:shop.mood", "mood"},
+      {"drop_function", "function:shop.f", "f"},
+      {"drop_sequence", "sequence:shop.seq", "seq"},
+  };
+  for (const auto& c : cases) {
+    auto obs = obs_objects();
+    obs.objects[c.key]["depended_on_by"] =
+        json::array({"column m of table shop.uses_it"});
+    json body = json{{"kind", c.kind}, {"schema", "shop"}, {"name", c.name}};
+    if (std::string(c.kind) == "drop_function") {
+      body["arguments"] = json::array({json{{"type", "integer"}}});
+    }
+    const auto plan =
+        pglaswell::plan_migration(spec_of(json::array({body})), obs, {});
+    EXPECT_FALSE(plan.ok) << c.kind << " was allowed:\n" << plan.render();
+    ASSERT_FALSE(plan.conflicts.empty()) << c.kind;
+    EXPECT_NE(plan.conflicts[0].find("shop.uses_it"), std::string::npos)
+        << c.kind << ": " << plan.conflicts[0];
+    EXPECT_NE(plan.conflicts[0].find("CASCADE"), std::string::npos)
+        << c.kind << " must say why CASCADE is not the way out: "
+        << plan.conflicts[0];
+  }
+}
+
+TEST(Planner, AddingAnEnumValueOwnsItsTransactionBecauseNothingMayUseItYet) {
+  // Measured: "unsafe use of new value" -- a new label cannot be USED until the
+  // transaction that added it commits. Forcing the boundary is what stops a
+  // backfill later in the same spec from failing on it.
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "add_enum_value"}, {"schema", "shop"},
+                                {"name", "mood"}, {"value", "great"},
+                                {"after", "ok"}}})),
+      obs_objects(), {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto* step = only_step(plan, "add_enum_value");
+  ASSERT_NE(step, nullptr);
+  EXPECT_TRUE(step->own_transaction)
+      << "without its own transaction, a later intent using the label fails";
+  EXPECT_NE(all_sql(*step).find("ADD VALUE 'great' AFTER 'ok'"), std::string::npos)
+      << all_sql(*step);
+  bool irreversible = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("IRREVERSIBLE") != std::string::npos &&
+        w.find("not implemented") != std::string::npos) irreversible = true;
+  }
+  EXPECT_TRUE(irreversible)
+      << "there is no revert for this step, in this tool or by hand: "
+      << plan.render();
+
+  // A label already present is satisfied, not a duplicate-add failure.
+  const auto again = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "add_enum_value"}, {"schema", "shop"},
+                                {"name", "mood"}, {"value", "bad"}}})),
+      obs_objects(), {});
+  EXPECT_EQ(only_step(again, "add_enum_value")->action,
+            pglaswell::Action::kSatisfied);
+}
+
+TEST(Planner, ChangingAFunctionsReturnTypeIsRefusedWithWhatItWouldCost) {
+  // Measured: CREATE OR REPLACE keeps the comment, grants, owner AND the OID,
+  // so dependants survive -- but it cannot change the return type. The drop
+  // that can loses all four, so it must be written down rather than hidden
+  // inside a "replace".
+  auto obs = obs_objects();
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "create_function"}, {"schema", "shop"},
+                                {"name", "f"},
+                                {"arguments", json::array({json{{"name", "a"}, {"type", "integer"}}})},
+                                {"returns", "bigint"}, {"language", "sql"},
+                                {"body", "SELECT a::bigint"}, {"comment", "d"}}})),
+      obs, {});
+  EXPECT_FALSE(plan.ok) << plan.render();
+  EXPECT_NE(plan.conflicts[0].find("cannot change return type"), std::string::npos)
+      << plan.conflicts[0];
+  EXPECT_NE(plan.conflicts[0].find("grants"), std::string::npos)
+      << "the refusal must say what the alternative costs: " << plan.conflicts[0];
+
+  // The same return type replaces cleanly, and says why that is the good path.
+  const auto ok = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "create_function"}, {"schema", "shop"},
+                                {"name", "f"},
+                                {"arguments", json::array({json{{"name", "a"}, {"type", "integer"}}})},
+                                {"returns", "integer"}, {"language", "sql"},
+                                {"body", "SELECT a * 2"}, {"comment", "d"}}})),
+      obs, {});
+  ASSERT_TRUE(ok.ok) << ok.render();
+  const auto sql = all_sql(*only_step(ok, "create_function"));
+  EXPECT_NE(sql.find("CREATE OR REPLACE FUNCTION shop.f"), std::string::npos) << sql;
+  EXPECT_NE(only_step(ok, "create_function")->why.find("OID"), std::string::npos)
+      << only_step(ok, "create_function")->why;
+}
+
+TEST(Planner, ASecurityDefinerFunctionIsFlagged) {
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "create_function"}, {"schema", "shop"},
+                                {"name", "g"}, {"arguments", json::array()},
+                                {"returns", "void"}, {"language", "sql"},
+                                {"body", "SELECT 1"}, {"security_definer", true},
+                                {"comment", "d"}}})),
+      obs_objects(), {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("SECURITY DEFINER") != std::string::npos &&
+        w.find("row-level security") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned) << plan.render();
+}
+
+TEST(Planner, DroppingANonEmptySchemaIsRefusedRatherThanCascaded) {
+  auto obs = obs_objects();
+  obs.objects["schema:reporting"]["contains"] =
+      json::array({"daily_totals", "monthly_totals"});
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "drop_schema"}, {"schema", "reporting"}}})),
+      obs, {});
+  EXPECT_FALSE(plan.ok) << plan.render();
+  EXPECT_NE(plan.conflicts[0].find("daily_totals"), std::string::npos)
+      << plan.conflicts[0];
+  EXPECT_NE(plan.conflicts[0].find("widest blast radius"), std::string::npos)
+      << plan.conflicts[0];
+}
+
+TEST(Planner, AnExtensionThatIsNotAvailableIsRefusedAsInfrastructure) {
+  auto obs = obs_objects();
+  obs.objects["extension:postgis"] =
+      json{{"exists", false}, {"kind", "extension"}, {"available", false}};
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "create_extension"}, {"name", "postgis"}}})),
+      obs, {});
+  EXPECT_FALSE(plan.ok) << plan.render();
+  EXPECT_NE(plan.conflicts[0].find("infrastructure prerequisite"), std::string::npos)
+      << plan.conflicts[0];
+
+  // An available one installs, and an unnamed schema is called out because
+  // where an extension lives is nearly impossible to change afterwards.
+  const auto ok = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "create_extension"}, {"name", "pg_trgm"}}})),
+      obs_objects(), {});
+  ASSERT_TRUE(ok.ok) << ok.render();
+  bool schema_warning = false, version_warning = false;
+  for (const auto& w : ok.warnings) {
+    if (w.find("does not name a schema") != std::string::npos) schema_warning = true;
+    if (w.find("does not pin one") != std::string::npos) version_warning = true;
+  }
+  EXPECT_TRUE(schema_warning) << ok.render();
+  EXPECT_TRUE(version_warning) << ok.render();
+}
+
+TEST(Planner, ObjectsCreatedEarlierInASpecAreVisibleToLaterIntents) {
+  // The projection, which was dead code until this test: project() returned
+  // early for anything not in `tables`, and every object kind is not.
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({
+          json{{"kind", "create_type"}, {"schema", "shop"}, {"name", "status"},
+               {"type_kind", "enum"}, {"labels", json::array({"open"})},
+               {"comment", "d"}},
+          json{{"kind", "add_enum_value"}, {"schema", "shop"}, {"name", "status"},
+               {"value", "closed"}},
+          json{{"kind", "add_enum_value"}, {"schema", "shop"}, {"name", "status"},
+               {"value", "open"}}})),
+      obs_objects(), {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto adds = steps_of(plan, "add_enum_value");
+  ASSERT_EQ(adds.size(), 2u) << plan.render();
+  EXPECT_EQ(adds[0]->action, pglaswell::Action::kApply);
+  EXPECT_EQ(adds[1]->action, pglaswell::Action::kSatisfied)
+      << "the label created by the first intent must be visible to the third:\n"
+      << plan.render();
+}
+
+TEST(Planner, CreatingATriggerTakesTheWeakerLockAndWarnsAboutExistingRows) {
+  auto obs = obs_rich();
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "create_trigger"}, {"schema", "shop"},
+                                {"table", "orders"}, {"name", "orders_touch"},
+                                {"timing", "BEFORE"},
+                                {"events", json::array({"INSERT", "UPDATE"})},
+                                {"function", "shop.touch()"}}})),
+      obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto* step = only_step(plan, "create_trigger");
+  ASSERT_NE(step, nullptr);
+  EXPECT_NE(all_sql(*step).find("BEFORE INSERT OR UPDATE ON shop.orders"),
+            std::string::npos) << all_sql(*step);
+  EXPECT_NE(step->lock.find("ShareRowExclusiveLock"), std::string::npos)
+      << "measured: creating a trigger blocks writes, not reads: " << step->lock;
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("none of the rows already there") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned) << plan.render();
+}
+
+TEST(Planner, DropViewRefusesAStackAndRefusesATable) {
+  auto obs = obs_rich();
+  obs.tables["public.v1"] =
+      json{{"exists", true}, {"kind", "view"},
+           {"dependent_views", json{{"public.v2", {{"level", 2}}}}}};
+  const auto stacked = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "drop_view"}, {"schema", "public"},
+                                {"name", "v1"}}})),
+      obs, {});
+  EXPECT_FALSE(stacked.ok) << stacked.render();
+  EXPECT_NE(stacked.conflicts[0].find("public.v2"), std::string::npos);
+
+  // And it will not drop a table, which is what makes drop_table's warning
+  // impossible to route around.
+  const auto table = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "drop_view"}, {"schema", "shop"},
+                                {"name", "orders"}}})),
+      obs_rich(), {});
+  EXPECT_FALSE(table.ok) << table.render();
+  EXPECT_NE(table.conflicts[0].find("drop_table"), std::string::npos)
+      << table.conflicts[0];
+}
+
+TEST(Spec, ATriggerEventTypoIsCaughtRatherThanSentToTheDatabase) {
+  json doc = minimal_spec();
+  doc["intents"] = json::array({json{{"kind", "create_trigger"}, {"schema", "s"},
+                                     {"table", "t"}, {"name", "trg"},
+                                     {"timing", "AFTER"},
+                                     {"events", json::array({"INSER"})},
+                                     {"function", "s.f()"}}});
+  const auto err = spec_error(doc);
+  EXPECT_NE(err.find("unknown event"), std::string::npos) << err;
+}
+
+TEST(Spec, ADropFunctionMustStateItsArgumentTypes) {
+  json doc = minimal_spec();
+  doc["intents"] = json::array({json{{"kind", "drop_function"}, {"schema", "s"},
+                                     {"name", "f"}}});
+  const auto err = spec_error(doc);
+  EXPECT_NE(err.find("overloads share a name"), std::string::npos) << err;
+}
+
 // --- drop_constraint --------------------------------------------------------
 //
 // The statement never varies, so for a while this kind looked like a psql
@@ -6195,6 +6488,220 @@ TEST_F(DatabaseTest, TheRemainingKindsRunAndRowSecurityReallyHidesEverything) {
   w.txn().exec("DROP TABLE laswell_sec CASCADE");
   w.txn().exec("DROP OWNED BY laswell_app");
   w.txn().exec("DROP ROLE laswell_app");
+  w.commit();
+}
+
+TEST_F(DatabaseTest, ARepositoryCanNowBuildADatabaseFromNothing) {
+  // The claim the object kinds exist for: before them a repository could not
+  // describe a database from scratch -- no schema, no extension, no enum, no
+  // function, no trigger. This builds one, applying each intent's own SQL, and
+  // then reads the catalog back.
+  pglaswell::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = url_;
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/scratch-clean");
+    w.txn().exec("DROP SCHEMA IF EXISTS lw_shop CASCADE");
+    w.commit();
+  }
+
+  pglaswell::Catalog cat(cfg);
+  auto apply = [&](const json& intent) {
+    std::vector<std::string> schemas, tables, keys;
+    pglaswell::Intent probe;
+    json doc = minimal_spec();
+    doc["intents"] = json::array({intent});
+    const auto spec = pglaswell::parse_spec(doc);
+    for (const auto& in : spec.intents) {
+      schemas.push_back(in.schema());
+      tables.push_back(in.table());
+      const auto k = pglaswell::object_key_for(in);
+      if (!k.empty()) keys.push_back(k);
+    }
+    const auto obs = cat.observe(schemas, tables, keys);
+    const auto plan = pglaswell::plan_migration(spec, obs, {});
+    EXPECT_TRUE(plan.ok) << plan.render();
+    for (const auto& step : plan.steps) {
+      for (const auto& q : step.sql) {
+        const std::string stmt = q;
+        pglaswell::WriteSession w(cfg);
+        w.begin("pg_laswell/test/scratch");
+        w.txn().exec(stmt.substr(0, stmt.size() - 1));
+        w.commit();
+      }
+    }
+    return plan;
+  };
+
+  apply(json{{"kind", "create_schema"}, {"schema", "lw_shop"},
+             {"comment", "The shop."}});
+  apply(json{{"kind", "create_type"}, {"schema", "lw_shop"}, {"name", "status"},
+             {"type_kind", "enum"},
+             {"labels", json::array({"open", "closed"})},
+             {"comment", "Order lifecycle."}});
+  apply(json{{"kind", "create_sequence"}, {"schema", "lw_shop"},
+             {"name", "order_no"}, {"comment", "Human-facing order number."}});
+  apply(json{{"kind", "create_table"}, {"schema", "lw_shop"}, {"table", "orders"},
+             {"comment", "Customer orders."},
+             {"primary_key", json::array({"id"})},
+             {"columns", json::array({
+                 json{{"name", "id"}, {"type", "bigint"}, {"nullable", false},
+                      {"comment", "Identity."}},
+                 json{{"name", "state"}, {"type", "lw_shop.status"},
+                      {"nullable", false}, {"comment", "Lifecycle."}},
+                 json{{"name", "touched"}, {"type", "timestamptz"},
+                      {"nullable", true}, {"comment", "Last change."}}})}});
+  apply(json{{"kind", "create_function"}, {"schema", "lw_shop"}, {"name", "touch"},
+             {"arguments", json::array()}, {"returns", "trigger"},
+             {"language", "plpgsql"},
+             {"body", "BEGIN NEW.touched := now(); RETURN NEW; END"},
+             {"comment", "Stamps touched."}});
+  apply(json{{"kind", "create_trigger"}, {"schema", "lw_shop"},
+             {"table", "orders"}, {"name", "orders_touch"},
+             {"timing", "BEFORE"}, {"events", json::array({"INSERT", "UPDATE"})},
+             {"function", "lw_shop.touch()"}});
+
+  // The enum value, whose own transaction is what makes the insert below legal.
+  const auto enum_plan = apply(json{{"kind", "add_enum_value"},
+                                    {"schema", "lw_shop"}, {"name", "status"},
+                                    {"value", "cancelled"}, {"after", "open"}});
+  EXPECT_TRUE(steps_of(enum_plan, "add_enum_value")[0]->own_transaction);
+
+  // Everything is there, and it works together.
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/scratch-use");
+    w.txn().exec("INSERT INTO lw_shop.orders(id, state) VALUES (1, 'cancelled')");
+    w.commit();
+  }
+  {
+    pglaswell::ReadSession r(cfg);
+    auto scalar = [&](const std::string& q) {
+      return r.txn().exec(q)[0][0].as<std::string>();
+    };
+    EXPECT_EQ(scalar("SELECT obj_description('lw_shop'::regnamespace,'pg_namespace')"),
+              "The shop.");
+    EXPECT_EQ(scalar("SELECT string_agg(enumlabel, ',' ORDER BY enumsortorder)"
+                     " FROM pg_enum WHERE enumtypid='lw_shop.status'::regtype"),
+              "open,cancelled,closed")
+        << "AFTER 'open' must place the label between open and closed";
+    // The trigger fired: touched was stamped by the function, on a row the
+    // migration never mentioned.
+    EXPECT_EQ(scalar("SELECT (touched IS NOT NULL)::text FROM lw_shop.orders"),
+              "true");
+    EXPECT_EQ(scalar("SELECT count(*)::text FROM pg_class"
+                     " WHERE relname='order_no' AND relkind='S'"), "1");
+  }
+
+  // And the drops refuse in the right order: the type is in use by the table.
+  {
+    const auto obs = cat.observe({}, {}, {"type:lw_shop.status"});
+    json doc = minimal_spec();
+    doc["intents"] = json::array({json{{"kind", "drop_type"},
+                                       {"schema", "lw_shop"},
+                                       {"name", "status"}}});
+    const auto plan =
+        pglaswell::plan_migration(pglaswell::parse_spec(doc), obs, {});
+    EXPECT_FALSE(plan.ok) << "the table's column depends on the type:\n"
+                          << plan.render();
+    EXPECT_NE(plan.conflicts[0].find("orders"), std::string::npos)
+        << plan.conflicts[0];
+  }
+
+  pglaswell::WriteSession w(cfg);
+  w.begin("pg_laswell/test/scratch-cleanup");
+  w.txn().exec("DROP SCHEMA lw_shop CASCADE");
+  w.commit();
+}
+
+TEST_F(DatabaseTest, ObjectDependantsMatchWhatPostgresqlRefusesToDrop) {
+  // The safeguard these object kinds are built on. Measured (S18): PostgreSQL
+  // refuses to drop a type, function or sequence anything uses, and names the
+  // dependant. pg_depend answers the same question first, so the plan can
+  // refuse precisely rather than letting execution fail with a hint suggesting
+  // CASCADE. Asserted BOTH ways -- our reading, and PostgreSQL's refusal.
+  pglaswell::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = url_;
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/objects");
+    w.txn().exec("DROP TABLE IF EXISTS lw_uses_mood, lw_uses_seq CASCADE");
+    w.txn().exec("DROP VIEW IF EXISTS lw_uses_fn");
+    w.txn().exec("DROP TYPE IF EXISTS lw_mood CASCADE");
+    w.txn().exec("DROP FUNCTION IF EXISTS lw_fn(int)");
+    w.txn().exec("DROP SEQUENCE IF EXISTS lw_seq CASCADE");
+    w.txn().exec("DROP SCHEMA IF EXISTS lw_sch CASCADE");
+    w.txn().exec("CREATE TYPE lw_mood AS ENUM ('ok','bad')");
+    w.txn().exec("CREATE TABLE lw_uses_mood(m lw_mood)");
+    w.txn().exec("CREATE FUNCTION lw_fn(a int) RETURNS int LANGUAGE sql AS 'SELECT a'");
+    w.txn().exec("CREATE VIEW lw_uses_fn AS SELECT lw_fn(1) AS v");
+    w.txn().exec("CREATE SEQUENCE lw_seq");
+    w.txn().exec("CREATE TABLE lw_uses_seq(id int DEFAULT nextval('lw_seq'))");
+    w.txn().exec("CREATE SCHEMA lw_sch");
+    w.txn().exec("CREATE TABLE lw_sch.inside(id int)");
+    w.commit();
+  }
+
+  pglaswell::Catalog cat(cfg);
+  const auto obs = cat.observe({}, {},
+      {"type:public.lw_mood", "function:public.lw_fn", "sequence:public.lw_seq",
+       "schema:lw_sch", "extension:pg_trgm", "type:public.lw_absent"});
+
+  auto dependants = [&](const char* key) {
+    std::string all;
+    for (const auto& d : obs.object(key).value("depended_on_by", json::array())) {
+      all += d.get<std::string>() + "|";
+    }
+    return all;
+  };
+
+  EXPECT_TRUE(obs.object("type:public.lw_mood").value("exists", false));
+  EXPECT_EQ(obs.object("type:public.lw_mood").value("type_kind", ""), "enum");
+  EXPECT_EQ(obs.object("type:public.lw_mood")["enum_labels"].dump(),
+            json::array({"ok", "bad"}).dump())
+      << "labels must come back in sort order, not creation order";
+  EXPECT_NE(dependants("type:public.lw_mood").find("lw_uses_mood"),
+            std::string::npos) << dependants("type:public.lw_mood");
+  EXPECT_NE(dependants("function:public.lw_fn").find("lw_uses_fn"),
+            std::string::npos) << dependants("function:public.lw_fn");
+  EXPECT_NE(dependants("sequence:public.lw_seq").find("lw_uses_seq"),
+            std::string::npos) << dependants("sequence:public.lw_seq");
+
+  // A function's identity is its signature, not its name.
+  EXPECT_EQ(obs.object("function:public.lw_fn").value("signature", ""),
+            "lw_fn(integer)");
+  EXPECT_EQ(obs.object("function:public.lw_fn").value("returns", ""), "integer");
+
+  // A schema reports what is inside it, because dropping a non-empty one needs
+  // CASCADE and that is the widest blast radius in the tool.
+  EXPECT_NE(obs.object("schema:lw_sch")["contains"].dump().find("inside"),
+            std::string::npos) << obs.object("schema:lw_sch").dump();
+
+  // An extension reports whether it can be installed at all.
+  EXPECT_TRUE(obs.object("extension:pg_trgm").contains("available"));
+
+  // An absent object is an absence, not an error.
+  EXPECT_FALSE(obs.object("type:public.lw_absent").value("exists", true));
+
+  // And PostgreSQL agrees with every refusal we would make.
+  for (const char* stmt : {"DROP TYPE lw_mood", "DROP FUNCTION lw_fn(int)",
+                           "DROP SEQUENCE lw_seq", "DROP SCHEMA lw_sch"}) {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/objects-refute");
+    EXPECT_THROW(w.txn().exec(stmt), pqxx::sql_error)
+        << stmt << " succeeded, so the dependant reading is wrong";
+  }
+
+  pglaswell::WriteSession w(cfg);
+  w.begin("pg_laswell/test/objects-cleanup");
+  w.txn().exec("DROP VIEW lw_uses_fn");
+  w.txn().exec("DROP TABLE lw_uses_mood, lw_uses_seq");
+  w.txn().exec("DROP TYPE lw_mood");
+  w.txn().exec("DROP FUNCTION lw_fn(int)");
+  w.txn().exec("DROP SEQUENCE lw_seq");
+  w.txn().exec("DROP SCHEMA lw_sch CASCADE");
   w.commit();
 }
 

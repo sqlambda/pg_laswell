@@ -347,9 +347,23 @@ This build implements
 .Cm create_policy ,
 .Cm drop_policy ,
 .Cm set_trigger_state ,
-.Cm grant
+.Cm grant ,
+.Cm revoke ,
+.Cm create_schema ,
+.Cm drop_schema ,
+.Cm create_extension ,
+.Cm drop_extension ,
+.Cm create_type ,
+.Cm drop_type ,
+.Cm add_enum_value ,
+.Cm create_function ,
+.Cm drop_function ,
+.Cm create_trigger ,
+.Cm drop_trigger ,
+.Cm create_sequence ,
+.Cm drop_sequence
 and
-.Cm revoke .
+.Cm drop_view .
 .Pp
 An intent that creates an object must carry a
 .Va comment ,
@@ -641,6 +655,58 @@ There is no
 measured on 18.6, a cascading drop under a three-level stack left
 .Em zero
 views standing.
+.Ss Schemas, extensions, types, functions and sequences
+These are what a repository needs to describe a database from nothing, and each
+carries the same safeguards as the rest of the tool rather than being a
+wrapper.
+.Pp
+.Em Every drop refuses when something depends on the object ,
+naming the dependant PostgreSQL would have named, and none of them emits
+.Ic CASCADE .
+Dropping a non-empty schema is refused outright: cascading there is the widest
+blast radius in the tool.
+.Pp
+.Cm add_enum_value
+is the sharpest case.
+Adding a label is
+.Em irreversible
+--
+.Qq dropping an enum value is not implemented
+-- so there is no revert for the step in this tool or by hand, and the plan
+says so.
+The new label also cannot be
+.Em used
+until the transaction that added it commits
+.Pq Qq unsafe use of new value ,
+so the step takes its own transaction; without that boundary a backfill later
+in the same specification fails on the label it just added.
+.Pp
+.Cm create_function
+uses
+.Ic CREATE OR REPLACE ,
+which keeps the comment, the grants, the owner and the function's OID -- so
+dependent views survive.
+It cannot change the return type, and the drop that can loses all four, so a
+return-type change is
+.Em refused
+with what the alternative would cost rather than quietly becoming a drop.
+A
+.Ic SECURITY DEFINER
+function is flagged: it runs with the owner's privileges and bypasses
+row-level security.
+.Pp
+.Cm create_extension
+refuses a name the server does not have available -- that is an infrastructure
+prerequisite, not something a specification can fix -- and warns when the spec
+names no schema, because an extension's objects land wherever
+.Va search_path
+points and moving them later is far harder than choosing now.
+.Pp
+.Cm create_trigger
+takes
+.Va ShareRowExclusiveLock ,
+so it blocks writes and not reads, and warns that the trigger fires for rows
+changed from the commit onwards and for none of the rows already there.
 .Ss Renames
 A rename repairs the catalog by itself.
 Dependencies are held by OID, so after renaming a column the dependent view's

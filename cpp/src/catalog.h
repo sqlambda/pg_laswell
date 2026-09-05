@@ -304,6 +304,102 @@ SELECT COALESCE(
   JSONB_BUILD_OBJECT('exists', false))
 )SQL";
 
+// Everything that is not a relation, and -- for anything droppable -- what
+// depends on it.
+//
+// The dependants are the point. Measured (spike S18, 18.6), PostgreSQL refuses
+// to drop a type, a function or a sequence that anything uses, and names the
+// dependant every time:
+//
+//   ERROR: cannot drop type mood because other objects depend on it
+//   DETAIL: column m of table uses_mood depends on type mood
+//
+// pg_depend answers the same question beforehand, so the planner refuses
+// precisely instead of letting execution fail with a hint suggesting CASCADE.
+// One query per object, $1 = kind, $2 = name, $3 = schema (ignored where the
+// object is not schema-qualified).
+inline constexpr const char* kObjectObservationSql = R"SQL(
+WITH target AS (
+  SELECT CASE $1
+    WHEN 'schema'    THEN (SELECT oid FROM pg_namespace WHERE nspname = $2)
+    WHEN 'extension' THEN (SELECT oid FROM pg_extension WHERE extname = $2)
+    WHEN 'type'      THEN (SELECT t.oid FROM pg_type t
+                             JOIN pg_namespace n ON n.oid = t.typnamespace
+                            WHERE t.typname = $2 AND n.nspname = $3)
+    WHEN 'sequence'  THEN (SELECT c.oid FROM pg_class c
+                             JOIN pg_namespace n ON n.oid = c.relnamespace
+                            WHERE c.relname = $2 AND n.nspname = $3
+                              AND c.relkind = 'S')
+    WHEN 'function'  THEN (SELECT p.oid FROM pg_proc p
+                             JOIN pg_namespace n ON n.oid = p.pronamespace
+                            WHERE p.proname = $2 AND n.nspname = $3
+                            ORDER BY p.oid LIMIT 1)
+    END AS oid,
+    CASE $1
+      WHEN 'schema' THEN 'pg_namespace' WHEN 'extension' THEN 'pg_extension'
+      WHEN 'type' THEN 'pg_type' WHEN 'function' THEN 'pg_proc'
+      ELSE 'pg_class' END::regclass AS classid
+)
+SELECT COALESCE((
+  SELECT JSONB_BUILD_OBJECT(
+    'exists', true,
+    'kind', $1,
+    -- What would block a drop. pg_describe_object renders each dependant the
+    -- way PostgreSQL's own error message does, so the refusal reads like the
+    -- one the author would otherwise have hit.
+    'depended_on_by', COALESCE((
+       SELECT JSONB_AGG(DISTINCT PG_DESCRIBE_OBJECT(d.classid, d.objid, d.objsubid))
+         FROM pg_depend d
+        WHERE d.refobjid = t.oid AND d.refclassid = t.classid
+          AND d.deptype IN ('n', 'a')
+          AND NOT (d.classid = t.classid AND d.objid = t.oid)), '[]'::jsonb),
+    -- Enum labels, so add_enum_value can report satisfied instead of failing
+    -- on a duplicate, and so the plan can show the resulting order.
+    'enum_labels', CASE WHEN $1 = 'type' THEN COALESCE((
+       SELECT JSONB_AGG(e.enumlabel ORDER BY e.enumsortorder)
+         FROM pg_enum e WHERE e.enumtypid = t.oid), '[]'::jsonb) END,
+    'type_kind', CASE WHEN $1 = 'type' THEN
+       (SELECT CASE ty.typtype WHEN 'e' THEN 'enum' WHEN 'd' THEN 'domain'
+                               WHEN 'c' THEN 'composite' WHEN 'r' THEN 'range'
+                               ELSE 'base' END
+          FROM pg_type ty WHERE ty.oid = t.oid) END,
+    'version', CASE WHEN $1 = 'extension' THEN
+       (SELECT extversion FROM pg_extension WHERE oid = t.oid) END,
+    'schema', CASE WHEN $1 = 'extension' THEN
+       (SELECT n.nspname FROM pg_extension e
+          JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.oid = t.oid) END,
+    -- A function's identity is its argument types, not its name; the planner
+    -- needs the full signature to emit a legal DROP.
+    'signature', CASE WHEN $1 = 'function' THEN
+       (SELECT p.oid::regprocedure::text FROM pg_proc p WHERE p.oid = t.oid) END,
+    'returns', CASE WHEN $1 = 'function' THEN
+       (SELECT PG_GET_FUNCTION_RESULT(p.oid) FROM pg_proc p WHERE p.oid = t.oid) END,
+    'owner', CASE $1
+       WHEN 'function' THEN (SELECT PG_GET_USERBYID(proowner) FROM pg_proc WHERE oid = t.oid)
+       WHEN 'type' THEN (SELECT PG_GET_USERBYID(typowner) FROM pg_type WHERE oid = t.oid)
+       WHEN 'schema' THEN (SELECT PG_GET_USERBYID(nspowner) FROM pg_namespace WHERE oid = t.oid)
+       END,
+    -- For a schema: what is still inside it. Dropping a non-empty schema is
+    -- refused without CASCADE, and CASCADE here is the widest blast radius in
+    -- the whole tool.
+    'contains', CASE WHEN $1 = 'schema' THEN COALESCE((
+       SELECT JSONB_AGG(c.relname ORDER BY c.relname)
+         FROM pg_class c WHERE c.relnamespace = t.oid
+          AND c.relkind IN ('r','p','v','m','S','f')), '[]'::jsonb) END)
+  FROM target t WHERE t.oid IS NOT NULL),
+  JSONB_BUILD_OBJECT('exists', false, 'kind', $1))
+)SQL";
+
+// Extensions that could be installed, with their versions -- so create_extension
+// can refuse a name the server cannot satisfy rather than emitting a statement
+// that fails, and can say which version it would get.
+inline constexpr const char* kAvailableExtensionSql = R"SQL(
+SELECT JSONB_BUILD_OBJECT(
+  'available', EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = $1),
+  'default_version', (SELECT default_version FROM pg_available_extensions
+                       WHERE name = $1))
+)SQL";
+
 // Server-wide readings: the connection budget (spike S12) and how busy the
 // server is right now. The application's OWN pool limit is the ceiling that
 // actually matters and is invisible from here, so it is configuration; what
@@ -365,8 +461,44 @@ class Catalog {
       : cfg_(cfg), cache_(cache) {}
 
   // Gathers everything the planner needs for the tables a spec names.
+  // Observes non-relation objects. `keys` are "kind:schema.name" or
+  // "kind:name" for the unqualified ones (schema, extension).
+  void observe_objects(ReadSession& s, Observations& obs,
+                       const std::vector<std::string>& keys) {
+    for (const auto& key : keys) {
+      if (obs.objects.contains(key)) continue;
+      const auto colon = key.find(':');
+      if (colon == std::string::npos) continue;
+      const auto kind = key.substr(0, colon);
+      auto rest = key.substr(colon + 1);
+      std::string schema, name;
+      const auto dot = rest.find('.');
+      if (dot == std::string::npos) {
+        name = rest;
+      } else {
+        schema = rest.substr(0, dot);
+        name = rest.substr(dot + 1);
+      }
+      const auto r = pqxx_exec(s.txn(), detail::kObjectObservationSql,
+                               pqxx::params{kind, name, schema});
+      if (!r.empty() && !r[0][0].is_null()) {
+        obs.objects[key] = json::parse(r[0][0].as<std::string>());
+      }
+      if (kind == "extension") {
+        const auto a = pqxx_exec(s.txn(), detail::kAvailableExtensionSql,
+                                 pqxx::params{name});
+        if (!a.empty() && !a[0][0].is_null()) {
+          const auto avail = json::parse(a[0][0].as<std::string>());
+          obs.objects[key]["available"] = avail.value("available", false);
+          obs.objects[key]["default_version"] = avail.value("default_version", json());
+        }
+      }
+    }
+  }
+
   Observations observe(const std::vector<std::string>& schemas,
-                       const std::vector<std::string>& tables) {
+                       const std::vector<std::string>& tables,
+                       const std::vector<std::string>& object_keys = {}) {
     if (schemas.size() != tables.size()) {
       throw std::runtime_error("observe: schema/table lists differ in length");
     }
@@ -379,6 +511,7 @@ class Catalog {
       obs.server = json::parse(server[0][0].as<std::string>());
     }
     obs.gathered_at = obs.server.value("now", json());
+    observe_objects(s, obs, object_keys);
 
     for (std::size_t i = 0; i < schemas.size(); ++i) {
       const auto qualified = schemas[i] + "." + tables[i];

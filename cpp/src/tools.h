@@ -283,13 +283,18 @@ inline json plan_migration_tool(ToolContext& ctx, const json& args) {
 
   // Observe only the tables the spec names. Nothing else is measured, so the
   // reading cannot be blamed on a table the change does not touch.
-  std::vector<std::string> schemas, tables;
+  std::vector<std::string> schemas, tables, object_keys;
   for (const auto& in : spec.intents) {
     schemas.push_back(in.schema());
     tables.push_back(in.table());
+    // Types, functions, sequences, schemas and extensions are not relations and
+    // are measured separately -- without this the planner sees every one of
+    // them as absent and happily plans a CREATE over something that is there.
+    const auto key = object_key_for(in);
+    if (!key.empty()) object_keys.push_back(key);
   }
   Catalog cat(cfg, ctx.cache);
-  const auto obs = cat.observe(schemas, tables);
+  const auto obs = cat.observe(schemas, tables, object_keys);
   const auto plan = plan_migration(spec, obs, cfg.executor);
 
   json out = plan.to_json();

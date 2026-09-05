@@ -22,6 +22,13 @@ using json = nlohmann::json;
 struct Observations {
   int server_version = 0;
   json tables = json::object();   // "schema.table" -> measurements
+  // Everything that is not a relation: schemas, extensions, types, functions,
+  // sequences, triggers. Keyed "kind:name" -- "type:public.mood",
+  // "function:public.f(integer)", "extension:pg_trgm", "schema:reporting" --
+  // because the namespaces do not overlap and a single map keeps the planner's
+  // lookups uniform. Each entry carries at least `exists` and, for anything
+  // droppable, `depended_on_by`.
+  json objects = json::object();
   json server = json::object();   // max_connections, headroom, activity
   json gathered_at = json();
 
@@ -29,6 +36,11 @@ struct Observations {
     static const json kEmpty = json::object();
     const auto it = tables.find(qualified);
     return it == tables.end() ? kEmpty : *it;
+  }
+  const json& object(const std::string& key) const {
+    static const json kEmpty = json::object();
+    const auto it = objects.find(key);
+    return it == objects.end() ? kEmpty : *it;
   }
   bool has_table(const std::string& qualified) const {
     const auto& t = table(qualified);

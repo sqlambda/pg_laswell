@@ -11,7 +11,7 @@ says so plainly where it can prove nothing. It converges databases that have
 drifted. And it never states a number it cannot derive.
 
 **Status: pre-0.1.0.** The whole path works — repository, signing, planning,
-dry run, paced execution, ledger — with 274 tests green on GCC and Clang, under
+dry run, paced execution, ledger — with 287 tests green on GCC and Clang, under
 AddressSanitizer/UBSan and ThreadSanitizer. Packages build for seven targets —
 deb, rpm and tarball, x86_64 and arm64, plus macOS arm64 — each installed and
 run inside the platform it targets before upload. The manual is the
