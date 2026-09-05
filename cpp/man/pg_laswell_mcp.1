@@ -1,0 +1,129 @@
+.Dd September 5, 2026
+.Dt PG_LASWELL_MCP 1
+.Os
+.Sh NAME
+.Nm pg_laswell_mcp
+.Nd lock-aware PostgreSQL migration executor, speaking MCP over stdio
+.Sh SYNOPSIS
+.Nm
+.Op Fl c Ar file
+.Op Ar conninfo
+.Nm
+.Fl h | Fl V
+.Sh DESCRIPTION
+.Nm
+applies signed migration specifications to a PostgreSQL database.
+It is not a generic migration runner: a specification states a business-level
+.Em change intent ,
+and
+.Nm
+reads the live catalog to decide how to apply it, based on what the target
+table actually is rather than on what the statement says.
+.Pp
+The two properties that motivate it:
+.Bl -bullet
+.It
+.Em The safe method is a property of the table, not the statement .
+.Ic CREATE INDEX
+is instant on an empty table and an outage at a billion rows.
+A script written elsewhere, against a database of a different size, cannot
+know which it faces.
+.It
+.Em Pacing depends on contention, not on row count .
+A backfill batched at a fixed number of rows per commit holds locks for
+however long that many rows happens to take today.
+It should instead commit when something starts waiting on it.
+.El
+.Pp
+.Nm
+is the executing half of a pair.
+Its sibling,
+.Xr pg_licht_mcp 1 ,
+is read-only by invariant and can only advise; this program is allowed to act.
+Use both: read load, locks and capacity through pg_licht, and apply change
+through
+.Nm .
+.Sh OPTIONS
+.Bl -tag -width Ds
+.It Fl c , Fl -config Ar file
+Connection registry, in INI format.
+.It Fl h , Fl -help
+Print a usage summary and exit.
+.It Fl V , Fl -version
+Print the version and exit.
+.El
+.Sh CONFIGURATION
+Configuration is resolved in this order, first match winning:
+.Bl -enum -compact
+.It
+.Fl -config Ar file
+.It
+.Ev PGLASWELL_CONFIG
+.It
+.Pa ~/.config/pg_laswell/laswell.ini ,
+if it exists
+.It
+.Ev DATABASE_URL
+.It
+the first non-option argument
+.El
+.Sh POOLERS
+The executor requires a
+.Em direct
+connection.
+This is a departure from
+.Xr pg_licht_mcp 1 ,
+which is deliberately safe behind a transaction-mode pooler, and the reason
+is not stylistic.
+.Pp
+Measured against PgBouncer on PostgreSQL 18.6: with
+.Va pool_mode = transaction ,
+a session GUC set by one client was readable by a
+.Em different
+client, and an advisory lock taken by one client was visible as held to
+another.
+PgBouncer does not run
+.Va server_reset_query
+in transaction mode unless
+.Va server_reset_query_always
+is enabled, and it is off by default.
+Most operators do not know this.
+.Pp
+Job coordination in
+.Nm
+rests on session advisory locks, and
+.Fn pg_try_advisory_lock
+is re-entrant within a single session.
+Two jobs sharing one server connection would therefore both believe they hold
+the exclusive lock on the same table, with no error reported anywhere.
+.Pp
+Detection at startup is not achievable: comparing
+.Fn pg_backend_pid
+across two transactions has false negatives at both ends of the pool-size
+range.
+Instead the worker re-reads its backend PID at the start of every transaction
+and aborts the job on any change.
+A startup probe additionally looks for leaked session state across two
+connections; a positive result is conclusive and refuses, but a negative
+result proves nothing and is never reported as a direct connection having
+been confirmed.
+.Sh ENVIRONMENT
+.Bl -tag -width Ds
+.It Ev DATABASE_URL
+libpq connection string, used when no registry file is given.
+.It Ev PGLASWELL_CONFIG
+Path to the connection registry.
+.El
+.Sh EXIT STATUS
+.Ex -std
+.Sh SEE ALSO
+.Xr psql 1
+.Sh STANDARDS
+Model Context Protocol, revisions 2024-11-05 through 2025-11-25, over stdio
+using JSON-RPC 2.0.
+.Sh AUTHORS
+.An Daniel Cristian Cruz
+.Sh CAVEATS
+This is pre-release software.
+The specification format, the ledger schema and the tool surface are all
+expected to change before 1.0.

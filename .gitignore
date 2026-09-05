@@ -1,0 +1,19 @@
+# Build trees
+cpp/build/
+cpp/build_*/
+cpp/Testing/
+cpp/dist/
+
+# Working documents. docs/ROADMAP.md is deliberately untracked -- see the note
+# at the top of that file. It is not in any clone, CI checkout, or release
+# tarball, and a session that cannot find it should read it off disk rather
+# than assume the plan does not exist.
+docs/
+
+# Editors and noise
+.vscode/
+.idea/
+*~
+*.swp
+*.log
+.env
