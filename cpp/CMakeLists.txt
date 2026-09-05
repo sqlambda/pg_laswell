@@ -93,6 +93,14 @@ if(BUILD_TESTING)
     # point of that mode and gtest cannot see it: the suite observes return
     # values, not process status. Runs without a database too, covering the
     # flags that need none.
+    # One bug shape has appeared five times in this project: iterating the
+    # temporary that .value() returns. -Wdangling-reference has caught it every
+    # time so far, which is luck rather than a guarantee -- it is a heuristic,
+    # and it is not in every compiler. This makes it a build failure instead.
+    add_test(NAME no_dangling_items
+             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/no-dangling-items.sh
+                     ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
     # DATABASE_URL is read by the script at RUN time, not baked in here.
     # $ENV{} is evaluated during configure, so a conninfo captured then
     # outlives the database it names: the suite went on "passing" against a

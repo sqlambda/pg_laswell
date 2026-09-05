@@ -153,7 +153,7 @@ class ReadSession {
     // three. Every interpolated value is an integer this process computed, so
     // none of it can carry a quote or a semicolon.
     std::string setup = "SET TRANSACTION READ ONLY";
-    if (timeout > 0) {
+    if (timeout > 0) {  // `timeout` is already a plain int here
       setup += "; SET LOCAL statement_timeout = " + std::to_string(timeout);
     }
     // A read that can queue behind a strong lock is not a safe read. Some
@@ -161,11 +161,21 @@ class ReadSession {
     // open the relation and therefore take AccessShareLock, so an observation
     // of a table being ALTERed would wait behind that ALTER rather than
     // reporting it. Bounding it here turns a hang into a reading.
-    if (lock_timeout_ms.value_or(0) > 0) {
-      setup += "; SET LOCAL lock_timeout = " + std::to_string(*lock_timeout_ms);
+    //
+    // Read once through has_value() rather than twice through value_or().
+    // std::optional leaves its payload uninitialised when empty, and the
+    // optimiser is entitled to compile value_or() as a branchless select that
+    // loads the payload before discarding it -- harmless at the machine level,
+    // and a "conditional jump depends on uninitialised value(s)" under
+    // Valgrind. It appeared here after unrelated header changes shifted
+    // inlining, which is exactly how much that formulation is worth relying
+    // on. This form reads the payload only when there is one.
+    const int lock_timeout = lock_timeout_ms.has_value() ? *lock_timeout_ms : 0;
+    if (lock_timeout > 0) {
+      setup += "; SET LOCAL lock_timeout = " + std::to_string(lock_timeout);
     }
     setup += "; SELECT pg_is_in_recovery()";
-    lock_timeout_ms_ = lock_timeout_ms.value_or(0);
+    lock_timeout_ms_ = lock_timeout;
     const auto r = txn_->exec(setup);
     if (!r.empty() && !r[0][0].is_null()) in_recovery_ = r[0][0].as<bool>();
   }

@@ -862,7 +862,30 @@ TEST(Spec, KnownKindsAreExactlyTheImplementedKinds) {
                          "partition":"t_2025","from":"'2025-01-01'",
                          "to":"'2026-01-01'"},
     "detach_partition": {"kind":"detach_partition","schema":"s","table":"t",
-                         "partition":"t_2025"}
+                         "partition":"t_2025"},
+    "rename_table":  {"kind":"rename_table","schema":"s","table":"t","to":"t2"},
+    "rename_column": {"kind":"rename_column","schema":"s","table":"t",
+                      "column":"c","to":"c2"},
+    "rename_constraint": {"kind":"rename_constraint","schema":"s","table":"t",
+                          "name":"ck","to":"ck2"},
+    "create_table": {"kind":"create_table","schema":"s","table":"t2",
+                     "comment":"doc",
+                     "columns":[{"name":"id","type":"bigint","nullable":false,
+                                 "comment":"pk"}]},
+    "drop_table":   {"kind":"drop_table","schema":"s","table":"t"},
+    "delete_rows":  {"kind":"delete_rows","schema":"s","table":"t","key":"id",
+                     "where":"created_at < now() - interval '1 year'"},
+    "set_row_security": {"kind":"set_row_security","schema":"s","table":"t",
+                         "enabled":true},
+    "create_policy": {"kind":"create_policy","schema":"s","table":"t",
+                      "name":"p","using":"tenant = current_user"},
+    "drop_policy":  {"kind":"drop_policy","schema":"s","table":"t","name":"p"},
+    "set_trigger_state": {"kind":"set_trigger_state","schema":"s","table":"t",
+                          "trigger":"trg","enabled":false},
+    "grant":  {"kind":"grant","schema":"s","table":"t",
+               "privileges":["SELECT"],"to":["app"]},
+    "revoke": {"kind":"revoke","schema":"s","table":"t",
+               "privileges":["SELECT"],"from":["app"]}
   })");
   for (const auto& [name, kind] : pglaswell::intent_kinds()) {
     (void)kind;
@@ -3786,6 +3809,7 @@ TEST(Planner, DroppingAnAbsentIndexIsSatisfied) {
 
 
 
+
 // --- attach_partition / detach_partition -----------------------------------
 
 static pglaswell::Observations obs_partitioned(bool with_default = false,
@@ -4632,6 +4656,369 @@ TEST(Planner, AddColumnIsNotBlockedByViewsButWarnsTheColumnIsInvisible) {
   for (const auto& w : plain.warnings) {
     EXPECT_EQ(w.find("will not be visible through"), std::string::npos) << w;
   }
+}
+
+// --- renames, tables, purges, and the security kinds -----------------------
+
+static pglaswell::Observations obs_rich() {
+  auto obs = observations(2LL << 30, 8000000);
+  obs.tables["shop.orders"]["columns"]["amount"] =
+      json{{"type", "integer"}, {"not_null", false}};
+  obs.tables["shop.orders"]["constraints"]["orders_amount_ck"] =
+      json{{"type", "c"}, {"has_index", false}, {"depended_on_by", json::array()}};
+  obs.tables["shop.orders"]["referenced_by"] = json::array();
+  obs.tables["shop.orders"]["row_security"] =
+      json{{"enabled", false}, {"forced", false}};
+  obs.tables["shop.orders"]["policies"] = json::object();
+  obs.tables["shop.orders"]["triggers"] =
+      json{{"orders_audit", {{"enabled", true}, {"state", "O"}}}};
+  obs.tables["shop.orders"]["dependent_views"] = view_stack();
+  return obs;
+}
+
+static const pglaswell::Step* only_step(const pglaswell::Plan& p,
+                                        const char* kind) {
+  const auto s = steps_of(p, kind);
+  EXPECT_EQ(s.size(), 1u) << p.render();
+  return s.empty() ? nullptr : s[0];
+}
+
+TEST(Planner, RenamingAColumnRebuildsNoViewsButSaysWhatTheyKeep) {
+  // Measured (S17): the catalog repairs itself -- the view definition becomes
+  // "SELECT id, value AS amount FROM t" on its own. So no rebuild. But the view
+  // KEEPS ITS OWN OUTPUT NAME, so nothing reading through it sees the rename,
+  // and nothing errors to say so. That warning is most of the value here.
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "rename_column"}, {"schema", "shop"},
+                                {"table", "orders"}, {"column", "amount"},
+                                {"to", "value"}}})),
+      obs_rich(), {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto* step = only_step(plan, "rename_column");
+  ASSERT_NE(step, nullptr);
+  const auto sql = all_sql(*step);
+  EXPECT_NE(sql.find("RENAME COLUMN \"amount\" TO \"value\""), std::string::npos);
+  for (const char* forbidden : {"DROP VIEW", "CREATE OR REPLACE", "GRANT"}) {
+    EXPECT_EQ(sql.find(forbidden), std::string::npos)
+        << "a rename must not rebuild anything: " << sql;
+  }
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("KEEPS ITS OWN OUTPUT NAME") != std::string::npos &&
+        w.find("public.v1") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned) << plan.render();
+}
+
+TEST(Planner, RenamingToANameThatIsTakenIsRefused) {
+  auto obs = obs_rich();
+  obs.tables["shop.orders"]["columns"]["value"] =
+      json{{"type", "text"}, {"not_null", false}};
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "rename_column"}, {"schema", "shop"},
+                                {"table", "orders"}, {"column", "amount"},
+                                {"to", "value"}}})),
+      obs, {});
+  EXPECT_FALSE(plan.ok) << plan.render();
+
+  // And a rename already applied is satisfied, not a second attempt: the old
+  // name is gone and the new one is there.
+  auto done = obs_rich();
+  done.tables["shop.orders"]["columns"].erase("amount");
+  done.tables["shop.orders"]["columns"]["value"] =
+      json{{"type", "integer"}, {"not_null", false}};
+  const auto again = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "rename_column"}, {"schema", "shop"},
+                                {"table", "orders"}, {"column", "amount"},
+                                {"to", "value"}}})),
+      done, {});
+  ASSERT_TRUE(again.ok) << again.render();
+  EXPECT_EQ(only_step(again, "rename_column")->action,
+            pglaswell::Action::kSatisfied);
+}
+
+TEST(Planner, RenamingAConstraintWarnsThatItsIndexIsRenamedToo) {
+  auto obs = obs_rich();
+  obs.tables["shop.orders"]["constraints"]["orders_code_uq"] =
+      json{{"type", "u"}, {"has_index", true}, {"depended_on_by", json::array()}};
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "rename_constraint"}, {"schema", "shop"},
+                                {"table", "orders"}, {"name", "orders_code_uq"},
+                                {"to", "orders_code_unique"}}})),
+      obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("also renames its backing index") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned) << plan.render();
+}
+
+TEST(Planner, CreateTableEmitsCommentsAndDoesNotCompareAnExistingOne) {
+  const auto spec = spec_of(json::array(
+      {json{{"kind", "create_table"}, {"schema", "shop"}, {"table", "regions"},
+            {"comment", "Warehouse regions."},
+            {"primary_key", json::array({"id"})},
+            {"columns", json::array({
+                json{{"name", "id"}, {"type", "bigint"}, {"nullable", false},
+                     {"comment", "Identity."}},
+                json{{"name", "name"}, {"type", "text"}, {"nullable", true},
+                     {"comment", "Display name."}}})}}}));
+  const auto plan = pglaswell::plan_migration(spec, observations(1024, 10), {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto sql = all_sql(*only_step(plan, "create_table"));
+  EXPECT_NE(sql.find("CREATE TABLE shop.regions"), std::string::npos) << sql;
+  EXPECT_NE(sql.find("\"id\" bigint NOT NULL"), std::string::npos) << sql;
+  EXPECT_NE(sql.find("PRIMARY KEY (\"id\")"), std::string::npos)
+      << "on an empty table the inline key is free; the two-step recipe would "
+         "be machinery for nothing:\n" << sql;
+  EXPECT_NE(sql.find("COMMENT ON TABLE shop.regions"), std::string::npos);
+  EXPECT_NE(sql.find("COMMENT ON COLUMN shop.regions.\"name\""), std::string::npos);
+
+  // An existing table is satisfied WITHOUT a shape comparison, and the plan
+  // must say so -- silently reporting satisfied over a table that differs is
+  // how a migration does nothing and reports success.
+  auto exists = observations(1024, 10);
+  exists.tables["shop.regions"] = json{{"exists", true}, {"kind", "table"}};
+  const auto second = pglaswell::plan_migration(spec, exists, {});
+  ASSERT_TRUE(second.ok);
+  EXPECT_EQ(only_step(second, "create_table")->action,
+            pglaswell::Action::kSatisfied);
+  bool warned = false;
+  for (const auto& w : second.warnings) {
+    if (w.find("WITHOUT comparing its columns") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned) << second.render();
+}
+
+TEST(Planner, DroppingATableNamesBothKindsOfDependant) {
+  // Measured (S17): PostgreSQL refuses for a dependent view AND for an inbound
+  // foreign key, and names them. Both are visible beforehand.
+  auto obs = obs_rich();
+  obs.tables["shop.orders"]["referenced_by"] =
+      json::array({"lines_order_fk on shop.order_lines"});
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "drop_table"}, {"schema", "shop"},
+                                {"table", "orders"}}})),
+      obs, {});
+  EXPECT_FALSE(plan.ok) << plan.render();
+  EXPECT_NE(plan.conflicts[0].find("view public.v1"), std::string::npos)
+      << plan.conflicts[0];
+  EXPECT_NE(plan.conflicts[0].find("lines_order_fk"), std::string::npos)
+      << plan.conflicts[0];
+  EXPECT_NE(plan.conflicts[0].find("CASCADE"), std::string::npos);
+
+  // With nothing depending on it, it goes -- with the warning that matters.
+  auto quiet = observations(2LL << 30, 8000000);
+  const auto ok = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "drop_table"}, {"schema", "shop"},
+                                {"table", "orders"}}})),
+      quiet, {});
+  ASSERT_TRUE(ok.ok) << ok.render();
+  bool warned = false;
+  for (const auto& w : ok.warnings) {
+    if (w.find("irreversible") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned) << ok.render();
+}
+
+TEST(Planner, DeleteRowsIsPacedLikeABackfillAndWarnsAboutChildren) {
+  auto obs = obs_rich();
+  obs.tables["shop.orders"]["referenced_by"] =
+      json::array({"lines_order_fk on shop.order_lines"});
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "delete_rows"}, {"schema", "shop"},
+                                {"table", "orders"}, {"key", "id"},
+                                {"where", "created_at < now() - interval '1 year'"}}})),
+      obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto* step = only_step(plan, "delete_rows");
+  ASSERT_NE(step, nullptr);
+  EXPECT_EQ(step->txn_class, pglaswell::TxnClass::kOwnTxnPerBatch);
+  const auto sql = all_sql(*step);
+  // The shape the executor's generic paced runner requires: $1 cursor, $2
+  // batch, and the key returned.
+  EXPECT_NE(sql.find("> $1"), std::string::npos) << sql;
+  EXPECT_NE(sql.find("LIMIT $2"), std::string::npos) << sql;
+  EXPECT_NE(sql.find("RETURNING shop.orders.id"), std::string::npos) << sql;
+  EXPECT_NE(sql.find("FOR UPDATE"), std::string::npos) << sql;
+  EXPECT_EQ(step->lock.find("AccessExclusive"), std::string::npos) << step->lock;
+
+  bool child_warning = false, space_warning = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("already COMMITTED") != std::string::npos) child_warning = true;
+    if (w.find("does not shrink") != std::string::npos) space_warning = true;
+  }
+  EXPECT_TRUE(child_warning)
+      << "a paced delete that hits a foreign key stops part-done: "
+      << plan.render();
+  EXPECT_TRUE(space_warning) << plan.render();
+}
+
+TEST(Spec, AnUnfilteredDeleteIsRefused) {
+  json doc = minimal_spec();
+  doc["intents"] = json::array({json{{"kind", "delete_rows"}, {"schema", "s"},
+                                     {"table", "t"}, {"key", "id"},
+                                     {"where", ""}}});
+  const auto err = spec_error(doc);
+  EXPECT_NE(err.find("empties the table"), std::string::npos) << err;
+  EXPECT_NE(err.find("\"true\""), std::string::npos)
+      << "the hint must say how to opt in deliberately: " << err;
+  EXPECT_NE(err.find("drop_table"), std::string::npos)
+      << "and name the intent that is probably meant instead: " << err;
+  // ... and opting in explicitly works.
+  doc["intents"][0]["where"] = "true";
+  EXPECT_NO_THROW(pglaswell::parse_spec(doc));
+}
+
+TEST(Planner, EnablingRowSecurityWithNoPolicyIsTheLoudestWarningWeHave) {
+  // Measured on 18.6: an application role went from 1000 rows to 0 the moment
+  // RLS was enabled with no policy -- no error, the query just returns nothing.
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "set_row_security"}, {"schema", "shop"},
+                                {"table", "orders"}, {"enabled", true}}})),
+      obs_rich(), {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  bool deny = false, invisible = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("hides every row") != std::string::npos) deny = true;
+    if (w.find("SUPERUSER bypasses it") != std::string::npos) invisible = true;
+  }
+  EXPECT_TRUE(deny) << plan.render();
+  EXPECT_TRUE(invisible)
+      << "verifying RLS from a superuser session shows nothing, however wrong "
+         "the policy is: " << plan.render();
+
+  // With a policy already there, the default-deny warning does not fire.
+  auto with_policy = obs_rich();
+  with_policy.tables["shop.orders"]["policies"]["tenant_isolation"] =
+      json{{"command", "ALL"}};
+  const auto quieter = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "set_row_security"}, {"schema", "shop"},
+                                {"table", "orders"}, {"enabled", true}}})),
+      with_policy, {});
+  for (const auto& w : quieter.warnings) {
+    EXPECT_EQ(w.find("hides every row"), std::string::npos) << w;
+  }
+}
+
+TEST(Planner, APolicyOnATableWithoutRlsIsStoredAndDoesNothing) {
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "create_policy"}, {"schema", "shop"},
+                                {"table", "orders"}, {"name", "tenant_iso"},
+                                {"command", "UPDATE"},
+                                {"roles", json::array({"app"})},
+                                {"using", "tenant = current_user"}}})),
+      obs_rich(), {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto sql = all_sql(*only_step(plan, "create_policy"));
+  EXPECT_NE(sql.find("CREATE POLICY \"tenant_iso\" ON shop.orders FOR UPDATE "
+                     "TO \"app\" USING (tenant = current_user)"),
+            std::string::npos) << sql;
+  bool inert = false, check = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("does nothing at all until it is") != std::string::npos) inert = true;
+    if (w.find("WITH CHECK") != std::string::npos) check = true;
+  }
+  EXPECT_TRUE(inert) << plan.render();
+  EXPECT_TRUE(check)
+      << "USING without WITH CHECK lets a role write a row it could not read: "
+      << plan.render();
+}
+
+TEST(Planner, DroppingTheLastPolicyLeavesEveryRowHidden) {
+  auto obs = obs_rich();
+  obs.tables["shop.orders"]["row_security"] =
+      json{{"enabled", true}, {"forced", false}};
+  obs.tables["shop.orders"]["policies"]["only_one"] = json{{"command", "ALL"}};
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "drop_policy"}, {"schema", "shop"},
+                                {"table", "orders"}, {"name", "only_one"}}})),
+      obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("LAST policy") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned) << plan.render();
+}
+
+TEST(Planner, DisablingATriggerTakesTheWeakerLockAndSaysWhatStopsHappening) {
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "set_trigger_state"}, {"schema", "shop"},
+                                {"table", "orders"}, {"trigger", "orders_audit"},
+                                {"enabled", false}}})),
+      obs_rich(), {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto* step = only_step(plan, "set_trigger_state");
+  ASSERT_NE(step, nullptr);
+  EXPECT_NE(step->lock.find("ShareRowExclusiveLock"), std::string::npos)
+      << "measured: not AccessExclusiveLock, so readers are unaffected: "
+      << step->lock;
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("does not backfill it") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned) << plan.render();
+
+  // A trigger already in the wanted state is satisfied; an unknown one is a
+  // conflict rather than a statement that would fail.
+  const auto satisfied = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "set_trigger_state"}, {"schema", "shop"},
+                                {"table", "orders"}, {"trigger", "orders_audit"},
+                                {"enabled", true}}})),
+      obs_rich(), {});
+  EXPECT_EQ(only_step(satisfied, "set_trigger_state")->action,
+            pglaswell::Action::kSatisfied);
+  const auto missing = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "set_trigger_state"}, {"schema", "shop"},
+                                {"table", "orders"}, {"trigger", "nope"},
+                                {"enabled", false}}})),
+      obs_rich(), {});
+  EXPECT_FALSE(missing.ok) << missing.render();
+}
+
+TEST(Planner, GrantIsCheapAndRevokeHitsLiveConnections) {
+  const auto g = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "grant"}, {"schema", "shop"},
+                                {"table", "orders"},
+                                {"privileges", json::array({"SELECT", "UPDATE"})},
+                                {"columns", json::array({"amount"})},
+                                {"to", json::array({"app", "PUBLIC"})}}})),
+      obs_rich(), {});
+  ASSERT_TRUE(g.ok) << g.render();
+  const auto sql = all_sql(*only_step(g, "grant"));
+  // The column list goes after the PRIVILEGES, not after the relation -- the
+  // syntax error this project already made once and found by running it.
+  EXPECT_NE(sql.find("GRANT SELECT, UPDATE (\"amount\") ON shop.orders "
+                     "TO \"app\", PUBLIC;"),
+            std::string::npos) << sql;
+  EXPECT_NE(only_step(g, "grant")->lock.find("AccessShareLock"), std::string::npos);
+
+  const auto r = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "revoke"}, {"schema", "shop"},
+                                {"table", "orders"},
+                                {"privileges", json::array({"SELECT"})},
+                                {"from", json::array({"app"})}}})),
+      obs_rich(), {});
+  ASSERT_TRUE(r.ok) << r.render();
+  EXPECT_NE(all_sql(*only_step(r, "revoke")).find("REVOKE SELECT ON shop.orders FROM \"app\";"),
+            std::string::npos);
+  bool warned = false;
+  for (const auto& w : r.warnings) {
+    if (w.find("ALREADY CONNECTED") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned) << r.render();
+}
+
+TEST(Spec, APrivilegeTypoIsCaughtRatherThanSentToTheDatabase) {
+  json doc = minimal_spec();
+  doc["intents"] = json::array({json{{"kind", "grant"}, {"schema", "s"},
+                                     {"table", "t"},
+                                     {"privileges", json::array({"SELCT"})},
+                                     {"to", json::array({"app"})}}});
+  const auto err = spec_error(doc);
+  EXPECT_NE(err.find("unknown privilege"), std::string::npos) << err;
 }
 
 // --- drop_constraint --------------------------------------------------------
@@ -5619,6 +6006,195 @@ TEST_F(DatabaseTest, ThePartitionRecipesRunAndTheCheckReallyRemovesTheScan) {
   w.begin("pg_laswell/test/part-cleanup");
   w.txn().exec("DROP TABLE laswell_ev CASCADE");
   w.txn().exec("DROP TABLE laswell_ev_a");
+  w.commit();
+}
+
+TEST_F(DatabaseTest, TheRemainingKindsRunAndRowSecurityReallyHidesEverything) {
+  // The new kinds end to end. The one that matters most is row security: the
+  // measured behaviour is that enabling it with no policy takes an application
+  // from every row to none, silently, and that a superuser cannot see this
+  // happen at all. Both are asserted against PostgreSQL, from the right role.
+  pglaswell::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = url_;
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/rest");
+    w.txn().exec("DROP TABLE IF EXISTS laswell_sec CASCADE");
+    w.txn().exec("DO $$BEGIN"
+                 "  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname='laswell_app') THEN"
+                 "    EXECUTE 'DROP OWNED BY laswell_app';"
+                 "    EXECUTE 'DROP ROLE laswell_app';"
+                 "  END IF;"
+                 "END$$");
+    w.txn().exec("CREATE ROLE laswell_app");
+    w.commit();
+  }
+
+  pglaswell::Catalog cat(cfg);
+  auto apply = [&](const json& intent, const char* table) {
+    const auto obs = cat.observe({"public"}, {table});
+    json doc = minimal_spec();
+    doc["intents"] = json::array({intent});
+    const auto plan =
+        pglaswell::plan_migration(pglaswell::parse_spec(doc), obs, {});
+    EXPECT_TRUE(plan.ok) << plan.render();
+    for (const auto& step : plan.steps) {
+      for (const auto& q : step.sql) {
+        const std::string stmt = q;
+        pglaswell::WriteSession w(cfg);
+        w.begin("pg_laswell/test/rest-apply");
+        w.txn().exec(stmt.substr(0, stmt.size() - 1));
+        w.commit();
+      }
+    }
+  };
+
+  // create_table, with its comments.
+  apply(json{{"kind", "create_table"}, {"schema", "public"},
+             {"table", "laswell_sec"}, {"comment", "Security fixture."},
+             {"primary_key", json::array({"id"})},
+             {"columns", json::array({
+                 json{{"name", "id"}, {"type", "bigint"}, {"nullable", false},
+                      {"comment", "Identity."}},
+                 json{{"name", "tenant"}, {"type", "text"}, {"nullable", false},
+                      {"comment", "Owning tenant."}}})}},
+        "laswell_sec");
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/rest-seed");
+    w.txn().exec("INSERT INTO laswell_sec SELECT g, 'a'"
+                 " FROM generate_series(1,100) g");
+    w.commit();
+  }
+  {
+    pglaswell::ReadSession r(cfg);
+    EXPECT_EQ(r.txn().exec("SELECT obj_description('laswell_sec'::regclass)")[0][0]
+                  .as<std::string>(), "Security fixture.");
+    EXPECT_EQ(r.txn().exec("SELECT contype::text FROM pg_constraint WHERE"
+                           " conrelid='laswell_sec'::regclass AND contype='p'")[0][0]
+                  .as<std::string>(), "p");
+  }
+
+  // grant, then the policy, then row security -- the order the plan's own
+  // warnings push an author towards.
+  apply(json{{"kind", "grant"}, {"schema", "public"}, {"table", "laswell_sec"},
+             {"privileges", json::array({"SELECT"})},
+             {"to", json::array({"laswell_app"})}},
+        "laswell_sec");
+  {
+    pglaswell::ReadSession r(cfg);
+    EXPECT_EQ(r.txn().exec("SELECT has_table_privilege('laswell_app',"
+                           "'laswell_sec','SELECT')")[0][0].as<bool>(), true);
+  }
+
+  apply(json{{"kind", "set_row_security"}, {"schema", "public"},
+             {"table", "laswell_sec"}, {"enabled", true}},
+        "laswell_sec");
+
+  // The whole point, checked as the APPLICATION role rather than as us.
+  {
+    pglaswell::ReadSession r(cfg);
+    r.txn().exec("SET LOCAL ROLE laswell_app");
+    EXPECT_EQ(r.txn().exec("SELECT count(*) FROM laswell_sec")[0][0].as<int>(), 0)
+        << "row security with no policy must hide every row from the "
+           "application -- silently, which is why the plan shouts about it";
+  }
+  // ... and from this session, which cannot see the change at all.
+  {
+    pglaswell::ReadSession r(cfg);
+    EXPECT_EQ(r.txn().exec("SELECT count(*) FROM laswell_sec")[0][0].as<int>(), 100)
+        << "a superuser or owner bypasses RLS, which is exactly why verifying "
+           "this from the migrating session proves nothing";
+  }
+
+  // A policy restores the application's view.
+  apply(json{{"kind", "create_policy"}, {"schema", "public"},
+             {"table", "laswell_sec"}, {"name", "tenant_iso"},
+             {"roles", json::array({"laswell_app"})},
+             {"using", "tenant = 'a'"}},
+        "laswell_sec");
+  {
+    pglaswell::ReadSession r(cfg);
+    r.txn().exec("SET LOCAL ROLE laswell_app");
+    EXPECT_EQ(r.txn().exec("SELECT count(*) FROM laswell_sec")[0][0].as<int>(), 100);
+  }
+
+  // rename_column, and the measured fact that a view keeps its own name.
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/rest-view");
+    w.txn().exec("CREATE VIEW laswell_sec_v AS SELECT id, tenant FROM laswell_sec");
+    w.commit();
+  }
+  apply(json{{"kind", "rename_column"}, {"schema", "public"},
+             {"table", "laswell_sec"}, {"column", "tenant"}, {"to", "owner_id"}},
+        "laswell_sec");
+  {
+    pglaswell::ReadSession r(cfg);
+    EXPECT_EQ(r.txn().exec("SELECT count(*) FROM pg_attribute WHERE attrelid="
+                           "'laswell_sec'::regclass AND attname='owner_id'")[0][0]
+                  .as<int>(), 1);
+    EXPECT_EQ(r.txn().exec("SELECT count(*) FROM pg_attribute WHERE attrelid="
+                           "'laswell_sec_v'::regclass AND attname='tenant'")[0][0]
+                  .as<int>(), 1)
+        << "the view keeps its OWN output name after the rename -- measured, "
+           "and the reason the plan warns that nothing reading through a view "
+           "sees the change";
+  }
+
+  // delete_rows, applied by hand in one batch since the executor's pacing has
+  // its own tests; what is checked here is that the emitted SQL is valid and
+  // deletes what it claims.
+  {
+    const auto obs = cat.observe({"public"}, {"laswell_sec"});
+    json doc = minimal_spec();
+    doc["intents"] = json::array({json{{"kind", "delete_rows"},
+                                       {"schema", "public"},
+                                       {"table", "laswell_sec"},
+                                       {"key", "id"},
+                                       {"where", "id <= 40"}}});
+    const auto plan =
+        pglaswell::plan_migration(pglaswell::parse_spec(doc), obs, {});
+    ASSERT_TRUE(plan.ok) << plan.render();
+    const auto steps = steps_of(plan, "delete_rows");
+    ASSERT_EQ(steps.size(), 1u);
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/rest-delete");
+    const std::string stmt = steps[0]->sql[0];
+    const auto rows = w.txn().exec(stmt.substr(0, stmt.size() - 1),
+                                   pqxx::params{"0", 1000});
+    w.commit();
+    EXPECT_EQ(rows.size(), 40u) << "the paced delete statement is malformed";
+  }
+  {
+    pglaswell::ReadSession r(cfg);
+    EXPECT_EQ(r.txn().exec("SELECT count(*) FROM laswell_sec")[0][0].as<int>(), 60);
+  }
+
+  // drop_table is refused while the view depends on it, and works once it does
+  // not -- the refusal being the part that matters.
+  {
+    const auto obs = cat.observe({"public"}, {"laswell_sec"});
+    json doc = minimal_spec();
+    doc["intents"] = json::array({json{{"kind", "drop_table"},
+                                       {"schema", "public"},
+                                       {"table", "laswell_sec"}}});
+    const auto plan =
+        pglaswell::plan_migration(pglaswell::parse_spec(doc), obs, {});
+    EXPECT_FALSE(plan.ok) << "a dependent view must block the drop:\n"
+                          << plan.render();
+    // And PostgreSQL agrees, which is what keeps the refusal honest.
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/rest-drop");
+    EXPECT_THROW(w.txn().exec("DROP TABLE laswell_sec"), pqxx::sql_error);
+  }
+
+  pglaswell::WriteSession w(cfg);
+  w.begin("pg_laswell/test/rest-cleanup");
+  w.txn().exec("DROP TABLE laswell_sec CASCADE");
+  w.txn().exec("DROP OWNED BY laswell_app");
+  w.txn().exec("DROP ROLE laswell_app");
   w.commit();
 }
 

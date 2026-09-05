@@ -335,9 +335,21 @@ This build implements
 .Cm replace_view ,
 .Cm add_unique_constraint ,
 .Cm add_primary_key ,
-.Cm attach_partition
+.Cm attach_partition ,
+.Cm detach_partition ,
+.Cm rename_table ,
+.Cm rename_column ,
+.Cm rename_constraint ,
+.Cm create_table ,
+.Cm drop_table ,
+.Cm delete_rows ,
+.Cm set_row_security ,
+.Cm create_policy ,
+.Cm drop_policy ,
+.Cm set_trigger_state ,
+.Cm grant
 and
-.Cm detach_partition .
+.Cm revoke .
 .Pp
 An intent that creates an object must carry a
 .Va comment ,
@@ -629,6 +641,77 @@ There is no
 measured on 18.6, a cascading drop under a three-level stack left
 .Em zero
 views standing.
+.Ss Renames
+A rename repairs the catalog by itself.
+Dependencies are held by OID, so after renaming a column the dependent view's
+definition becomes
+.Ql SELECT id, value AS amount FROM t
+on its own, views stacked on it stay queryable, and every index, check and
+foreign-key definition follows.
+The lock is
+.Va AccessExclusiveLock
+on the table alone; no view is locked and nothing is rebuilt.
+.Pp
+What does
+.Em not
+change is the part people expect to.
+The view keeps its own output column name, so after renaming
+.Va amount
+to
+.Va value
+the view still exposes a column called
+.Va amount .
+The rename therefore never reaches anything reading through a view, and nothing
+errors to say so.
+.Nm
+names the views concerned and points at
+.Cm replace_view .
+Renaming a constraint also renames its backing index.
+.Ss Row security, policies and privileges
+These take one statement each and belong here by the second test above: each is
+a change to schema state, applied once.
+Their locks are measured --
+.Ic DISABLE TRIGGER
+takes
+.Va ShareRowExclusiveLock
+and so blocks writes but not reads,
+.Ic ENABLE ROW LEVEL SECURITY
+and
+.Ic CREATE POLICY
+take
+.Va AccessExclusiveLock ,
+and
+.Ic GRANT
+takes only
+.Va AccessShareLock
+-- but the reason they are worth planning is that their effect is nearly
+invisible from the session that makes it.
+.Pp
+Enabling row-level security with no policy is a
+.Em default deny .
+Measured on 18.6, an application role reading the table went from a thousand
+rows to none, with no error: the query succeeds and returns nothing.
+.Pp
+And you will probably not be able to see it.
+A table's owner bypasses row-level security unless
+.Ic FORCE
+is also set, and a
+.Em superuser
+bypasses it whatever either flag says.
+Verifying an RLS change from the migrating session shows no change at all,
+however wrong the policy is; check it as the application role, with
+.Ic SET ROLE .
+.Pp
+The other quiet ones:
+a policy created before row security is enabled is stored and does nothing;
+dropping the last policy while row security stays on hides every row;
+.Ic USING
+without
+.Ic WITH CHECK
+lets a role write a row its own policy would not let it read back;
+a revoke takes effect on already-connected sessions at their next statement;
+and while a trigger is disabled, whatever it maintained is not maintained, with
+nothing recording the gap and no backfill on re-enabling.
 .Ss What is not a migration
 An intent kind has to pass two tests, and the second one is easy to overlook.
 It must make a real decision -- if the planner would emit one possible

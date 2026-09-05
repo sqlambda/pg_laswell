@@ -3,7 +3,7 @@
 ## 0.1.0 (unreleased)
 
 The whole path works: repository, signing, planning, dry run, paced execution,
-ledger. 260 tests green on GCC 14.2 and Clang 22, under AddressSanitizer/UBSan
+ledger. 274 tests green on GCC 14.2 and Clang 22, under AddressSanitizer/UBSan
 and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
 `--call` contract test.
 
@@ -207,6 +207,33 @@ and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
   one rewrites. `text`→`varchar(200)` rewrites; `varchar(50)`→`text` does not.
   Anything unproven is reported as a rewrite, because a cautious plan costs
   less than an unplanned outage.
+- **Twelve more intent kinds**, closing the list of what a migration tool has
+  to be able to say. `rename_table` / `rename_column` / `rename_constraint`;
+  `create_table` / `drop_table`; `delete_rows`; and `set_row_security`,
+  `create_policy`, `drop_policy`, `set_trigger_state`, `grant`, `revoke`.
+  **Renames rebuild nothing.** Measured: the catalog repairs itself — a
+  dependent view's definition becomes `SELECT id, value AS amount FROM t` on its
+  own, and indexes, checks and FKs all follow. But the view keeps its *own*
+  output name, so the rename never reaches anything reading through it, and
+  nothing errors. The plan names the views and points at `replace_view`.
+  **`create_table` is satisfied without comparing shape**, and says so — quietly
+  reporting satisfied over a table that differs is how a migration does nothing
+  and reports success. **`drop_table`** refuses for dependent views *and*
+  inbound foreign keys, both visible beforehand.
+  **`delete_rows`** is a retention purge paced exactly like a backfill, reusing
+  the executor's generic runner; it warns that a foreign-key violation stops it
+  *part-done* because earlier batches have already committed, and that the
+  space is not returned to the filesystem.
+  **Row security is the loudest warning in the tool**, and it is measured:
+  enabling it with no policy took an application role from 1000 rows to **0**,
+  silently. And you cannot see it happen — an owner bypasses RLS unless `FORCE`
+  is set, and a superuser bypasses it regardless, so verifying from the
+  migrating session proves nothing.
+- **A build gate against one recurring bug.** Iterating the temporary that
+  `.value()` returns has appeared five times in this project;
+  `-Wdangling-reference` caught it every time, which is luck rather than a
+  guarantee. `cpp/test/no-dangling-items.sh` now fails the build instead, and is
+  itself tested against a known-bad snippet.
 - **`attach_partition` and `detach_partition`** — partition rotation, which is
   how time-series data is actually retired. `ATTACH` validates the candidate
   unless a CHECK already proves the bounds: **98.393 ms vs 0.914 ms on 2M

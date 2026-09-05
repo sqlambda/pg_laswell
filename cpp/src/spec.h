@@ -37,7 +37,10 @@ enum class IntentKind { kAddColumn, kBackfill, kCreateIndex, kDropIndex,
                         kDropConstraint, kAlterColumnType, kDropColumn,
                         kReplaceView, kAddUniqueConstraint,
                         kAddPrimaryKey, kAttachPartition,
-                        kDetachPartition };
+                        kDetachPartition, kRenameTable, kRenameColumn,
+                        kRenameConstraint, kCreateTable, kDropTable,
+                        kDeleteRows, kSetRowSecurity, kCreatePolicy,
+                        kDropPolicy, kSetTriggerState, kGrant, kRevoke };
 
 inline const std::map<std::string, IntentKind>& intent_kinds() {
   static const std::map<std::string, IntentKind> kKinds = {
@@ -56,6 +59,18 @@ inline const std::map<std::string, IntentKind>& intent_kinds() {
       {"add_primary_key", IntentKind::kAddPrimaryKey},
       {"attach_partition", IntentKind::kAttachPartition},
       {"detach_partition", IntentKind::kDetachPartition},
+      {"rename_table", IntentKind::kRenameTable},
+      {"rename_column", IntentKind::kRenameColumn},
+      {"rename_constraint", IntentKind::kRenameConstraint},
+      {"create_table", IntentKind::kCreateTable},
+      {"drop_table", IntentKind::kDropTable},
+      {"delete_rows", IntentKind::kDeleteRows},
+      {"set_row_security", IntentKind::kSetRowSecurity},
+      {"create_policy", IntentKind::kCreatePolicy},
+      {"drop_policy", IntentKind::kDropPolicy},
+      {"set_trigger_state", IntentKind::kSetTriggerState},
+      {"grant", IntentKind::kGrant},
+      {"revoke", IntentKind::kRevoke},
   };
   return kKinds;
 }
@@ -430,6 +445,219 @@ inline void parse_add_check_constraint(Intent& in) {
 // for the attach, and once as a CHECK constraint, which is what turns the
 // attach from a full scan into a catalog change. A raw clause could be copied
 // into the first and not derived for the second.
+// The three renames share a body: what is being renamed, and to what. `what`
+// names the extra key -- "column" or "name" -- that a column or constraint
+// rename needs and a table rename does not.
+// Columns are STRUCTURED, not a DDL fragment.
+//
+// This is where the intent model is most at risk of becoming a SQL grammar
+// written in JSON, so the vocabulary is deliberately the same one add_column
+// already uses -- name, type, nullable, default, comment -- and nothing more.
+// Anything a table needs beyond that (an index, a foreign key, a check, a
+// primary key over several columns) has its own intent kind already, and
+// stating it there keeps each change separately reviewable instead of buried
+// in a CREATE TABLE nobody reads to the end.
+// A retention purge is a migration by both tests: it changes state, and it is
+// applied once. It is paced exactly as a backfill is, because a single DELETE
+// over a retention window is the same outage a single UPDATE would be.
+inline void parse_set_row_security(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(in.body, {"kind", "schema", "table", "enabled", "force"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
+  if (!in.body.contains("enabled") || !in.body["enabled"].is_boolean()) {
+    detail::fail(at + ".enabled must be stated as a boolean",
+                 "Row-level security is on or off; there is no default, "
+                 "because turning it on with no policy hides every row.");
+  }
+  if (in.body.contains("force") && !in.body["force"].is_boolean()) {
+    detail::fail(at + ".force must be a boolean", "");
+  }
+}
+
+inline void parse_create_policy(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(
+      in.body, {"kind", "schema", "table", "name", "command", "roles", "using",
+                "check"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "name", at), "name", in.ordinal);
+  if (!in.body.contains("using") && !in.body.contains("check")) {
+    detail::fail(at + " needs a \"using\" or \"check\" expression",
+                 "A policy with neither restricts nothing and grants nothing; "
+                 "it is almost certainly not what was meant.");
+  }
+  for (const char* k : {"using", "check", "command"}) {
+    if (in.body.contains(k) && !in.body[k].is_string()) {
+      detail::fail(at + "." + k + " must be a string", "");
+    }
+  }
+  if (in.body.contains("roles")) {
+    if (!in.body["roles"].is_array() || in.body["roles"].empty()) {
+      detail::fail(at + ".roles must be a non-empty array", "Omit it for PUBLIC.");
+    }
+    for (const auto& r : in.body["roles"]) {
+      if (!r.is_string()) detail::fail(at + ".roles must be strings", "");
+      detail::require_identifier(r.get<std::string>(), "roles", in.ordinal);
+    }
+  }
+}
+
+inline void parse_drop_policy(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(in.body, {"kind", "schema", "table", "name"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "name", at), "name", in.ordinal);
+}
+
+inline void parse_set_trigger_state(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(in.body, {"kind", "schema", "table", "trigger", "enabled"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "trigger", at), "trigger", in.ordinal);
+  if (!in.body.contains("enabled") || !in.body["enabled"].is_boolean()) {
+    detail::fail(at + ".enabled must be stated as a boolean", "");
+  }
+}
+
+inline void parse_grant_like(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  const bool granting = in.kind == IntentKind::kGrant;
+  const std::string who = granting ? "to" : "from";
+  detail::reject_unknown_keys(
+      in.body, {"kind", "schema", "table", "privileges", "columns", who}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
+  if (!in.body.contains("privileges") || !in.body["privileges"].is_array() ||
+      in.body["privileges"].empty()) {
+    detail::fail(at + ".privileges must be a non-empty array",
+                 "SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, "
+                 "TRIGGER, or ALL.");
+  }
+  static const std::set<std::string> kPrivs = {
+      "SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE",
+      "REFERENCES", "TRIGGER", "ALL"};
+  for (const auto& pv : in.body["privileges"]) {
+    if (!pv.is_string() || kPrivs.count(pv.get<std::string>()) == 0) {
+      detail::fail(at + ".privileges has an unknown privilege: " + pv.dump(),
+                   "Written in upper case, one of SELECT, INSERT, UPDATE, "
+                   "DELETE, TRUNCATE, REFERENCES, TRIGGER, ALL. They are not "
+                   "passed through unchecked, because a typo would otherwise "
+                   "reach the database as SQL.");
+    }
+  }
+  if (!in.body.contains(who) || !in.body[who].is_array() || in.body[who].empty()) {
+    detail::fail(at + "." + who + " must be a non-empty array of roles",
+                 "Use \"PUBLIC\" for everyone.");
+  }
+  for (const auto& r : in.body[who]) {
+    if (!r.is_string()) detail::fail(at + "." + who + " must be strings", "");
+  }
+  if (in.body.contains("columns")) {
+    if (!in.body["columns"].is_array() || in.body["columns"].empty()) {
+      detail::fail(at + ".columns must be a non-empty array", "");
+    }
+    for (const auto& cn : in.body["columns"]) {
+      if (!cn.is_string()) detail::fail(at + ".columns must be strings", "");
+      detail::require_identifier(cn.get<std::string>(), "columns", in.ordinal);
+    }
+  }
+}
+
+inline void parse_delete_rows(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(
+      in.body, {"kind", "schema", "table", "key", "where", "verify_remaining",
+                "preserve"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "key", at), "key", in.ordinal);
+  // Read with value() rather than require_string(), so the refusal below is the
+  // one the author sees. require_string rejects an empty string first, with a
+  // generic message -- which made this hint dead code until a test noticed.
+  // Worded to match backfill's, because it is the same mistake.
+  const auto where = in.body.value("where", "");
+  if (!in.body.contains("where") || !in.body["where"].is_string() || where.empty()) {
+    detail::fail(at + " has no \"where\" clause",
+                 "An unfiltered delete empties the table. If that is really "
+                 "intended, write \"where\": \"true\" and say so in the "
+                 "rationale -- and consider whether drop_table is what you "
+                 "meant instead.");
+  }
+  if (in.body.contains("verify_remaining") &&
+      !in.body["verify_remaining"].is_string()) {
+    detail::fail(at + ".verify_remaining must be a string", "");
+  }
+}
+
+inline void parse_create_table(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(
+      in.body, {"kind", "schema", "table", "columns", "comment", "primary_key",
+                "partition_by", "unlogged"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
+  detail::require_string(in.body, "comment", at);
+  if (!in.body.contains("columns") || !in.body["columns"].is_array() ||
+      in.body["columns"].empty()) {
+    detail::fail(at + ".columns must be a non-empty array",
+                 "Each entry needs name, type, nullable and comment -- the "
+                 "same vocabulary add_column uses.");
+  }
+  for (const auto& col : in.body["columns"]) {
+    if (!col.is_object()) {
+      detail::fail(at + ".columns entries must be objects", "");
+    }
+    detail::reject_unknown_keys(
+        col, {"name", "type", "nullable", "default", "comment"},
+        at + ".columns");
+    detail::require_identifier(detail::require_string(col, "name", at), "name", in.ordinal);
+    detail::require_string(col, "type", at);
+    detail::require_string(col, "comment", at);
+    if (!col.contains("nullable") || !col["nullable"].is_boolean()) {
+      detail::fail(at + ".columns." + col.value("name", "?") +
+                       ".nullable must be stated as a boolean",
+                   "There is no default, for the same reason add_column has "
+                   "none: NOT NULL is a different risk class and must be "
+                   "written down.");
+    }
+  }
+  if (in.body.contains("primary_key")) {
+    if (!in.body["primary_key"].is_array() || in.body["primary_key"].empty()) {
+      detail::fail(at + ".primary_key must be a non-empty array of columns", "");
+    }
+    for (const auto& c : in.body["primary_key"]) {
+      if (!c.is_string()) detail::fail(at + ".primary_key must be strings", "");
+    }
+  }
+}
+
+inline void parse_drop_table(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(in.body, {"kind", "schema", "table"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
+  // No CASCADE, as everywhere else. Measured (S17): DROP TABLE ... CASCADE
+  // removes dependent views and inbound foreign keys, none of which the spec
+  // named.
+}
+
+inline void parse_rename(Intent& in, const std::string& what) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  std::set<std::string> allowed = {"kind", "schema", "table", "to"};
+  if (!what.empty()) allowed.insert(what);
+  detail::reject_unknown_keys(in.body, allowed, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "to", at), "to", in.ordinal);
+  if (!what.empty()) {
+    detail::require_identifier(detail::require_string(in.body, what, at), what, in.ordinal);
+  }
+}
+
 inline void parse_attach_partition(Intent& in) {
   const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
   detail::reject_unknown_keys(
@@ -687,6 +915,18 @@ inline Spec parse_spec(const json& doc) {
     case IntentKind::kAddPrimaryKey: parse_unique_like(in); break;
     case IntentKind::kAttachPartition: parse_attach_partition(in); break;
     case IntentKind::kDetachPartition: parse_detach_partition(in); break;
+    case IntentKind::kRenameTable: parse_rename(in, {}); break;
+    case IntentKind::kRenameColumn: parse_rename(in, "column"); break;
+    case IntentKind::kRenameConstraint: parse_rename(in, "name"); break;
+    case IntentKind::kCreateTable: parse_create_table(in); break;
+    case IntentKind::kDropTable: parse_drop_table(in); break;
+    case IntentKind::kDeleteRows: parse_delete_rows(in); break;
+    case IntentKind::kSetRowSecurity: parse_set_row_security(in); break;
+    case IntentKind::kCreatePolicy: parse_create_policy(in); break;
+    case IntentKind::kDropPolicy: parse_drop_policy(in); break;
+    case IntentKind::kSetTriggerState: parse_set_trigger_state(in); break;
+    case IntentKind::kGrant:
+    case IntentKind::kRevoke: parse_grant_like(in); break;
     }
     s.intents.push_back(std::move(in));
     ++ordinal;

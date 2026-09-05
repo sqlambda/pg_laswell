@@ -368,6 +368,68 @@ inline void project(const Intent& in, const Step& step, Observations& projected)
     case IntentKind::kDropColumn:
       projected.tables[qualified]["columns"].erase(in.body.value("column", ""));
       return;
+    case IntentKind::kCreateTable: {
+      json cols = json::object();
+      for (const auto& c : in.body.value("columns", json::array())) {
+        cols[c.value("name", "")] =
+            json{{"type", c.value("type", "")},
+                 {"not_null", !c.value("nullable", true)}};
+      }
+      projected.tables[qualified] =
+          json{{"exists", true}, {"kind", "table"}, {"columns", cols},
+               {"indexes", json::object()}, {"constraints", json::object()},
+               {"dependent_views", json::object()},
+               {"referenced_by", json::array()}, {"size_estimate", 0}};
+      return;
+    }
+    case IntentKind::kDropTable:
+      projected.tables[qualified] = json{{"exists", false}};
+      return;
+    case IntentKind::kDeleteRows:
+      return;  // rows change, the schema does not
+    case IntentKind::kSetRowSecurity:
+      projected.tables[qualified]["row_security"] =
+          json{{"enabled", in.body.value("enabled", false)},
+               {"forced", in.body.value("force", false)}};
+      return;
+    case IntentKind::kCreatePolicy:
+      projected.tables[qualified]["policies"][in.body.value("name", "")] =
+          json{{"command", in.body.value("command", "ALL")}};
+      return;
+    case IntentKind::kDropPolicy:
+      projected.tables[qualified]["policies"].erase(in.body.value("name", ""));
+      return;
+    case IntentKind::kSetTriggerState:
+      projected.tables[qualified]["triggers"][in.body.value("trigger", "")]
+               ["enabled"] = in.body.value("enabled", false);
+      return;
+    case IntentKind::kGrant:
+    case IntentKind::kRevoke:
+      return;  // privileges are not part of the shape later intents plan against
+    case IntentKind::kRenameTable: {
+      const auto to = in.body.value("schema", "") + "." + in.body.value("to", "");
+      projected.tables[to] = projected.tables[qualified];
+      projected.tables.erase(qualified);
+      return;
+    }
+    case IntentKind::kRenameColumn: {
+      auto& cols = projected.tables[qualified]["columns"];
+      const auto from = in.body.value("column", "");
+      if (cols.contains(from)) {
+        cols[in.body.value("to", "")] = cols[from];
+        cols.erase(from);
+      }
+      return;
+    }
+    case IntentKind::kRenameConstraint: {
+      auto& cs = projected.tables[qualified]["constraints"];
+      const auto from = in.body.value("name", "");
+      if (cs.contains(from)) {
+        cs[in.body.value("to", "")] = cs[from];
+        cs.erase(from);
+      }
+      return;
+    }
     case IntentKind::kAttachPartition: {
       const auto ch = in.body.value("schema", "") + "." + in.body.value("partition", "");
       projected.tables[qualified]["partitions"].push_back(ch);
@@ -1390,6 +1452,624 @@ inline void warn_about_rebuild(
 }
 
 }  // namespace detail
+
+// --- row security, policies, triggers, grants ------------------------------
+//
+// These emit one statement each, and they belong here by the second test: every
+// one is a change to schema state, applied once. They are also the changes
+// whose EFFECT is least visible from the session that makes them, which is
+// where the planning value is.
+//
+// Locks, measured on 18.6:
+//   ALTER TABLE ... DISABLE TRIGGER   ShareRowExclusiveLock  (blocks writes,
+//                                                             not reads)
+//   ENABLE ROW LEVEL SECURITY         AccessExclusiveLock
+//   CREATE POLICY                     AccessExclusiveLock
+//   GRANT                             AccessShareLock        (cheap)
+inline void plan_security(const Intent& in, const Observations& obs, Plan& plan,
+                          std::vector<Step>& out) {
+  Step step;
+  step.kind = in.kind_name;
+  struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
+
+  const auto qualified = in.qualified_table();
+  const auto& t = obs.table(qualified);
+  if (!t.value("exists", false)) {
+    step.action = Action::kConflict;
+    step.why = qualified + " does not exist";
+    plan.conflicts.push_back(step.why);
+    return;
+  }
+  step.txn_class = TxnClass::kRequired;
+
+  switch (in.kind) {
+    case IntentKind::kSetRowSecurity: {
+      const bool want = in.body.value("enabled", false);
+      const bool force = in.body.value("force", false);
+      const json rls = t.value("row_security", json::object());
+      if (rls.value("enabled", false) == want &&
+          rls.value("forced", false) == force) {
+        step.action = Action::kSatisfied;
+        step.why = "row security on " + qualified + " is already " +
+                   (want ? "enabled" : "disabled") +
+                   (force ? " and forced" : "");
+        return;
+      }
+      step.sql.push_back("ALTER TABLE " + qualified +
+                         (want ? " ENABLE" : " DISABLE") +
+                         " ROW LEVEL SECURITY;");
+      if (want) {
+        step.sql.push_back("ALTER TABLE " + qualified +
+                           (force ? " FORCE" : " NO FORCE") +
+                           " ROW LEVEL SECURITY;");
+      }
+      step.lock = "AccessExclusiveLock on " + qualified;
+      step.why = std::string(want ? "enabling" : "disabling") +
+                 " row-level security is a catalog change, and its effect is "
+                 "immediate for every session already connected";
+
+      // The measured trap, and the reason this kind is worth having. Enabling
+      // RLS with no policy is not a no-op: it is a default deny.
+      if (want) {
+        const json policies = t.value("policies", json::object());
+        if (policies.empty()) {
+          plan.warnings.push_back(
+              "enabling row-level security on " + qualified +
+              " with NO POLICY hides every row from every non-owner. Measured "
+              "on 18.6: an application role reading the table went from 1000 "
+              "rows to 0, with no error -- the query succeeds and returns "
+              "nothing. Create the policies in EARLIER intents than this one.");
+        }
+        plan.warnings.push_back(
+            "you will probably not be able to see this working. Measured: a "
+            "table's OWNER bypasses row-level security unless FORCE is also "
+            "set" + std::string(force ? " (this plan sets it)" : "") +
+            ", and a SUPERUSER bypasses it whatever either flag says. "
+            "Verifying an RLS change from a superuser session shows no change "
+            "at all, however wrong the policy is. Check it as the application "
+            "role, with SET ROLE.");
+      }
+      step.detail["enabled"] = want;
+      step.detail["forced"] = force;
+      return;
+    }
+
+    case IntentKind::kCreatePolicy: {
+      const auto name = in.body.value("name", "");
+      const json policies = t.value("policies", json::object());
+      if (policies.contains(name)) {
+        step.action = Action::kSatisfied;
+        step.why = "policy " + name + " already exists on " + qualified;
+        return;
+      }
+      std::string sql = "CREATE POLICY " + detail::quote_identifier(name) +
+                        " ON " + qualified;
+      if (in.body.contains("command")) sql += " FOR " + in.body.value("command", "");
+      if (in.body.contains("roles")) {
+        std::vector<std::string> roles;
+        for (const auto& r : in.body["roles"]) {
+          roles.push_back(detail::quote_identifier(r.get<std::string>()));
+        }
+        sql += " TO " + detail::join(roles, ", ");
+      }
+      if (in.body.contains("using")) sql += " USING (" + in.body.value("using", "") + ")";
+      if (in.body.contains("check")) {
+        sql += " WITH CHECK (" + in.body.value("check", "") + ")";
+      }
+      step.sql.push_back(sql + ";");
+      step.lock = "AccessExclusiveLock on " + qualified;
+      step.why = "adding a policy is a catalog change, and it takes effect for "
+                 "sessions already connected";
+      step.detail["policy"] = name;
+      if (!t.value("row_security", json::object()).value("enabled", false)) {
+        plan.warnings.push_back(
+            "policy \"" + name + "\" is being created on " + qualified +
+            ", which does not have row-level security ENABLED. The policy is "
+            "stored and does nothing at all until it is. That is the safe "
+            "order to write it in -- policies first, then set_row_security -- "
+            "but only if the enabling intent actually follows.");
+      }
+      if (!in.body.contains("check") && in.body.contains("command") &&
+          in.body.value("command", "") != "SELECT") {
+        plan.warnings.push_back(
+            "policy \"" + name + "\" has USING but no WITH CHECK. USING filters "
+            "the rows a statement may SEE; WITH CHECK constrains the rows it "
+            "may WRITE. With only USING, a role can insert or update a row "
+            "into a state its own policy would not have let it read back.");
+      }
+      return;
+    }
+
+    case IntentKind::kDropPolicy: {
+      const auto name = in.body.value("name", "");
+      const json policies = t.value("policies", json::object());
+      if (!policies.contains(name)) {
+        step.action = Action::kSatisfied;
+        step.why = "no policy named " + name + " on " + qualified;
+        return;
+      }
+      step.sql.push_back("DROP POLICY " + detail::quote_identifier(name) +
+                         " ON " + qualified + ";");
+      step.lock = "AccessExclusiveLock on " + qualified;
+      step.why = "dropping a policy is a catalog change";
+      step.detail["policy"] = name;
+      if (policies.size() == 1 &&
+          t.value("row_security", json::object()).value("enabled", false)) {
+        plan.warnings.push_back(
+            "\"" + name + "\" is the LAST policy on " + qualified +
+            " and row-level security stays enabled, so afterwards every "
+            "non-owner sees zero rows -- silently, with no error. If the "
+            "intention is to stop filtering, disable row security in the same "
+            "migration.");
+      }
+      return;
+    }
+
+    case IntentKind::kSetTriggerState: {
+      const auto name = in.body.value("trigger", "");
+      const bool want = in.body.value("enabled", false);
+      const json triggers = t.value("triggers", json::object());
+      if (!triggers.contains(name)) {
+        step.action = Action::kConflict;
+        step.why = "no trigger named " + name + " on " + qualified;
+        plan.conflicts.push_back(step.why);
+        return;
+      }
+      if (triggers[name].value("enabled", true) == want) {
+        step.action = Action::kSatisfied;
+        step.why = "trigger " + name + " is already " +
+                   (want ? "enabled" : "disabled");
+        return;
+      }
+      step.sql.push_back("ALTER TABLE " + qualified +
+                         (want ? " ENABLE TRIGGER " : " DISABLE TRIGGER ") +
+                         detail::quote_identifier(name) + ";");
+      step.lock = "ShareRowExclusiveLock on " + qualified +
+                  " -- blocks writes, not reads";
+      step.why =
+          "measured on 18.6: this takes ShareRowExclusiveLock rather than the "
+          "AccessExclusiveLock most ALTER TABLE forms need, so readers are "
+          "unaffected";
+      step.detail["trigger"] = name;
+      if (!want) {
+        plan.warnings.push_back(
+            "while trigger \"" + name + "\" is disabled, whatever it maintains "
+            "stops being maintained -- an audit row not written, a denormalised "
+            "column not updated, a total not adjusted. Nothing records the gap, "
+            "and re-enabling does not backfill it. If rows change in between, "
+            "they will need repairing explicitly.");
+      }
+      return;
+    }
+
+    default: break;  // grant / revoke below
+  }
+
+  // grant / revoke
+  const bool granting = in.kind == IntentKind::kGrant;
+  std::vector<std::string> privs;
+  for (const auto& pv : in.body.value("privileges", json::array())) {
+    privs.push_back(pv.get<std::string>());
+  }
+  std::vector<std::string> roles;
+  for (const auto& r : in.body.value(granting ? "to" : "from", json::array())) {
+    const auto name = r.get<std::string>();
+    roles.push_back(name == "PUBLIC" ? "PUBLIC" : detail::quote_identifier(name));
+  }
+  std::string cols;
+  if (in.body.contains("columns")) {
+    std::vector<std::string> cs;
+    for (const auto& cn : in.body["columns"]) {
+      cs.push_back(detail::quote_identifier(cn.get<std::string>()));
+    }
+    // The column list goes after the PRIVILEGE, not after the relation. The
+    // other order is a syntax error -- found once already, by running it.
+    cols = " (" + detail::join(cs, ", ") + ")";
+  }
+  step.sql.push_back(std::string(granting ? "GRANT " : "REVOKE ") +
+                     detail::join(privs, ", ") + cols +
+                     " ON " + qualified + (granting ? " TO " : " FROM ") +
+                     detail::join(roles, ", ") + ";");
+  step.lock = "AccessShareLock on " + qualified +
+              " -- measured; a privilege change does not block anything";
+  step.why = std::string(granting ? "granting" : "revoking") +
+             " takes only AccessShareLock, so this is safe on a busy table at "
+             "any size";
+  step.detail["privileges"] = privs;
+  if (!granting) {
+    plan.warnings.push_back(
+        "a revoke takes effect for sessions that are ALREADY CONNECTED, on "
+        "their next statement. An application holding a pool of connections "
+        "starts failing immediately, not at its next deploy.");
+  }
+}
+
+// --- delete_rows -----------------------------------------------------------
+//
+// A retention purge, paced exactly as a backfill is and for the same reason: a
+// single DELETE over a retention window holds locks for as long as it takes and
+// is the same outage a single UPDATE would be. The executor's paced runner is
+// generic over the statement -- $1 is the cursor, $2 the batch size, and the
+// key comes back in RETURNING -- so this is a planner change and nothing else.
+//
+// It is a migration by both tests: it changes state, and it is applied once.
+inline void plan_delete_rows(const Intent& in, const Observations& obs,
+                             const ExecutorConfig& cfg, Plan& plan,
+                             std::vector<Step>& out) {
+  Step step;
+  step.kind = in.kind_name;
+  struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
+
+  const auto qualified = in.qualified_table();
+  const auto& t = obs.table(qualified);
+  const auto key = in.body.value("key", "");
+  const auto where = in.body.value("where", "");
+
+  if (!t.value("exists", false)) {
+    step.action = Action::kConflict;
+    step.why = qualified + " does not exist";
+    plan.conflicts.push_back(step.why);
+    return;
+  }
+  const json columns = t.value("columns", json::object());
+  if (!columns.contains(key)) {
+    step.action = Action::kConflict;
+    step.why = qualified + "." + key + " does not exist";
+    plan.conflicts.push_back(
+        step.why + ", so there is nothing to walk the table by.");
+    return;
+  }
+
+  // A delete that removes a parent row a foreign key points at fails per row,
+  // mid-batch, after some batches have already committed. Saying so first is
+  // the difference between a migration that stops understandably and one that
+  // stops half-done.
+  const auto referenced = t.value("referenced_by", json::array());
+  if (!referenced.empty()) {
+    std::vector<std::string> names;
+    for (const auto& r : referenced) names.push_back(r.get<std::string>());
+    plan.warnings.push_back(
+        qualified + " is referenced by " + detail::join(names, ", ") +
+        ". Any row still referenced will fail its batch, and because this is "
+        "paced, earlier batches have already COMMITTED by then -- the purge "
+        "stops part-done rather than rolling back. Delete the children first, "
+        "in an earlier intent, or confirm the constraint cascades.");
+  }
+
+  const auto rows = t.value("reltuples", 0LL);
+  step.txn_class = TxnClass::kOwnTxnPerBatch;
+  step.sql.push_back(
+      "WITH batch AS (\n"
+      "  SELECT " + qualified + "." + key + "\n"
+      "    FROM " + qualified + "\n"
+      "   WHERE " + qualified + "." + key + " > $1 AND (" + where + ")\n"
+      "   ORDER BY " + qualified + "." + key + "\n"
+      "   LIMIT $2\n"
+      "   FOR UPDATE\n"
+      ")\n"
+      "DELETE FROM " + qualified + "\n"
+      " USING batch AS b\n"
+      " WHERE " + qualified + "." + key + " = b." + key + "\n"
+      "RETURNING " + qualified + "." + key + ";");
+
+  step.lock = "RowExclusiveLock on " + qualified +
+              " -- no table-level exclusive lock at any point";
+  step.why =
+      "deleting " + std::to_string(rows) +
+      " estimated rows in batches of " + std::to_string(cfg.batch_rows) +
+      ", committing on a lock waiter, on " + std::to_string(cfg.commit_interval_ms) +
+      "ms elapsed, or on " + std::to_string(cfg.batch_cap_rows) +
+      " rows -- whichever comes first. A single DELETE over the same predicate "
+      "would hold its locks for the whole of it";
+  step.detail["qualified"] = qualified;
+  step.detail["key"] = key;
+  step.detail["where"] = where;
+  step.detail["batch_rows"] = cfg.batch_rows;
+  step.detail["commit_interval_ms"] = cfg.commit_interval_ms;
+  step.detail["batch_cap_rows"] = cfg.batch_cap_rows;
+  step.detail["rows_estimated"] = rows;
+  if (in.body.contains("verify_remaining")) {
+    step.detail["verify_remaining"] = in.body["verify_remaining"];
+  }
+
+  // The space is not returned to the operating system, and an operator who
+  // expects it to be will go looking for a bug that is not there.
+  plan.warnings.push_back(
+      "a delete does not shrink " + qualified +
+      " on disk: the rows become dead tuples and the space is reused by future "
+      "inserts, not returned to the filesystem. Autovacuum will reclaim it for "
+      "reuse; only VACUUM FULL or pg_repack returns it, and neither is a "
+      "migration. pg_licht tableBloat shows what is actually there afterwards.");
+}
+
+// --- create_table / drop_table ---------------------------------------------
+//
+// These emit one statement whatever the database looks like, so the original
+// rule -- a kind must make a real decision -- excluded them. That was the wrong
+// instrument. The second test decides it: a migration is a change to schema
+// state applied exactly once, and creating a table is the clearest example
+// there is. A repository that cannot express the tables it depends on describes
+// a database that does not exist.
+inline void plan_create_table(const Intent& in, const Observations& obs,
+                              Plan& plan, std::vector<Step>& out) {
+  Step step;
+  step.kind = in.kind_name;
+  struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
+
+  const auto qualified = in.qualified_table();
+  const auto& t = obs.table(qualified);
+
+  if (t.value("exists", false)) {
+    // Deliberately NOT compared column by column. A table that exists with a
+    // different shape is a conflict the author has to look at, and quietly
+    // reporting "satisfied" over a table that differs would be the worst
+    // possible answer -- it is how a migration silently does nothing.
+    step.action = Action::kSatisfied;
+    step.why = qualified + " already exists";
+    plan.warnings.push_back(
+        qualified +
+        " already exists, so create_table is reported satisfied WITHOUT "
+        "comparing its columns to the spec. This kind proves absence, not "
+        "shape: if the existing table might differ, check it, or express the "
+        "difference as add_column and alter_column_type intents which do "
+        "compare.");
+    return;
+  }
+
+  std::vector<std::string> defs;
+  std::vector<std::string> comments;
+  for (const auto& col : in.body.value("columns", json::array())) {
+    const auto name = col.value("name", "");
+    std::string d = detail::quote_identifier(name) + " " + col.value("type", "");
+    if (col.contains("default")) d += " DEFAULT " + col.value("default", "");
+    if (!col.value("nullable", true)) d += " NOT NULL";
+    defs.push_back(d);
+    comments.push_back("COMMENT ON COLUMN " + qualified + "." +
+                       detail::quote_identifier(name) + " IS " +
+                       detail::quote_literal(col.value("comment", "")) + ";");
+  }
+  if (in.body.contains("primary_key")) {
+    std::vector<std::string> pk;
+    for (const auto& c : in.body["primary_key"]) {
+      pk.push_back(detail::quote_identifier(c.get<std::string>()));
+    }
+    // Inline, and only here. On an EMPTY table there is no scan to avoid and
+    // nothing to lock out, so the two-step add_primary_key recipe would be
+    // machinery for nothing.
+    defs.push_back("PRIMARY KEY (" + detail::join(pk, ", ") + ")");
+  }
+
+  std::string sql = std::string("CREATE ") +
+                    (in.body.value("unlogged", false) ? "UNLOGGED " : "") +
+                    "TABLE " + qualified + " (\n  " + detail::join(defs, ",\n  ") +
+                    "\n)";
+  if (in.body.contains("partition_by")) {
+    sql += " PARTITION BY " + in.body.value("partition_by", "");
+  }
+  step.sql.push_back(sql + ";");
+  step.sql.push_back("COMMENT ON TABLE " + qualified + " IS " +
+                     detail::quote_literal(in.body.value("comment", "")) + ";");
+  for (auto& c : comments) step.sql.push_back(std::move(c));
+
+  step.txn_class = TxnClass::kRequired;
+  step.lock = "no lock on any existing object -- the table does not exist yet";
+  step.why =
+      "creating a table locks nothing and scans nothing, whatever else is "
+      "happening; the risk of this intent is what it OMITS, not what it does";
+  step.detail["columns"] = static_cast<int>(defs.size());
+  if (in.body.value("unlogged", false)) {
+    plan.warnings.push_back(
+        qualified +
+        " is UNLOGGED: it is not written to WAL, so it is not replicated to "
+        "any standby and its contents do not survive a crash. That is a "
+        "durability decision, not a performance setting.");
+  }
+}
+
+inline void plan_drop_table(const Intent& in, const Observations& obs,
+                            Plan& plan, std::vector<Step>& out) {
+  Step step;
+  step.kind = in.kind_name;
+  struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
+
+  const auto qualified = in.qualified_table();
+  const auto& t = obs.table(qualified);
+
+  if (!t.value("exists", false)) {
+    step.action = Action::kSatisfied;
+    step.why = qualified + " does not exist";
+    return;
+  }
+
+  // Both kinds of dependant, because PostgreSQL refuses for either and the
+  // catalog shows both beforehand (measured, S17).
+  std::vector<std::string> blockers;
+  const json blocking_views = t.value("dependent_views", json::object());
+  for (const auto& [name, v] : blocking_views.items()) {
+    (void)v;
+    blockers.push_back("view " + name);
+  }
+  for (const auto& fk : t.value("referenced_by", json::array())) {
+    blockers.push_back("foreign key " + fk.get<std::string>());
+  }
+  if (!blockers.empty()) {
+    step.action = Action::kConflict;
+    step.why = qualified + " has " + std::to_string(blockers.size()) +
+               " dependant(s)";
+    plan.conflicts.push_back(
+        "cannot drop " + qualified + ": " + detail::join(blockers, ", ") +
+        " depend on it. Remove them in earlier intents, where each removal is "
+        "written down and reviewed. pg_laswell will not emit CASCADE, which "
+        "would drop every one of those objects without the spec ever naming "
+        "them.");
+    return;
+  }
+
+  step.txn_class = TxnClass::kRequired;
+  step.sql.push_back("DROP TABLE " + qualified + ";");
+  step.lock = "AccessExclusiveLock on " + qualified;
+  step.why =
+      "nothing depends on " + qualified +
+      ", so the drop is a brief catalog change whatever the table's size";
+  plan.warnings.push_back(
+      "dropping " + qualified + " is irreversible. " +
+      detail::human_bytes(t.value("size_estimate", 0LL)) +
+      " and roughly " + std::to_string(t.value("reltuples", 0LL)) +
+      " rows go at commit, and no revert recovers them. If the data may be "
+      "wanted, copy it out in an earlier intent.");
+}
+
+// --- rename_table / rename_column / rename_constraint ----------------------
+//
+// Measured (spike S17, 18.6): a rename needs NONE of the S13 view machinery.
+// Dependencies are held by OID, so the catalog repairs itself -- after
+// renaming a column, the dependent view's definition became
+// "SELECT id, value AS amount FROM t" on its own, views stacked on it stayed
+// queryable, and the index, CHECK and foreign-key definitions all followed.
+// The lock is AccessExclusiveLock on the table alone; no view is locked.
+//
+// What does NOT change is the part people expect to. The view keeps its own
+// output column name, so after renaming amount to value the view still exposes
+// a column called "amount". That is good for compatibility and it means the
+// rename does not reach anything reading through a view -- half-done, from the
+// application's point of view, and silently. Saying so is most of the value
+// this intent kind adds.
+inline void plan_rename(const Intent& in, const Observations& obs, Plan& plan,
+                        std::vector<Step>& out) {
+  Step step;
+  step.kind = in.kind_name;
+  struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
+
+  const auto qualified = in.qualified_table();
+  const auto& t = obs.table(qualified);
+  const auto to = in.body.value("to", "");
+
+  if (!t.value("exists", false)) {
+    step.action = Action::kConflict;
+    step.why = qualified + " does not exist";
+    plan.conflicts.push_back(step.why);
+    return;
+  }
+
+  step.txn_class = TxnClass::kRequired;
+  step.lock = "AccessExclusiveLock on " + qualified +
+              " only -- dependent views are not locked and not rebuilt";
+  step.detail["to"] = to;
+
+  const json views = t.value("dependent_views", json::object());
+
+  if (in.kind == IntentKind::kRenameTable) {
+    if (in.table() == to) {
+      step.action = Action::kSatisfied;
+      step.why = qualified + " is already named " + to;
+      return;
+    }
+    step.sql.push_back("ALTER TABLE " + qualified + " RENAME TO " +
+                       detail::quote_identifier(to) + ";");
+    step.why =
+        "renaming a table is catalog-only, and every index, constraint and "
+        "dependent view follows it by OID -- measured, not assumed";
+    if (!views.empty()) {
+      plan.warnings.push_back(
+          std::to_string(views.size()) + " view(s) read " + qualified +
+          " and will follow the rename automatically -- their stored "
+          "definitions are rewritten to name " + to +
+          ". Nothing in the database breaks. What breaks is anything holding "
+          "the OLD name as text: application SQL, a search_path-dependent "
+          "script, a dashboard query.");
+    }
+    return;
+  }
+
+  if (in.kind == IntentKind::kRenameColumn) {
+    const auto column = in.body.value("column", "");
+    const json columns = t.value("columns", json::object());
+    if (columns.contains(to) && !columns.contains(column)) {
+      step.action = Action::kSatisfied;
+      step.why = qualified + "." + to + " already exists and " + column +
+                 " does not, so the rename has been applied";
+      return;
+    }
+    if (!columns.contains(column)) {
+      step.action = Action::kConflict;
+      step.why = qualified + "." + column + " does not exist";
+      plan.conflicts.push_back(step.why);
+      return;
+    }
+    if (columns.contains(to)) {
+      step.action = Action::kConflict;
+      step.why = qualified + "." + to + " already exists";
+      plan.conflicts.push_back(
+          "cannot rename " + qualified + "." + column + " to " + to +
+          ": a column of that name is already there. Drop or rename it first, "
+          "in an earlier intent.");
+      return;
+    }
+    step.sql.push_back("ALTER TABLE " + qualified + " RENAME COLUMN " +
+                       detail::quote_identifier(column) + " TO " +
+                       detail::quote_identifier(to) + ";");
+    step.why =
+        "renaming a column is catalog-only; indexes, constraints and view "
+        "definitions follow it by OID with no rebuild";
+    step.detail["column"] = column;
+
+    // The measured surprise, and the reason this is worth an intent kind at
+    // all rather than a psql call.
+    std::vector<std::string> reading;
+    for (const auto& [name, v] : views.items()) {
+      for (const auto& c : v.value("uses_columns", json::array())) {
+        if (c.get<std::string>() == column) reading.push_back(name);
+      }
+    }
+    if (!reading.empty()) {
+      plan.warnings.push_back(
+          detail::join(reading, ", ") + " read " + qualified + "." + column +
+          " and will follow the rename, but each KEEPS ITS OWN OUTPUT NAME: "
+          "the view definition becomes \"" + to + " AS " + column +
+          "\" and anything selecting through the view still sees \"" + column +
+          "\". Measured on 18.6. So this rename does not reach the "
+          "application at all unless those views are changed too, with "
+          "replace_view intents -- and nothing will error to tell you.");
+    }
+    return;
+  }
+
+  // rename_constraint
+  const auto name = in.body.value("name", "");
+  const json constraints = t.value("constraints", json::object());
+  if (constraints.contains(to) && !constraints.contains(name)) {
+    step.action = Action::kSatisfied;
+    step.why = to + " already exists on " + qualified + " and " + name +
+               " does not, so the rename has been applied";
+    return;
+  }
+  if (!constraints.contains(name)) {
+    step.action = Action::kConflict;
+    step.why = "no constraint named " + name + " on " + qualified;
+    plan.conflicts.push_back(step.why);
+    return;
+  }
+  if (constraints.contains(to)) {
+    step.action = Action::kConflict;
+    step.why = to + " already exists on " + qualified;
+    plan.conflicts.push_back("cannot rename " + name + " to " + to + " on " +
+                             qualified + ": that name is taken.");
+    return;
+  }
+  step.sql.push_back("ALTER TABLE " + qualified + " RENAME CONSTRAINT " +
+                     detail::quote_identifier(name) + " TO " +
+                     detail::quote_identifier(to) + ";");
+  step.why = "renaming a constraint is catalog-only";
+  step.detail["constraint"] = name;
+  if (constraints[name].value("has_index", false)) {
+    plan.warnings.push_back(
+        "renaming constraint \"" + name + "\" also renames its backing index "
+        "to \"" + to +
+        "\" -- measured on 18.6. Anything naming the old index, a dashboard or "
+        "an alert or a REINDEX script, stops matching, and PostgreSQL says "
+        "nothing about it.");
+  }
+}
 
 // --- attach_partition / detach_partition -----------------------------------
 //
@@ -2747,6 +3427,23 @@ inline Plan plan_migration(const Spec& spec, const Observations& obs,
         plan_attach_partition(in, projected, plan, emitted); break;
       case IntentKind::kDetachPartition:
         plan_detach_partition(in, projected, plan, emitted); break;
+      case IntentKind::kRenameTable:
+      case IntentKind::kRenameColumn:
+      case IntentKind::kRenameConstraint:
+        plan_rename(in, projected, plan, emitted); break;
+      case IntentKind::kCreateTable:
+        plan_create_table(in, projected, plan, emitted); break;
+      case IntentKind::kDropTable:
+        plan_drop_table(in, projected, plan, emitted); break;
+      case IntentKind::kDeleteRows:
+        plan_delete_rows(in, projected, cfg, plan, emitted); break;
+      case IntentKind::kSetRowSecurity:
+      case IntentKind::kCreatePolicy:
+      case IntentKind::kDropPolicy:
+      case IntentKind::kSetTriggerState:
+      case IntentKind::kGrant:
+      case IntentKind::kRevoke:
+        plan_security(in, projected, plan, emitted); break;
     }
     if (!emitted.empty()) project(in, emitted.front(), projected);
 

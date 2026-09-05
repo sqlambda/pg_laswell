@@ -37,7 +37,8 @@ namespace detail {
 inline const char* kTableObservationSql = R"SQL(
 WITH target AS (
   SELECT c.oid, c.relname, c.relkind, c.relispartition, c.reltuples, c.relpages,
-         c.reloptions, c.relowner, n.nspname
+         c.reloptions, c.relowner, c.relacl,
+         c.relrowsecurity, c.relforcerowsecurity, n.nspname
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
    WHERE n.nspname = $1 AND c.relname = $2
@@ -109,6 +110,42 @@ SELECT COALESCE(
                    JOIN pg_am am ON am.oid = ic.relam
                   WHERE i.indrelid = t.oid),
                  '{}'::jsonb),
+     -- Row-level security, its policies, and the table's own triggers.
+     --
+     -- relrowsecurity alone is not the whole answer: measured on 18.6, an
+     -- owner BYPASSES RLS unless relforcerowsecurity is also set, and a
+     -- superuser bypasses it whatever either flag says. Both are recorded so
+     -- the planner can say which of those a reader is about to be fooled by.
+     'row_security', JSONB_BUILD_OBJECT(
+        'enabled', t.relrowsecurity, 'forced', t.relforcerowsecurity),
+     'policies', COALESCE((
+        SELECT JSONB_OBJECT_AGG(pol.polname, JSONB_BUILD_OBJECT(
+                 'command', pol.polcmd::text,
+                 'permissive', pol.polpermissive,
+                 'roles', COALESCE((SELECT JSONB_AGG(PG_GET_USERBYID(r))
+                                      FROM UNNEST(pol.polroles) AS r), '[]'::jsonb),
+                 'using', PG_GET_EXPR(pol.polqual, pol.polrelid),
+                 'check', PG_GET_EXPR(pol.polwithcheck, pol.polrelid)))
+          FROM pg_policy pol WHERE pol.polrelid = t.oid), '{}'::jsonb),
+     'triggers', COALESCE((
+        SELECT JSONB_OBJECT_AGG(tg.tgname, JSONB_BUILD_OBJECT(
+                 -- tgenabled: O origin, D disabled, R replica, A always.
+                 'enabled', tg.tgenabled = 'O' OR tg.tgenabled = 'A',
+                 'state', tg.tgenabled::text,
+                 'definition', PG_GET_TRIGGERDEF(tg.oid)))
+          FROM pg_trigger tg
+         WHERE tg.tgrelid = t.oid AND NOT tg.tgisinternal), '{}'::jsonb),
+     'grants', COALESCE(TO_JSONB(t.relacl::text[]), '[]'::jsonb),
+     -- Foreign keys pointing AT this table, from elsewhere.
+     --
+     -- The table's own constraints say what it depends on; this says what
+     -- depends on it, and only this can answer whether a DROP will be refused.
+     -- Measured (S17): DROP TABLE names the inbound constraint and stops.
+     'referenced_by', COALESCE((
+        SELECT JSONB_AGG(k.conname || ' on ' || k.conrelid::regclass::text
+                         ORDER BY k.conname)
+          FROM pg_constraint k
+         WHERE k.contype = 'f' AND k.confrelid = t.oid), '[]'::jsonb),
      -- Views that read this table, transitively, with everything a rebuild
      -- has to put back.
      --
