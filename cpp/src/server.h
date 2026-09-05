@@ -25,9 +25,11 @@
 //     worker threads are running, so "who may touch stdout" needs to be one
 //     answer -- run() -- rather than a convention.
 
+#include <functional>
 #include <iostream>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -55,33 +57,28 @@ inline constexpr int kInvalidRequest = -32600;
 inline constexpr int kMethodNotFound = -32601;
 inline constexpr int kInvalidParams = -32602;
 
-class McpServer;
-
 // One tool, declared once. `invoke` receives the already-extracted `arguments`
 // object and returns the payload; the framing around it (content block,
 // structuredContent, isError) is applied by the caller so no tool can get it
 // subtly wrong.
+//
+// `invoke` is a std::function rather than a plain pointer so a tool can close
+// over whatever it needs -- a connection registry, a cache, a job table --
+// without this header knowing those types exist. That is what keeps the
+// transport free of any dependency on the tools, and therefore free of pqxx.
 struct ToolDef {
-  const char* name;         // camelCase on the wire
-  const char* description;  // what the model reads when choosing
-  json (*input_schema)();
-  json (*output_schema)();
+  std::string name;         // camelCase on the wire
+  std::string description;  // what the model reads when choosing
+  std::function<json()> input_schema;
+  std::function<json()> output_schema;
   struct {
-    bool read_only;
-    bool destructive;
-    bool idempotent;
-    bool long_running;  // returns a jobId; the work outlives the call
+    bool read_only = true;
+    bool destructive = false;
+    bool idempotent = true;
+    bool long_running = false;  // returns a jobId; the work outlives the call
   } hints;
-  json (*invoke)(McpServer&, const json& arguments);
+  std::function<json(const json& arguments)> invoke;
 };
-
-// The sole registration site. Empty through phase 1: the machinery is here so
-// that phases 2-4 add a row rather than a subsystem, and so the consistency
-// tests exist before there is anything to be inconsistent about.
-inline const std::vector<ToolDef>& tool_defs() {
-  static const std::vector<ToolDef> kTools = {};
-  return kTools;
-}
 
 namespace detail {
 
@@ -112,6 +109,7 @@ inline std::string negotiate_protocol(const json& params) {
 class McpServer {
  public:
   McpServer() = default;
+  explicit McpServer(std::vector<ToolDef> tools) : tools_(std::move(tools)) {}
   McpServer(const McpServer&) = delete;
   McpServer& operator=(const McpServer&) = delete;
 
@@ -171,6 +169,7 @@ class McpServer {
   }
 
   const std::string& protocol() const { return protocol_; }
+  const std::vector<ToolDef>& tools() const { return tools_; }
 
  private:
   json initialize(const json& params) {
@@ -194,11 +193,11 @@ class McpServer {
     const bool wants_annotations = protocol_ >= "2025-03-26";
     const bool wants_output_schema = protocol_ >= "2025-06-18";
 
-    for (const auto& t : tool_defs()) {
+    for (const auto& t : tools_) {
       json entry{{"name", t.name},
                  {"description", t.description},
                  {"inputSchema", t.input_schema()}};
-      if (wants_output_schema && t.output_schema != nullptr) {
+      if (wants_output_schema && t.output_schema) {
         entry["outputSchema"] = t.output_schema();
       }
       if (wants_annotations) {
@@ -222,10 +221,10 @@ class McpServer {
                                ? params["arguments"]
                                : json::object();
 
-    for (const auto& t : tool_defs()) {
+    for (const auto& t : tools_) {
       if (name != t.name) continue;
       try {
-        return make_result(id, tool_result(t.invoke(*this, arguments)));
+        return make_result(id, tool_result(t.invoke(arguments)));
       } catch (const std::exception& e) {
         // A tool that throws produces an isError result rather than a
         // JSON-RPC error: the model can read and act on the former, whereas a
@@ -269,6 +268,7 @@ class McpServer {
   }
 
   std::string protocol_ = kDefaultProtocol;
+  std::vector<ToolDef> tools_;
 };
 
 }  // namespace pglaswell

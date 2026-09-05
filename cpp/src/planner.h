@@ -485,21 +485,50 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
   // skip contended rows while the cursor advanced past them, leaving a
   // backfill that reports complete and is not. It looks like the obviously
   // right pacing idiom and is wrong here.
+  // The `from` items appear in BOTH the CTE and the outer UPDATE, because the
+  // filter may reference them -- a backfill whose predicate joins to another
+  // table is the ordinary case, not the exotic one. An earlier version put
+  // them only in the outer UPDATE, which produced a CTE referencing an alias
+  // that was not in scope: SQL that renders convincingly and does not parse.
+  //
+  // FOR UPDATE OF t, not a bare FOR UPDATE: with a join, a bare FOR UPDATE
+  // locks rows in every table named, so the backfill would take row locks on
+  // the lookup table it merely reads. That is contention this tool exists to
+  // avoid, inflicted by its own batch statement.
+  // The target table is referenced by its OWN NAME, not by an alias.
+  //
+  // A spec's `where` and `set` expressions have to name the target somehow, and
+  // that choice is an interface contract: `orders.warehouse_id = w.id` and
+  // `t.warehouse_id = w.id` are both plausible, and a spec written for one
+  // fails against the other. Using the table's own name is what someone
+  // writing this SQL by hand would do, and it needs no explanation -- an alias
+  // would be a convention every author had to learn from a footnote.
+  //
+  // The `from` items appear in BOTH the CTE and the outer UPDATE, because the
+  // filter may reference them: a backfill whose predicate joins to another
+  // table is the ordinary case. An earlier version put them only in the outer
+  // UPDATE, producing a CTE that referenced an alias not in scope -- SQL that
+  // renders convincingly and does not parse.
+  //
+  // FOR UPDATE OF <target>, not a bare FOR UPDATE: with a join, a bare FOR
+  // UPDATE locks rows in every table named, so the backfill would take row
+  // locks on the lookup table it merely reads. That is contention this tool
+  // exists to avoid, inflicted by its own batch statement.
+  const std::string rel = in.table();
   const std::string batch_sql =
       "WITH batch AS (\n"
-      "  SELECT t." + key + "\n"
-      "    FROM " + qualified + " AS t\n"
-      "   WHERE t." + key + " > $1 AND (" + where + ")\n"
-      "   ORDER BY t." + key + "\n"
+      "  SELECT " + rel + "." + key + "\n"
+      "    FROM " + qualified + (from.empty() ? "" : ", " + from) + "\n"
+      "   WHERE " + rel + "." + key + " > $1 AND (" + where + ")\n"
+      "   ORDER BY " + rel + "." + key + "\n"
       "   LIMIT $2\n"
-      "   FOR UPDATE\n"
+      "   FOR UPDATE OF " + rel + "\n"
       ")\n"
-      "UPDATE " + qualified + " AS t\n"
-      "   SET " + detail::join(assignments, ", ") + "\n" +
-      (from.empty() ? "" : "  FROM " + from + ", batch AS b\n") +
-      (from.empty() ? "  FROM batch AS b\n" : "") +
-      " WHERE t." + key + " = b." + key + "\n"
-      "RETURNING t." + key + ";";
+      "UPDATE " + qualified + "\n"
+      "   SET " + detail::join(assignments, ", ") + "\n"
+      "  FROM batch AS b" + (from.empty() ? "" : ", " + from) + "\n"
+      " WHERE " + rel + "." + key + " = b." + key + "\n"
+      "RETURNING " + rel + "." + key + ";";
 
   step.sql.push_back(batch_sql);
   step.detail["batch_rows"] = cfg.batch_rows;

@@ -32,11 +32,13 @@
 #include "canonical.h"
 #include "catalog.h"
 #include "config.h"
+#include "ledger.h"
 #include "observations.h"
 #include "planner.h"
 #include "server.h"
 #include "session.h"
 #include "spec.h"
+#include "tools.h"
 #include "trust.h"
 
 using pglaswell::json;
@@ -194,12 +196,21 @@ TEST(Tools, ListIsDerivedEntirelyFromToolDefs) {
   initialize(s);
   const json r = rpc(s, json{{"jsonrpc", "2.0"}, {"id", 4}, {"method", "tools/list"}});
   ASSERT_TRUE(r["result"]["tools"].is_array()) << r.dump();
-  EXPECT_EQ(r["result"]["tools"].size(), pglaswell::tool_defs().size());
+  EXPECT_EQ(r["result"]["tools"].size(), s.tools().size());
 }
+
+namespace {
+pglaswell::ToolContext& tool_ctx() {
+  static pglaswell::ToolContext ctx{
+      pglaswell::Registry::from_url("port=5555 dbname=postgres", "test"), nullptr};
+  return ctx;
+}
+std::vector<pglaswell::ToolDef> all_tools() { return pglaswell::make_tools(tool_ctx()); }
+}  // namespace
 
 TEST(Tools, NamesAreUniqueAndCamelCase) {
   std::set<std::string> seen;
-  for (const auto& t : pglaswell::tool_defs()) {
+  for (const auto& t : all_tools()) {
     const std::string name = t.name;
     ASSERT_FALSE(name.empty());
     EXPECT_TRUE(seen.insert(name).second) << "duplicate tool name: " << name;
@@ -211,12 +222,11 @@ TEST(Tools, NamesAreUniqueAndCamelCase) {
 }
 
 TEST(Tools, EveryToolHasADescriptionAndSchemas) {
-  for (const auto& t : pglaswell::tool_defs()) {
-    EXPECT_NE(t.description, nullptr) << t.name;
-    EXPECT_STRNE(t.description, "") << t.name;
-    ASSERT_NE(t.input_schema, nullptr) << t.name;
+  for (const auto& t : all_tools()) {
+    EXPECT_FALSE(t.description.empty()) << t.name;
+    ASSERT_TRUE(static_cast<bool>(t.input_schema)) << t.name;
     EXPECT_TRUE(t.input_schema().is_object()) << t.name;
-    ASSERT_NE(t.invoke, nullptr) << t.name;
+    ASSERT_TRUE(static_cast<bool>(t.invoke)) << t.name;
   }
 }
 
@@ -224,9 +234,9 @@ TEST(Tools, EveryLongRunningToolReturnsAJobId) {
   // A long-running tool that returned results inline would block the stdio
   // loop for the length of a migration, which is the one thing the job
   // registry exists to prevent.
-  for (const auto& t : pglaswell::tool_defs()) {
+  for (const auto& t : all_tools()) {
     if (!t.hints.long_running) continue;
-    ASSERT_NE(t.output_schema, nullptr) << t.name;
+    ASSERT_TRUE(static_cast<bool>(t.output_schema)) << t.name;
     const json schema = t.output_schema();
     EXPECT_TRUE(schema.dump().find("jobId") != std::string::npos)
         << t.name << " is long-running but its output schema has no jobId";
@@ -583,20 +593,7 @@ std::vector<unsigned char> sign(const std::string& message) {
 }
 
 std::string base64(const std::vector<unsigned char>& in) {
-  static const char* kAlpha =
-      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  std::string out;
-  for (std::size_t i = 0; i < in.size(); i += 3) {
-    const unsigned int b0 = in[i];
-    const unsigned int b1 = (i + 1 < in.size()) ? in[i + 1] : 0u;
-    const unsigned int b2 = (i + 2 < in.size()) ? in[i + 2] : 0u;
-    const unsigned int t = (b0 << 16) | (b1 << 8) | b2;
-    out += kAlpha[(t >> 18) & 0x3Fu];
-    out += kAlpha[(t >> 12) & 0x3Fu];
-    out += (i + 1 < in.size()) ? kAlpha[(t >> 6) & 0x3Fu] : '=';
-    out += (i + 2 < in.size()) ? kAlpha[t & 0x3Fu] : '=';
-  }
-  return out;
+  return pglaswell::Registry::base64_encode(in);
 }
 
 pglaswell::TrustPolicy policy_trusting_test_key() {
@@ -668,7 +665,10 @@ TEST(Trust, PolicyRejectsASignatureOverDifferentCanonicalBytes) {
 }
 
 TEST(Trust, PolicyRejectsASignatureFromAKeyItDoesNotAccept) {
-  pglaswell::TrustPolicy policy;  // accepts nothing
+  // A CONFIGURED policy that excludes the key. An empty policy is a different
+  // case entirely -- see AnUnconfiguredLocalPolicyIsNotARefusal.
+  pglaswell::TrustPolicy policy;
+  policy.accept.push_back("ed25519:1111111111111111");
   const json sigs = json::array({{{"key_id", test_key().key_id},
                                   {"algorithm", "ed25519"},
                                   {"signature", "AAAA"}}});
@@ -699,6 +699,7 @@ TEST(Trust, PolicyRefusesAKeyIdThatDoesNotMatchItsOwnKeyBytes) {
 
 TEST(Trust, AnUnsupportedAlgorithmIsRefusedRatherThanIgnored) {
   pglaswell::TrustPolicy policy;
+  policy.accept.push_back("ed25519:1111111111111111");
   const json sigs = json::array(
       {{{"key_id", "x"}, {"algorithm", "rsa"}, {"signature", "AAAA"}}});
   const auto r = pglaswell::verify_against_policy(policy, "b", sigs);
@@ -706,8 +707,9 @@ TEST(Trust, AnUnsupportedAlgorithmIsRefusedRatherThanIgnored) {
   EXPECT_NE(r.reason.find("ed25519 only"), std::string::npos) << r.reason;
 }
 
-TEST(Trust, AnUnsignedSpecIsRefused) {
+TEST(Trust, AnUnsignedSpecIsRefusedByAConfiguredPolicy) {
   pglaswell::TrustPolicy policy;
+  policy.accept.push_back("ed25519:1111111111111111");
   const auto r = pglaswell::verify_against_policy(policy, "b", json::array());
   EXPECT_FALSE(r.verified);
   EXPECT_NE(r.reason.find("no signatures"), std::string::npos) << r.reason;
@@ -1606,8 +1608,13 @@ TEST(Planner, TheBackfillBatchUsesForUpdateWithoutSkipLocked) {
   EXPECT_NE(sql.find("FOR UPDATE"), std::string::npos) << sql;
   EXPECT_EQ(sql.find("SKIP LOCKED"), std::string::npos)
       << "SKIP LOCKED would make the cursor lie: " << sql;
-  EXPECT_NE(sql.find("ORDER BY t.id"), std::string::npos) << sql;
-  EXPECT_NE(sql.find("t.id > $1"), std::string::npos) << sql;
+  // The target is referenced by its own name, not an alias -- the naming
+  // contract a spec's where/set expressions have to match.
+  EXPECT_NE(sql.find("ORDER BY orders.id"), std::string::npos) << sql;
+  EXPECT_NE(sql.find("orders.id > $1"), std::string::npos) << sql;
+  EXPECT_NE(sql.find("FOR UPDATE OF orders"), std::string::npos)
+      << "a bare FOR UPDATE would lock rows in the joined lookup table too: "
+      << sql;
   EXPECT_EQ(s->txn_class, pglaswell::TxnClass::kOwnTxnPerBatch);
 }
 
@@ -2037,4 +2044,630 @@ TEST_F(DatabaseTest, PlanningEndToEndAgainstARealCatalog) {
   w.begin("pg_laswell/test/cleanup");
   w.txn().exec("DROP SCHEMA shop CASCADE");
   w.commit();
+}
+
+// --- the ledger: gate 2 -----------------------------------------------------
+
+namespace {
+
+// A database with the laswell schema installed and the suite's key trusted.
+// Built by running the SHIPPED bootstrap.sql, so the script cannot rot
+// alongside the code that depends on it.
+class BootstrappedTest : public DatabaseTest {
+ protected:
+  void SetUp() override {
+    DatabaseTest::SetUp();
+    if (::testing::Test::IsSkipped()) return;
+
+    pglaswell::ConnConfig cfg;
+    cfg.name = "t";
+    cfg.conninfo = url_;
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/bootstrap");
+    w.txn().exec("DROP SCHEMA IF EXISTS laswell CASCADE");
+    w.commit();
+
+    // The bootstrap script is psql-flavoured (\if, :'var'), so it is run
+    // through psql rather than reimplemented here -- reimplementing it would
+    // test a copy rather than the thing that ships.
+    const std::string key_b64 =
+        pglaswell::Registry::base64_encode(test_key().pub);
+    const std::string cmd =
+        "PSQLRC=/dev/null psql -X -q -v ON_ERROR_STOP=1 "
+        "-v laswell_role=laswell_runner "
+        "-v first_key_id=" + test_key().key_id +
+        " -v first_key_b64=" + key_b64 +
+        " -v first_key_label=suite "
+        "-f " + std::string(PGLASWELL_BOOTSTRAP_SQL) + " \"" + url_ + "\" 2>&1";
+    if (std::system(("psql -X -q -c 'CREATE ROLE laswell_runner NOLOGIN' \"" +
+                     url_ + "\" >/dev/null 2>&1")
+                        .c_str()) != 0) {
+      // Already exists: fine.
+    }
+    ASSERT_EQ(std::system(cmd.c_str()), 0) << "bootstrap.sql failed";
+  }
+
+  pglaswell::ConnConfig cfg() const {
+    pglaswell::ConnConfig c;
+    c.name = "t";
+    c.conninfo = url_;
+    return c;
+  }
+
+  // A spec signed by the suite key, ready for gate 2.
+  json signed_spec() const {
+    const auto parsed = pglaswell::parse_spec(minimal_spec());
+    json doc = minimal_spec();
+    doc["signatures"] = json::array({{{"key_id", test_key().key_id},
+                                      {"algorithm", "ed25519"},
+                                      {"signature", base64(sign(parsed.canonical_bytes))}}});
+    return doc;
+  }
+};
+
+}  // namespace
+
+TEST_F(BootstrappedTest, StatusReportsAUsableLedgerAndItsTrustedKeys) {
+  pglaswell::Ledger ledger(cfg());
+  const auto st = ledger.status();
+  EXPECT_TRUE(st.installed);
+  EXPECT_EQ(st.version, pglaswell::kLedgerSchemaVersion);
+  EXPECT_TRUE(st.usable) << st.error;
+  ASSERT_EQ(st.trusted_key_ids.size(), 1u);
+  EXPECT_EQ(st.trusted_key_ids[0], test_key().key_id);
+}
+
+TEST_F(BootstrappedTest, AnAbsentSchemaIsAnAnswerNotAnException) {
+  // "You have not bootstrapped" and "your signer is not trusted" are very
+  // different things for an operator to read, and collapsing them would be the
+  // same mistake as reporting a privilege denial as an empty result.
+  pglaswell::WriteSession w(cfg());
+  w.begin("pg_laswell/test/drop-schema");
+  w.txn().exec("DROP SCHEMA laswell CASCADE");
+  w.commit();
+
+  pglaswell::Ledger ledger(cfg());
+  const auto st = ledger.status();
+  EXPECT_FALSE(st.installed);
+  EXPECT_FALSE(st.usable);
+  EXPECT_NE(st.error.find("not installed"), std::string::npos) << st.error;
+  EXPECT_NE(st.hint.find("bootstrap.sql"), std::string::npos) << st.hint;
+  EXPECT_NE(st.hint.find("never installs it itself"), std::string::npos)
+      << "the hint should say why the tool does not do this for you";
+}
+
+TEST_F(BootstrappedTest, AWrongLedgerVersionIsRefusedRatherThanUpgraded) {
+  pglaswell::WriteSession w(cfg());
+  w.begin("pg_laswell/test/bump-version");
+  w.txn().exec("INSERT INTO laswell.schema_version(version) VALUES (99)");
+  w.commit();
+
+  const auto st = pglaswell::Ledger(cfg()).status();
+  EXPECT_FALSE(st.usable);
+  EXPECT_NE(st.error.find("version 99"), std::string::npos) << st.error;
+}
+
+TEST_F(BootstrappedTest, ADatabaseTrustingNoKeysIsUsableButAcceptsNothing) {
+  // The ledger is fine; it simply trusts nobody. That is a TRUST answer, not a
+  // ledger fault, and conflating the two would point an operator at
+  // bootstrap.sql when the fix is an INSERT into trusted_key.
+  pglaswell::WriteSession w(cfg());
+  w.begin("pg_laswell/test/revoke");
+  w.txn().exec("UPDATE laswell.trusted_key SET revoked_at = now()");
+  w.commit();
+
+  const auto st = pglaswell::Ledger(cfg()).status();
+  EXPECT_TRUE(st.usable) << st.error;
+  EXPECT_TRUE(st.error.empty()) << st.error;
+  EXPECT_TRUE(st.trusted_key_ids.empty());
+  EXPECT_NE(st.hint.find("INSERT INTO laswell.trusted_key"), std::string::npos)
+      << st.hint;
+
+  // And a spec signed by the now-revoked key is refused, by gate 2.
+  const auto check =
+      pglaswell::Ledger(cfg()).verify_signer(pglaswell::parse_spec(signed_spec()));
+  EXPECT_FALSE(check.verified);
+}
+
+TEST_F(BootstrappedTest, GateTwoVerifiesAgainstTheKeyBytesTheDatabaseHolds) {
+  const auto spec = pglaswell::parse_spec(signed_spec());
+  const auto check = pglaswell::Ledger(cfg()).verify_signer(spec);
+  ASSERT_TRUE(check.verified) << check.reason;
+  EXPECT_EQ(check.key_id, test_key().key_id);
+  EXPECT_EQ(check.label, "suite");
+}
+
+TEST_F(BootstrappedTest, GateTwoRefusesASpecSignedByAKeyThisDatabaseDoesNotTrust) {
+  // THE test that proves gate 2 is real: the local policy is made maximally
+  // permissive, and the database still refuses.
+  pglaswell::WriteSession w(cfg());
+  w.begin("pg_laswell/test/untrust");
+  w.txn().exec("DELETE FROM laswell.trusted_key");
+  w.commit();
+
+  const auto spec = pglaswell::parse_spec(signed_spec());
+  // Gate 1 would happily pass this: the local policy trusts the key.
+  const auto gate1 = pglaswell::verify_against_policy(
+      policy_trusting_test_key(), spec.canonical_bytes, spec.signatures);
+  ASSERT_TRUE(gate1.verified) << "precondition: gate 1 accepts this spec";
+
+  const auto gate2 = pglaswell::Ledger(cfg()).verify_signer(spec);
+  EXPECT_FALSE(gate2.verified)
+      << "a permissive client config talked the database into accepting a spec";
+  EXPECT_NE(gate2.reason.find("this database trusts"), std::string::npos)
+      << gate2.reason;
+}
+
+TEST_F(BootstrappedTest, GateTwoIgnoresTheClientsCopyOfTheKeyBytes) {
+  // A config that files an attacker's key under a trusted id must get nowhere:
+  // the bytes the DATABASE holds are the ones that have to verify.
+  const auto spec = pglaswell::parse_spec(signed_spec());
+  pglaswell::WriteSession w(cfg());
+  w.begin("pg_laswell/test/swap-key");
+  // Replace the trusted key's bytes with a different valid key, keeping the
+  // id. The CHECK constraint forbids exactly this, which is itself the point.
+  const auto r = w.txn().exec(
+      "SELECT 1 FROM laswell.trusted_key WHERE key_id = " +
+      w.txn().quote(test_key().key_id));
+  ASSERT_EQ(r.size(), 1u);
+  EXPECT_THROW(
+      w.txn().exec("UPDATE laswell.trusted_key SET public_key = decode('00','hex')"),
+      pqxx::sql_error)
+      << "the content-address CHECK should forbid swapping key bytes under an id";
+  w.rollback();
+}
+
+TEST_F(BootstrappedTest, ARevokedKeyVerifiesNothing) {
+  pglaswell::WriteSession w(cfg());
+  w.begin("pg_laswell/test/revoke-one");
+  w.txn().exec("UPDATE laswell.trusted_key SET revoked_at = now()");
+  w.commit();
+
+  const auto spec = pglaswell::parse_spec(signed_spec());
+  const auto check = pglaswell::Ledger(cfg()).verify_signer(spec);
+  EXPECT_FALSE(check.verified);
+  EXPECT_NE(check.reason.find("revoked"), std::string::npos) << check.reason;
+}
+
+TEST_F(BootstrappedTest, ATamperedSpecFailsGateTwoEvenWithATrustedSigner) {
+  json doc = signed_spec();
+  doc["intents"][2]["name"] = "orders_something_else_idx";
+  const auto spec = pglaswell::parse_spec(doc);
+  const auto check = pglaswell::Ledger(cfg()).verify_signer(spec);
+  EXPECT_FALSE(check.verified);
+  EXPECT_NE(check.reason.find("does not verify"), std::string::npos) << check.reason;
+}
+
+TEST_F(BootstrappedTest, RecordingAMigrationIsIdempotentOnTheDigest) {
+  const auto spec = pglaswell::parse_spec(signed_spec());
+  pglaswell::Ledger ledger(cfg());
+  const auto first = ledger.record_migration(spec, test_key().key_id);
+  const auto second = ledger.record_migration(spec, test_key().key_id);
+  EXPECT_EQ(first, second) << "the same spec must not create two ledger rows";
+
+  pglaswell::ReadSession r(cfg());
+  const auto row = pglaswell::pqxx_exec(
+      r.txn(),
+      "SELECT spec_id, encode(canonical_bytes,'escape'), signer_key_id "
+      "  FROM laswell.migration WHERE migration_id = $1",
+      pqxx::params{first});
+  ASSERT_EQ(row.size(), 1u);
+  EXPECT_EQ(row[0][0].template as<std::string>(), spec.id);
+  // The bytes that were verified are stored, so what ran is never inferred
+  // from a file on somebody's disk.
+  EXPECT_EQ(row[0][1].template as<std::string>(), spec.canonical_bytes);
+  EXPECT_EQ(row[0][2].template as<std::string>(), test_key().key_id);
+}
+
+TEST_F(BootstrappedTest, TheForeignKeyIsTheGateNotACodePath) {
+  // Even bypassing verify_signer entirely, an untrusted signer cannot get a
+  // ledger row. That is the property worth having: no branch to forget.
+  const auto spec = pglaswell::parse_spec(signed_spec());
+  EXPECT_THROW(
+      pglaswell::Ledger(cfg()).record_migration(spec, "ed25519:0000000000000000"),
+      pqxx::sql_error);
+}
+
+TEST_F(BootstrappedTest, NoInterruptedJobsOnACleanLedger) {
+  EXPECT_TRUE(pglaswell::Ledger(cfg()).interrupted_jobs().empty());
+}
+
+// --- the MCP tools, end to end ---------------------------------------------
+
+namespace {
+
+class ToolTest : public BootstrappedTest {
+ protected:
+  void SetUp() override {
+    BootstrappedTest::SetUp();
+    if (::testing::Test::IsSkipped()) return;
+    ctx_ = std::make_unique<pglaswell::ToolContext>(
+        pglaswell::Registry::from_url(url_, "pg-laswell/test"), nullptr);
+    // Gate 1 trusts the suite key, so gate 2 is the one under test.
+    const_cast<pglaswell::TrustPolicy&>(ctx_->registry.trust()) =
+        policy_trusting_test_key();
+    server_ = std::make_unique<pglaswell::McpServer>(pglaswell::make_tools(*ctx_));
+    initialize(*server_);
+  }
+
+  json call(const std::string& tool, const json& arguments) {
+    const json r = rpc(*server_, json{{"jsonrpc", "2.0"},
+                                      {"id", 42},
+                                      {"method", "tools/call"},
+                                      {"params",
+                                       {{"name", tool}, {"arguments", arguments}}}});
+    EXPECT_TRUE(r.contains("result")) << r.dump();
+    return r["result"];
+  }
+
+  json payload(const json& result) {
+    return json::parse(result["content"][0]["text"].get<std::string>());
+  }
+
+  std::unique_ptr<pglaswell::ToolContext> ctx_;
+  std::unique_ptr<pglaswell::McpServer> server_;
+};
+
+}  // namespace
+
+TEST_F(ToolTest, CheckPrivilegesReportsTheLedgerAndTheRole) {
+  const auto p = payload(call("checkPrivileges", json::object()));
+  EXPECT_FALSE(p.value("role", "").empty());
+  EXPECT_GT(p.value("serverVersion", 0), 140000);
+  EXPECT_TRUE(p["ledger"].value("schemaPresent", false));
+  EXPECT_TRUE(p["ledger"].value("canReadTrustedKey", false));
+  EXPECT_FALSE(p.value("isStandby", true));
+}
+
+TEST_F(ToolTest, CheckPrivilegesWarnsWhenTheRoleCanGrantItselfTrust) {
+  // The suite runs as the owner, so it CAN write trusted_key -- which is
+  // exactly the configuration the warning exists for.
+  const auto p = payload(call("checkPrivileges", json::object()));
+  bool warned = false;
+  for (const auto& n : p["notes"]) {
+    if (n.get<std::string>().find("grant itself trust") != std::string::npos) {
+      warned = true;
+    }
+  }
+  EXPECT_TRUE(warned) << p["notes"].dump();
+}
+
+TEST_F(ToolTest, GetSpecDigestReturnsTheBytesThatWillBeVerified) {
+  const auto p = payload(call("getSpecDigest", json{{"spec", minimal_spec()}}));
+  const auto expected = pglaswell::parse_spec(minimal_spec());
+  EXPECT_EQ(p.value("digest", ""), expected.digest);
+  EXPECT_EQ(p.value("canonicalBytes", ""), expected.canonical_bytes);
+  // Signing those exact bytes must satisfy both gates.
+  const auto sig = base64(sign(p["canonicalBytes"].get<std::string>()));
+  json doc = minimal_spec();
+  doc["signatures"] = json::array({{{"key_id", test_key().key_id},
+                                    {"algorithm", "ed25519"},
+                                    {"signature", sig}}});
+  const auto v = payload(call("validateSpec", json{{"spec", doc}}));
+  EXPECT_TRUE(v.value("accepted", false)) << v.dump(2);
+}
+
+TEST_F(ToolTest, GetSpecDigestRejectsABadSpecWithAHint) {
+  json doc = minimal_spec();
+  doc["intents"][0]["kind"] = "make_it_fast";
+  const auto p = payload(call("getSpecDigest", json{{"spec", doc}}));
+  EXPECT_NE(p.value("error", "").find("make_it_fast"), std::string::npos);
+  EXPECT_NE(p.value("hint", "").find("add_column"), std::string::npos)
+      << "the hint must list what this binary supports";
+}
+
+TEST_F(ToolTest, ValidateSpecReportsBothGatesSeparately) {
+  const auto p = payload(call("validateSpec", json{{"spec", signed_spec()}}));
+  EXPECT_TRUE(p.value("accepted", false)) << p.dump(2);
+  EXPECT_TRUE(p["clientTrust"].value("accepted", false));
+  EXPECT_TRUE(p["databaseTrust"].value("accepted", false));
+  EXPECT_EQ(p["databaseTrust"].value("label", ""), "suite");
+  EXPECT_TRUE(p["ledger"].value("usable", false));
+}
+
+TEST_F(ToolTest, ValidateSpecDistinguishesNotBootstrappedFromNotTrusted) {
+  // Two very different things for an operator to read.
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/drop");
+    w.txn().exec("DROP SCHEMA laswell CASCADE");
+    w.commit();
+  }
+  const auto absent = payload(call("validateSpec", json{{"spec", signed_spec()}}));
+  EXPECT_FALSE(absent.value("accepted", true));
+  EXPECT_NE(absent.value("error", "").find("not installed"), std::string::npos);
+  EXPECT_NE(absent.value("hint", "").find("bootstrap.sql"), std::string::npos);
+  // And it does not claim anything about the signer, because it cannot know.
+  EXPECT_FALSE(absent.contains("databaseTrust"))
+      << "with no schema there is nothing to say about the signer, and saying "
+         "something anyway would be a guess";
+}
+
+TEST_F(ToolTest, ValidateSpecRefusesAnUntrustedSignerEvenWithAPermissiveClient) {
+  pglaswell::WriteSession w(cfg());
+  w.begin("pg_laswell/test/untrust");
+  w.txn().exec("DELETE FROM laswell.trusted_key");
+  w.commit();
+
+  const auto p = payload(call("validateSpec", json{{"spec", signed_spec()}}));
+  EXPECT_FALSE(p.value("accepted", true)) << p.dump(2);
+  EXPECT_TRUE(p.value("clientTrust", json::object()).value("accepted", false))
+      << "precondition: this machine's config accepts the key";
+  // A database with no trusted keys is still a TRUST answer, not a ledger
+  // fault: reporting it as the latter would point at the wrong remedy.
+  ASSERT_TRUE(p.contains("databaseTrust")) << p.dump(2);
+  EXPECT_FALSE(p["databaseTrust"].value("accepted", true));
+  EXPECT_NE(p.value("hint", "").find("laswell.trusted_key"), std::string::npos)
+      << p.value("hint", "");
+}
+
+TEST_F(ToolTest, PlanMigrationExecutesNothing) {
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/plan-fixture");
+    w.txn().exec("DROP SCHEMA IF EXISTS shop CASCADE");
+    w.txn().exec("CREATE SCHEMA shop");
+    w.txn().exec(
+        "CREATE TABLE shop.orders(id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"
+        " warehouse_id bigint, status text NOT NULL DEFAULT 'open',"
+        " created_at timestamptz NOT NULL DEFAULT now())");
+    w.txn().exec("CREATE TABLE shop.warehouse(id bigint PRIMARY KEY, region text)");
+    w.txn().exec("INSERT INTO shop.orders(warehouse_id) SELECT (g%5)+1 FROM generate_series(1,200) g");
+    w.commit();
+  }
+
+  const auto p = payload(call("planMigration", json{{"spec", signed_spec()}}));
+  ASSERT_TRUE(p.value("ok", false)) << p.dump(2);
+  EXPECT_FALSE(p.value("executed", true));
+  EXPECT_FALSE(p.value("planDigest", "").empty());
+  EXPECT_NE(p.value("rendered", "").find("transaction group"), std::string::npos);
+
+  pglaswell::ReadSession r(cfg());
+  EXPECT_EQ(r.txn()
+                .exec("SELECT count(*) FROM information_schema.columns"
+                      " WHERE table_schema='shop' AND table_name='orders'"
+                      " AND column_name='fulfilment_region'")[0][0]
+                .as<int>(),
+            0)
+      << "planMigration ran DDL";
+
+  pglaswell::WriteSession w(cfg());
+  w.begin("pg_laswell/test/cleanup");
+  w.txn().exec("DROP SCHEMA shop CASCADE");
+  w.commit();
+}
+
+TEST_F(ToolTest, PlanMigrationIsDeterministicAcrossCalls) {
+  pglaswell::WriteSession w(cfg());
+  w.begin("pg_laswell/test/det-fixture");
+  w.txn().exec("DROP SCHEMA IF EXISTS shop CASCADE");
+  w.txn().exec("CREATE SCHEMA shop");
+  w.txn().exec("CREATE TABLE shop.orders(id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"
+               " warehouse_id bigint, status text, created_at timestamptz)");
+  w.txn().exec("CREATE TABLE shop.warehouse(id bigint PRIMARY KEY, region text)");
+  w.commit();
+
+  const auto a = payload(call("planMigration", json{{"spec", signed_spec()}}));
+  const auto b = payload(call("planMigration", json{{"spec", signed_spec()}}));
+  EXPECT_EQ(a.value("planDigest", "a"), b.value("planDigest", "b"));
+
+  pglaswell::WriteSession c(cfg());
+  c.begin("pg_laswell/test/cleanup");
+  c.txn().exec("DROP SCHEMA shop CASCADE");
+  c.commit();
+}
+
+TEST_F(ToolTest, PlanMigrationRefusesAnUntrustedSpecBeforeMeasuringAnything) {
+  pglaswell::WriteSession w(cfg());
+  w.begin("pg_laswell/test/untrust");
+  w.txn().exec("DELETE FROM laswell.trusted_key");
+  w.commit();
+
+  const auto p = payload(call("planMigration", json{{"spec", signed_spec()}}));
+  EXPECT_TRUE(p.contains("error")) << p.dump(2);
+  EXPECT_FALSE(p.contains("steps")) << "a refused spec must not produce a plan";
+  EXPECT_NE(p.value("hint", "").find("validateSpec"), std::string::npos);
+}
+
+TEST_F(ToolTest, AnUnsignedDraftCanBePlannedButIsMarkedUnexecutable) {
+  pglaswell::WriteSession w(cfg());
+  w.begin("pg_laswell/test/draft-fixture");
+  w.txn().exec("DROP SCHEMA IF EXISTS shop CASCADE");
+  w.txn().exec("CREATE SCHEMA shop");
+  w.txn().exec("CREATE TABLE shop.orders(id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"
+               " warehouse_id bigint, status text, created_at timestamptz)");
+  w.txn().exec("CREATE TABLE shop.warehouse(id bigint PRIMARY KEY, region text)");
+  w.commit();
+
+  const auto p = payload(call(
+      "planMigration", json{{"spec", minimal_spec()}, {"skipTrustChecks", true}}));
+  EXPECT_TRUE(p.value("ok", false)) << p.dump(2);
+  EXPECT_TRUE(p.value("draft", false));
+  EXPECT_NE(p.value("note", "").find("cannot be executed"), std::string::npos);
+
+  pglaswell::WriteSession c(cfg());
+  c.begin("pg_laswell/test/cleanup");
+  c.txn().exec("DROP SCHEMA shop CASCADE");
+  c.commit();
+}
+
+TEST_F(ToolTest, AToolThatThrowsBecomesAnIsErrorResultNotAProtocolError) {
+  // A protocol-level error is usually surfaced to a user as a crash; an
+  // isError result is something a model can read and act on.
+  const json r = rpc(*server_, json{{"jsonrpc", "2.0"},
+                                    {"id", 9},
+                                    {"method", "tools/call"},
+                                    {"params",
+                                     {{"name", "checkPrivileges"},
+                                      {"arguments", {{"connection", "nosuch"}}}}}});
+  ASSERT_TRUE(r.contains("result")) << r.dump();
+  EXPECT_TRUE(r["result"].value("isError", false));
+  const auto p = payload(r["result"]);
+  EXPECT_NE(p.value("error", "").find("nosuch"), std::string::npos) << p.dump();
+}
+
+TEST(Trust, AnUnconfiguredLocalPolicyIsNotARefusal) {
+  // Gate 1 is a fail-fast convenience; gate 2 in the database is the boundary.
+  // Treating "no [trust] section" as "accepts nothing" would make the
+  // DATABASE_URL form unable to run anything -- a papercut masquerading as a
+  // security property.
+  pglaswell::TrustPolicy empty;
+  EXPECT_FALSE(empty.configured());
+  const auto r = pglaswell::verify_against_policy(empty, "bytes", json::array());
+  EXPECT_FALSE(r.verified);
+  EXPECT_TRUE(r.not_configured);
+  EXPECT_NE(r.reason.find("the target database decides"), std::string::npos);
+}
+
+TEST(Trust, AConfiguredPolicyThatExcludesTheKeyIsStillARefusal) {
+  // The distinction that matters: configured-and-excludes is a refusal,
+  // not-configured is a deferral.
+  auto policy = policy_trusting_test_key();
+  policy.accept[0] = "ed25519:1111111111111111";
+  policy.keys["ed25519:1111111111111111"] = policy.keys[test_key().key_id];
+  policy.keys["ed25519:1111111111111111"].key_id = "ed25519:1111111111111111";
+  EXPECT_TRUE(policy.configured());
+  const json sigs = json::array({{{"key_id", test_key().key_id},
+                                  {"algorithm", "ed25519"},
+                                  {"signature", "AAAA"}}});
+  const auto r = pglaswell::verify_against_policy(policy, "bytes", sigs);
+  EXPECT_FALSE(r.verified);
+  EXPECT_FALSE(r.not_configured);
+}
+
+// --- the dry run ------------------------------------------------------------
+
+namespace {
+void make_shop(const pglaswell::ConnConfig& c) {
+  pglaswell::WriteSession w(c);
+  w.begin("pg_laswell/test/shop");
+  w.txn().exec("DROP SCHEMA IF EXISTS shop CASCADE");
+  w.txn().exec("CREATE SCHEMA shop");
+  w.txn().exec("CREATE TABLE shop.warehouse(id bigint PRIMARY KEY, region text NOT NULL)");
+  w.txn().exec("INSERT INTO shop.warehouse SELECT g, 'r'||g FROM generate_series(1,5) g");
+  w.txn().exec(
+      "CREATE TABLE shop.orders(id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"
+      " warehouse_id bigint, status text NOT NULL DEFAULT 'open',"
+      " created_at timestamptz NOT NULL DEFAULT now())");
+  w.txn().exec("INSERT INTO shop.orders(warehouse_id) SELECT (g%5)+1 FROM generate_series(1,300) g");
+  w.commit();
+}
+}  // namespace
+
+TEST_F(ToolTest, TheDryRunValidatesLaterStepsAgainstEarlierOnesSchema) {
+  // The property the project rests on: PostgreSQL DDL is transactional, so the
+  // backfill can be checked against the column that step 0 adds -- which does
+  // not exist yet, and which statement-by-statement checking therefore cannot
+  // validate at all.
+  make_shop(cfg());
+  const auto p = payload(call("planMigration", json{{"spec", signed_spec()}}));
+  ASSERT_TRUE(p.value("ok", false)) << p.dump(2);
+  ASSERT_TRUE(p.contains("dryRun")) << p.dump(2);
+  EXPECT_TRUE(p["dryRun"].value("ran", false));
+  EXPECT_FALSE(p["dryRun"].contains("problems")) << p["dryRun"].dump(2);
+}
+
+TEST_F(ToolTest, TheDryRunCommitsNothing) {
+  make_shop(cfg());
+  const auto p = payload(call("planMigration", json{{"spec", signed_spec()}}));
+  ASSERT_TRUE(p.value("ok", false)) << p.dump(2);
+  ASSERT_TRUE(p["dryRun"].value("ran", false));
+
+  pglaswell::ReadSession r(cfg());
+  EXPECT_EQ(r.txn()
+                .exec("SELECT count(*) FROM information_schema.columns"
+                      " WHERE table_schema='shop' AND table_name='orders'"
+                      " AND column_name='fulfilment_region'")[0][0]
+                .as<int>(),
+            0)
+      << "the dry run committed its DDL";
+  EXPECT_EQ(r.txn()
+                .exec("SELECT count(*) FROM pg_class"
+                      " WHERE relname='orders_open_by_region_idx'")[0][0]
+                .as<int>(),
+            0);
+}
+
+TEST_F(ToolTest, TheDryRunCatchesSqlThatDoesNotWorkAgainstTheRealSchema) {
+  // A backfill whose expression references a column that no step creates. The
+  // spec parses, the plan renders, and only actually trying it finds the fault.
+  make_shop(cfg());
+  json doc = minimal_spec();
+  doc["intents"][1]["set"] = json{{"fulfilment_region", "w.no_such_column"}};
+  const auto parsed = pglaswell::parse_spec(doc);
+  doc["signatures"] = json::array({{{"key_id", test_key().key_id},
+                                    {"algorithm", "ed25519"},
+                                    {"signature", base64(sign(parsed.canonical_bytes))}}});
+
+  const auto p = payload(call("planMigration", json{{"spec", doc}}));
+  EXPECT_FALSE(p.value("ok", true)) << p.dump(2);
+  ASSERT_TRUE(p["dryRun"].contains("problems")) << p.dump(2);
+  EXPECT_NE(p["dryRun"]["problems"][0].get<std::string>().find("no_such_column"),
+            std::string::npos);
+}
+
+TEST_F(ToolTest, AConcurrentIndexBuildIsReportedAsUnverifiedNotSilentlyPassed) {
+  // CREATE INDEX CONCURRENTLY cannot run inside a transaction block, so a dry
+  // run cannot cover it. Saying so is the difference between a check and a
+  // claim.
+  pglaswell::WriteSession w(cfg());
+  w.begin("pg_laswell/test/big");
+  w.txn().exec("DROP SCHEMA IF EXISTS shop CASCADE");
+  w.txn().exec("CREATE SCHEMA shop");
+  w.txn().exec("CREATE TABLE shop.warehouse(id bigint PRIMARY KEY, region text NOT NULL)");
+  w.txn().exec("INSERT INTO shop.warehouse SELECT g, 'r'||g FROM generate_series(1,5) g");
+  w.txn().exec(
+      "CREATE TABLE shop.orders(id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"
+      " warehouse_id bigint, status text NOT NULL DEFAULT 'open',"
+      " created_at timestamptz NOT NULL DEFAULT now(), pad text)");
+  // Past the 64 MiB ceiling, so the planner chooses the concurrent build.
+  w.txn().exec("INSERT INTO shop.orders(warehouse_id, pad)"
+               " SELECT (g%5)+1, repeat('x',400) FROM generate_series(1,200000) g");
+  w.txn().exec("ANALYZE shop.orders");
+  w.commit();
+
+  const auto p = payload(call("planMigration", json{{"spec", signed_spec()}}));
+  ASSERT_TRUE(p.value("ok", false)) << p.dump(2);
+  const auto* idx = [&]() -> const json* {
+    for (const auto& s : p["steps"]) {
+      if (s["kind"] == "create_index") return &s;
+    }
+    return nullptr;
+  }();
+  ASSERT_NE(idx, nullptr);
+  ASSERT_EQ((*idx)["txnClass"], "txn_forbidden") << "expected a concurrent build";
+  EXPECT_FALSE(p["dryRun"]["unverifiedSteps"].empty())
+      << "the concurrent build must be reported as unverified: "
+      << p["dryRun"].dump(2);
+  EXPECT_NE(p["dryRun"].value("note", "").find("rather than silently passed"),
+            std::string::npos);
+}
+
+TEST_F(ToolTest, TheDryRunCanBeDeclined) {
+  // It takes real locks, briefly. An operator who does not want planning to
+  // touch the table at all must be able to say so.
+  make_shop(cfg());
+  const auto p = payload(
+      call("planMigration", json{{"spec", signed_spec()}, {"dryRun", false}}));
+  EXPECT_TRUE(p.value("ok", false)) << p.dump(2);
+  EXPECT_FALSE(p.contains("dryRun"));
+}
+
+TEST_F(ToolTest, TheDryRunDeclinesRatherThanQueueingBehindAStrongLock) {
+  // Planning must never block the application. The dry run holds strong locks
+  // itself, so its own lock_timeout is what keeps that promise.
+  make_shop(cfg());
+  pqxx::connection holder(url_);
+  pqxx::work holder_txn(holder);
+  holder_txn.exec("LOCK TABLE shop.orders IN ACCESS EXCLUSIVE MODE");
+
+  const auto started = std::chrono::steady_clock::now();
+  const auto p = payload(call("planMigration", json{{"spec", signed_spec()}}));
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+  holder_txn.abort();
+
+  EXPECT_LT(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count(), 15)
+      << "planning queued behind the lock instead of declining";
+  // Either observation or the dry run reports the contention; neither hangs.
+  EXPECT_FALSE(p.value("ok", true)) << p.dump(2);
 }

@@ -47,5 +47,18 @@ First skeleton. Nothing is applied to a database yet.
 - `planner.h` — pure, and `planner_purity_check.cpp` fails the build if pqxx
   ever reaches it. Each intent is planned against the catalog as its
   predecessors will leave it, so "add a column, then backfill it" works.
+- `sql/bootstrap.sql` — run by hand by a DBA, never by the binary. The runtime
+  role gets SELECT on `laswell.trusted_key` and nothing more, so it cannot
+  grant itself trust. A CHECK constraint makes the key id the content address
+  of the key, which even a superuser cannot forge.
+- `ledger.h` — gate 2. Re-verifies against the key bytes the *database* holds,
+  and `migration.signer_key_id` is a foreign key to `trusted_key`, so an
+  untrusted signer cannot create a row at all: a constraint, not a code path.
+- `tools.h` — `checkPrivileges`, `getSpecDigest`, `validateSpec`,
+  `planMigration`. None of them execute anything.
+- **The dry run.** `planMigration` applies the whole plan in a transaction and
+  rolls it back, so later steps are checked against the schema earlier ones
+  produce. Statement-by-statement checking cannot do this: a backfill
+  referencing a column that step 0 adds does not parse until step 0 has run.
 - `cpp/test/spikes/` — the Phase 0 experiments that settled the design against
   PostgreSQL 18.6. Four of them changed it.

@@ -87,6 +87,7 @@ inline bool verify_ed25519(const std::vector<unsigned char>& public_key,
 
 struct SignatureCheck {
   bool verified = false;
+  bool not_configured = false;  // gate 1 only: no local policy exists to check
   std::string key_id;
   std::string label;
   std::string reason;  // set only when verified is false
@@ -102,6 +103,17 @@ inline SignatureCheck verify_against_policy(
     const TrustPolicy& policy, const std::string& canonical_bytes,
     const json& signatures) {
   SignatureCheck out;
+  if (!policy.configured()) {
+    // No [trust] section: there is no local policy to check against. Reported
+    // as such rather than as a refusal, because gate 2 -- the database -- is
+    // the gate that decides, and a machine with no config file must still be
+    // able to run a migration the target database trusts.
+    out.not_configured = true;
+    out.reason =
+        "no [trust] accept list is configured on this machine, so nothing is "
+        "checked locally; the target database decides";
+    return out;
+  }
   if (!signatures.is_array() || signatures.empty()) {
     out.reason = "the spec carries no signatures";
     return out;

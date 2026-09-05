@@ -93,6 +93,14 @@ struct TrustPolicy {
   std::vector<std::string> accept;
   std::map<std::string, TrustedKey> keys;
 
+  // Whether a local policy exists at all. With DATABASE_URL and no config
+  // file there is nothing to check locally, and that is NOT the same as "this
+  // machine accepts nothing" -- gate 1 is a fail-fast convenience, gate 2 in
+  // the database is the boundary. Conflating the two would make the
+  // single-connection form unable to run anything, which is a papercut
+  // masquerading as a security property.
+  bool configured() const { return !accept.empty(); }
+
   bool accepts(const std::string& key_id) const {
     for (const auto& k : accept) {
       if (k == key_id) return true;
@@ -474,6 +482,24 @@ class Registry {
   }
 
  public:
+  static std::string base64_encode(const std::vector<unsigned char>& in) {
+    static const char* kAlpha =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve((in.size() + 2) / 3 * 4);
+    for (std::size_t i = 0; i < in.size(); i += 3) {
+      const unsigned int b0 = in[i];
+      const unsigned int b1 = (i + 1 < in.size()) ? in[i + 1] : 0u;
+      const unsigned int b2 = (i + 2 < in.size()) ? in[i + 2] : 0u;
+      const unsigned int t = (b0 << 16) | (b1 << 8) | b2;
+      out += kAlpha[(t >> 18) & 0x3Fu];
+      out += kAlpha[(t >> 12) & 0x3Fu];
+      out += (i + 1 < in.size()) ? kAlpha[(t >> 6) & 0x3Fu] : '=';
+      out += (i + 2 < in.size()) ? kAlpha[t & 0x3Fu] : '=';
+    }
+    return out;
+  }
+
   // Strict base64: rejects any character outside the alphabet rather than
   // skipping it. A lenient decoder would silently accept a truncated or
   // corrupted key and produce a key id that simply never matches, which is a

@@ -65,7 +65,10 @@ if(BUILD_TESTING)
     find_package(GTest REQUIRED)
     add_executable(pg_laswell_mcp_test src/test_main.cpp src/planner_purity_check.cpp)
     target_compile_definitions(pg_laswell_mcp_test PRIVATE
-        PGLASWELL_VERSION="${PROJECT_VERSION}")
+        PGLASWELL_VERSION="${PROJECT_VERSION}"
+        # The shipped bootstrap script, so a test runs the file that actually
+        # ships rather than a reimplementation of it that can drift.
+        PGLASWELL_BOOTSTRAP_SQL="${CMAKE_CURRENT_SOURCE_DIR}/../sql/bootstrap.sql")
     target_link_libraries(pg_laswell_mcp_test PRIVATE
         GTest::gtest GTest::gtest_main ${PGLASWELL_LIBS})
     pglaswell_harden(pg_laswell_mcp_test)

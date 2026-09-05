@@ -210,6 +210,13 @@ inline void parse_backfill(Intent& in) {
     }
   }
 
+  // Naming convention, stated here because it is an interface contract:
+  // `where`, `set` and `from` reference the target table BY ITS OWN NAME, not
+  // by an alias -- "orders.warehouse_id = w.id", never "t.warehouse_id".
+  // Tables introduced by `from` are referenced by whatever alias `from` gives
+  // them. A spec written against the other convention fails in the dry run
+  // with "missing FROM-clause entry", which is why the hint below names this.
+
   // An unfiltered backfill rewrites every row in the table, which is almost
   // always a mistake and is never what someone means by accident. Refusing it
   // costs one explicit "true" in the rare case it was intended.

@@ -110,6 +110,16 @@ SELECT JSONB_BUILD_OBJECT(
 )
 )SQL";
 
+inline std::string strip_trailing_semicolon(const std::string& s) {
+  auto end = s.find_last_not_of(" \n\t\r");
+  if (end == std::string::npos) return {};
+  if (s[end] == ';') {
+    end = s.find_last_not_of(" \n\t\r", end == 0 ? 0 : end - 1);
+    if (end == std::string::npos) return {};
+  }
+  return s.substr(0, end + 1);
+}
+
 }  // namespace detail
 
 // How stale an estimate may be before it is worth paying AccessShareLock for a
@@ -187,6 +197,90 @@ class Catalog {
       }
     }
     return obs;
+  }
+
+  // Proves a whole plan actually works, in a transaction that never commits.
+  //
+  // This is the property the project was conceived around: almost all
+  // PostgreSQL DDL is transactional, so the earlier steps of a plan can be
+  // APPLIED, the later steps checked against the schema they produce, and the
+  // whole thing rolled back. Statement-by-statement checking cannot do this --
+  // a backfill referencing a column that step 0 adds does not parse until step
+  // 0 has run, and that is the ordinary case, not an edge one.
+  //
+  // Three honest costs, all bounded and all reported:
+  //
+  //  - It takes the real locks. An ALTER TABLE here takes AccessExclusiveLock,
+  //    briefly, and rolls it back. lock_timeout bounds the attempt so a dry run
+  //    can never queue behind anything, and it is the same lock the migration
+  //    would take anyway -- but it IS a side effect of planning, so it is
+  //    opt-outable and the result says whether it ran.
+  //  - CREATE INDEX CONCURRENTLY cannot run inside a transaction block, so it
+  //    is skipped and reported as unverified rather than silently passed.
+  //  - The backfill is EXPLAINed, never executed. ANALYZE is never used.
+  struct DryRun {
+    bool ran = false;
+    std::vector<std::string> problems;
+    std::vector<int> unverified_steps;  // txn_forbidden: could not be included
+    std::string skipped_reason;
+  };
+
+  DryRun dry_run(const std::vector<std::pair<int, std::vector<std::string>>>& steps,
+                 const std::vector<bool>& txn_forbidden, int server_version) {
+    DryRun out;
+    WriteSession w(cfg_);
+    // A dry run must never queue: it holds strong locks, and a planning call
+    // that blocks the application is worse than one that declines to check.
+    ConnConfig probe = cfg_;
+    probe.executor.lock_timeout_ms = kObservationLockTimeoutMs;
+    WriteSession session(probe);
+
+    try {
+      session.begin("pg_laswell/dry-run (rolled back)");
+    } catch (const std::exception& e) {
+      out.skipped_reason = std::string("could not open a dry-run transaction: ") + e.what();
+      return out;
+    }
+
+    out.ran = true;
+    for (std::size_t i = 0; i < steps.size(); ++i) {
+      if (txn_forbidden[i]) {
+        out.unverified_steps.push_back(steps[i].first);
+        continue;
+      }
+      for (const auto& raw : steps[i].second) {
+        const auto stmt = detail::strip_trailing_semicolon(raw);
+        if (stmt.empty()) continue;
+        const auto head = stmt.substr(0, stmt.find_first_of(" \n"));
+        const bool is_query =
+            stmt.rfind("WITH", 0) == 0 || head == "UPDATE" || head == "INSERT" ||
+            head == "SELECT" || head == "DELETE" || head == "MERGE";
+        try {
+          if (is_query) {
+            // GENERIC_PLAN (PG16+) plans a statement with $1/$2 placeholders
+            // without binding values. On older servers PREPARE catches the
+            // same class of error. Never ANALYZE: EXPLAIN must not execute the
+            // thing being planned.
+            if (server_version >= 160000) {
+              session.txn().exec("EXPLAIN (GENERIC_PLAN, FORMAT JSON) " + stmt);
+            } else {
+              session.txn().exec("PREPARE laswell_dry AS " + stmt);
+              session.txn().exec("DEALLOCATE laswell_dry");
+            }
+          } else {
+            session.txn().exec(stmt);  // real DDL, rolled back below
+          }
+        } catch (const pqxx::sql_error& e) {
+          out.problems.push_back("step " + std::to_string(steps[i].first) + ": " +
+                                 e.what());
+          session.rollback();
+          return out;
+        }
+      }
+    }
+    // Always. Nothing a dry run does is ever committed.
+    session.rollback();
+    return out;
   }
 
   // Escalates one table to a measured size.
