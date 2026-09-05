@@ -406,6 +406,9 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
 
   step.sql.push_back("COMMENT ON INDEX " + in.schema() + "." + name + " IS " +
                      detail::quote_literal(in.body.value("comment", "")) + ";");
+  step.detail["schema"] = in.schema();
+  step.detail["index"] = name;
+  step.detail["qualified"] = qualified;
   step.detail["size_bytes"] = size;
   step.detail["size_source"] = measured ? "measured" : "estimate";
   step.detail["estimated_from"] = t.value("estimated_from", json());
@@ -531,6 +534,10 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
       "RETURNING " + rel + "." + key + ";";
 
   step.sql.push_back(batch_sql);
+  step.detail["qualified"] = qualified;
+  // Carried so the executor can check a resume cursor against the predicate
+  // rather than trusting it.
+  step.detail["where"] = where;
   step.detail["batch_rows"] = cfg.batch_rows;
   step.detail["commit_interval_ms"] = cfg.commit_interval_ms;
   step.detail["batch_cap_rows"] = cfg.batch_cap_rows;
@@ -668,7 +675,8 @@ inline Plan plan_migration(const Spec& spec, const Observations& obs,
     v.txn_class = TxnClass::kOptional;
     v.lock = "none (catalog read)";
     v.why = "a concurrent build can return without error and leave an invalid index";
-    v.detail = json{{"index", s.detail.value("index_name", json())}};
+    v.detail = json{{"schema", s.detail.value("schema", "")},
+                    {"index", s.detail.value("index", "")}};
     with_verification.push_back(std::move(v));
   }
   // Renumber so ordinals stay dense after the insertions.

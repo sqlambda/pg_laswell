@@ -22,6 +22,8 @@
 
 #include "catalog.h"
 #include "config.h"
+#include "executor.h"
+#include "jobs.h"
 #include "ledger.h"
 #include "planner.h"
 #include "server.h"
@@ -36,6 +38,8 @@ namespace pglaswell {
 struct ToolContext {
   Registry registry;
   ConnectionCache* cache = nullptr;
+  JobRegistry* jobs = nullptr;
+  Observer* observer = nullptr;
 
   const ConnConfig& connection(const json& args) const {
     const auto name = args.value("connection", registry.default_name());
@@ -346,6 +350,208 @@ inline json plan_migration_tool(ToolContext& ctx, const json& args) {
   return out;
 }
 
+// --- startMigration --------------------------------------------------------
+//
+// Returns immediately with a job id. The work outlives the call, because the
+// stdio loop must stay answerable while a migration runs -- that is the whole
+// reason the job registry exists.
+inline json start_migration(ToolContext& ctx, const json& args) {
+  if (ctx.jobs == nullptr) {
+    return json{{"error", "this server has no job registry"},
+                {"hint", "startMigration is unavailable in this build."}};
+  }
+  const auto planned = plan_migration_tool(ctx, args);
+  if (planned.contains("error")) return planned;
+  if (!planned.value("ok", false)) {
+    json out = planned;
+    out["accepted"] = false;
+    out["hint"] = "The plan was refused; nothing was started.";
+    return out;
+  }
+  if (planned.value("draft", false)) {
+    return json{{"error", "a draft plan cannot be executed"},
+                {"hint",
+                 "This plan was produced with skipTrustChecks, so its "
+                 "signatures were never verified. Sign the spec and plan again."}};
+  }
+
+  const auto& cfg = ctx.connection(args);
+  if (ctx.jobs->running_count() >= cfg.executor.max_concurrent_jobs) {
+    return json{{"error", "the concurrency limit is reached"},
+                {"hint", "max_concurrent_jobs is " +
+                             std::to_string(cfg.executor.max_concurrent_jobs) +
+                             "; wait for a job to finish or raise it in "
+                             "[executor]."},
+                {"running", ctx.jobs->running_count()}};
+  }
+
+  const auto spec = parse_spec(args["spec"]);
+  Ledger status_ledger(cfg, ctx.cache);
+  const auto signer = status_ledger.verify_signer(spec);
+  if (!signer.verified) {
+    return json{{"error", signer.reason}, {"hint", "Call validateSpec."}};
+  }
+
+  auto job = ctx.jobs->create(new_job_id());
+  job->spec_id = spec.id;
+  job->spec_digest = spec.digest;
+  job->signer_key_id = signer.key_id;
+  job->connection = cfg.name;
+  job->plan = planned;
+  job->plan_digest = planned.value("planDigest", "");
+
+  // One lock per spec and one per target table, so two different specs
+  // touching the same table serialise.
+  std::vector<long long> keys{advisory_key("laswell:spec:" + spec.id)};
+  std::set<std::string> targets;
+  for (const auto& in : spec.intents) targets.insert(in.qualified_table());
+  for (const auto& t : targets) keys.push_back(advisory_key("laswell:table:" + t));
+  job->lock_key = keys.front();
+
+  auto ledger = std::make_shared<Ledger>(cfg, nullptr);
+  long long migration_id = 0;
+  try {
+    migration_id = ledger->record_migration(spec, signer.key_id);
+  } catch (const std::exception& e) {
+    job->state = JobState::kFailed;
+    return json{{"error", std::string("could not record the migration: ") + e.what()},
+                {"hint",
+                 "laswell.migration.signer_key_id references trusted_key, so "
+                 "an untrusted signer cannot open a job. Call validateSpec."}};
+  }
+
+  std::string conflict;
+  if (!ledger->open_job(job->job_id, migration_id, planned,
+                        job->plan_digest, planned.value("budget", json::object()),
+                        0, keys, &conflict)) {
+    job->state = JobState::kFailed;
+    return json{{"error", conflict},
+                {"hint", "Call jobStatus to see the job that holds it."}};
+  }
+
+  if (ctx.observer) ctx.observer->start();
+  job->worker = std::thread([cfg, job, ledger] {
+    Executor(cfg, job, ledger.get()).run();
+  });
+
+  return json{{"jobId", job->job_id},
+              {"accepted", true},
+              {"specId", spec.id},
+              {"specDigest", spec.digest},
+              {"planDigest", job->plan_digest},
+              {"signerKeyId", signer.key_id},
+              {"note",
+               "the work runs in the background; poll jobStatus for progress, "
+               "contention and an ETA. The planDigest above is the plan that "
+               "is being executed -- it must equal what planMigration showed."}};
+}
+
+// --- jobStatus -------------------------------------------------------------
+inline json job_snapshot(const Job& j, const ExecutorConfig& e) {
+  json out{{"jobId", j.job_id},
+           {"specId", j.spec_id},
+           {"specDigest", j.spec_digest},
+           {"signerKeyId", j.signer_key_id},
+           {"planDigest", j.plan_digest},
+           {"state", to_string(j.state.load())}};
+
+  const auto now = std::chrono::steady_clock::now();
+  const auto end = j.has_finished ? j.finished : now;
+  out["elapsedS"] =
+      std::chrono::duration<double>(end - j.started).count();
+
+  out["contention"] = json{
+      {"directWaiters", j.pacing.direct_waiters.load()},
+      {"transitiveWaiters", j.pacing.transitive_waiters.load()},
+      {"blockingWaiterPid", j.pacing.blocking_waiter_pid.load()},
+      {"oldestWaitMs", j.pacing.oldest_wait_ms.load()},
+      {"inflictedBlockedMs", j.pacing.inflicted_blocked_ms.load()},
+      {"throttled", j.pacing.throttled.load()},
+      {"paused", j.pacing.paused.load()},
+      {"thresholds", {{"throttleWaiters", e.throttle_waiters},
+                      {"pauseWaiters", e.pause_waiters},
+                      {"resumeWaiters", e.resume_waiters}}},
+      {"note",
+       "counts are TRANSITIVE: a direct-blocker count understates a pile-up, "
+       "because pg_blocking_pids() returns direct blockers only. This measures "
+       "harm this job causes, and is blind to harm it causes without holding a "
+       "lock -- I/O, WAL volume, replication lag. Read those through pg_licht."}};
+
+  if (j.pacing.cic_lockers_total.load() > 0) {
+    out["createIndex"] = json{
+        {"lockersTotal", j.pacing.cic_lockers_total.load()},
+        {"lockersDone", j.pacing.cic_lockers_done.load()},
+        {"currentLockerPid", j.pacing.cic_current_locker_pid.load()},
+        {"note",
+         "a concurrent build waits for transactions that could see the table. "
+         "One idle-in-transaction backend stalls it indefinitely while holding "
+         "only ShareUpdateExclusiveLock, so nothing looks blocked."}};
+  }
+
+  out["workerPid"] = j.pacing.worker_pid.load();
+  out["steps"] = j.steps;
+  if (!j.backfill.empty()) out["backfill"] = j.backfill;
+  if (!j.warnings.empty()) out["warnings"] = j.warnings;
+  if (!j.error.is_null()) out["error"] = j.error;
+  return out;
+}
+
+inline json job_status(ToolContext& ctx, const json& args) {
+  if (ctx.jobs == nullptr) {
+    return json{{"jobs", json::array()},
+                {"error", "this server has no job registry"}};
+  }
+  const auto& cfg = ctx.connection(args);
+  const auto wanted = args.value("jobId", "");
+
+  json jobs = json::array();
+  for (const auto& j : ctx.jobs->all()) {
+    if (!wanted.empty() && j->job_id != wanted) continue;
+    // A SNAPSHOT COPY, taken under the job's own lock and never a reference
+    // into live state. This is the invariant that makes the concurrency story
+    // auditable in one paragraph.
+    std::lock_guard<std::mutex> lock(j->m);
+    jobs.push_back(job_snapshot(*j, cfg.executor));
+  }
+
+  json out{{"jobs", std::move(jobs)},
+           {"concurrency", {{"running", ctx.jobs->running_count()},
+                            {"limit", cfg.executor.max_concurrent_jobs}}}};
+  try {
+    Ledger ledger(cfg, ctx.cache);
+    out["interrupted"] = ledger.interrupted_jobs();
+  } catch (const std::exception&) {
+    // The in-memory answer is still worth returning.
+  }
+  return out;
+}
+
+// --- cancelJob -------------------------------------------------------------
+inline json cancel_job(ToolContext& ctx, const json& args) {
+  if (ctx.jobs == nullptr) {
+    return json{{"error", "this server has no job registry"}};
+  }
+  const auto id = args.value("jobId", "");
+  auto job = ctx.jobs->find(id);
+  if (!job) {
+    return json{{"error", "no such job: " + id},
+                {"hint", "Call jobStatus to list the jobs this server knows."}};
+  }
+  if (is_terminal(job->state.load())) {
+    return json{{"jobId", id},
+                {"state", to_string(job->state.load())},
+                {"note", "the job had already finished; nothing to cancel"}};
+  }
+  job->pacing.cancel_stop = true;
+  return json{{"jobId", id},
+              {"requested", true},
+              {"note",
+               "cancellation is cooperative: the job stops at its next batch "
+               "boundary, after committing what it has done. The cursor is "
+               "committed too, so a later job for the same spec digest resumes "
+               "from it rather than starting over."}};
+}
+
 // --- registration ----------------------------------------------------------
 
 inline json no_args_schema() {
@@ -424,6 +630,54 @@ inline std::vector<ToolDef> make_tools(ToolContext& ctx) {
       [] { return json{{"type", "object"}}; },
       {true, false, true, false},
       [&ctx](const json& a) { return plan_migration_tool(ctx, a); }});
+
+  tools.push_back(ToolDef{
+      "startMigration",
+      "plan and then apply a signed specification. Returns a jobId "
+      "immediately; the work runs in the background. The plan it executes is "
+      "byte-identically what planMigration showed, which the matching "
+      "planDigest proves.",
+      plan_schema_in,
+      [] {
+        return json{{"type", "object"},
+                    {"properties",
+                     {{"jobId", {{"type", "string"}}},
+                      {"planDigest", {{"type", "string"}}}}}};
+      },
+      {false, true, false, true},
+      [&ctx](const json& a) { return start_migration(ctx, a); }});
+
+  tools.push_back(ToolDef{
+      "jobStatus",
+      "report every migration this server is running: per-step progress, the "
+      "backfill's commit-reason histogram, and the contention it is causing "
+      "measured as backends TRANSITIVELY blocked by it. Also lists jobs that "
+      "died with their connection.",
+      [] {
+        return json{{"type", "object"},
+                    {"properties",
+                     {{"jobId",
+                       {{"type", "string"},
+                        {"description", "one job; omit for all of them"}}},
+                      {"connection", {{"type", "string"}}}}}};
+      },
+      [] { return json{{"type", "object"}}; },
+      {true, false, true, false},
+      [&ctx](const json& a) { return job_status(ctx, a); }});
+
+  tools.push_back(ToolDef{
+      "cancelJob",
+      "ask a running migration to stop. Cooperative: it stops at the next "
+      "batch boundary after committing what it has done, and the committed "
+      "cursor lets a later job resume rather than start over.",
+      [] {
+        return json{{"type", "object"},
+                    {"properties", {{"jobId", {{"type", "string"}}}}},
+                    {"required", json::array({"jobId"})}};
+      },
+      [] { return json{{"type", "object"}}; },
+      {false, false, true, false},
+      [&ctx](const json& a) { return cancel_job(ctx, a); }});
 
   return tools;
 }

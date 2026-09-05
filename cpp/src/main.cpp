@@ -108,8 +108,19 @@ int main(int argc, char* argv[]) {
     pglaswell::ConnectionCache cache;
     ctx.cache = &cache;
 
+    pglaswell::JobRegistry jobs;
+    ctx.jobs = &jobs;
+    const auto& first = ctx.registry.get(ctx.registry.default_name());
+    pglaswell::Observer observer(first, &jobs, first.executor.observer_tick_ms);
+    ctx.observer = &observer;
+
     pglaswell::McpServer server(pglaswell::make_tools(ctx));
     server.run();
+
+    // Joined, never abandoned. A worker thread racing PQfinish against static
+    // destruction is the classic intermittent crash at shutdown.
+    observer.stop();
+    jobs.join_all();
   } catch (const std::exception& e) {
     std::cerr << "Fatal: " << e.what() << std::endl;
     return 1;

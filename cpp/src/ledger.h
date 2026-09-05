@@ -218,6 +218,98 @@ class Ledger {
     return id;
   }
 
+  // Opens a job row and takes its advisory locks, on a connection this object
+  // KEEPS OPEN for the job's lifetime. A session advisory lock is released the
+  // moment its backend goes away, which is what makes a crashed job detectable
+  // with no heartbeat and no timeout to tune -- but only if the lock lives on a
+  // connection that outlives every transaction the job runs.
+  bool open_job(const std::string& job_id, long long migration_id,
+                const json& plan, const std::string& plan_digest,
+                const json& observations, int server_version,
+                const std::vector<long long>& lock_keys,
+                std::string* conflict_reason) {
+    if (!coordination_) coordination_ = std::make_unique<WriteSession>(cfg_);
+
+    for (const auto lock_key : lock_keys) {
+      const auto r = pqxx_exec(
+          coordination_->exec_nontransactional_txn(),
+          "SELECT pg_try_advisory_lock($1)", pqxx::params{lock_key});
+      if (r.empty() || !r[0][0].as<bool>()) {
+        if (conflict_reason) {
+          *conflict_reason =
+              "another job already holds the advisory lock for one of this "
+              "spec's targets; call jobStatus to see it";
+        }
+        return false;
+      }
+      held_.push_back(lock_key);
+    }
+
+    coordination_->begin("pg_laswell/" + job_id + "/open");
+    pqxx_exec(coordination_->txn(),
+              "INSERT INTO laswell.job (job_id, migration_id, state, plan,"
+              "  plan_digest, observations, server_version, backend_pid, lock_key)"
+              "  VALUES ($1::uuid, $2, 'running', $3::jsonb, $4, $5::jsonb, $6, $7, $8)",
+              pqxx::params{job_id, migration_id, plan.dump(), plan_digest,
+                           observations.dump(), server_version,
+                           coordination_->backend_pid(),
+                           lock_keys.empty() ? 0 : lock_keys.front()});
+    coordination_->commit();
+    return true;
+  }
+
+  void record_step(const std::string& job_id, int ordinal, const json& step,
+                   const std::string& state, long long rows, const json& detail) {
+    if (!coordination_) return;
+    std::string sql;
+    for (const auto& q : step.value("sql", json::array())) {
+      sql += q.get<std::string>() + "\n";
+    }
+    coordination_->begin("pg_laswell/" + job_id + "/ledger");
+    pqxx_exec(coordination_->txn(),
+              "INSERT INTO laswell.step (job_id, ordinal, txn_group, kind,"
+              "  txn_class, sql, why, state, started_at, finished_at,"
+              "  rows_affected, detail)"
+              "  VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, now(), now(), $9, $10::jsonb)"
+              "  ON CONFLICT (job_id, ordinal) DO UPDATE"
+              "  SET state = EXCLUDED.state, finished_at = now(),"
+              "      rows_affected = EXCLUDED.rows_affected,"
+              "      detail = EXCLUDED.detail",
+              pqxx::params{job_id, ordinal, step.value("txnGroup", 0),
+                           step.value("kind", ""), step.value("txnClass", ""),
+                           sql, step.value("why", ""), state, rows,
+                           detail.dump()});
+    coordination_->commit();
+  }
+
+  void finish_job(const std::string& job_id, const std::string& state,
+                  const json& error) {
+    if (!coordination_) return;
+    try {
+      coordination_->begin("pg_laswell/" + job_id + "/finish");
+      pqxx_exec(coordination_->txn(),
+                "UPDATE laswell.job SET state = $2, finished_at = now(),"
+                "  error = $3::jsonb WHERE job_id = $1::uuid",
+                pqxx::params{job_id, state,
+                             error.is_null() ? std::string("null") : error.dump()});
+      coordination_->commit();
+    } catch (const std::exception&) {
+    }
+    release_locks();
+  }
+
+  void release_locks() {
+    if (!coordination_) return;
+    for (const auto k : held_) {
+      try {
+        pqxx_exec(coordination_->exec_nontransactional_txn(),
+                  "SELECT pg_advisory_unlock($1)", pqxx::params{k});
+      } catch (const std::exception&) {
+      }
+    }
+    held_.clear();
+  }
+
   // A job with no finished_at whose advisory lock is absent from pg_locks died
   // with its connection. No heartbeat table, no timeout to tune, and no false
   // positive from a merely slow job: a session advisory lock is released by
@@ -248,6 +340,22 @@ class Ledger {
 
   ConnConfig cfg_;
   ConnectionCache* cache_ = nullptr;
+  std::unique_ptr<WriteSession> coordination_;
+  std::vector<long long> held_;
 };
+
+// The advisory-lock key for a spec, and for each table it touches. Session
+// locks, not transaction locks: a job spans hundreds of transactions and the
+// whole point is that no single one is long.
+inline long long advisory_key(const std::string& s) {
+  // Same shape as hashtextextended(s, 0), computed here so the key is stable
+  // across servers and visible in the ledger.
+  std::uint64_t h = 1469598103934665603ULL;
+  for (const char ch : s) {
+    h ^= static_cast<unsigned char>(ch);
+    h *= 1099511628211ULL;
+  }
+  return static_cast<long long>(h & 0x7FFFFFFFFFFFFFFFULL);
+}
 
 }  // namespace pglaswell

@@ -267,6 +267,7 @@ class WriteSession {
   // malfunctioning quietly.
   void begin(const std::string& application_name) {
     if (txn_) throw std::runtime_error("WriteSession: a transaction is open");
+    nontxn_.reset();
     txn_.emplace(*conn_);
 
     const int idle_timeout = cfg_.executor.commit_interval_ms * 3;
@@ -332,6 +333,19 @@ class WriteSession {
 
   bool in_transaction() const { return txn_.has_value(); }
 
+  // A nontransaction on this connection, for statements that must run outside
+  // any transaction and whose result is needed -- session advisory locks, which
+  // are released at COMMIT if taken with pg_advisory_xact_lock and must
+  // therefore be taken outside one.
+  pqxx::nontransaction& exec_nontransactional_txn() {
+    if (txn_) {
+      throw std::runtime_error(
+          "exec_nontransactional_txn called while a transaction is open");
+    }
+    nontxn_.emplace(*conn_);
+    return *nontxn_;
+  }
+
   // For statements that cannot run inside a transaction block at all --
   // CREATE INDEX CONCURRENTLY and DROP INDEX CONCURRENTLY.
   //
@@ -384,6 +398,7 @@ class WriteSession {
   std::unique_ptr<pqxx::connection> conn_;
   ConnConfig cfg_;
   std::optional<pqxx::work> txn_;
+  std::optional<pqxx::nontransaction> nontxn_;
   int backend_pid_ = 0;
 };
 

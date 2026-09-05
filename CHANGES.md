@@ -60,5 +60,16 @@ First skeleton. Nothing is applied to a database yet.
   rolls it back, so later steps are checked against the schema earlier ones
   produce. Statement-by-statement checking cannot do this: a backfill
   referencing a column that step 0 adds does not parse until step 0 has run.
+- `jobs.h` / `executor.h` — the executor. Three connections per job, one
+  process-wide observer thread, and a job registry whose every read is a
+  snapshot copy taken under one mutex.
+- **Lock-aware pacing works.** Measured on 300 000 rows with an application
+  contending: 48 of 63 commits were triggered by a lock waiter and **zero** by
+  the 3-second interval, finishing in the same wall time as an uncontended run
+  (which took 19 interval commits and no waiter commits).
+- `startMigration` / `jobStatus` / `cancelJob`. Progress is published per
+  batch, not per commit, so a long transaction is distinguishable from a stuck
+  job — and committed rows are reported separately, because only those survive
+  a crash.
 - `cpp/test/spikes/` — the Phase 0 experiments that settled the design against
   PostgreSQL 18.6. Four of them changed it.

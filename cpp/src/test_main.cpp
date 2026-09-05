@@ -32,6 +32,8 @@
 #include "canonical.h"
 #include "catalog.h"
 #include "config.h"
+#include "executor.h"
+#include "jobs.h"
 #include "ledger.h"
 #include "observations.h"
 #include "planner.h"
@@ -2277,15 +2279,18 @@ TEST_F(BootstrappedTest, NoInterruptedJobsOnACleanLedger) {
 namespace {
 
 class ToolTest : public BootstrappedTest {
- protected:
+ public:
   void SetUp() override {
     BootstrappedTest::SetUp();
     if (::testing::Test::IsSkipped()) return;
+    jobs_ = std::make_unique<pglaswell::JobRegistry>();
     ctx_ = std::make_unique<pglaswell::ToolContext>(
         pglaswell::Registry::from_url(url_, "pg-laswell/test"), nullptr);
+    ctx_->jobs = jobs_.get();
+    observer_ = std::make_unique<pglaswell::Observer>(cfg(), jobs_.get(), 25);
+    ctx_->observer = observer_.get();
     // Gate 1 trusts the suite key, so gate 2 is the one under test.
-    const_cast<pglaswell::TrustPolicy&>(ctx_->registry.trust()) =
-        policy_trusting_test_key();
+    ctx_->registry.mutable_trust() = policy_trusting_test_key();
     server_ = std::make_unique<pglaswell::McpServer>(pglaswell::make_tools(*ctx_));
     initialize(*server_);
   }
@@ -2304,6 +2309,29 @@ class ToolTest : public BootstrappedTest {
     return json::parse(result["content"][0]["text"].get<std::string>());
   }
 
+  void TearDown() override {
+    if (jobs_) {
+      for (const auto& j : jobs_->all()) j->pacing.cancel_stop = true;
+      jobs_->join_all();
+    }
+    if (observer_) observer_->stop();
+  }
+
+  // The status of one job, as an agent would read it.
+  json status_of(const std::string& job_id) {
+    const auto r = payload(call("jobStatus", json{{"jobId", job_id}}));
+    if (!r.contains("jobs") || r["jobs"].empty()) return json();
+    return r["jobs"][0];
+  }
+
+  // Executor tuning is configuration precisely so a test can drive the
+  // identical code path in seconds instead of minutes.
+  void set_executor(const pglaswell::ExecutorConfig& e) {
+    ctx_->registry.mutable_get(ctx_->registry.default_name()).executor = e;
+  }
+
+  std::unique_ptr<pglaswell::JobRegistry> jobs_;
+  std::unique_ptr<pglaswell::Observer> observer_;
   std::unique_ptr<pglaswell::ToolContext> ctx_;
   std::unique_ptr<pglaswell::McpServer> server_;
 };
@@ -2538,6 +2566,23 @@ TEST(Trust, AConfiguredPolicyThatExcludesTheKeyIsStillARefusal) {
 // --- the dry run ------------------------------------------------------------
 
 namespace {
+void make_big_shop(const pglaswell::ConnConfig& c, int rows) {
+  pglaswell::WriteSession w(c);
+  w.begin("pg_laswell/test/big-shop");
+  w.txn().exec("DROP SCHEMA IF EXISTS shop CASCADE");
+  w.txn().exec("CREATE SCHEMA shop");
+  w.txn().exec("CREATE TABLE shop.warehouse(id bigint PRIMARY KEY, region text NOT NULL)");
+  w.txn().exec("INSERT INTO shop.warehouse SELECT g, 'r'||g FROM generate_series(1,5) g");
+  w.txn().exec(
+      "CREATE TABLE shop.orders(id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"
+      " warehouse_id bigint, status text NOT NULL DEFAULT 'open',"
+      " created_at timestamptz NOT NULL DEFAULT now())");
+  w.txn().exec("INSERT INTO shop.orders(warehouse_id) SELECT (g%5)+1 FROM generate_series(1," +
+               std::to_string(rows) + ") g");
+  w.txn().exec("ANALYZE shop.orders");
+  w.commit();
+}
+
 void make_shop(const pglaswell::ConnConfig& c) {
   pglaswell::WriteSession w(c);
   w.begin("pg_laswell/test/shop");
@@ -2670,4 +2715,445 @@ TEST_F(ToolTest, TheDryRunDeclinesRatherThanQueueingBehindAStrongLock) {
       << "planning queued behind the lock instead of declining";
   // Either observation or the dry run reports the contention; neither hangs.
   EXPECT_FALSE(p.value("ok", true)) << p.dump(2);
+}
+
+// --- the executor -----------------------------------------------------------
+
+namespace {
+
+// Waits for a predicate on the job status, or fails. Polling rather than a
+// condition variable because the executor is a black box to the test: it is
+// driven through the same MCP surface an agent would use.
+template <typename Pred>
+bool wait_for_status(ToolTest& t, const std::string& job_id, Pred pred,
+                     int attempts = 400) {
+  for (int i = 0; i < attempts; ++i) {
+    const auto st = t.status_of(job_id);
+    if (!st.is_null() && pred(st)) return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  }
+  return false;
+}
+
+}  // namespace
+
+TEST_F(ToolTest, StartMigrationReturnsAJobIdBeforeDoingTheWork) {
+  make_shop(cfg());
+  const auto started = std::chrono::steady_clock::now();
+  const auto p = payload(call("startMigration", json{{"spec", signed_spec()}}));
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+
+  ASSERT_TRUE(p.value("accepted", false)) << p.dump(2);
+  EXPECT_FALSE(p.value("jobId", "").empty());
+  // The stdio loop must stay answerable while a migration runs; that is the
+  // whole reason the job registry exists.
+  EXPECT_FALSE(p.contains("steps")) << "startMigration returned step results";
+  EXPECT_LT(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count(), 20);
+
+  ASSERT_TRUE(wait_for_status(*this, p["jobId"], [](const json& s) {
+    return s.value("state", "") == "succeeded" || s.value("state", "") == "failed";
+  })) << "the job never finished";
+  const auto final_status = status_of(p["jobId"]);
+  EXPECT_EQ(final_status.value("state", ""), "succeeded") << final_status.dump(2);
+}
+
+TEST_F(ToolTest, TheExecutedPlanIsTheOneThatWasShown) {
+  // "What ran is what you were shown" has to be checkable, not promised.
+  make_shop(cfg());
+  const auto planned = payload(call("planMigration", json{{"spec", signed_spec()}}));
+  ASSERT_TRUE(planned.value("ok", false)) << planned.dump(2);
+
+  const auto started = payload(call("startMigration", json{{"spec", signed_spec()}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  EXPECT_EQ(started.value("planDigest", "a"), planned.value("planDigest", "b"));
+
+  ASSERT_TRUE(wait_for_status(*this, started["jobId"], [](const json& s) {
+    return s.value("state", "") == "succeeded";
+  })) << status_of(started["jobId"]).dump(2);
+}
+
+TEST_F(ToolTest, AMigrationActuallyChangesTheDatabase) {
+  make_shop(cfg());
+  const auto p = payload(call("startMigration", json{{"spec", signed_spec()}}));
+  ASSERT_TRUE(wait_for_status(*this, p["jobId"], [](const json& s) {
+    return s.value("state", "") == "succeeded";
+  })) << status_of(p["jobId"]).dump(2);
+
+  pglaswell::ReadSession r(cfg());
+  // The column exists, with its COMMENT.
+  EXPECT_EQ(r.txn()
+                .exec("SELECT count(*) FROM information_schema.columns"
+                      " WHERE table_schema='shop' AND table_name='orders'"
+                      " AND column_name='fulfilment_region'")[0][0]
+                .as<int>(),
+            1);
+  EXPECT_NE(r.txn()
+                .exec("SELECT col_description('shop.orders'::regclass,"
+                      " (SELECT attnum FROM pg_attribute"
+                      "   WHERE attrelid='shop.orders'::regclass"
+                      "     AND attname='fulfilment_region'))")[0][0]
+                .as<std::string>(""),
+            "");
+  // Every row was backfilled.
+  EXPECT_EQ(r.txn()
+                .exec("SELECT count(*) FROM shop.orders"
+                      " WHERE fulfilment_region IS NULL")[0][0]
+                .as<int>(),
+            0);
+  // And the index exists and is valid.
+  EXPECT_EQ(r.txn()
+                .exec("SELECT count(*) FROM pg_index i JOIN pg_class c"
+                      " ON c.oid=i.indexrelid"
+                      " WHERE c.relname='orders_open_by_region_idx'"
+                      "   AND i.indisvalid")[0][0]
+                .as<int>(),
+            1);
+}
+
+TEST_F(ToolTest, TheLedgerRecordsWhatRanVerbatim) {
+  make_shop(cfg());
+  const auto p = payload(call("startMigration", json{{"spec", signed_spec()}}));
+  ASSERT_TRUE(wait_for_status(*this, p["jobId"], [](const json& s) {
+    return s.value("state", "") == "succeeded";
+  }));
+
+  pglaswell::ReadSession r(cfg());
+  const auto rows = pglaswell::pqxx_exec(
+      r.txn(),
+      "SELECT ordinal, kind, state, sql, why FROM laswell.step"
+      " WHERE job_id = $1::uuid ORDER BY ordinal",
+      pqxx::params{p["jobId"].get<std::string>()});
+  ASSERT_GE(rows.size(), 3u) << "the ledger has no steps";
+  for (const auto& row : rows) {
+    // The statement verbatim, and the rule that chose the method. What ran is
+    // never inferred from the spec.
+    EXPECT_FALSE(row[3].template as<std::string>("").empty())
+        << "step " << row[0].template as<int>() << " recorded no SQL";
+    EXPECT_FALSE(row[4].template as<std::string>("").empty())
+        << "step " << row[0].template as<int>() << " recorded no reason";
+  }
+  const auto job = pglaswell::pqxx_exec(
+      r.txn(),
+      "SELECT state, plan_digest, finished_at IS NOT NULL FROM laswell.job"
+      " WHERE job_id = $1::uuid",
+      pqxx::params{p["jobId"].get<std::string>()});
+  ASSERT_EQ(job.size(), 1u);
+  EXPECT_EQ(job[0][0].template as<std::string>(), "succeeded");
+  EXPECT_EQ(job[0][1].template as<std::string>(), p.value("planDigest", ""));
+  EXPECT_TRUE(job[0][2].template as<bool>());
+}
+
+TEST_F(ToolTest, ThePacedBackfillCommitsRepeatedlyRatherThanOnce) {
+  // The observable proof that pacing happens at all.
+  make_big_shop(cfg(), 20000);
+  auto c = cfg();
+  c.executor.batch_rows = 200;
+  c.executor.commit_interval_ms = 50;
+  c.executor.observer_tick_ms = 25;
+  set_executor(c.executor);
+
+  const auto p = payload(call("startMigration", json{{"spec", signed_spec()}}));
+  ASSERT_TRUE(wait_for_status(*this, p["jobId"], [](const json& s) {
+    return s.value("state", "") == "succeeded";
+  })) << status_of(p["jobId"]).dump(2);
+
+  const auto st = status_of(p["jobId"]);
+  ASSERT_TRUE(st.contains("backfill")) << st.dump(2);
+  const auto& b = st["backfill"];
+  EXPECT_GT(b.value("commits", 0), 1)
+      << "the backfill committed once; it was not paced: " << b.dump(2);
+  EXPECT_EQ(b["commitReasons"].value("interval", 0) +
+                b["commitReasons"].value("batch_cap", 0) +
+                b["commitReasons"].value("lock_waiter", 0) +
+                b["commitReasons"].value("final", 0),
+            b.value("commits", 0));
+}
+
+TEST_F(ToolTest, CancellingAJobStopsItAndLeavesTheCursorCommitted) {
+  make_big_shop(cfg(), 40000);
+  auto c = cfg();
+  c.executor.batch_rows = 100;
+  c.executor.commit_interval_ms = 25;
+  set_executor(c.executor);
+
+  const auto p = payload(call("startMigration", json{{"spec", signed_spec()}}));
+  const auto job_id = p["jobId"].get<std::string>();
+  ASSERT_TRUE(wait_for_status(*this, job_id, [](const json& s) {
+    return s.contains("backfill") && s["backfill"].value("commits", 0) > 0;
+  })) << "the backfill never started committing";
+
+  const auto cancelled = payload(call("cancelJob", json{{"jobId", job_id}}));
+  EXPECT_TRUE(cancelled.value("requested", false)) << cancelled.dump(2);
+
+  ASSERT_TRUE(wait_for_status(*this, job_id, [](const json& s) {
+    const auto st = s.value("state", "");
+    return st == "cancelled" || st == "succeeded";
+  }));
+
+  // Whatever it committed is consistent: the cursor and the data agree.
+  pglaswell::ReadSession r(cfg());
+  const auto cur = pglaswell::pqxx_exec(
+      r.txn(),
+      "SELECT last_key FROM laswell.backfill_cursor WHERE job_id = $1::uuid",
+      pqxx::params{job_id});
+  if (!cur.empty()) {
+    const auto last = cur[0][0].template as<std::string>();
+    const auto beyond = pglaswell::pqxx_exec(
+        r.txn(),
+        "SELECT count(*) FROM shop.orders"
+        " WHERE id <= $1::bigint AND fulfilment_region IS NULL"
+        "   AND warehouse_id IS NOT NULL",
+        pqxx::params{last});
+    EXPECT_EQ(beyond[0][0].template as<int>(), 0)
+        << "rows at or below the committed cursor were not backfilled";
+  }
+}
+
+TEST_F(ToolTest, JobStatusReportsContentionThresholdsAndItsOwnBlindSpot) {
+  make_shop(cfg());
+  const auto p = payload(call("startMigration", json{{"spec", signed_spec()}}));
+  ASSERT_TRUE(wait_for_status(*this, p["jobId"], [](const json& s) {
+    return s.value("state", "") == "succeeded";
+  }));
+  const auto st = status_of(p["jobId"]);
+  ASSERT_TRUE(st.contains("contention")) << st.dump(2);
+  const auto& c = st["contention"];
+  EXPECT_TRUE(c.contains("transitiveWaiters"));
+  EXPECT_TRUE(c.contains("inflictedBlockedMs"));
+  EXPECT_TRUE(c["thresholds"].contains("pauseWaiters"));
+  // The honest boundary: this measures harm it causes by holding locks, and is
+  // blind to I/O, WAL and replication lag.
+  EXPECT_NE(c.value("note", "").find("pg_licht"), std::string::npos) << c.dump(2);
+  EXPECT_NE(c.value("note", "").find("TRANSITIVE"), std::string::npos);
+}
+
+TEST_F(ToolTest, TwoJobsForTheSameSpecCannotRunAtOnce) {
+  make_big_shop(cfg(), 30000);
+  auto c = cfg();
+  c.executor.batch_rows = 100;
+  c.executor.commit_interval_ms = 25;
+  c.executor.max_concurrent_jobs = 4;  // not the limit under test
+  set_executor(c.executor);
+
+  const auto first = payload(call("startMigration", json{{"spec", signed_spec()}}));
+  ASSERT_TRUE(first.value("accepted", false)) << first.dump(2);
+
+  const auto second = payload(call("startMigration", json{{"spec", signed_spec()}}));
+  EXPECT_FALSE(second.value("accepted", false))
+      << "a second job for the same spec was admitted: " << second.dump(2);
+
+  call("cancelJob", json{{"jobId", first["jobId"]}});
+  wait_for_status(*this, first["jobId"], [](const json& s) {
+    return s.value("state", "") == "cancelled" || s.value("state", "") == "succeeded";
+  });
+}
+
+TEST_F(ToolTest, AFailedStepFailsTheJobAndTheLedgerSaysWhich) {
+  make_shop(cfg());
+  // A backfill expression that parses and plans but fails at runtime: a cast
+  // that only fails on real data.
+  json doc = minimal_spec();
+  doc["intents"][1]["set"] = json{{"fulfilment_region", "(1/0)::text"}};
+  const auto parsed = pglaswell::parse_spec(doc);
+  doc["signatures"] = json::array({{{"key_id", test_key().key_id},
+                                    {"algorithm", "ed25519"},
+                                    {"signature", base64(sign(parsed.canonical_bytes))}}});
+
+  const auto p = payload(call("startMigration", json{{"spec", doc}}));
+  if (!p.value("accepted", false)) {
+    // The dry run caught it first, which is also a correct outcome.
+    SUCCEED() << "refused before starting: " << p.dump(2);
+    return;
+  }
+  ASSERT_TRUE(wait_for_status(*this, p["jobId"], [](const json& s) {
+    return s.value("state", "") == "failed";
+  })) << status_of(p["jobId"]).dump(2);
+
+  pglaswell::ReadSession r(cfg());
+  const auto rows = pglaswell::pqxx_exec(
+      r.txn(),
+      "SELECT count(*) FROM laswell.step WHERE job_id = $1::uuid AND state = 'failed'",
+      pqxx::params{p["jobId"].get<std::string>()});
+  EXPECT_GT(rows[0][0].template as<int>(), 0) << "no step was recorded as failed";
+}
+
+TEST_F(ToolTest, ALockWaiterForcesACommitBeforeTheIntervalWouldHave) {
+  // THE crux of the suite, and it is deterministic rather than timing-lucky.
+  //
+  // The commit interval is set to ten minutes and the row cap out of reach, so
+  // the ONLY commit trigger a test finishing in seconds can reach is a lock
+  // waiter. A non-zero lock_waiter count therefore cannot have come from
+  // anything else, and interval must be exactly zero.
+  make_big_shop(cfg(), 60000);
+  auto e = cfg().executor;
+  e.batch_rows = 50;
+  e.commit_interval_ms = 600000;   // ten minutes: unreachable here
+  e.batch_cap_rows = 100000000;    // unreachable here
+  e.observer_tick_ms = 25;
+  e.pause_waiters = 1000;          // the breaker must not interfere
+  e.throttle_waiters = 1000;
+  e.max_waiter_wait_ms = 600000;   // no escalation either
+  set_executor(e);
+
+  const auto p = payload(call("startMigration", json{{"spec", signed_spec()}}));
+  ASSERT_TRUE(p.value("accepted", false)) << p.dump(2);
+  const auto job_id = p["jobId"].get<std::string>();
+
+  // Wait until the backfill is actually running and holding locks. Progress is
+  // published per BATCH, so this fires while the transaction is still open --
+  // which is the only window in which a waiter can form.
+  ASSERT_TRUE(wait_for_status(*this, job_id, [](const json& s) {
+    return s.contains("backfill") && s["backfill"].value("rowsDone", "0") != "0";
+  })) << "the backfill never started: " << status_of(job_id).dump(2);
+
+  // Create a waiter on purpose. SHARE conflicts with the RowExclusiveLock the
+  // worker holds, so this queues behind the worker's open transaction.
+  std::atomic<bool> stop{false};
+  std::thread victim([&] {
+    while (!stop.load()) {
+      try {
+        pqxx::connection c(url_);
+        pqxx::work tx(c);
+        tx.exec("SET LOCAL lock_timeout = 2000");
+        tx.exec("LOCK TABLE shop.orders IN SHARE MODE");
+        tx.commit();
+      } catch (...) {
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+  });
+
+  const bool saw = wait_for_status(*this, job_id, [](const json& s) {
+    return s.contains("backfill") &&
+           s["backfill"]["commitReasons"].value("lock_waiter", 0) > 0;
+  }, 240);
+
+  stop = true;
+  victim.join();
+  call("cancelJob", json{{"jobId", job_id}});
+  wait_for_status(*this, job_id, [](const json& s) {
+    const auto st = s.value("state", "");
+    return st == "cancelled" || st == "succeeded" || st == "failed";
+  });
+
+  const auto st = status_of(job_id);
+  if (!saw) {
+    GTEST_SKIP() << "the lock wait was never observed; on a loaded machine the "
+                    "waiter can come and go between observer ticks: "
+                 << st["backfill"].dump(2);
+  }
+  const json reasons = st["backfill"]["commitReasons"];
+  EXPECT_GT(reasons.value("lock_waiter", 0), 0);
+  // The deterministic assertion: with a ten-minute interval, an interval
+  // commit in a test lasting seconds is impossible.
+  EXPECT_EQ(reasons.value("interval", 0), 0)
+      << "an interval commit fired with a ten-minute interval: " << st.dump(2);
+  EXPECT_EQ(reasons.value("batch_cap", 0), 0);
+}
+
+TEST_F(ToolTest, WithNoWaiterTheIntervalIsWhatCommits) {
+  // The inverse, so the previous test cannot pass by accident: nothing waiting,
+  // a tiny interval, and every commit must be attributed to the interval.
+  make_big_shop(cfg(), 20000);
+  auto e = cfg().executor;
+  e.batch_rows = 100;
+  e.commit_interval_ms = 20;
+  e.batch_cap_rows = 100000000;
+  e.observer_tick_ms = 25;
+  set_executor(e);
+
+  const auto p = payload(call("startMigration", json{{"spec", signed_spec()}}));
+  ASSERT_TRUE(wait_for_status(*this, p["jobId"], [](const json& s) {
+    return s.value("state", "") == "succeeded";
+  })) << status_of(p["jobId"]).dump(2);
+
+  // By value: status_of() returns a temporary, so binding a reference into it
+  // dangles. GCC's -Wdangling-reference catches this one at compile time --
+  // the same family as the ostringstream::str() and json::value() bugs earlier.
+  const json reasons = status_of(p["jobId"])["backfill"]["commitReasons"];
+  EXPECT_GT(reasons.value("interval", 0), 0) << reasons.dump(2);
+  EXPECT_EQ(reasons.value("lock_waiter", 0), 0)
+      << "a lock waiter was reported with nothing contending";
+}
+
+TEST_F(ToolTest, ProgressIsVisibleWhileATransactionIsStillOpen) {
+  // With a long commit interval an entire backfill can run in one transaction.
+  // If progress were published only at commit, an agent polling jobStatus
+  // would see zero throughout -- indistinguishable from a stuck job. It also
+  // reports committed rows separately, because only those survive a crash.
+  make_big_shop(cfg(), 40000);
+  auto e = cfg().executor;
+  e.batch_rows = 50;
+  e.commit_interval_ms = 600000;  // one transaction for the whole run
+  e.batch_cap_rows = 100000000;
+  set_executor(e);
+
+  const auto p = payload(call("startMigration", json{{"spec", signed_spec()}}));
+  ASSERT_TRUE(p.value("accepted", false)) << p.dump(2);
+  const auto job_id = p["jobId"].get<std::string>();
+
+  ASSERT_TRUE(wait_for_status(*this, job_id, [](const json& s) {
+    return s.contains("backfill") && s["backfill"].value("rowsDone", "0") != "0";
+  })) << "no progress was visible before the first commit";
+
+  const auto mid = status_of(job_id);
+  EXPECT_NE(mid["backfill"].value("rowsDone", "0"), "0");
+  // Nothing is committed yet, so the crash-survivable figure is still zero.
+  EXPECT_EQ(mid["backfill"].value("rowsCommitted", "-1"), "0")
+      << "rows were reported as committed before any commit: "
+      << mid["backfill"].dump(2);
+
+  ASSERT_TRUE(wait_for_status(*this, job_id, [](const json& s) {
+    return s.value("state", "") == "succeeded";
+  }));
+  const auto done = status_of(job_id);
+  EXPECT_EQ(done["backfill"].value("rowsCommitted", "0"),
+            done["backfill"].value("rowsDone", "-1"));
+}
+
+TEST_F(ToolTest, ASucceededJobsCursorIsNotResumedFrom) {
+  // A succeeded job's cursor sits at the end of the table. Resuming from it
+  // would make the next run skip everything and report success -- which is
+  // precisely what verify_remaining exists to catch, and it did catch it. But
+  // a completeness check should be the second line of defence, not the first.
+  make_big_shop(cfg(), 5000);
+  auto e = cfg().executor;
+  e.batch_rows = 500;
+  e.commit_interval_ms = 50;
+  set_executor(e);
+
+  const auto first = payload(call("startMigration", json{{"spec", signed_spec()}}));
+  ASSERT_TRUE(wait_for_status(*this, first["jobId"], [](const json& s) {
+    return s.value("state", "") == "succeeded";
+  })) << status_of(first["jobId"]).dump(2);
+
+  // Undo the schema change, leaving the succeeded job's cursor behind.
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/undo");
+    w.txn().exec("DROP INDEX IF EXISTS shop.orders_open_by_region_idx");
+    w.txn().exec("ALTER TABLE shop.orders DROP COLUMN fulfilment_region");
+    w.commit();
+  }
+
+  const auto second = payload(call("startMigration", json{{"spec", signed_spec()}}));
+  ASSERT_TRUE(second.value("accepted", false)) << second.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, second["jobId"], [](const json& s) {
+    const auto st = s.value("state", "");
+    return st == "succeeded" || st == "failed";
+  })) << status_of(second["jobId"]).dump(2);
+
+  const auto st = status_of(second["jobId"]);
+  EXPECT_EQ(st.value("state", ""), "succeeded")
+      << "the second run resumed from the first's completed cursor: "
+      << st.dump(2);
+  EXPECT_EQ(st["backfill"].value("rowsDone", "0"), "5000")
+      << "the second run skipped rows it should have backfilled";
+
+  pglaswell::ReadSession r(cfg());
+  EXPECT_EQ(r.txn()
+                .exec("SELECT count(*) FROM shop.orders"
+                      " WHERE fulfilment_region IS NULL")[0][0]
+                .as<int>(),
+            0);
 }

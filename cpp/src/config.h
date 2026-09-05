@@ -381,6 +381,14 @@ class Registry {
     return r;
   }
 
+  // Mutable access, for callers that adjust executor tuning after parsing --
+  // the test suite drives the identical code paths with tiny values.
+  ConnConfig& mutable_get(const std::string& name) {
+    const auto it = conns_.find(name);
+    if (it == conns_.end()) throw std::runtime_error("no such connection: " + name);
+    return it->second;
+  }
+
   const ConnConfig& get(const std::string& name) const {
     const auto it = conns_.find(name);
     if (it == conns_.end()) {
@@ -392,6 +400,7 @@ class Registry {
   const std::string& default_name() const { return default_name_; }
   const std::vector<std::string>& order() const { return order_; }
   const TrustPolicy& trust() const { return trust_; }
+  TrustPolicy& mutable_trust() { return trust_; }
   const ExecutorConfig& executor() const { return executor_; }
 
  private:
