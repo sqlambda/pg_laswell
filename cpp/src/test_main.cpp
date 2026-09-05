@@ -4140,9 +4140,25 @@ TEST(Planner, AddColumnIsNotBlockedByViewsButWarnsTheColumnIsInvisible) {
   const auto plan =
       pglaswell::plan_migration(pglaswell::parse_spec(doc), obs, {});
   ASSERT_TRUE(plan.ok) << plan.render();
-  const auto sql = all_sql(*steps_of(plan, "add_column")[0]);
-  EXPECT_EQ(sql.find("DROP VIEW"), std::string::npos)
-      << "add_column must not rebuild views; PostgreSQL never blocks it:\n" << sql;
+  // add_column touches NO view, in either direction. It does not rebuild them
+  // -- PostgreSQL never blocks it -- and it does not silently rewrite them to
+  // carry the new column either. Deciding that a view should now expose a
+  // column is a judgement about what that view means, and it belongs in a
+  // replace_view intent somebody wrote and signed. Asserted on the whole
+  // statement list rather than on one forbidden keyword, so a future change
+  // that starts emitting view DDL here fails loudly.
+  const auto* step = steps_of(plan, "add_column")[0];
+  ASSERT_EQ(step->sql.size(), 2u) << all_sql(*step);
+  EXPECT_NE(step->sql[0].find("ALTER TABLE shop.orders ADD COLUMN region"),
+            std::string::npos) << step->sql[0];
+  EXPECT_NE(step->sql[1].find("COMMENT ON COLUMN"), std::string::npos)
+      << step->sql[1];
+  const auto sql = all_sql(*step);
+  for (const char* forbidden : {"DROP VIEW", "CREATE VIEW", "CREATE OR REPLACE",
+                                "MATERIALIZED"}) {
+    EXPECT_EQ(sql.find(forbidden), std::string::npos)
+        << "add_column emitted " << forbidden << ":\n" << sql;
+  }
 
   bool warned = false;
   for (const auto& w : plan.warnings) {
