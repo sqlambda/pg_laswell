@@ -3434,3 +3434,111 @@ TEST_F(RepoTest, AnUnreadableSpecIsReportedNotSkipped) {
   EXPECT_EQ(e->value("status", ""), "unreadable");
   EXPECT_FALSE(e->value("error", "").empty());
 }
+
+TEST(Planner, AnIndexIdenticalToAnExistingOneUnderAnotherNameIsAConflict) {
+  // The name check does not catch this, because the name is the one thing that
+  // differs. A redundant index costs write time on every INSERT, UPDATE and
+  // DELETE for as long as it exists.
+  auto obs = observations(1024, 10);
+  // PostgreSQL's OWN rendering, not the spec's string. An earlier version of
+  // this test used the spec's text on both sides and therefore could not fail
+  // the way reality fails: pg_get_expr returns "(status = 'open'::text)".
+  obs.tables["shop.orders"]["indexes"]["some_other_name"] =
+      json{{"is_valid", true}, {"is_unique", false}, {"method", "btree"},
+           {"predicate", "(status = 'open'::text)"}, {"has_expressions", false},
+           {"columns", json::array({"fulfilment_region", "created_at"})},
+           {"leading_column", "fulfilment_region"}};
+
+  const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(minimal_spec()), obs, {});
+  EXPECT_FALSE(plan.ok) << plan.render();
+  ASSERT_FALSE(plan.conflicts.empty());
+  EXPECT_NE(plan.conflicts[0].find("some_other_name"), std::string::npos)
+      << plan.conflicts[0];
+  EXPECT_NE(plan.conflicts[0].find("write time on every"), std::string::npos)
+      << "the refusal should say why a redundant index is not free";
+}
+
+TEST(Planner, ADifferentPredicateWarnsRatherThanRefusing) {
+  // Same columns, different WHERE. Two SQL expressions being equivalent is not
+  // decidable by string comparison, so this must not refuse -- it names both
+  // predicates and lets the reader judge.
+  auto obs = observations(1024, 10);
+  obs.tables["shop.orders"]["indexes"]["partial_other"] =
+      json{{"is_valid", true}, {"is_unique", false}, {"method", "btree"},
+           {"predicate", "(status = 'closed'::text)"}, {"has_expressions", false},
+           {"columns", json::array({"fulfilment_region", "created_at"})},
+           {"leading_column", "fulfilment_region"}};
+  const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(minimal_spec()), obs, {});
+  EXPECT_TRUE(plan.ok) << plan.render();
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("their predicates differ as written") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned) << json(plan.warnings).dump(2);
+}
+
+TEST(Planner, APrefixRedundantIndexWarnsRatherThanRefusing) {
+  // There are legitimate reasons to want a narrower index -- size, fillfactor
+  // -- so refusing would be the tool overriding a judgement it cannot make.
+  auto obs = observations(1024, 10);
+  obs.tables["shop.orders"]["indexes"]["wider"] =
+      json{{"is_valid", true}, {"is_unique", false}, {"method", "btree"},
+           {"predicate", "(status = 'open'::text)"}, {"has_expressions", false},
+           {"columns", json::array({"fulfilment_region", "created_at", "id"})},
+           {"leading_column", "fulfilment_region"}};
+  const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(minimal_spec()), obs, {});
+  EXPECT_TRUE(plan.ok) << plan.render();
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("is a prefix of the existing index") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned) << "no prefix warning: " << json(plan.warnings).dump(2);
+}
+
+TEST(Planner, AnIndexOverExpressionsIsNotComparedRatherThanComparedBadly) {
+  // indkey carries 0 for an expression column, which cannot be named. A partial
+  // comparison would be worse than declining to compare.
+  auto obs = observations(1024, 10);
+  obs.tables["shop.orders"]["indexes"]["expr_idx"] =
+      json{{"is_valid", true}, {"is_unique", false}, {"method", "btree"},
+           {"predicate", "(status = 'open'::text)"}, {"has_expressions", true},
+           {"columns", json::array({"fulfilment_region"})},
+           {"leading_column", "fulfilment_region"}};
+  const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(minimal_spec()), obs, {});
+  EXPECT_TRUE(plan.ok) << plan.render();
+}
+
+TEST(Planner, AnInvalidDuplicateDoesNotBlockTheRebuild) {
+  // A leftover INVALID index from a failed concurrent build must not be
+  // mistaken for a legitimate duplicate: it is exactly what we are replacing.
+  auto obs = observations(1024, 10);
+  obs.tables["shop.orders"]["indexes"]["leftover"] =
+      json{{"is_valid", false}, {"is_unique", false}, {"method", "btree"},
+           {"predicate", "(status = 'open'::text)"}, {"has_expressions", false},
+           {"columns", json::array({"fulfilment_region", "created_at"})},
+           {"leading_column", "fulfilment_region"}};
+  const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(minimal_spec()), obs, {});
+  EXPECT_TRUE(plan.ok) << plan.render();
+}
+
+TEST(Planner, APartialAndAFullIndexAreDifferentNotAmbiguous) {
+  // One covers rows the other does not, so there is nothing to be ambiguous
+  // about. Warning here would be noise on every narrow index built beside a
+  // partial one.
+  auto obs = observations(1024, 10);
+  obs.tables["shop.orders"]["indexes"]["partial"] =
+      json{{"is_valid", true}, {"is_unique", false}, {"method", "btree"},
+           {"predicate", "(status = 'open'::text)"}, {"has_expressions", false},
+           {"columns", json::array({"fulfilment_region", "created_at"})},
+           {"leading_column", "fulfilment_region"}};
+  auto doc = minimal_spec();
+  for (auto& i : doc["intents"]) {
+    if (i["kind"] == "create_index") i.erase("where");  // no predicate
+  }
+  const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(doc), obs, {});
+  EXPECT_TRUE(plan.ok) << plan.render();
+  for (const auto& w : plan.warnings) {
+    EXPECT_EQ(w.find("predicates differ as written"), std::string::npos)
+        << "a full index beside a partial one was reported as ambiguous: " << w;
+  }
+}

@@ -82,5 +82,12 @@ First skeleton. Nothing is applied to a database yet.
   intent declared; foreign keys are followed both ways. Triggers are *named,
   never resolved* — a trigger function body is invisible to both the catalog
   and the plan, so it downgrades confidence instead of being guessed at.
+- **Redundant-index detection.** The name check never caught an index
+  identical to an existing one under a *different* name — a permanent cost paid
+  on every write. Identical is now a conflict; prefix-redundancy warns, because
+  wanting a narrower index is a judgement this tool cannot make.
+- A backfill reports **no bloat figure**. Rows updated is not dead tuples:
+  autovacuum reclaims some during the run, HOT updates may not bloat indexes at
+  all, and other workload contributes. It points at `tableBloat` instead.
 - `cpp/test/spikes/` — the Phase 0 experiments that settled the design against
   PostgreSQL 18.6. Four of them changed it.

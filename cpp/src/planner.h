@@ -14,6 +14,7 @@
 // replace.
 
 #include <algorithm>
+#include <cctype>
 #include <map>
 #include <string>
 #include <vector>
@@ -320,7 +321,7 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
     return;
   }
 
-  const auto& indexes = t.value("indexes", json::object());
+  const json indexes = t.value("indexes", json::object());
   bool rebuild_after_drop = false;
   if (indexes.contains(name)) {
     const auto& existing = indexes[name];
@@ -335,6 +336,163 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
       step.why = "index already present and valid";
       step.detail["existing_definition"] = existing.value("definition", "");
       return;
+    }
+  }
+
+  // An index identical to one already present, under a different name, is a
+  // permanent cost paid on every write forever. The name check above does not
+  // catch it, because the name is the one thing that differs.
+  //
+  // Identical is a CONFLICT: there is no reading of the database that makes
+  // building it correct. Prefix-redundancy is a WARNING, because there are
+  // legitimate reasons to want a narrower index -- a smaller one, a different
+  // fillfactor -- and refusing would be this tool overriding a judgement it is
+  // not equipped to make.
+  {
+    // PostgreSQL renders a predicate its own way: a spec's
+    //   status = 'open'
+    // comes back from pg_get_expr as
+    //   (status = 'open'::text)
+    // so a raw string comparison never matches. Measured on 18.6.
+    //
+    // This normalises the common shapes -- outer parens, ::type casts,
+    // whitespace, case -- and NOTHING MORE. Two SQL expressions being
+    // equivalent is not decidable by string munging, so a match here upgrades
+    // to a conflict and a mismatch only warns. Claiming a duplicate on the
+    // strength of a normaliser would be exactly the confidently-wrong answer
+    // this tool must not give.
+    const auto normalize = [](const std::string& p) {
+      std::string out;
+      bool in_string = false;
+      for (std::size_t i = 0; i < p.size(); ++i) {
+        const char c = p[i];
+        if (c == '\'') {
+          in_string = !in_string;
+          out += c;
+          continue;
+        }
+        if (in_string) {  // never touch the inside of a literal
+          out += c;
+          continue;
+        }
+        if (c == ':' && i + 1 < p.size() && p[i + 1] == ':') {
+          // Skip ::identifier, and an optional (n) or [] suffix.
+          i += 2;
+          while (i < p.size() && (std::isalnum(static_cast<unsigned char>(p[i])) ||
+                                  p[i] == '_' || p[i] == '.')) {
+            ++i;
+          }
+          if (i < p.size() && p[i] == '(') {
+            while (i < p.size() && p[i] != ')') ++i;
+          } else if (i + 1 < p.size() && p[i] == '[' && p[i + 1] == ']') {
+            ++i;
+          } else {
+            --i;
+          }
+          continue;
+        }
+        if (c == ' ' || c == '\n' || c == '\t') {
+          if (!out.empty() && out.back() != ' ') out += ' ';
+          continue;
+        }
+        out += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      }
+      // Strip balanced outer parentheses.
+      auto trim = [](std::string v) {
+        while (!v.empty() && v.front() == ' ') v.erase(v.begin());
+        while (!v.empty() && v.back() == ' ') v.pop_back();
+        return v;
+      };
+      out = trim(out);
+      while (out.size() > 1 && out.front() == '(' && out.back() == ')') {
+        int depth = 0;
+        bool wraps = true;
+        for (std::size_t i = 0; i < out.size(); ++i) {
+          if (out[i] == '(') ++depth;
+          if (out[i] == ')') --depth;
+          if (depth == 0 && i + 1 < out.size()) { wraps = false; break; }
+        }
+        if (!wraps) break;
+        out = trim(out.substr(1, out.size() - 2));
+      }
+      return out;
+    };
+
+    const auto want_pred = normalize(where);
+    for (auto it = indexes.begin(); it != indexes.end(); ++it) {
+      if (it.key() == name) continue;
+      const auto& ex = it.value();
+      if (!ex.value("is_valid", false)) continue;
+      // An index over expressions cannot be compared by column name, and a
+      // partial comparison would be worse than none.
+      if (ex.value("has_expressions", false)) continue;
+      if (ex.value("method", "") != method) continue;
+
+      std::vector<std::string> ex_cols;
+      for (const auto& c : ex.value("columns", json::array())) {
+        ex_cols.push_back(c.get<std::string>());
+      }
+      const auto ex_pred = normalize(ex.value("predicate", ""));
+      const bool same_shape =
+          ex_cols == columns && ex.value("is_unique", false) == unique;
+
+      // Same columns, predicates that did not normalise to the same string.
+      // Equivalence is not provable here, so this warns and names both rather
+      // than refusing on a guess.
+      //
+      // But only when BOTH are non-empty. A full index and a partial index are
+      // definitively different -- one covers rows the other does not -- so
+      // there is no ambiguity to report, and warning about it would be noise
+      // on every narrow index built beside a partial one.
+      const bool both_partial = !ex_pred.empty() && !want_pred.empty();
+      if (same_shape && ex_pred != want_pred && both_partial) {
+        plan.warnings.push_back(
+            "\"" + name + "\" has the same columns and method as the existing "
+            "index \"" + it.key() + "\" on " + qualified +
+            ", but their predicates differ as written: this spec has [" +
+            (where.empty() ? "none" : where) + "] and the existing index has [" +
+            (ex.value("predicate", "").empty() ? "none" : ex.value("predicate", "")) +
+            "]. If those are equivalent, this would be a duplicate. pg_licht "
+            "duplicateIndexes compares them properly.");
+        continue;
+      }
+      if (same_shape && ex_pred != want_pred) continue;  // definitively different
+      if (same_shape) {
+        step.action = Action::kConflict;
+        step.why = "an index identical to this one already exists as " + it.key();
+        plan.conflicts.push_back(
+            "\"" + name + "\" would duplicate the existing index \"" + it.key() +
+            "\" on " + qualified + ": same method, same columns (" +
+            detail::join(columns, ", ") +
+            "), same predicate. A redundant index costs write time on every "
+            "INSERT, UPDATE and DELETE for as long as it exists. Drop this "
+            "intent, or if the intent is to replace " + it.key() +
+            ", say so with a separate spec that drops it.");
+        return;
+      }
+      // The planned index is a prefix of an existing one: the existing index
+      // already serves these lookups.
+      if (ex_cols.size() > columns.size() &&
+          std::equal(columns.begin(), columns.end(), ex_cols.begin())) {
+        plan.warnings.push_back(
+            "\"" + name + "\" on (" + detail::join(columns, ", ") +
+            ") is a prefix of the existing index \"" + it.key() + "\" on (" +
+            detail::join(ex_cols, ", ") +
+            "), which already serves those lookups. Build it only if the "
+            "narrower index is wanted for its size. pg_licht evaluateIndex "
+            "will say whether the planner would actually use it.");
+      }
+      // The planned index is a superset: the existing one becomes redundant.
+      if (columns.size() > ex_cols.size() &&
+          std::equal(ex_cols.begin(), ex_cols.end(), columns.begin())) {
+        plan.warnings.push_back(
+            "\"" + name + "\" on (" + detail::join(columns, ", ") +
+            ") makes the existing index \"" + it.key() + "\" on (" +
+            detail::join(ex_cols, ", ") +
+            ") redundant. Dropping it afterwards is a separate migration; "
+            "pg_licht duplicateIndexes confirms the redundancy and "
+            "evaluateIndex hide will say whether anything still needs it.");
+      }
     }
   }
 

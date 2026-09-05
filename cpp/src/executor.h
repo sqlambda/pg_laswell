@@ -421,6 +421,23 @@ class Executor {
            {"commitReasons", reasons},
            {"finalCursor", cursor},
            {"key", key_column}};
+    // What this step DID, and deliberately not what bloat resulted.
+    //
+    // rows updated is not dead tuples. Autovacuum runs during the backfill and
+    // removes some as it goes -- which is partly the point of pacing into short
+    // transactions, since each commit makes the previous row versions
+    // removable. HOT updates do not bloat indexes at all when the updated
+    // column is unindexed and there is fillfactor room. And other workload
+    // contributes to the same counter. Reporting rows_affected as bloat would
+    // be a confidently wrong number, which is the one thing this tool must
+    // never produce.
+    d["bloatNote"] =
+        "this updated " + std::to_string(rows_done) +
+        " rows, and each update leaves a dead row version behind. How many "
+        "remain is NOT derivable from that figure -- autovacuum reclaims some "
+        "during the run, HOT updates may not bloat indexes at all, and other "
+        "workload contributes too. Read pg_licht tableBloat or "
+        "tableStats.n_dead_tup for the actual state.";
 
     // Completeness, checked on the WORKER connection. An imported snapshot on
     // another connection cannot see this transaction's rows (spike S1), so

@@ -77,10 +77,23 @@ SELECT COALESCE(
                    'is_unique', i.indisunique,
                    'is_primary', i.indisprimary,
                    'definition', pg_get_indexdef(i.indexrelid),
+                   'method', am.amname,
+                   'predicate', COALESCE(pg_get_expr(i.indpred, i.indrelid), ''),
+                   -- Column names in index order. An expression column has
+                   -- attnum 0 and cannot be named, so has_expressions marks the
+                   -- index as one this tool must not reason about: comparing a
+                   -- partial list would be worse than declining to compare.
+                   'has_expressions', (0 = ANY(i.indkey)),
+                   'columns', (SELECT JSONB_AGG(a.attname ORDER BY k.ord)
+                                 FROM unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord)
+                                 JOIN pg_attribute a ON a.attrelid = t.oid
+                                                    AND a.attnum = k.attnum),
                    'leading_column', (SELECT a.attname FROM pg_attribute a
                                        WHERE a.attrelid = t.oid
                                          AND a.attnum = i.indkey[0])))
-                   FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid
+                   FROM pg_index i
+                   JOIN pg_class ic ON ic.oid = i.indexrelid
+                   JOIN pg_am am ON am.oid = ic.relam
                   WHERE i.indrelid = t.oid),
                  '{}'::jsonb),
      'lock_waiters', (SELECT COUNT(*) FROM pg_locks l
