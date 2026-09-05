@@ -629,6 +629,49 @@ There is no
 measured on 18.6, a cascading drop under a three-level stack left
 .Em zero
 views standing.
+.Ss What is not a migration
+An intent kind has to pass two tests, and the second one is easy to overlook.
+It must make a real decision -- if the planner would emit one possible
+statement whatever the database looked like, it is a wrapper around
+.Xr psql 1 .
+And it must be a change to schema
+.Em state ,
+applied exactly once.
+.Pp
+The ledger keys on the specification digest, and a digest that has succeeded is
+never listed pending again.
+So anything meant to run
+.Em repeatedly
+cannot be a migration here: the specification would run once, be marked
+applied, and never run again.
+.Pp
+.Ic REINDEX
+is the clearest example, and it passes the first test --
+.Ic REINDEX CONCURRENTLY
+against a plain rebuild is a genuine, bloat-driven decision.
+It fails the second one completely.
+It changes no state: the catalog is identical before and after, same index,
+same definition, same name.
+It can never be
+.Em satisfied ,
+because nothing in the catalog says an index has been reindexed.
+And it answers a condition that is transient, so a signature attesting that
+somebody reviewed it three months ago says nothing about whether that index is
+bloated today.
+.Pp
+There is no gap to fill either.
+.Xr reindexdb 1
+ships with PostgreSQL and takes
+.Fl -concurrently ,
+and pg_licht
+.Cm indexBloat
+answers whether it is worth doing.
+Use those.
+The same reasoning applies to
+.Ic VACUUM ,
+.Ic ANALYZE
+and
+.Ic CLUSTER .
 .Ss Partitions
 .Ic ATTACH
 validates the candidate against the new bounds unless a CHECK constraint

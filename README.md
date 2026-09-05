@@ -103,6 +103,19 @@ costs nothing and bounds the harm.
 Signing answers *"did this exact change come from someone we trust?"*, not
 *"should this change be allowed?"*. The second question is `GRANT`'s job.
 
+## What it deliberately does not do
+
+An intent kind must make a real decision **and** be a change to schema state
+applied exactly once. `REINDEX` passes the first test — concurrent versus plain
+is a genuine, bloat-driven choice — and fails the second: it changes no state,
+can never be *satisfied*, and answers a condition that is transient. The ledger
+keys on a spec digest and never lists an applied one again, so a repeatable
+operation would run once and never again.
+
+So there is no `reindex`, `vacuum`, `analyze` or `cluster`. `reindexdb
+--concurrently` ships with PostgreSQL, and pg_licht `indexBloat` says whether
+it is worth doing. Maintenance is not migration.
+
 ## Building
 
 PostgreSQL 14+ headers, libpqxx, nlohmann/json, OpenSSL and GoogleTest, all
