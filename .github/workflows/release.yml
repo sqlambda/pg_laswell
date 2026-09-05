@@ -18,36 +18,104 @@ concurrency:
 
 env:
   DEBIAN_FRONTEND: noninteractive
+  # Pinned, and built statically from source on every Linux target, rather than
+  # linking whatever libpqxx each distribution happens to package. This is
+  # pg_licht's method, and it is the reason pg_licht's packages work.
+  #
+  # What the alternative actually produced, measured rather than assumed:
+  # building against Debian's shared libpqxx-7.10 leaves the binary with a
+  # NEEDED entry for libpqxx-7.10.so -- a soname no RPM distribution provides,
+  # and one that pins the deb to a single Debian release. libpq stays dynamic on
+  # purpose: its C ABI is stable across versions and distributions patch it
+  # independently, so it should come from the target's own repository.
+  PQXX_VERSION: 8.0.2
 
 jobs:
   build:
     name: ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-latest
+    container: ${{ matrix.container || '' }}
     timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: deb-amd64
-            runner: ubuntu-latest
+            container: debian:trixie
+            distro: debian
             generator: DEB
           - name: rpm-amd64
-            runner: ubuntu-latest
+            container: rockylinux:9
+            distro: rocky
             generator: RPM
           - name: tarball-amd64
-            runner: ubuntu-latest
+            distro: ubuntu
             generator: TGZ
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
-      - name: Install dependencies
+      # `file` is not optional on Debian: without it CPack refuses outright --
+      # "file utility is not available. CPACK_DEBIAN_PACKAGE_SHLIBDEPS ... not
+      # available" -- and produces no package. A minimal container lacks it.
+      - name: Install dependencies (Debian)
+        if: matrix.distro == 'debian'
         run: |
-          sudo apt-get update -o DPkg::Lock::Timeout=300
+          apt-get update -q
+          apt-get install -y --no-install-recommends \
+            curl ca-certificates cmake build-essential pkg-config dpkg-dev file \
+            libpq-dev libssl-dev nlohmann-json3-dev
+          curl -fsSL "https://github.com/jtv/libpqxx/archive/refs/tags/${PQXX_VERSION}.tar.gz" | tar -xz -C /tmp
+          cmake -S "/tmp/libpqxx-${PQXX_VERSION}" -B /tmp/libpqxx-build \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DSKIP_BUILD_TEST=ON
+          cmake --build /tmp/libpqxx-build -j"$(nproc)"
+          cmake --install /tmp/libpqxx-build
+          echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig" >> $GITHUB_ENV
+
+      - name: Install dependencies (Rocky Linux)
+        if: matrix.distro == 'rocky'
+        run: |
+          dnf install -y epel-release dnf-plugins-core
+          dnf config-manager --set-enabled crb
+          dnf install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-9-$(uname -m)/pgdg-redhat-repo-latest.noarch.rpm
+          dnf module disable -y postgresql
+          # Rocky 9's default gcc-c++ is GCC 11, which cannot build this at all
+          # (C++23) and lacks the complete <format> that libpqxx 8.x needs.
+          # gcc-toolset-13 is Rocky's own AppStream package for a newer GCC
+          # without replacing the system compiler.
+          #
+          # PGDG's "libpq-devel" on RHEL/Rocky resolves to the *versioned*
+          # postgresql18-devel, which installs libpq.pc under /usr/pgsql-18/lib
+          # and never on pkg-config's default search path. libpq5-devel is
+          # PGDG's separate unversioned package that installs to the standard
+          # FHS location instead.
+          dnf install -y cmake gcc-toolset-13-gcc-c++ binutils libpq5-devel \
+            openssl-devel nlohmann-json-devel pkg-config rpm-build
+          echo "CC=/opt/rh/gcc-toolset-13/root/usr/bin/gcc" >> $GITHUB_ENV
+          echo "CXX=/opt/rh/gcc-toolset-13/root/usr/bin/g++" >> $GITHUB_ENV
+          export CC=/opt/rh/gcc-toolset-13/root/usr/bin/gcc
+          export CXX=/opt/rh/gcc-toolset-13/root/usr/bin/g++
+          curl -fsSL "https://github.com/jtv/libpqxx/archive/refs/tags/${PQXX_VERSION}.tar.gz" | tar -xz -C /tmp
+          cmake -S "/tmp/libpqxx-${PQXX_VERSION}" -B /tmp/libpqxx-build \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DSKIP_BUILD_TEST=ON
+          cmake --build /tmp/libpqxx-build -j"$(nproc)"
+          cmake --install /tmp/libpqxx-build
+          echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig" >> $GITHUB_ENV
+
+      - name: Install dependencies (Ubuntu)
+        if: matrix.distro == 'ubuntu'
+        run: |
+          sudo apt-get update -o DPkg::Lock::Timeout=300 -q
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build libpqxx-dev libpq-dev nlohmann-json3-dev \
-            libssl-dev rpm file
+            cmake build-essential pkg-config file curl ca-certificates \
+            libpq-dev libssl-dev nlohmann-json3-dev
+          curl -fsSL "https://github.com/jtv/libpqxx/archive/refs/tags/${PQXX_VERSION}.tar.gz" | tar -xz -C /tmp
+          cmake -S "/tmp/libpqxx-${PQXX_VERSION}" -B /tmp/libpqxx-build \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DSKIP_BUILD_TEST=ON
+          cmake --build /tmp/libpqxx-build -j"$(nproc)"
+          sudo cmake --install /tmp/libpqxx-build
+          echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig" >> $GITHUB_ENV
 
       # The tag is the source of truth for the version. A tag that disagrees
       # with the project() version means one of them is wrong, and shipping
@@ -56,7 +124,7 @@ jobs:
         run: |
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
           WANT="${TAG#v}"
-          HAVE=$(grep -oP 'project\(pg_laswell_mcp VERSION \K[0-9.]+' cpp/CMakeLists.txt)
+          HAVE=$(grep -oE 'project\(pg_laswell_mcp VERSION [0-9.]+' cpp/CMakeLists.txt | grep -oE '[0-9.]+$')
           echo "tag=$WANT  CMakeLists=$HAVE"
           [ "$WANT" = "$HAVE" ] || {
             echo "::error::tag $TAG does not match project version $HAVE"
@@ -65,9 +133,20 @@ jobs:
 
       - name: Build
         run: |
-          cmake -S cpp -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
-          cmake --build build --target pg_laswell_mcp
+          cmake -S cpp -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+          cmake --build build --target pg_laswell_mcp -j"$(nproc)"
+
+      # Static libpqxx is the entire point of the source build above, and a
+      # silent fall back to the distribution's shared copy would produce a
+      # package that installs and then cannot start. Assert it where it is
+      # actually visible: the linker's own record.
+      - name: libpqxx must be linked statically
+        run: |
+          objdump -p build/pg_laswell_mcp | grep NEEDED
+          if objdump -p build/pg_laswell_mcp | grep -q 'NEEDED.*libpqxx'; then
+            echo "::error::libpqxx was linked dynamically; the source build did not take effect"
+            exit 1
+          fi
 
       - name: Package
         run: cd build && cpack -G ${{ matrix.generator }}
@@ -80,14 +159,41 @@ jobs:
               dpkg-deb -c ./*.deb | grep -q 'bin/pg_laswell_mcp'
               dpkg-deb -c ./*.deb | grep -q 'man1/pg_laswell_mcp.1'
               dpkg-deb -c ./*.deb | grep -q 'share/pg_laswell/bootstrap.sql'
+              # Dependencies are derived, so this asserts that generation RAN,
+              # not what it produced: pinning the exact list here would be the
+              # same mistake as pinning it in CMakeLists.
               dpkg-deb -f ./*.deb Depends | grep -q libpq5 ;;
             RPM)
               rpm -qlp ./*.rpm | grep -q 'bin/pg_laswell_mcp'
-              rpm -qlp ./*.rpm | grep -q 'share/pg_laswell/bootstrap.sql' ;;
+              rpm -qlp ./*.rpm | grep -q 'man1/pg_laswell_mcp.1'
+              rpm -qlp ./*.rpm | grep -q 'share/pg_laswell/bootstrap.sql'
+              rpm -qp --requires ./*.rpm | grep -q 'libpq.so.5' ;;
             TGZ)
               tar tzf ./*.tar.gz | grep -q 'bin/pg_laswell_mcp'
+              tar tzf ./*.tar.gz | grep -q 'man1/pg_laswell_mcp.1'
               tar tzf ./*.tar.gz | grep -q 'share/pg_laswell/bootstrap.sql' ;;
           esac
+
+      # Inspecting metadata is not evidence that a package works.
+      #
+      # The gate this joins used to be the ONLY packaging check, and it passed
+      # on a package whose binary died at exec with "libpqxx-7.10.so: cannot
+      # open shared object file" -- because a wrong Depends line still contains
+      # the string it was grepped for. So install it and run it. getSpecDigest
+      # is the right probe: it needs no database, and it still exercises
+      # loading, the canonicaliser and OpenSSL.
+      - name: Install the package and run the binary
+        run: |
+          cd build
+          SPEC='{"spec":{"laswell_spec_version":1,"id":"x","description":"d","intents":[{"kind":"add_column","schema":"s","table":"t","column":"c","type":"text","nullable":true,"comment":"c"}]}}'
+          case "${{ matrix.generator }}" in
+            DEB) apt-get install -y --no-install-recommends ./*.deb ;;
+            RPM) dnf install -y ./*.rpm ;;
+            TGZ) sudo tar xzf ./*.tar.gz -C /usr/local --strip-components=1 ;;
+          esac
+          pg_laswell_mcp --version
+          pg_laswell_mcp --call getSpecDigest --args "$SPEC" | grep -q '"digest"'
+          echo "installed from the package, and answered"
 
       - uses: actions/upload-artifact@v4
         with:

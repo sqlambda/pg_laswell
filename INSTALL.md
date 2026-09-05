@@ -23,18 +23,30 @@ decisions rather than steps.
 
 **Dependencies are derived from the binary, never listed by hand.** The DEB
 uses `dpkg-shlibdeps` and the RPM uses rpmbuild's soname scan, so the package
-describes what was actually linked:
+describes what was actually linked rather than what someone believed was
+linked.
+
+**Release packages link libpqxx statically**, built from a pinned source
+release inside the target distribution's own container (`debian:trixie`,
+`rockylinux:9`) — the same method as pg_licht. libpq stays dynamic: its C ABI
+is stable and distributions patch it independently, so it should come from the
+target's own repository. Release dependencies are then:
 
 ```
-libc6 (>= 2.38), libgcc-s1 (>= 3.0), libpqxx-7.10 (>= 7.10.0),
+libc6 (>= 2.38), libgcc-s1 (>= 4.3), libpq5 (>= 10~~),
 libssl3t64 (>= 3.0.0), libstdc++6 (>= 14)
 ```
 
-The hand-written list this replaced said `libpq5` and was wrong in both
-directions — it missed `libpqxx-7.10`, which the binary links directly, and
-`libstdc++6 (>= 14)`, which C++23 needs; and `libpq5` itself is redundant,
-because `libpqxx-7.10` already depends on it. A package built from that list
-installed without complaint on a clean Debian 13 and then failed to start.
+A **local** `cpack` links your distribution's shared libpqxx instead and will
+name it (`libpqxx-7.10` on Debian 13). That package is fine on the machine that
+built it and is not what gets released — a soname like `libpqxx-7.10.so` is
+provided by no RPM distribution and pins the deb to one Debian release.
+
+Two failures this arrangement exists to prevent, both observed rather than
+imagined. A hand-written `libpq5` was wrong in both directions: it missed
+`libpqxx-7.10` and `libstdc++6 (>= 14)`, and named `libpq5` redundantly. And
+`CPACK_DEBIAN_PACKAGE_SHLIBDEPS` silently needs the `file` utility — without it
+CPack produces no package at all.
 
 ## 1. Bootstrap, by hand
 

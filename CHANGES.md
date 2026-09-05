@@ -154,14 +154,28 @@ and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
   `AccessExclusiveLock` the statement never names, a unique or exclusion
   constraint takes its index with it, and a NOT NULL constraint leaves the
   column nullable again.
-- **Packages that work.** `cpack -G DEB`/`-G RPM`, with dependencies **derived
-  from the binary** rather than listed by hand. The hand-written list said
-  `libpq5`; installed into a clean `debian:13-slim`, the package reported no
-  problem and the binary then died with `libpqxx-7.10.so: cannot open shared
-  object file`. It also missed `libstdc++6 (>= 14)`, and named `libpq5`
-  redundantly — `libpqxx-7.10` already depends on it. `CPACK_RPM_PACKAGE_REQUIRES`
-  is gone too: it carried a *Debian* package name, which would have made the
-  RPM uninstallable rather than merely under-specified.
+- **Packages that work**, by adopting pg_licht's release method rather than a
+  parallel one. Release builds run inside the target distribution's own
+  container (`debian:trixie`, `rockylinux:9`) and link **libpqxx statically**
+  from a pinned source release; libpq stays dynamic, since its C ABI is stable
+  and distributions patch it independently. The previous workflow built all
+  three artifacts on bare `ubuntu-latest` against Debian's shared libpqxx —
+  which produced an RPM carrying Ubuntu sonames, and a deb pinned to one Debian
+  release.
+- **Package dependencies are derived from the binary**, by `dpkg-shlibdeps` and
+  rpmbuild's soname scan, rather than listed by hand. The hand-written list said
+  `libpq5` — the one library the binary does *not* link directly. Installed into
+  a clean `debian:13-slim`, the package reported no problem and the binary then
+  died with `libpqxx-7.10.so: cannot open shared object file`. It also missed
+  `libstdc++6 (>= 14)`. `CPACK_RPM_PACKAGE_REQUIRES` is gone too: it carried a
+  *Debian* package name, which makes an RPM uninstallable rather than merely
+  under-specified.
+- **The release workflow now installs the package and runs the binary.** Its
+  only packaging gate was `Depends | grep -q libpq5`, which passed on the
+  broken package — a wrong Depends line still contains the string it is grepped
+  for. It also asserts libpqxx is not in the binary's `NEEDED` entries, because
+  a silent fall back to the distribution's shared copy is exactly the failure
+  that shipped.
 - **`getSpecDigest` no longer demands a database it never uses.** The signing
   workflow the man page documents runs on the machine holding the private key —
   deliberately not the machine that can reach production — and refusing to start
