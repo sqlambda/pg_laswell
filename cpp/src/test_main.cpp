@@ -14,13 +14,28 @@
 // Same pattern as pg_licht's PGLICHT_REQUIRE_HYPOPG.
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <set>
 #include <sstream>
 #include <string>
+#include <thread>
 
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
+
+#if defined(__GNUC__) && !defined(__clang__)
+// GCC-only false positive from std::variant inside pqxx headers; Clang does not
+// have this warning group at all, and with -Werror active an unguarded pragma
+// would hard-fail there on "unknown warning group".
+#  pragma GCC diagnostic push
+#  pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+#endif
+#include <pqxx/pqxx>
+#if defined(__GNUC__) && !defined(__clang__)
+#  pragma GCC diagnostic pop
+#endif
 
 #include "server.h"
 
@@ -266,4 +281,130 @@ class DatabaseTest : public ::testing::Test {
 
 TEST_F(DatabaseTest, FixtureResolvesAConnectionString) {
   EXPECT_FALSE(url_.empty());
+}
+
+// --- S6: cancelling a worker's statement from the observer thread ---------
+//
+// The escalation path depends on this: when a backend has been blocked behind
+// one of our batch statements for longer than kMaxWaiterWaitMs, the observer
+// thread cancels that statement rather than waiting for it to finish. libpqxx
+// documents cancel_query() as callable from another thread, with the caveat
+// that it is the caller's job not to cancel the wrong query. These tests are
+// what makes that caveat concrete, and they run under TSAN in CI.
+
+TEST_F(DatabaseTest, CancelQueryFromAnotherThreadStopsALongStatement) {
+  pqxx::connection worker(url_);
+  const int worker_pid = worker.backendpid();
+  ASSERT_GT(worker_pid, 0);
+
+  std::atomic<bool> threw_sql_error{false};
+  std::atomic<bool> finished{false};
+  std::string sqlstate;
+
+  const auto started = std::chrono::steady_clock::now();
+  std::thread runner([&] {
+    try {
+      pqxx::work txn(worker);
+      // Long enough that a pass here cannot be the statement simply finishing.
+      txn.exec("SELECT pg_sleep(30)");
+      txn.commit();
+    } catch (const pqxx::sql_error& e) {
+      threw_sql_error = true;
+      sqlstate = e.sqlstate();
+    } catch (const std::exception&) {
+      // Any other exception leaves threw_sql_error false and fails below.
+    }
+    finished = true;
+  });
+
+  // Do not cancel until the statement is provably in flight. Cancelling before
+  // the query is sent would cancel nothing and the test would pass for the
+  // wrong reason -- this is exactly the "wrong query" hazard the libpqxx
+  // documentation warns about, and the observer has the same obligation.
+  {
+    pqxx::connection watcher(url_);
+    bool running = false;
+    for (int i = 0; i < 200 && !running; ++i) {
+      pqxx::nontransaction tx(watcher);
+      const auto r = tx.exec(
+          "SELECT count(*) FROM pg_stat_activity "
+          " WHERE pid = " + std::to_string(worker_pid) +
+          "   AND state = 'active' AND query LIKE '%pg_sleep%'");
+      running = !r.empty() && r[0][0].as<int>() > 0;
+      if (!running) std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    ASSERT_TRUE(running) << "the sleep never became visible in pg_stat_activity";
+  }
+
+  worker.cancel_query();
+  runner.join();
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+
+  EXPECT_TRUE(finished);
+  ASSERT_TRUE(threw_sql_error) << "cancel_query() did not interrupt the statement";
+  // 57014 is query_canceled. libpqxx has no exception class for it -- see the
+  // next test -- so the SQLSTATE string is the only handle.
+  EXPECT_EQ(sqlstate, "57014");
+  EXPECT_LT(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count(), 20)
+      << "the statement ran to completion instead of being cancelled";
+}
+
+TEST_F(DatabaseTest, ACancelledQueryHasNoDedicatedExceptionClassSoMatchSqlstate) {
+  // pg_licht's hard-won lesson is that insufficient_privilege must be matched
+  // by exception TYPE, because libpqxx leaves sqlstate() empty on that class.
+  // Cancellation is the mirror image: libpqxx declares no query_canceled
+  // class, so a cancelled statement arrives as a plain sql_error and the type
+  // tells you nothing. Type where a class exists, SQLSTATE where it does not.
+  //
+  // The consequence for the executor, recorded here because it is easy to miss:
+  // 57014 is ALSO what statement_timeout raises. The two cannot be told apart
+  // from the error alone, so the worker must consult its own
+  // PacingState::cancel_requested_ flag to know which happened. An executor
+  // that reported every 57014 as "we cancelled you" would silently mislabel
+  // every statement-timeout as deliberate.
+  pqxx::connection conn(url_);
+  bool caught_plain_sql_error = false;
+  try {
+    pqxx::work txn(conn);
+    txn.exec("SET LOCAL statement_timeout = 100");
+    txn.exec("SELECT pg_sleep(5)");
+    txn.commit();
+  } catch (const pqxx::sql_error& e) {
+    caught_plain_sql_error = true;
+    EXPECT_EQ(std::string(e.sqlstate()), "57014")
+        << "statement_timeout should also surface as 57014";
+  }
+  EXPECT_TRUE(caught_plain_sql_error);
+}
+
+TEST_F(DatabaseTest, SetLocalIsSilentlyANoOpOnANontransaction) {
+  // Found by writing the test above wrongly, and kept because the executor is
+  // going to walk into it: CREATE INDEX CONCURRENTLY cannot run inside a
+  // transaction block, so it runs on a pqxx::nontransaction -- and SET LOCAL
+  // there is not an error, it simply does nothing. PostgreSQL emits a warning
+  // ("SET LOCAL can only be used in transaction blocks") that libpqxx does not
+  // raise, so the timeout would appear to be set and would not be.
+  //
+  // Consequence: the CIC step must use a session-level SET with an explicit
+  // RESET afterwards, never SET LOCAL. That is the one place this project
+  // knowingly uses session state, and it is licensed only because the executor
+  // requires a direct connection.
+  pqxx::connection conn(url_);
+  pqxx::nontransaction tx(conn);
+  tx.exec("SET LOCAL statement_timeout = 100");
+  const auto after_set_local =
+      tx.exec("SELECT current_setting('statement_timeout')")[0][0]
+          .as<std::string>();
+  EXPECT_EQ(after_set_local, "0")
+      << "SET LOCAL unexpectedly took effect outside a transaction block; "
+         "if this ever changes, the CIC step's session-level SET can be "
+         "simplified";
+
+  // A session-level SET, by contrast, does take effect here.
+  tx.exec("SET statement_timeout = 100");
+  const auto after_set =
+      tx.exec("SELECT current_setting('statement_timeout')")[0][0]
+          .as<std::string>();
+  EXPECT_EQ(after_set, "100ms");
+  tx.exec("RESET statement_timeout");
 }

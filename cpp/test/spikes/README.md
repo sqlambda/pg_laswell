@@ -48,10 +48,17 @@ that matches the system service too.
 | `s11b_chain_cost.sh` | what does the transitive chain cost? | 0.118 ms vs 0.087 ms server-side — no cost argument for the weaker signal |
 | `s12_exhaustion.sh` | does the connection-exhaustion budget hold? | **yes, 1:1** — one blocked query pins one connection; harm is *quadratic* in block duration |
 
-## Still outstanding
+## Outstanding
 
-**S6** — `pqxx::connection::cancel_query()` called from a second thread against
-a worker running a long statement, under TSAN. It needs the C++ build, so it is
-not a shell script and is not here yet. It gates only the escalation path
-(cancel a batch whose waiter has been blocked past `kMaxWaiterWaitMs`); the
-fallback if it fails is to drop escalation and lower `batch_rows`.
+Nothing. **S6 is done** and lives in `cpp/src/test_main.cpp` rather than here,
+as `DatabaseTest.CancelQueryFromAnotherThreadStopsALongStatement` and its two
+companions — cancelling from another thread is a permanent property the
+escalation path depends on, so it belongs in the suite that runs under TSAN in
+CI, not in a script somebody has to remember to run.
+
+Run them with:
+
+```bash
+DATABASE_URL="port=5555 dbname=laswell_spike" PGLASWELL_REQUIRE_DATABASE=1 \
+  ./cpp/build/pg_laswell_mcp_test --gtest_filter='DatabaseTest.*'
+```
