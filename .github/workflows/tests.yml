@@ -1,0 +1,194 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A push to a branch that already has a run in flight cancels it, but a run on
+# main does not: main's history is what a release is cut from, so its results
+# have to be complete rather than merely recent.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  DEBIAN_FRONTEND: noninteractive
+
+jobs:
+  # Both compilers, because they disagree about -Wconversion around the OpenSSL
+  # C boundary and about dangling references. -Werror is on everywhere, so a
+  # disagreement is a build failure rather than a warning nobody reads.
+  build-and-test:
+    name: ${{ matrix.compiler }} / PostgreSQL ${{ matrix.pg }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [g++, clang++]
+        pg: [16, 17, 18]
+        include:
+          # PostgreSQL 15 has no EXPLAIN (GENERIC_PLAN), so listMigrations
+          # cannot derive relations hidden in expressions and says so. One job
+          # covers that degraded path; running the whole matrix on it would
+          # test the same fallback five times.
+          - compiler: g++
+            pg: 15
+    services:
+      postgres:
+        image: postgres:${{ matrix.pg }}
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 10
+        ports: ['5432:5432']
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -o DPkg::Lock::Timeout=300
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build libpqxx-dev libpq-dev nlohmann-json3-dev \
+            libgtest-dev libssl-dev mandoc postgresql-client
+      - name: Configure
+        run: cmake -S cpp -B build -G Ninja -DCMAKE_CXX_COMPILER=${{ matrix.compiler }}
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+          # A skip nobody notices is a test that silently stopped running.
+          PGLASWELL_REQUIRE_DATABASE: '1'
+        run: ctest --test-dir build --output-on-failure
+
+  # THREAD is a gate for this project rather than belt-and-braces: a worker
+  # thread per job plus one process-wide observer against a shared registry is
+  # real concurrency, not a theoretical possibility.
+  sanitizers:
+    name: ${{ matrix.sanitizer }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [ADDRESS_UNDEFINED, THREAD]
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 10
+        ports: ['5432:5432']
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -o DPkg::Lock::Timeout=300
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build libpqxx-dev libpq-dev nlohmann-json3-dev \
+            libgtest-dev libssl-dev mandoc postgresql-client
+      - name: Configure
+        run: cmake -S cpp -B build -G Ninja -DPGLASWELL_SANITIZER=${{ matrix.sanitizer }}
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+          PGLASWELL_REQUIRE_DATABASE: '1'
+          # Fail on a finding rather than printing it and passing.
+          TSAN_OPTIONS: halt_on_error=1
+          ASAN_OPTIONS: abort_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ctest --test-dir build --output-on-failure
+
+  # Valgrind covers what a sanitizer build cannot run under, and the OpenSSL
+  # EVP handle lifetimes are the one place with manual C resource management.
+  valgrind:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 10
+        ports: ['5432:5432']
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -o DPkg::Lock::Timeout=300
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build libpqxx-dev libpq-dev nlohmann-json3-dev \
+            libgtest-dev libssl-dev mandoc valgrind postgresql-client
+      - name: Configure and build
+        run: cmake -S cpp -B build -G Ninja && cmake --build build
+      - name: Valgrind
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+          PGLASWELL_REQUIRE_DATABASE: '1'
+        run: ctest --test-dir build -R valgrind --output-on-failure
+
+  # The executor refuses to run behind a transaction-mode pooler. This asserts
+  # that the refusal HAPPENS -- not that the incompatibility is absent.
+  pooled:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 10
+        ports: ['5432:5432']
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -o DPkg::Lock::Timeout=300
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build libpqxx-dev libpq-dev nlohmann-json3-dev \
+            libgtest-dev libssl-dev mandoc pgbouncer postgresql-client
+      - name: Configure and build
+        run: cmake -S cpp -B build -G Ninja && cmake --build build
+      - name: Read-only tools work through a pooler
+        run: bash cpp/test/run-pooled-tests.sh ./build/pg_laswell_mcp
+
+  packages:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -o DPkg::Lock::Timeout=300
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build libpqxx-dev libpq-dev nlohmann-json3-dev \
+            libssl-dev rpm file
+      - name: Build packages
+        run: |
+          cmake -S cpp -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+          cmake --build build --target pg_laswell_mcp
+          cd build && cpack -G DEB && cpack -G RPM && cpack -G TGZ
+      - name: The package must carry the binary, the manual and bootstrap.sql
+        run: |
+          cd build
+          dpkg-deb -c ./*.deb | tee /dev/stderr | grep -q 'bin/pg_laswell_mcp'
+          dpkg-deb -c ./*.deb | grep -q 'man1/pg_laswell_mcp.1'
+          # Shipped alongside the binary precisely because the binary must
+          # never run it: an owner of laswell.trusted_key can grant itself
+          # trust.
+          dpkg-deb -c ./*.deb | grep -q 'share/pg_laswell/bootstrap.sql'
+          dpkg-deb -f ./*.deb Depends | grep -q libpq5
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: build/pg-laswell-*

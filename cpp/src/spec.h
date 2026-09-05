@@ -32,13 +32,17 @@ namespace pglaswell {
 
 inline constexpr int kSpecVersion = 1;
 
-enum class IntentKind { kAddColumn, kBackfill, kCreateIndex };
+enum class IntentKind { kAddColumn, kBackfill, kCreateIndex, kDropIndex,
+                        kSetNotNull, kAddForeignKey };
 
 inline const std::map<std::string, IntentKind>& intent_kinds() {
   static const std::map<std::string, IntentKind> kKinds = {
       {"add_column", IntentKind::kAddColumn},
       {"backfill", IntentKind::kBackfill},
       {"create_index", IntentKind::kCreateIndex},
+      {"drop_index", IntentKind::kDropIndex},
+      {"set_not_null", IntentKind::kSetNotNull},
+      {"add_foreign_key", IntentKind::kAddForeignKey},
   };
   return kKinds;
 }
@@ -293,6 +297,80 @@ inline void parse_create_index(Intent& in) {
   }
 }
 
+inline void parse_drop_index(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(in.body, {"kind", "schema", "table", "name"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "name", at), "name", in.ordinal);
+  // No comment key: dropping an object cannot document one.
+}
+
+inline void parse_set_not_null(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(
+      in.body, {"kind", "schema", "table", "column", "keep_check"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "column", at), "column", in.ordinal);
+  if (in.body.contains("keep_check") && !in.body["keep_check"].is_boolean()) {
+    detail::fail(at + ".keep_check must be a boolean",
+                 "The CHECK constraint is redundant once the column is NOT "
+                 "NULL and costs time on every insert, so it is dropped by "
+                 "default. Set keep_check to true to keep it.");
+  }
+}
+
+inline void parse_add_foreign_key(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(
+      in.body,
+      {"kind", "schema", "table", "name", "columns", "references_schema",
+       "references_table", "references_columns", "on_delete", "on_update"},
+      at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
+  // Named rather than derived, for the same reason an index is: a derived name
+  // is a name nobody can search for during an incident.
+  detail::require_identifier(detail::require_string(in.body, "name", at), "name", in.ordinal);
+  detail::require_identifier(
+      detail::require_string(in.body, "references_schema", at), "references_schema", in.ordinal);
+  detail::require_identifier(
+      detail::require_string(in.body, "references_table", at), "references_table", in.ordinal);
+
+  for (const char* key : {"columns", "references_columns"}) {
+    if (!in.body.contains(key) || !in.body[key].is_array() || in.body[key].empty()) {
+      detail::fail(at + " needs a non-empty \"" + key + "\" array", "");
+    }
+    for (const auto& c : in.body[key]) {
+      if (!c.is_string()) detail::fail(at + "." + key + " entries must be strings", "");
+      detail::require_identifier(c.get<std::string>(), key, in.ordinal);
+    }
+  }
+  if (in.body["columns"].size() != in.body["references_columns"].size()) {
+    detail::fail(at + " has " + std::to_string(in.body["columns"].size()) +
+                     " columns and " +
+                     std::to_string(in.body["references_columns"].size()) +
+                     " references_columns",
+                 "A foreign key maps its columns one to one.");
+  }
+  static const std::set<std::string> kActions = {
+      "NO ACTION", "RESTRICT", "CASCADE", "SET NULL", "SET DEFAULT"};
+  for (const char* key : {"on_delete", "on_update"}) {
+    if (!in.body.contains(key)) continue;
+    const auto v = in.body.value(key, "");
+    if (kActions.count(v) == 0) {
+      std::string list;
+      for (const auto& a : kActions) {
+        if (!list.empty()) list += ", ";
+        list += a;
+      }
+      detail::fail(at + "." + std::string(key) + " must be one of: " + list,
+                   "Spelled exactly as PostgreSQL spells them, upper case.");
+    }
+  }
+}
+
 // Parses and validates a spec document. Throws SpecError, whose hint names the
 // exact thing to change.
 inline Spec parse_spec(const json& doc) {
@@ -405,6 +483,9 @@ inline Spec parse_spec(const json& doc) {
       case IntentKind::kAddColumn:   parse_add_column(in);   break;
       case IntentKind::kBackfill:    parse_backfill(in);     break;
       case IntentKind::kCreateIndex: parse_create_index(in); break;
+      case IntentKind::kDropIndex:   parse_drop_index(in);   break;
+      case IntentKind::kSetNotNull:  parse_set_not_null(in); break;
+      case IntentKind::kAddForeignKey: parse_add_foreign_key(in); break;
     }
     s.intents.push_back(std::move(in));
     ++ordinal;

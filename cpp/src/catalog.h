@@ -241,8 +241,9 @@ class Catalog {
   struct DryRun {
     bool ran = false;
     std::vector<std::string> problems;
-    std::vector<int> unverified_steps;  // txn_forbidden: could not be included
+    std::vector<int> unverified_steps;  // could not be included, or not reached
     std::string skipped_reason;
+    int timed_out_at = -1;
   };
 
   DryRun dry_run(const std::vector<std::pair<int, std::vector<std::string>>>& steps,
@@ -253,6 +254,11 @@ class Catalog {
     // that blocks the application is worse than one that declines to check.
     ConnConfig probe = cfg_;
     probe.executor.lock_timeout_ms = kObservationLockTimeoutMs;
+    // The dry run runs the whole plan in one transaction, so a scanning step
+    // holds every lock the steps before it took. Bounded so a planning call
+    // can never block writes for the length of a scan: correctness is what a
+    // dry run proves, and it does not need to finish the work to prove it.
+    probe.statement_timeout_ms = cfg_.executor.dry_run_statement_timeout_ms;
     WriteSession session(probe);
 
     try {
@@ -291,6 +297,18 @@ class Catalog {
             session.txn().exec(stmt);  // real DDL, rolled back below
           }
         } catch (const pqxx::sql_error& e) {
+          // A statement timeout is not a defect in the plan -- it means this
+          // step does real work that a dry run declines to finish. Everything
+          // from here on is simply unverified, and saying so beats reporting a
+          // problem that does not exist.
+          if (std::string(e.sqlstate()) == "57014") {
+            out.timed_out_at = steps[i].first;
+            for (std::size_t k = i; k < steps.size(); ++k) {
+              out.unverified_steps.push_back(steps[k].first);
+            }
+            session.rollback();
+            return out;
+          }
           out.problems.push_back("step " + std::to_string(steps[i].first) + ": " +
                                  e.what());
           session.rollback();

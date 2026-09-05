@@ -315,6 +315,16 @@ inline json plan_migration_tool(ToolContext& ctx, const json& args) {
             "transaction block (CREATE INDEX CONCURRENTLY) and were skipped "
             "rather than silently passed."}};
     if (!dry.skipped_reason.empty()) d["skippedReason"] = dry.skipped_reason;
+    if (dry.timed_out_at >= 0) {
+      d["timedOutAtStep"] = dry.timed_out_at;
+      d["note"] =
+          "the dry run stopped at a step that does real work -- a scan, most "
+          "likely -- rather than holding the earlier steps' locks for the "
+          "length of it. A planning call must never block writes. Everything "
+          "from that step on is unverified; raise "
+          "dry_run_statement_timeout_ms if you want it checked, knowing what "
+          "that costs.";
+    }
     if (!dry.problems.empty()) {
       d["problems"] = dry.problems;
       out["ok"] = false;

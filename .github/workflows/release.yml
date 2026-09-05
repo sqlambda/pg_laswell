@@ -1,0 +1,134 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'tag to build (must already exist)'
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false   # never cancel a release mid-upload
+
+env:
+  DEBIAN_FRONTEND: noninteractive
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: deb-amd64
+            runner: ubuntu-latest
+            generator: DEB
+          - name: rpm-amd64
+            runner: ubuntu-latest
+            generator: RPM
+          - name: tarball-amd64
+            runner: ubuntu-latest
+            generator: TGZ
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -o DPkg::Lock::Timeout=300
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build libpqxx-dev libpq-dev nlohmann-json3-dev \
+            libssl-dev rpm file
+
+      # The tag is the source of truth for the version. A tag that disagrees
+      # with the project() version means one of them is wrong, and shipping
+      # either would make the ledger's record of which binary ran unreliable.
+      - name: The tag must match the project version
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          WANT="${TAG#v}"
+          HAVE=$(grep -oP 'project\(pg_laswell_mcp VERSION \K[0-9.]+' cpp/CMakeLists.txt)
+          echo "tag=$WANT  CMakeLists=$HAVE"
+          [ "$WANT" = "$HAVE" ] || {
+            echo "::error::tag $TAG does not match project version $HAVE"
+            exit 1
+          }
+
+      - name: Build
+        run: |
+          cmake -S cpp -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+          cmake --build build --target pg_laswell_mcp
+
+      - name: Package
+        run: cd build && cpack -G ${{ matrix.generator }}
+
+      - name: The package must carry all three things
+        run: |
+          cd build
+          case "${{ matrix.generator }}" in
+            DEB)
+              dpkg-deb -c ./*.deb | grep -q 'bin/pg_laswell_mcp'
+              dpkg-deb -c ./*.deb | grep -q 'man1/pg_laswell_mcp.1'
+              dpkg-deb -c ./*.deb | grep -q 'share/pg_laswell/bootstrap.sql'
+              dpkg-deb -f ./*.deb Depends | grep -q libpq5 ;;
+            RPM)
+              rpm -qlp ./*.rpm | grep -q 'bin/pg_laswell_mcp'
+              rpm -qlp ./*.rpm | grep -q 'share/pg_laswell/bootstrap.sql' ;;
+            TGZ)
+              tar tzf ./*.tar.gz | grep -q 'bin/pg_laswell_mcp'
+              tar tzf ./*.tar.gz | grep -q 'share/pg_laswell/bootstrap.sql' ;;
+          esac
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: build/pg-laswell-*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # CHANGES.md must carry the version being released. A release whose
+      # changelog does not mention it is a release nobody can read afterwards,
+      # which is the same failure the ledger exists to prevent in the database.
+      - name: CHANGES.md must mention this version
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          grep -q "## ${TAG#v}" CHANGES.md || {
+            echo "::error::CHANGES.md has no entry for ${TAG#v}"
+            exit 1
+          }
+
+      # Idempotent on a re-run: an existing release is uploaded to rather than
+      # failing, so a transient upload error can simply be retried.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* \
+              --title "$TAG" --generate-notes
+          fi

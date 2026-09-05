@@ -835,7 +835,13 @@ TEST(Spec, KnownKindsAreExactlyTheImplementedKinds) {
     "backfill":     {"kind":"backfill","schema":"s","table":"t","key":"id",
                      "set":{"c":"1"},"where":"true"},
     "create_index": {"kind":"create_index","schema":"s","table":"t","name":"i",
-                     "columns":["c"],"comment":"c"}
+                     "columns":["c"],"comment":"c"},
+    "drop_index":   {"kind":"drop_index","schema":"s","table":"t","name":"i"},
+    "set_not_null": {"kind":"set_not_null","schema":"s","table":"t","column":"c"},
+    "add_foreign_key": {"kind":"add_foreign_key","schema":"s","table":"t",
+                        "name":"fk","columns":["pid"],
+                        "references_schema":"s","references_table":"p",
+                        "references_columns":["id"]}
   })");
   for (const auto& [name, kind] : pglaswell::intent_kinds()) {
     (void)kind;
@@ -3621,4 +3627,274 @@ TEST(Planner, APartialAndAFullIndexAreDifferentNotAmbiguous) {
     EXPECT_EQ(w.find("predicates differ as written"), std::string::npos)
         << "a full index beside a partial one was reported as ambiguous: " << w;
   }
+}
+
+// --- drop_index, set_not_null, add_foreign_key ------------------------------
+
+namespace {
+pglaswell::Spec spec_of(const json& intents) {
+  json doc = minimal_spec();
+  doc["intents"] = intents;
+  return pglaswell::parse_spec(doc);
+}
+std::vector<const pglaswell::Step*> steps_of(const pglaswell::Plan& p,
+                                             const std::string& kind) {
+  std::vector<const pglaswell::Step*> out;
+  for (const auto& s : p.steps) {
+    if (s.kind == kind) out.push_back(&s);
+  }
+  return out;
+}
+}  // namespace
+
+TEST(Planner, DroppingAnIndexOnAQuietTableUsesAPlainDrop) {
+  // A drop is fast whatever else is true. What costs is ACQUIRING the lock, so
+  // the rule reads lock_waiters and ignores the table's size.
+  auto obs = observations(2LL << 30, 8000000);  // huge, but quiet
+  obs.tables["shop.orders"]["indexes"]["stale_idx"] =
+      json{{"is_valid", true}, {"is_unique", false}, {"method", "btree"},
+           {"columns", json::array({"created_at"})}, {"leading_column", "created_at"}};
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "drop_index"}, {"schema", "shop"},
+                                {"table", "orders"}, {"name", "stale_idx"}}})),
+      obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto s = steps_of(plan, "drop_index");
+  ASSERT_EQ(s.size(), 1u);
+  EXPECT_NE(all_sql(*s[0]).find("DROP INDEX shop.stale_idx"), std::string::npos);
+  EXPECT_EQ(all_sql(*s[0]).find("CONCURRENTLY"), std::string::npos);
+  EXPECT_EQ(s[0]->txn_class, pglaswell::TxnClass::kOptional);
+}
+
+TEST(Planner, DroppingAnIndexWithWaitersUsesConcurrently) {
+  auto obs = observations(1024, 10, /*waiters=*/2);
+  obs.tables["shop.orders"]["indexes"]["stale_idx"] =
+      json{{"is_valid", true}, {"is_unique", false}, {"method", "btree"},
+           {"columns", json::array({"created_at"})}, {"leading_column", "created_at"}};
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "drop_index"}, {"schema", "shop"},
+                                {"table", "orders"}, {"name", "stale_idx"}}})),
+      obs, {});
+  const auto s = steps_of(plan, "drop_index");
+  ASSERT_EQ(s.size(), 1u);
+  EXPECT_NE(all_sql(*s[0]).find("DROP INDEX CONCURRENTLY"), std::string::npos);
+  EXPECT_EQ(s[0]->txn_class, pglaswell::TxnClass::kForbidden);
+  EXPECT_NE(s[0]->why.find("queue behind"), std::string::npos) << s[0]->why;
+}
+
+TEST(Planner, DroppingAConstraintBackedIndexIsRefused) {
+  auto obs = observations(1024, 10);
+  obs.tables["shop.orders"]["indexes"]["orders_uq"] =
+      json{{"is_valid", true}, {"is_unique", true}, {"constraint_backed", true},
+           {"method", "btree"}, {"columns", json::array({"created_at"})},
+           {"leading_column", "created_at"}};
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "drop_index"}, {"schema", "shop"},
+                                {"table", "orders"}, {"name", "orders_uq"}}})),
+      obs, {});
+  EXPECT_FALSE(plan.ok) << plan.render();
+  EXPECT_NE(plan.conflicts[0].find("drop the constraint instead"), std::string::npos);
+}
+
+TEST(Planner, DroppingAnAbsentIndexIsSatisfied) {
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "drop_index"}, {"schema", "shop"},
+                                {"table", "orders"}, {"name", "never_existed"}}})),
+      observations(1024, 10), {});
+  ASSERT_TRUE(plan.ok);
+  EXPECT_EQ(steps_of(plan, "drop_index")[0]->action, pglaswell::Action::kSatisfied);
+}
+
+TEST(Planner, SetNotNullUsesTheFourStepRecipeInSeparateTransactions) {
+  // The recipe only works if each step COMMITS before the next runs: if the
+  // NOT VALID add and the VALIDATE shared a transaction, the stronger lock
+  // would be held across the scan and it would buy nothing.
+  auto obs = observations(2LL << 30, 8000000);
+  obs.tables["shop.orders"]["columns"]["fulfilment_region"] =
+      json{{"type", "text"}, {"not_null", false}};
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "set_not_null"}, {"schema", "shop"},
+                                {"table", "orders"}, {"column", "fulfilment_region"}}})),
+      obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto s = steps_of(plan, "set_not_null");
+  ASSERT_EQ(s.size(), 4u) << plan.render();
+
+  EXPECT_NE(all_sql(*s[0]).find("CHECK (fulfilment_region IS NOT NULL) NOT VALID"),
+            std::string::npos);
+  EXPECT_NE(all_sql(*s[1]).find("VALIDATE CONSTRAINT"), std::string::npos);
+  EXPECT_NE(all_sql(*s[2]).find("SET NOT NULL"), std::string::npos);
+  EXPECT_NE(all_sql(*s[3]).find("DROP CONSTRAINT"), std::string::npos);
+
+  // Every step in its own transaction group. This is the property that makes
+  // the recipe worth anything.
+  for (std::size_t i = 1; i < s.size(); ++i) {
+    EXPECT_GT(s[i]->txn_group, s[i - 1]->txn_group)
+        << "step " << i << " shares a transaction with the one before it, so "
+           "the earlier step's lock is held across it";
+  }
+  // The scan happens under a lock that does not block the application.
+  EXPECT_NE(s[1]->lock.find("does NOT block reads or writes"), std::string::npos)
+      << s[1]->lock;
+}
+
+TEST(Planner, SetNotNullKeepsTheCheckWhenAsked) {
+  auto obs = observations(1024, 10);
+  obs.tables["shop.orders"]["columns"]["fulfilment_region"] =
+      json{{"type", "text"}, {"not_null", false}};
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "set_not_null"}, {"schema", "shop"},
+                                {"table", "orders"}, {"column", "fulfilment_region"},
+                                {"keep_check", true}}})),
+      obs, {});
+  EXPECT_EQ(steps_of(plan, "set_not_null").size(), 3u) << plan.render();
+}
+
+TEST(Planner, AColumnAlreadyNotNullIsSatisfied) {
+  auto obs = observations(1024, 10);
+  obs.tables["shop.orders"]["columns"]["fulfilment_region"] =
+      json{{"type", "text"}, {"not_null", true}};
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "set_not_null"}, {"schema", "shop"},
+                                {"table", "orders"}, {"column", "fulfilment_region"}}})),
+      obs, {});
+  const auto s = steps_of(plan, "set_not_null");
+  ASSERT_EQ(s.size(), 1u);
+  EXPECT_EQ(s[0]->action, pglaswell::Action::kSatisfied);
+}
+
+TEST(Planner, AddForeignKeySplitsIntoNotValidThenValidate) {
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "add_foreign_key"}, {"schema", "shop"},
+                                {"table", "orders"}, {"name", "orders_wh_fk"},
+                                {"columns", json::array({"warehouse_id"})},
+                                {"references_schema", "shop"},
+                                {"references_table", "warehouse"},
+                                {"references_columns", json::array({"id"})},
+                                {"on_delete", "RESTRICT"}}})),
+      observations(2LL << 30, 8000000), {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto s = steps_of(plan, "add_foreign_key");
+  ASSERT_EQ(s.size(), 2u);
+  EXPECT_NE(all_sql(*s[0]).find("NOT VALID"), std::string::npos);
+  EXPECT_NE(all_sql(*s[0]).find("ON DELETE RESTRICT"), std::string::npos);
+  EXPECT_NE(all_sql(*s[1]).find("VALIDATE CONSTRAINT orders_wh_fk"), std::string::npos);
+  EXPECT_GT(s[1]->txn_group, s[0]->txn_group)
+      << "VALIDATE must commit separately or step 1's lock spans the scan";
+
+  // The lock people are surprised by: a statement naming one table locks two.
+  EXPECT_NE(s[0]->lock.find("shop.warehouse"), std::string::npos) << s[0]->lock;
+  EXPECT_NE(s[0]->why.find("names one table and locks two"), std::string::npos);
+  EXPECT_NE(s[1]->lock.find("does NOT block reads or writes"), std::string::npos);
+}
+
+TEST(Planner, AnUnindexedForeignKeyColumnWarns) {
+  // Without an index, every parent UPDATE or DELETE scans the child.
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "add_foreign_key"}, {"schema", "shop"},
+                                {"table", "orders"}, {"name", "fk"},
+                                {"columns", json::array({"warehouse_id"})},
+                                {"references_schema", "shop"},
+                                {"references_table", "warehouse"},
+                                {"references_columns", json::array({"id"})}}})),
+      observations(1024, 10), {});
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("will scan") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned) << json(plan.warnings).dump(2);
+}
+
+TEST(Spec, AForeignKeyWithMismatchedColumnCountsIsRefused) {
+  json doc = minimal_spec();
+  doc["intents"] = json::array({json{
+      {"kind", "add_foreign_key"}, {"schema", "s"}, {"table", "t"}, {"name", "fk"},
+      {"columns", json::array({"a", "b"})}, {"references_schema", "s"},
+      {"references_table", "p"}, {"references_columns", json::array({"id"})}}});
+  const auto err = spec_error(doc);
+  EXPECT_NE(err.find("one to one"), std::string::npos) << err;
+}
+
+TEST(Spec, AnUnknownReferentialActionIsRefusedWithTheList) {
+  json doc = minimal_spec();
+  doc["intents"] = json::array({json{
+      {"kind", "add_foreign_key"}, {"schema", "s"}, {"table", "t"}, {"name", "fk"},
+      {"columns", json::array({"a"})}, {"references_schema", "s"},
+      {"references_table", "p"}, {"references_columns", json::array({"id"})},
+      {"on_delete", "cascade"}}});  // lower case: PostgreSQL spells it upper
+  const auto err = spec_error(doc);
+  EXPECT_NE(err.find("CASCADE"), std::string::npos) << err;
+}
+
+TEST_F(DatabaseTest, TheNotNullRecipeLeavesPostgresqlsOwnConstraintName) {
+  // PostgreSQL 17+ records NOT NULL constraints in pg_constraint, named
+  // <table>_<column>_not_null. A temporary CHECK on that name forces the
+  // permanent constraint to be auto-suffixed -- t_v_not_null1 -- for good,
+  // as a side effect of how the column was set rather than of anything anyone
+  // asked for.
+  pglaswell::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = url_;
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/nn");
+    w.txn().exec("DROP TABLE IF EXISTS laswell_nn");
+    w.txn().exec("CREATE TABLE laswell_nn(id bigint PRIMARY KEY, v int)");
+    w.txn().exec("INSERT INTO laswell_nn SELECT g,g FROM generate_series(1,100) g");
+    w.commit();
+  }
+
+  const auto spec = pglaswell::parse_spec([&] {
+    json d = minimal_spec();
+    d["intents"] = json::array({json{{"kind", "set_not_null"},
+                                     {"schema", "public"},
+                                     {"table", "laswell_nn"},
+                                     {"column", "v"}}});
+    return d;
+  }());
+
+  pglaswell::Catalog cat(cfg);
+  const auto obs = cat.observe({"public"}, {"laswell_nn"});
+  const auto plan = pglaswell::plan_migration(spec, obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+
+  // Apply the recipe by hand, in separate transactions as the plan requires.
+  for (const auto& step : plan.steps) {
+    for (const auto& q : step.sql) {
+      pglaswell::WriteSession w(cfg);
+      w.begin("pg_laswell/test/nn-apply");
+      const std::string stmt = q;  // Step::sql is already std::string
+      w.txn().exec(stmt.substr(0, stmt.size() - 1));  // strip the trailing ;
+      w.commit();
+    }
+  }
+
+  pglaswell::ReadSession r(cfg);
+  EXPECT_TRUE(r.txn()
+                  .exec("SELECT attnotnull FROM pg_attribute"
+                        " WHERE attrelid='laswell_nn'::regclass AND attname='v'")[0][0]
+                  .as<bool>())
+      << "the column was not set NOT NULL";
+  // No leftover CHECK from the recipe.
+  EXPECT_EQ(r.txn()
+                .exec("SELECT count(*) FROM pg_constraint"
+                      " WHERE conrelid='laswell_nn'::regclass AND contype='c'")[0][0]
+                .as<int>(),
+            0)
+      << "the temporary CHECK was not dropped";
+  // And on a server that catalogues NOT NULL constraints, the permanent one
+  // has PostgreSQL's natural name rather than an auto-suffixed one.
+  if (r.server_version() >= 170000) {
+    const auto names = r.txn().exec(
+        "SELECT coalesce(string_agg(conname, ','), '') FROM pg_constraint"
+        " WHERE conrelid='laswell_nn'::regclass AND contype='n'"
+        "   AND conname LIKE '%%v%%'");
+    EXPECT_EQ(names[0][0].as<std::string>(), "laswell_nn_v_not_null")
+        << "the recipe stole the name PostgreSQL wanted for its own constraint";
+  }
+
+  pglaswell::WriteSession w(cfg);
+  w.begin("pg_laswell/test/cleanup");
+  w.txn().exec("DROP TABLE laswell_nn");
+  w.commit();
 }

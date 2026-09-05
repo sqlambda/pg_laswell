@@ -109,5 +109,19 @@ and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
   `on_equivalent_index` selects `rename` (default), `adopt` or `refuse`.
   A constraint-backed index is never renamed, because renaming it renames the
   constraint too.
+- **Three more intent kinds**, each earning its place by making a real
+  planning decision rather than emitting one possible statement:
+  `drop_index` (plain vs `CONCURRENTLY`, decided on contention not size),
+  `set_not_null` and `add_foreign_key` (both `NOT VALID` + `VALIDATE`, in
+  *separate transactions* — sharing one would hold the stronger lock across the
+  scan and the recipe would buy nothing).
+- An intent can now emit **several steps in several transactions**, which those
+  recipes require.
+- The dry run is bounded by its own `statement_timeout`. It applies the plan in
+  one transaction, so a scanning step would otherwise hold every earlier step's
+  lock — a *planning* call could block writes for minutes. A timeout is
+  reported as "unverified beyond this step", not as a failure.
+- CI workflows: both compilers × PostgreSQL 15–18, both sanitizers, Valgrind, a
+  pooled run and package verification.
 - `cpp/test/spikes/` — the Phase 0 experiments that settled the design against
   PostgreSQL 18.6. Four of them changed it.

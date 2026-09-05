@@ -71,6 +71,10 @@ struct Step {
   std::vector<std::string> sql;  // verbatim, as it will be executed
   std::string why;               // the rule that fired, and the reading behind it
   std::string lock;              // the lock this takes, named
+  // Forces a transaction boundary before this step even when its class would
+  // otherwise let it join the previous group. NOT VALID must commit before
+  // VALIDATE runs, or the strong lock is held across the scan regardless.
+  bool own_transaction = false;
   json detail = json::object();
 
   json to_json() const {
@@ -185,7 +189,10 @@ inline json compute_budget(const Observations& obs, const ExecutorConfig& cfg) {
 // --- per-intent rules ------------------------------------------------------
 
 inline void plan_add_column(const Intent& in, const Observations& obs, Plan& plan,
-                            Step& step) {
+                            std::vector<Step>& out) {
+  Step step;
+  step.kind = in.kind_name;
+  struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
   const auto qualified = in.qualified_table();
   const auto& t = obs.table(qualified);
   const auto column = in.body.value("column", "");
@@ -297,11 +304,29 @@ inline void project(const Intent& in, const Step& step, Observations& projected)
     }
     case IntentKind::kBackfill:
       return;  // changes rows, not structure
+    case IntentKind::kDropIndex:
+      projected.tables[qualified]["indexes"].erase(in.body.value("name", ""));
+      return;
+    case IntentKind::kSetNotNull: {
+      const auto col = in.body.value("column", "");
+      if (projected.tables[qualified]["columns"].contains(col)) {
+        projected.tables[qualified]["columns"][col]["not_null"] = true;
+      }
+      return;
+    }
+    case IntentKind::kAddForeignKey:
+      // A constraint, not a relation or a column: nothing a later intent in
+      // this spec reads through Observations changes.
+      return;
   }
 }
 
 inline void plan_create_index(const Intent& in, const Observations& obs,
-                              const ExecutorConfig& cfg, Plan& plan, Step& step) {
+                              const ExecutorConfig& cfg, Plan& plan,
+                              std::vector<Step>& out) {
+  Step step;
+  step.kind = in.kind_name;
+  struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
   const auto qualified = in.qualified_table();
   const auto& t = obs.table(qualified);
   const auto name = in.body.value("name", "");
@@ -362,17 +387,17 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
     // strength of a normaliser would be exactly the confidently-wrong answer
     // this tool must not give.
     const auto normalize = [](const std::string& p) {
-      std::string out;
+      std::string norm;
       bool in_string = false;
       for (std::size_t i = 0; i < p.size(); ++i) {
         const char c = p[i];
         if (c == '\'') {
           in_string = !in_string;
-          out += c;
+          norm += c;
           continue;
         }
         if (in_string) {  // never touch the inside of a literal
-          out += c;
+          norm += c;
           continue;
         }
         if (c == ':' && i + 1 < p.size() && p[i + 1] == ':') {
@@ -392,10 +417,10 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
           continue;
         }
         if (c == ' ' || c == '\n' || c == '\t') {
-          if (!out.empty() && out.back() != ' ') out += ' ';
+          if (!norm.empty() && norm.back() != ' ') norm += ' ';
           continue;
         }
-        out += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        norm += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
       }
       // Strip balanced outer parentheses.
       auto trim = [](std::string v) {
@@ -403,19 +428,19 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
         while (!v.empty() && v.back() == ' ') v.pop_back();
         return v;
       };
-      out = trim(out);
-      while (out.size() > 1 && out.front() == '(' && out.back() == ')') {
+      norm = trim(norm);
+      while (norm.size() > 1 && norm.front() == '(' && norm.back() == ')') {
         int depth = 0;
         bool wraps = true;
-        for (std::size_t i = 0; i < out.size(); ++i) {
-          if (out[i] == '(') ++depth;
-          if (out[i] == ')') --depth;
-          if (depth == 0 && i + 1 < out.size()) { wraps = false; break; }
+        for (std::size_t i = 0; i < norm.size(); ++i) {
+          if (norm[i] == '(') ++depth;
+          if (norm[i] == ')') --depth;
+          if (depth == 0 && i + 1 < norm.size()) { wraps = false; break; }
         }
         if (!wraps) break;
-        out = trim(out.substr(1, out.size() - 2));
+        norm = trim(norm.substr(1, norm.size() - 2));
       }
-      return out;
+      return norm;
     };
 
     const auto want_pred = normalize(where);
@@ -624,7 +649,11 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
 }
 
 inline void plan_backfill(const Intent& in, const Observations& obs,
-                          const ExecutorConfig& cfg, Plan& plan, Step& step) {
+                          const ExecutorConfig& cfg, Plan& plan,
+                          std::vector<Step>& out) {
+  Step step;
+  step.kind = in.kind_name;
+  struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
   const auto qualified = in.qualified_table();
   const auto& t = obs.table(qualified);
   const auto key = in.body.value("key", "");
@@ -791,6 +820,287 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
   }
 }
 
+// --- drop_index ------------------------------------------------------------
+//
+// A drop is fast whatever else is true -- a catalog change and a file unlink.
+// What costs is ACQUIRING the lock: a plain DROP INDEX takes
+// AccessExclusiveLock, so it queues behind every reader and everything arriving
+// after it queues behind that. So the decision is about contention, not size,
+// which is why this rule reads lock_waiters and ignores the table's bytes.
+inline void plan_drop_index(const Intent& in, const Observations& obs, Plan& plan,
+                            std::vector<Step>& out) {
+  Step step;
+  step.kind = in.kind_name;
+  struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
+
+  const auto qualified = in.qualified_table();
+  const auto& t = obs.table(qualified);
+  const auto name = in.body.value("name", "");
+
+  if (!t.value("exists", false)) {
+    step.action = Action::kConflict;
+    step.why = qualified + " does not exist";
+    plan.conflicts.push_back(step.why);
+    return;
+  }
+  const json indexes = t.value("indexes", json::object());
+  if (!indexes.contains(name)) {
+    step.action = Action::kSatisfied;
+    step.why = "no index named " + name + " on " + qualified;
+    return;
+  }
+  const auto& ex = indexes[name];
+
+  // A constraint's index cannot be dropped on its own; PostgreSQL refuses, and
+  // the honest remedy is to drop the constraint.
+  if (ex.value("constraint_backed", false)) {
+    step.action = Action::kConflict;
+    step.why = name + " backs a constraint and cannot be dropped on its own";
+    plan.conflicts.push_back(
+        "\"" + name + "\" on " + qualified +
+        " backs a constraint. PostgreSQL refuses to drop such an index "
+        "directly; drop the constraint instead, which pg_laswell does not yet "
+        "plan.");
+    return;
+  }
+  if (ex.value("is_unique", false)) {
+    plan.warnings.push_back(
+        "\"" + name + "\" is UNIQUE. Dropping it removes the uniqueness it "
+        "enforces, not merely a lookup path. pg_licht evaluateIndex with hide "
+        "will say whether anything still plans against it.");
+  }
+
+  const int waiters = t.value("lock_waiters", 0);
+  if (waiters == 0) {
+    step.txn_class = TxnClass::kOptional;
+    step.lock = "AccessExclusiveLock, briefly";
+    step.sql.push_back("DROP INDEX " + in.schema() + "." + name + ";");
+    step.why = "0 lock waiters -> plain DROP (transactional, so a failure "
+               "leaves nothing behind)";
+  } else {
+    step.txn_class = TxnClass::kForbidden;
+    step.lock = "ShareUpdateExclusiveLock";
+    step.sql.push_back("DROP INDEX CONCURRENTLY " + in.schema() + "." + name + ";");
+    step.why = std::to_string(waiters) +
+               " lock waiters already on " + qualified +
+               " -> concurrent drop; a plain DROP would queue behind them and "
+               "everything arriving after it would queue behind that";
+  }
+  step.detail["index"] = name;
+  step.detail["schema"] = in.schema();
+}
+
+// --- set_not_null ----------------------------------------------------------
+//
+// A bare SET NOT NULL takes AccessExclusiveLock AND scans the whole table --
+// measured -- so the table is unavailable for the length of the scan.
+//
+// The safe form uses a CHECK constraint to do the scanning under a weaker lock:
+//
+//   1. ADD CONSTRAINT ... CHECK (col IS NOT NULL) NOT VALID
+//      ShareRowExclusiveLock, no scan, brief.
+//   2. VALIDATE CONSTRAINT
+//      ShareUpdateExclusiveLock -- does NOT block reads or writes -- and this
+//      is where the scan happens.
+//   3. SET NOT NULL
+//      still AccessExclusiveLock, but PostgreSQL skips the scan because the
+//      validated CHECK already proves it: 24ms on 5000 rows, measured.
+//   4. DROP the CHECK, which is now redundant and costs time on every insert.
+//
+// Each of the first three MUST be in its own transaction. If 1 and 2 shared
+// one, the ShareRowExclusiveLock from 1 would be held across 2's scan and the
+// recipe would buy nothing at all.
+inline void plan_set_not_null(const Intent& in, const Observations& obs, Plan& plan,
+                              std::vector<Step>& out) {
+  const auto qualified = in.qualified_table();
+  const auto& t = obs.table(qualified);
+  const auto column = in.body.value("column", "");
+  // Deliberately NOT <table>_<column>_not_null.
+  //
+  // PostgreSQL 17+ records NOT NULL constraints in pg_constraint and names
+  // them exactly that. Measured on 18.6: a temporary CHECK squatting on that
+  // name forces the permanent constraint to become t_v_not_null1, leaving the
+  // database with an auto-suffixed name for good, as a side effect of how the
+  // column was set rather than of anything anyone asked for. The scan is
+  // skipped on the strength of the constraint's EXPRESSION, never its name, so
+  // a distinct name costs nothing.
+  const auto check = in.table() + "_" + column + "_laswell_nn";
+
+  auto fail = [&](const std::string& why, const std::string& detail) {
+    Step s;
+    s.kind = in.kind_name;
+    s.action = Action::kConflict;
+    s.why = why;
+    plan.conflicts.push_back(detail);
+    out.push_back(std::move(s));
+  };
+
+  if (!t.value("exists", false)) {
+    fail(qualified + " does not exist", qualified + " does not exist");
+    return;
+  }
+  const json columns = t.value("columns", json::object());
+  if (!columns.contains(column)) {
+    fail(qualified + "." + column + " does not exist",
+         qualified + "." + column + " does not exist, so it cannot be set NOT NULL");
+    return;
+  }
+  if (columns[column].value("not_null", false)) {
+    Step s;
+    s.kind = in.kind_name;
+    s.action = Action::kSatisfied;
+    s.why = qualified + "." + column + " is already NOT NULL";
+    out.push_back(std::move(s));
+    return;
+  }
+
+  auto make = [&](TxnClass c, const std::string& sql, const std::string& lock,
+                  const std::string& why, bool own) {
+    Step s;
+    s.kind = in.kind_name;
+    s.txn_class = c;
+    s.own_transaction = own;
+    s.lock = lock;
+    s.why = why;
+    s.sql.push_back(sql);
+    s.detail["column"] = column;
+    s.detail["qualified"] = qualified;
+    out.push_back(std::move(s));
+  };
+
+  make(TxnClass::kRequired,
+       "ALTER TABLE " + qualified + " ADD CONSTRAINT " + check + " CHECK (" +
+           column + " IS NOT NULL) NOT VALID;",
+       "ShareRowExclusiveLock, briefly; NOT VALID means no scan",
+       "step 1 of 4: a NOT VALID check costs no scan, so the strong lock is "
+       "held only for the catalog change",
+       /*own=*/true);
+
+  make(TxnClass::kRequired,
+       "ALTER TABLE " + qualified + " VALIDATE CONSTRAINT " + check + ";",
+       "ShareUpdateExclusiveLock -- does NOT block reads or writes",
+       "step 2 of 4: this is where the scan happens, and it happens under a "
+       "lock that lets the application keep working. It must be its own "
+       "transaction, or step 1's stronger lock would be held across it",
+       /*own=*/true);
+
+  make(TxnClass::kRequired,
+       "ALTER TABLE " + qualified + " ALTER COLUMN " + column + " SET NOT NULL;",
+       "AccessExclusiveLock, but no scan",
+       "step 3 of 4: still an exclusive lock, but PostgreSQL skips the scan "
+       "because the validated CHECK already proves the column has no nulls "
+       "(measured: 24ms on 5000 rows)",
+       /*own=*/true);
+
+  if (!in.body.value("keep_check", false)) {
+    make(TxnClass::kRequired,
+         "ALTER TABLE " + qualified + " DROP CONSTRAINT " + check + ";",
+         "AccessExclusiveLock, briefly",
+         "step 4 of 4: the CHECK is redundant once the column is NOT NULL, and "
+         "a redundant constraint costs time on every insert. Set keep_check to "
+         "keep it",
+         /*own=*/true);
+  }
+}
+
+// --- add_foreign_key -------------------------------------------------------
+//
+// Measured: adding a foreign key in one statement takes ShareRowExclusiveLock
+// on the child and RowShareLock on the parent, and HOLDS THEM FOR THE WHOLE
+// SCAN -- so writes to both tables are blocked for its duration. The two-step
+// form takes the same strong lock for a catalog change only, then does the scan
+// under ShareUpdateExclusiveLock, which does not block writes.
+//
+// The parent's lock is the one people are surprised by: a statement that names
+// one table routinely locks two, and the table nobody mentioned is often the
+// busier one.
+inline void plan_add_foreign_key(const Intent& in, const Observations& obs,
+                                 Plan& plan, std::vector<Step>& out) {
+  const auto qualified = in.qualified_table();
+  const auto& t = obs.table(qualified);
+  const auto name = in.body.value("name", "");
+  const auto parent = in.body.value("references_schema", "") + "." +
+                      in.body.value("references_table", "");
+
+  if (!t.value("exists", false)) {
+    Step s;
+    s.kind = in.kind_name;
+    s.action = Action::kConflict;
+    s.why = qualified + " does not exist";
+    plan.conflicts.push_back(s.why);
+    out.push_back(std::move(s));
+    return;
+  }
+
+  std::vector<std::string> cols, refs;
+  for (const auto& c : in.body.value("columns", json::array())) {
+    cols.push_back(c.get<std::string>());
+  }
+  for (const auto& c : in.body.value("references_columns", json::array())) {
+    refs.push_back(c.get<std::string>());
+  }
+
+  // Index the FK column, or every parent update and delete scans the child.
+  bool supported = false;
+  const json indexes = t.value("indexes", json::object());
+  for (auto it = indexes.begin(); it != indexes.end(); ++it) {
+    if (it.value().value("leading_column", "") == (cols.empty() ? "" : cols[0])) {
+      supported = true;
+    }
+  }
+  if (!supported && !cols.empty()) {
+    plan.warnings.push_back(
+        "no index leads with " + qualified + "." + cols[0] +
+        ", so every UPDATE or DELETE on " + parent +
+        " will scan " + qualified +
+        " to check this constraint. Add the index first, in an earlier intent.");
+  }
+
+  std::string clause =
+      "FOREIGN KEY (" + detail::join(cols, ", ") + ") REFERENCES " + parent +
+      " (" + detail::join(refs, ", ") + ")";
+  if (in.body.contains("on_delete")) {
+    clause += " ON DELETE " + in.body.value("on_delete", "");
+  }
+  if (in.body.contains("on_update")) {
+    clause += " ON UPDATE " + in.body.value("on_update", "");
+  }
+
+  Step add;
+  add.kind = in.kind_name;
+  add.txn_class = TxnClass::kRequired;
+  add.own_transaction = true;
+  add.lock = "ShareRowExclusiveLock on " + qualified + " and RowShareLock on " +
+             parent + "; NOT VALID means no scan";
+  add.sql.push_back("ALTER TABLE " + qualified + " ADD CONSTRAINT " + name + " " +
+                    clause + " NOT VALID;");
+  add.why =
+      "step 1 of 2: NOT VALID takes the same strong locks as a validating add "
+      "but for a catalog change only, so they are held for milliseconds rather "
+      "than for the length of a scan. Note the second lock: this statement "
+      "names one table and locks two, and " + parent +
+      " may be the busier one";
+  add.detail["constraint"] = name;
+  add.detail["references"] = parent;
+  out.push_back(std::move(add));
+
+  Step validate;
+  validate.kind = in.kind_name;
+  validate.txn_class = TxnClass::kRequired;
+  validate.own_transaction = true;
+  validate.lock = "ShareUpdateExclusiveLock on " + qualified +
+                  " -- does NOT block reads or writes";
+  validate.sql.push_back("ALTER TABLE " + qualified + " VALIDATE CONSTRAINT " +
+                         name + ";");
+  validate.why =
+      "step 2 of 2: the scan, under a lock that lets the application keep "
+      "working. It must be its own transaction, or step 1's "
+      "ShareRowExclusiveLock would be held across it and the two-step form "
+      "would buy nothing";
+  validate.detail["constraint"] = name;
+  out.push_back(std::move(validate));
+}
+
 // --- the planner ----------------------------------------------------------
 
 inline Plan plan_migration(const Spec& spec, const Observations& obs,
@@ -840,30 +1150,39 @@ inline Plan plan_migration(const Spec& spec, const Observations& obs,
   }
 
   for (const auto& in : spec.intents) {
-    Step step;
-    step.ordinal = ordinal++;
-    step.kind = in.kind_name;
-
+    // An intent may need more than one step, and more importantly more than
+    // one TRANSACTION. The safe way to add a foreign key is ADD ... NOT VALID
+    // and then VALIDATE, and it only works if the first COMMITS before the
+    // second runs -- otherwise the ShareRowExclusiveLock is held across the
+    // scan anyway and the two-step recipe buys nothing.
+    std::vector<Step> emitted;
     switch (in.kind) {
-      case IntentKind::kAddColumn:   plan_add_column(in, projected, plan, step); break;
-      case IntentKind::kCreateIndex: plan_create_index(in, projected, cfg, plan, step); break;
-      case IntentKind::kBackfill:    plan_backfill(in, projected, cfg, plan, step); break;
+      case IntentKind::kAddColumn:   plan_add_column(in, projected, plan, emitted); break;
+      case IntentKind::kCreateIndex: plan_create_index(in, projected, cfg, plan, emitted); break;
+      case IntentKind::kBackfill:    plan_backfill(in, projected, cfg, plan, emitted); break;
+      case IntentKind::kDropIndex:   plan_drop_index(in, projected, plan, emitted); break;
+      case IntentKind::kSetNotNull:  plan_set_not_null(in, projected, plan, emitted); break;
+      case IntentKind::kAddForeignKey: plan_add_foreign_key(in, projected, plan, emitted); break;
     }
-    project(in, step, projected);
+    if (!emitted.empty()) project(in, emitted.front(), projected);
 
-    // Grouping: consecutive required/optional steps share a transaction, and
-    // anything forbidden or self-committing forces a boundary.
-    const bool boundary_before =
-        step.txn_class == TxnClass::kForbidden ||
-        step.txn_class == TxnClass::kOwnTxnPerBatch ||
-        previous == TxnClass::kForbidden ||
-        previous == TxnClass::kOwnTxnPerBatch;
-    if (!first && boundary_before) ++group;
-    step.txn_group = group;
-    previous = step.txn_class;
-    first = false;
-
-    plan.steps.push_back(std::move(step));
+    for (auto& step : emitted) {
+      step.ordinal = ordinal++;
+      // Grouping: consecutive required/optional steps share a transaction, and
+      // anything forbidden, self-committing, or explicitly wanting its own
+      // transaction forces a boundary.
+      const bool boundary_before =
+          step.own_transaction ||
+          step.txn_class == TxnClass::kForbidden ||
+          step.txn_class == TxnClass::kOwnTxnPerBatch ||
+          previous == TxnClass::kForbidden ||
+          previous == TxnClass::kOwnTxnPerBatch;
+      if (!first && boundary_before) ++group;
+      step.txn_group = group;
+      previous = step.txn_class;
+      first = false;
+      plan.steps.push_back(std::move(step));
+    }
   }
 
   // A CIC always gains a validity check. The tool must never report a

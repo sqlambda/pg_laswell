@@ -42,6 +42,14 @@ struct ExecutorConfig {
   int batch_cap_rows = 10000;  // backstop against pathological row widths
 
   int lock_timeout_ms = 3000;
+  // A dry run applies the whole plan in ONE transaction, so a step that scans
+  // -- VALIDATE CONSTRAINT, say -- runs its scan while holding whatever lock
+  // an earlier step took. On a large table a PLANNING call could then block
+  // writes for minutes, which is precisely what this tool exists to prevent.
+  // Bounded here: the dry run proves the SQL is correct, not that it is fast,
+  // and a timeout is reported as "unverified beyond this step" rather than as
+  // a failure.
+  int dry_run_statement_timeout_ms = 10000;
   int observer_tick_ms = 250;
   int max_concurrent_jobs = 2;
 
@@ -219,6 +227,7 @@ inline bool apply_executor_key(ExecutorConfig& e, const std::string& key,
   if (key == "commit_interval_ms") { e.commit_interval_ms = detail::positive_int(value, key, w); return true; }
   if (key == "batch_cap_rows") { e.batch_cap_rows = detail::positive_int(value, key, w); return true; }
   if (key == "lock_timeout_ms") { e.lock_timeout_ms = detail::positive_int(value, key, w); return true; }
+  if (key == "dry_run_statement_timeout_ms") { e.dry_run_statement_timeout_ms = detail::positive_int(value, key, w); return true; }
   if (key == "observer_tick_ms") { e.observer_tick_ms = detail::positive_int(value, key, w); return true; }
   if (key == "max_concurrent_jobs") { e.max_concurrent_jobs = detail::positive_int(value, key, w); return true; }
   if (key == "throttle_waiters") { e.throttle_waiters = detail::positive_int(value, key, w); return true; }

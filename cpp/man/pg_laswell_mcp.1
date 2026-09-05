@@ -323,9 +323,12 @@ recognised-but-unsupported kind, and an unknown one refuses the whole
 specification rather than skipping a step.
 This build implements
 .Cm add_column ,
-.Cm backfill
+.Cm backfill ,
+.Cm create_index ,
+.Cm drop_index ,
+.Cm set_not_null
 and
-.Cm create_index .
+.Cm add_foreign_key .
 .Pp
 An intent that creates an object must carry a
 .Va comment ,
@@ -391,6 +394,65 @@ or
 .Cm refuse .
 A constraint-backed index is never renamed, because renaming it renames the
 constraint too.
+.Pp
+.Cm drop_index
+decides on contention rather than size: a drop is fast whatever else is true,
+and what costs is acquiring the lock.
+With nothing waiting it uses a plain
+.Ic DROP INDEX ,
+which is transactional; with waiters it uses
+.Ic DROP INDEX CONCURRENTLY ,
+because a plain drop would queue behind them and everything arriving after it
+would queue behind that.
+A constraint-backed index is refused: PostgreSQL will not drop one directly.
+.Pp
+.Cm set_not_null
+does not issue a bare
+.Ic SET NOT NULL ,
+which takes
+.Va AccessExclusiveLock
+and scans the whole table.
+It emits four steps in four separate transactions: a
+.Ic NOT VALID
+check, a
+.Ic VALIDATE
+that does the scanning under
+.Va ShareUpdateExclusiveLock
+and therefore blocks neither reads nor writes, the
+.Ic SET NOT NULL
+itself
+.Pq which now skips the scan, the validated check having proved it ,
+and a drop of the now-redundant check.
+Set
+.Va keep_check
+to keep that last one.
+.Pp
+The separate transactions are the whole point: if the
+.Ic NOT VALID
+add shared a transaction with the
+.Ic VALIDATE ,
+its stronger lock would be held across the scan and the recipe would buy
+nothing.
+.Pp
+The temporary check is deliberately not named
+.Ql <table>_<column>_not_null .
+PostgreSQL 17 and later record NOT NULL constraints in
+.Va pg_constraint
+under exactly that name, so squatting on it would leave the permanent
+constraint auto-suffixed for good, as a side effect of how the column was set
+rather than of anything anyone asked for.
+.Pp
+.Cm add_foreign_key
+splits the same way, for the same reason.
+Note what the first step locks: adding a foreign key takes
+.Va ShareRowExclusiveLock
+on the child
+.Em and
+.Va RowShareLock
+on the parent, so a statement naming one table locks two, and the table nobody
+mentioned is often the busier one.
+It warns when no index leads with the referencing column, because without one
+every parent update or delete scans the child.
 .Sh SIGNING
 .Nm
 verifies; it never signs.
