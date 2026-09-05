@@ -21,5 +21,20 @@ First skeleton. Nothing is applied to a database yet.
   turns the skip into a failure. This differs from pg_licht, whose suite refuses
   to run at all without one, because pg_laswell's pure layers are the ones most
   worth running on a machine with no PostgreSQL.
+- `config.h` — INI registry, trust policy, executor tuning. Every knob is
+  configuration rather than `constexpr` so the tests can drive the identical
+  code paths with tiny values. Inconsistent settings are refused at parse time:
+  a `resume_waiters` at or above `pause_waiters` would make the breaker flap,
+  and that is caught when the file is read rather than mid-migration.
+- `canonical.h` — RFC 8785 (JCS) with SHA-256. Floats are refused outright,
+  which removes JCS's one genuinely error-prone clause; integers beyond 2^53
+  are refused too, since they stop round-tripping through the double most
+  clients parse them into.
+- `trust.h` — Ed25519 via OpenSSL EVP, one-shot as that algorithm requires.
+  Key ids are the content address of the key, so an id cannot be reassigned to
+  different bytes.
+- `spec.h` — change intents, not desired state. Top-level keys are an
+  allowlist, so a key outside the signed projection cannot be smuggled past
+  verification. An unknown intent kind refuses the whole spec.
 - `cpp/test/spikes/` — the Phase 0 experiments that settled the design against
   PostgreSQL 18.6. Four of them changed it.
