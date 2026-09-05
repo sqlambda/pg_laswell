@@ -170,6 +170,14 @@ and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
   `libstdc++6 (>= 14)`. `CPACK_RPM_PACKAGE_REQUIRES` is gone too: it carried a
   *Debian* package name, which makes an RPM uninstallable rather than merely
   under-specified.
+- **Seven release targets**, matching pg_licht: deb, rpm and portable tarball
+  for Linux x86_64 and arm64, plus a macOS arm64 tarball. CPack names every
+  package `-Linux` whatever the architecture, so each artifact is renamed per
+  target — otherwise x86_64 and arm64 arrive at the release under one filename
+  and one silently overwrites the other. `fail-fast` is off so one platform's
+  failure does not cancel the rest, which makes a *partial* release the thing
+  to guard against: publish refuses unless all seven artifacts are present, and
+  ships a `SHA256SUMS`.
 - **The release workflow now installs the package and runs the binary.** Its
   only packaging gate was `Depends | grep -q libpq5`, which passed on the
   broken package — a wrong Depends line still contains the string it is grepped

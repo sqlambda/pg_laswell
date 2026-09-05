@@ -12,9 +12,10 @@ drifted. And it never states a number it cannot derive.
 
 **Status: pre-0.1.0.** The whole path works — repository, signing, planning,
 dry run, paced execution, ledger — with 222 tests green on GCC and Clang, under
-AddressSanitizer/UBSan and ThreadSanitizer. `cpack` builds a deb and an rpm,
-verified by installing into a clean container; the manual is the authoritative
-reference. Not yet published anywhere.
+AddressSanitizer/UBSan and ThreadSanitizer. Packages build for seven targets —
+deb, rpm and tarball, x86_64 and arm64, plus macOS arm64 — each installed and
+run inside the platform it targets before upload. The manual is the
+authoritative reference. Not yet published anywhere.
 
 ## Why
 

@@ -18,39 +18,71 @@ concurrency:
 
 env:
   DEBIAN_FRONTEND: noninteractive
-  # Pinned, and built statically from source on every Linux target, rather than
-  # linking whatever libpqxx each distribution happens to package. This is
+  # Pinned, and built statically from source on every target, rather than
+  # linking whatever libpqxx each platform happens to package. This is
   # pg_licht's method, and it is the reason pg_licht's packages work.
   #
   # What the alternative actually produced, measured rather than assumed:
   # building against Debian's shared libpqxx-7.10 leaves the binary with a
   # NEEDED entry for libpqxx-7.10.so -- a soname no RPM distribution provides,
   # and one that pins the deb to a single Debian release. libpq stays dynamic on
-  # purpose: its C ABI is stable across versions and distributions patch it
+  # purpose: its C ABI is stable across versions and platforms patch it
   # independently, so it should come from the target's own repository.
   PQXX_VERSION: 8.0.2
 
 jobs:
   build:
-    name: ${{ matrix.name }}
-    runs-on: ubuntu-latest
+    name: ${{ matrix.artifact }}
+    runs-on: ${{ matrix.os }}
     container: ${{ matrix.container || '' }}
-    timeout-minutes: 40
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: deb-amd64
-            container: debian:trixie
-            distro: debian
-            generator: DEB
-          - name: rpm-amd64
-            container: rockylinux:9
-            distro: rocky
-            generator: RPM
-          - name: tarball-amd64
+          # Tarballs for distributions with no package here. "Portable" only
+          # within limits worth stating: each is built on the runner's own
+          # glibc (ubuntu-latest, currently 24.04) and glibc is
+          # backward-compatible, not forward -- so a tarball runs on that
+          # release and newer, and will not run on an older one. The deb and
+          # rpm below exist because a tarball can declare no dependency at all;
+          # anyone on an older glibc should build from source.
+          - os: ubuntu-latest
+            artifact: pg_laswell_mcp-linux-x86_64
             distro: ubuntu
-            generator: TGZ
+            extension: tar.gz
+          - os: ubuntu-24.04-arm
+            artifact: pg_laswell_mcp-linux-arm64
+            distro: ubuntu
+            extension: tar.gz
+          - os: ubuntu-latest
+            container: debian:trixie
+            artifact: pg_laswell_mcp-linux-x86_64-debian13
+            distro: debian
+            extension: deb
+          - os: ubuntu-24.04-arm
+            container: debian:trixie
+            artifact: pg_laswell_mcp-linux-arm64-debian13
+            distro: debian
+            extension: deb
+          - os: ubuntu-latest
+            container: rockylinux:9
+            artifact: pg_laswell_mcp-linux-x86_64-rocky9
+            distro: rocky
+            extension: rpm
+          - os: ubuntu-24.04-arm
+            container: rockylinux:9
+            artifact: pg_laswell_mcp-linux-arm64-rocky9
+            distro: rocky
+            extension: rpm
+          # GitHub's macos-latest is Apple silicon. There is no x86_64 macOS
+          # target: the runners for it are being retired, and Rosetta runs the
+          # arm64 binary anyway.
+          - os: macos-latest
+            artifact: pg_laswell_mcp-macos-arm64
+            distro: macos
+            extension: tar.gz
+
     steps:
       - uses: actions/checkout@v4
         with:
@@ -58,19 +90,34 @@ jobs:
 
       # `file` is not optional on Debian: without it CPack refuses outright --
       # "file utility is not available. CPACK_DEBIAN_PACKAGE_SHLIBDEPS ... not
-      # available" -- and produces no package. A minimal container lacks it.
+      # available" -- and produces no package at all. A minimal container lacks
+      # it, and the failure names a variable rather than a missing program.
       - name: Install dependencies (Debian)
         if: matrix.distro == 'debian'
         run: |
           apt-get update -q
           apt-get install -y --no-install-recommends \
             curl ca-certificates cmake build-essential pkg-config dpkg-dev file \
-            libpq-dev libssl-dev nlohmann-json3-dev
+            binutils libpq-dev libssl-dev nlohmann-json3-dev
           curl -fsSL "https://github.com/jtv/libpqxx/archive/refs/tags/${PQXX_VERSION}.tar.gz" | tar -xz -C /tmp
           cmake -S "/tmp/libpqxx-${PQXX_VERSION}" -B /tmp/libpqxx-build \
             -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DSKIP_BUILD_TEST=ON
           cmake --build /tmp/libpqxx-build -j"$(nproc)"
           cmake --install /tmp/libpqxx-build
+          echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig" >> $GITHUB_ENV
+
+      - name: Install dependencies (Ubuntu)
+        if: matrix.distro == 'ubuntu'
+        run: |
+          sudo apt-get update -o DPkg::Lock::Timeout=300 -q
+          sudo apt-get install -y --no-install-recommends \
+            cmake build-essential pkg-config file binutils \
+            curl ca-certificates libpq-dev libssl-dev nlohmann-json3-dev
+          curl -fsSL "https://github.com/jtv/libpqxx/archive/refs/tags/${PQXX_VERSION}.tar.gz" | tar -xz -C /tmp
+          cmake -S "/tmp/libpqxx-${PQXX_VERSION}" -B /tmp/libpqxx-build \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DSKIP_BUILD_TEST=ON
+          cmake --build /tmp/libpqxx-build -j"$(nproc)"
+          sudo cmake --install /tmp/libpqxx-build
           echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig" >> $GITHUB_ENV
 
       - name: Install dependencies (Rocky Linux)
@@ -90,8 +137,11 @@ jobs:
           # and never on pkg-config's default search path. libpq5-devel is
           # PGDG's separate unversioned package that installs to the standard
           # FHS location instead.
+          #
+          # curl is deliberately absent: rockylinux:9 ships curl-minimal, which
+          # already provides the binary and CONFLICTS with the curl package.
           dnf install -y cmake gcc-toolset-13-gcc-c++ binutils libpq5-devel \
-            openssl-devel nlohmann-json-devel pkg-config rpm-build
+            openssl-devel nlohmann-json-devel pkg-config rpm-build tar gzip
           echo "CC=/opt/rh/gcc-toolset-13/root/usr/bin/gcc" >> $GITHUB_ENV
           echo "CXX=/opt/rh/gcc-toolset-13/root/usr/bin/g++" >> $GITHUB_ENV
           export CC=/opt/rh/gcc-toolset-13/root/usr/bin/gcc
@@ -103,19 +153,22 @@ jobs:
           cmake --install /tmp/libpqxx-build
           echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig" >> $GITHUB_ENV
 
-      - name: Install dependencies (Ubuntu)
-        if: matrix.distro == 'ubuntu'
+      # macOS needs OpenSSL explicitly, which pg_licht never did: Apple ships
+      # only LibreSSL headers, and they are not a drop-in for EVP_DigestVerify
+      # over Ed25519. OPENSSL_ROOT_DIR is required because CMake finds Apple's
+      # copy first and would configure against headers the link then rejects.
+      - name: Install dependencies (macOS)
+        if: matrix.distro == 'macos'
         run: |
-          sudo apt-get update -o DPkg::Lock::Timeout=300 -q
-          sudo apt-get install -y --no-install-recommends \
-            cmake build-essential pkg-config file curl ca-certificates \
-            libpq-dev libssl-dev nlohmann-json3-dev
+          brew install cmake libpq nlohmann-json pkg-config openssl@3
+          echo "PKG_CONFIG_PATH=$(brew --prefix libpq)/lib/pkgconfig:/usr/local/lib/pkgconfig" >> $GITHUB_ENV
+          echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> $GITHUB_ENV
           curl -fsSL "https://github.com/jtv/libpqxx/archive/refs/tags/${PQXX_VERSION}.tar.gz" | tar -xz -C /tmp
           cmake -S "/tmp/libpqxx-${PQXX_VERSION}" -B /tmp/libpqxx-build \
-            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DSKIP_BUILD_TEST=ON
-          cmake --build /tmp/libpqxx-build -j"$(nproc)"
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DSKIP_BUILD_TEST=ON \
+            -DCMAKE_PREFIX_PATH="$(brew --prefix libpq)"
+          cmake --build /tmp/libpqxx-build -j"$(sysctl -n hw.ncpu)"
           sudo cmake --install /tmp/libpqxx-build
-          echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig" >> $GITHUB_ENV
 
       # The tag is the source of truth for the version. A tag that disagrees
       # with the project() version means one of them is wrong, and shipping
@@ -134,45 +187,97 @@ jobs:
       - name: Build
         run: |
           cmake -S cpp -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
-          cmake --build build --target pg_laswell_mcp -j"$(nproc)"
+          cmake --build build --target pg_laswell_mcp
+          strip build/pg_laswell_mcp
 
       # Static libpqxx is the entire point of the source build above, and a
-      # silent fall back to the distribution's shared copy would produce a
-      # package that installs and then cannot start. Assert it where it is
-      # actually visible: the linker's own record.
+      # silent fall back to the platform's shared copy would produce a package
+      # that installs and then cannot start. Assert it where it is actually
+      # visible: the linker's own record.
       - name: libpqxx must be linked statically
         run: |
-          objdump -p build/pg_laswell_mcp | grep NEEDED
-          if objdump -p build/pg_laswell_mcp | grep -q 'NEEDED.*libpqxx'; then
+          if [ "${{ matrix.distro }}" = "macos" ]; then
+            otool -L build/pg_laswell_mcp
+            LINKED=$(otool -L build/pg_laswell_mcp)
+          else
+            objdump -p build/pg_laswell_mcp | grep NEEDED
+            LINKED=$(objdump -p build/pg_laswell_mcp)
+          fi
+          if grep -q 'pqxx' <<<"$LINKED"; then
             echo "::error::libpqxx was linked dynamically; the source build did not take effect"
             exit 1
           fi
 
-      - name: Package
-        run: cd build && cpack -G ${{ matrix.generator }}
-
-      - name: The package must carry all three things
+      - name: Package (tar.gz)
+        if: matrix.extension == 'tar.gz'
+        env:
+          # BSD tar on macOS otherwise stores AppleDouble (._*) sidecars for
+          # extended attributes, which show up as junk on extraction.
+          COPYFILE_DISABLE: "1"
         run: |
-          cd build
-          case "${{ matrix.generator }}" in
-            DEB)
-              dpkg-deb -c ./*.deb | grep -q 'bin/pg_laswell_mcp'
-              dpkg-deb -c ./*.deb | grep -q 'man1/pg_laswell_mcp.1'
-              dpkg-deb -c ./*.deb | grep -q 'share/pg_laswell/bootstrap.sql'
-              # Dependencies are derived, so this asserts that generation RAN,
-              # not what it produced: pinning the exact list here would be the
-              # same mistake as pinning it in CMakeLists.
-              dpkg-deb -f ./*.deb Depends | grep -q libpq5 ;;
-            RPM)
-              rpm -qlp ./*.rpm | grep -q 'bin/pg_laswell_mcp'
-              rpm -qlp ./*.rpm | grep -q 'man1/pg_laswell_mcp.1'
-              rpm -qlp ./*.rpm | grep -q 'share/pg_laswell/bootstrap.sql'
-              rpm -qp --requires ./*.rpm | grep -q 'libpq.so.5' ;;
-            TGZ)
-              tar tzf ./*.tar.gz | grep -q 'bin/pg_laswell_mcp'
-              tar tzf ./*.tar.gz | grep -q 'man1/pg_laswell_mcp.1'
-              tar tzf ./*.tar.gz | grep -q 'share/pg_laswell/bootstrap.sql' ;;
+          rm -rf stage
+          # Staged through the install rules rather than tarred from the build
+          # tree, so the archive carries the same bin/ + share/ layout the deb
+          # and rpm get.
+          cmake --install build --prefix "$PWD/stage"
+          tar -czf ${{ matrix.artifact }}.tar.gz -C stage bin share
+          tar -tzf ${{ matrix.artifact }}.tar.gz | sort
+
+      - name: Package (deb)
+        if: matrix.extension == 'deb'
+        run: |
+          cd build && cpack -G DEB
+          dpkg-deb -f ./*.deb Depends
+          # CPack names every package "-Linux" regardless of architecture, so
+          # x86_64 and arm64 would arrive at the release as the same filename
+          # and one would silently overwrite the other.
+          mv pg-laswell-*.deb ../${{ matrix.artifact }}.deb
+
+      - name: Package (rpm)
+        if: matrix.extension == 'rpm'
+        run: |
+          cd build && cpack -G RPM
+          rpm -qp --requires ./*.rpm | grep -vE 'rpmlib|GLIBC|CXXABI|GLIBCXX|GCC_'
+          mv pg-laswell-*.rpm ../${{ matrix.artifact }}.rpm
+
+      # The listing is captured ONCE and then grepped, rather than piped into
+      # `grep -q` three times. `grep -q` exits at the first match and closes the
+      # pipe, which kills dpkg-deb's tar subprocess with SIGPIPE -- so a passing
+      # check printed "dpkg-deb: error: tar subprocess was killed by signal
+      # (Broken pipe)", and passed only because Actions' default shell does not
+      # set pipefail. Capturing first makes the check quiet, and makes pipefail
+      # safe to turn on, which is what catches a listing command that fails
+      # outright rather than merely matching nothing.
+      - name: The package must carry all three things
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ matrix.extension }}" in
+            deb)
+              LIST=$(dpkg-deb -c ${{ matrix.artifact }}.deb)
+              DEPS=$(dpkg-deb -f ${{ matrix.artifact }}.deb Depends) ;;
+            rpm)
+              # rpmbuild gzips man pages, so the shipped name ends .1.gz --
+              # which the substring below still matches.
+              LIST=$(rpm -qlp ${{ matrix.artifact }}.rpm)
+              DEPS=$(rpm -qp --requires ${{ matrix.artifact }}.rpm) ;;
+            tar.gz)
+              LIST=$(tar tzf ${{ matrix.artifact }}.tar.gz)
+              DEPS="" ;;
           esac
+          for want in bin/pg_laswell_mcp man1/pg_laswell_mcp.1 \
+                      share/pg_laswell/bootstrap.sql; do
+            grep -q "$want" <<<"$LIST" || {
+              echo "::error::$want is missing from the package"; exit 1; }
+          done
+          # Dependencies are derived, so this asserts that generation RAN, not
+          # what it produced: pinning the exact list here would be the same
+          # mistake as pinning it in CMakeLists.
+          case "${{ matrix.extension }}" in
+            deb) grep -q 'libpq5'     <<<"$DEPS" || { echo "::error::no derived Depends"; exit 1; } ;;
+            rpm) grep -q 'libpq.so.5' <<<"$DEPS" || { echo "::error::no derived Requires"; exit 1; } ;;
+          esac
+          echo "$LIST"
 
       # Inspecting metadata is not evidence that a package works.
       #
@@ -184,21 +289,27 @@ jobs:
       # loading, the canonicaliser and OpenSSL.
       - name: Install the package and run the binary
         run: |
-          cd build
           SPEC='{"spec":{"laswell_spec_version":1,"id":"x","description":"d","intents":[{"kind":"add_column","schema":"s","table":"t","column":"c","type":"text","nullable":true,"comment":"c"}]}}'
-          case "${{ matrix.generator }}" in
-            DEB) apt-get install -y --no-install-recommends ./*.deb ;;
-            RPM) dnf install -y ./*.rpm ;;
-            TGZ) sudo tar xzf ./*.tar.gz -C /usr/local --strip-components=1 ;;
+          case "${{ matrix.extension }}" in
+            deb) apt-get install -y --no-install-recommends ./${{ matrix.artifact }}.deb
+                 BIN=pg_laswell_mcp ;;
+            rpm) dnf install -y ./${{ matrix.artifact }}.rpm
+                 BIN=pg_laswell_mcp ;;
+            tar.gz)
+                 rm -rf verify && mkdir verify
+                 tar xzf ${{ matrix.artifact }}.tar.gz -C verify
+                 BIN="$PWD/verify/bin/pg_laswell_mcp" ;;
           esac
-          pg_laswell_mcp --version
-          pg_laswell_mcp --call getSpecDigest --args "$SPEC" | grep -q '"digest"'
-          echo "installed from the package, and answered"
+          "$BIN" --version
+          OUT=$("$BIN" --call getSpecDigest --args "$SPEC")
+          grep -q '"digest"' <<<"$OUT" || {
+            echo "::error::the installed binary did not answer: $OUT"; exit 1; }
+          echo "unpacked from the release artifact, and answered"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.name }}
-          path: build/pg-laswell-*
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.${{ matrix.extension }}
           if-no-files-found: error
 
   publish:
@@ -224,6 +335,28 @@ jobs:
             echo "::error::CHANGES.md has no entry for ${TAG#v}"
             exit 1
           }
+
+      # Every target must have arrived. fail-fast is off so one platform's
+      # failure does not cancel the others, which means a partial release is
+      # exactly what would otherwise get published -- silently, and looking
+      # complete.
+      - name: All seven artifacts must be present
+        run: |
+          missing=0
+          for f in pg_laswell_mcp-linux-x86_64.tar.gz \
+                   pg_laswell_mcp-linux-arm64.tar.gz \
+                   pg_laswell_mcp-linux-x86_64-debian13.deb \
+                   pg_laswell_mcp-linux-arm64-debian13.deb \
+                   pg_laswell_mcp-linux-x86_64-rocky9.rpm \
+                   pg_laswell_mcp-linux-arm64-rocky9.rpm \
+                   pg_laswell_mcp-macos-arm64.tar.gz; do
+            [ -f "dist/$f" ] || { echo "::error::missing artifact $f"; missing=1; }
+          done
+          ls -l dist
+          exit $missing
+
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
 
       # Idempotent on a re-run: an existing release is uploaded to rather than
       # failing, so a transient upload error can simply be retried.

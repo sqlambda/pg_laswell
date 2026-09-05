@@ -1,14 +1,32 @@
 # Installing pg_laswell
 
-**Pre-release.** Packages build from the source tree and are verified by
-installing into a clean container; they are not yet published anywhere, so
-build them yourself or build from source — see [BUILD.md](BUILD.md).
+**Pre-release.** Packages are built and verified for seven targets, each one
+installed and run inside the platform it targets before it is uploaded. They
+are not yet published anywhere, so build them yourself or build from source —
+see [BUILD.md](BUILD.md).
+
+| target | artifact |
+|---|---|
+| Linux x86_64 (portable) | `pg_laswell_mcp-linux-x86_64.tar.gz` |
+| Linux arm64 (portable) | `pg_laswell_mcp-linux-arm64.tar.gz` |
+| Debian 13 x86_64 | `pg_laswell_mcp-linux-x86_64-debian13.deb` |
+| Debian 13 arm64 | `pg_laswell_mcp-linux-arm64-debian13.deb` |
+| Rocky/RHEL 9 x86_64 | `pg_laswell_mcp-linux-x86_64-rocky9.rpm` |
+| Rocky/RHEL 9 arm64 | `pg_laswell_mcp-linux-arm64-rocky9.rpm` |
+| macOS arm64 | `pg_laswell_mcp-macos-arm64.tar.gz` |
 
 ```bash
 cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release
 cmake --build cpp/build
-cd cpp/build && cpack -G DEB      # or -G RPM
+cd cpp/build && cpack -G DEB      # or -G RPM, -G TGZ
 ```
+
+Two limits worth stating rather than discovering. The **tarballs** are built on
+the runner's own glibc and glibc is backward-compatible, not forward — so a
+Linux tarball runs on that release and newer, never on an older one; build from
+source there. The **macOS tarball** links Homebrew's libpq and openssl@3, so it
+needs `brew install libpq openssl@3`; a Homebrew formula would declare those,
+and there is not one yet.
 
 This file records what installation involves, because three parts of it are
 decisions rather than steps.
