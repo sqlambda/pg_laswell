@@ -26,6 +26,7 @@
 #include "jobs.h"
 #include "ledger.h"
 #include "planner.h"
+#include "repository.h"
 #include "server.h"
 #include "spec.h"
 #include "trust.h"
@@ -552,6 +553,21 @@ inline json cancel_job(ToolContext& ctx, const json& args) {
                "from it rather than starting over."}};
 }
 
+// --- listMigrations --------------------------------------------------------
+inline json list_migrations(ToolContext& ctx, const json& args) {
+  const auto dir = args.value("directory", "");
+  if (dir.empty()) {
+    return json{{"error", "listMigrations needs a \"directory\""},
+                {"hint", "Point it at the folder holding the migration specs."}};
+  }
+  const auto& cfg = ctx.connection(args);
+  MigrationRepository repo(cfg, ctx.cache);
+  auto out = repo.scan(dir, args.value("deriveRelations", true));
+  out["connection"] = cfg.name;
+  out["database"] = cfg.dbname;
+  return out;
+}
+
 // --- registration ----------------------------------------------------------
 
 inline json no_args_schema() {
@@ -630,6 +646,31 @@ inline std::vector<ToolDef> make_tools(ToolContext& ctx) {
       [] { return json{{"type", "object"}}; },
       {true, false, true, false},
       [&ctx](const json& a) { return plan_migration_tool(ctx, a); }});
+
+  tools.push_back(ToolDef{
+      "listMigrations",
+      "read a directory of specs and report what is pending against THIS "
+      "database, in dependency order, with the groups that may run "
+      "concurrently. Also flags any spec that was edited after it was applied "
+      "-- the database no longer matches the file that claims to describe it.",
+      [] {
+        json props{{"directory",
+                    {{"type", "string"},
+                     {"description", "folder holding the migration specs"}}},
+                   {"deriveRelations",
+                    {{"type", "boolean"},
+                     {"description",
+                      "derive what each migration touches by planning it and "
+                      "reading foreign keys; needed for concurrency advice. "
+                      "Default true."}}}};
+        props.update(detail::connection_property());
+        return json{{"type", "object"},
+                    {"properties", props},
+                    {"required", json::array({"directory"})}};
+      },
+      [] { return json{{"type", "object"}}; },
+      {true, false, true, false},
+      [&ctx](const json& a) { return list_migrations(ctx, a); }});
 
   tools.push_back(ToolDef{
       "startMigration",

@@ -73,6 +73,9 @@ struct Spec {
   std::string rationale;
   std::string target_database;
   int min_server_version = 0;
+  // Business ordering, which no amount of measurement can derive. Relation
+  // overlap says what MUST NOT run together; this says what must run FIRST.
+  std::vector<std::string> depends_on;
   std::vector<Intent> intents;
   json signatures = json::array();
 };
@@ -160,9 +163,17 @@ inline void reject_unknown_keys(const json& obj, const std::set<std::string>& al
 inline const std::set<std::string>& signed_top_level_keys() {
   static const std::set<std::string> kKeys = {
       "laswell_spec_version", "id", "description", "rationale", "target",
-      "intents"};
+      "depends_on", "intents"};
   return kKeys;
 }
+
+// Adding an OPTIONAL key to this allowlist is backward-compatible, and that is
+// the allowlist design paying off rather than luck. The signed projection is
+// built from allowlisted keys PRESENT in the document, so a spec without
+// depends_on canonicalises byte-identically before and after this change and
+// its existing signature still verifies. A spec WITH depends_on is refused
+// outright by an older binary -- unknown top-level key -- rather than applied
+// with its dependencies silently ignored, which is the failure that matters.
 
 inline void parse_add_column(Intent& in) {
   const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
@@ -313,6 +324,22 @@ inline Spec parse_spec(const json& doc) {
   // signed alongside the change and lands in the ledger.
   s.description = detail::require_string(doc, "description", "the spec");
   s.rationale = doc.value("rationale", "");
+
+  if (doc.contains("depends_on")) {
+    if (!doc["depends_on"].is_array()) {
+      detail::fail("\"depends_on\" must be an array of spec ids", "");
+    }
+    for (const auto& d : doc["depends_on"]) {
+      if (!d.is_string() || d.get<std::string>().empty()) {
+        detail::fail("depends_on entries must be non-empty spec ids", "");
+      }
+      const auto id = d.get<std::string>();
+      if (id == s.id) {
+        detail::fail("spec \"" + s.id + "\" depends on itself", "");
+      }
+      s.depends_on.push_back(id);
+    }
+  }
 
   if (doc.contains("target")) {
     if (!doc["target"].is_object()) {

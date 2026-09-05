@@ -37,6 +37,7 @@
 #include "ledger.h"
 #include "observations.h"
 #include "planner.h"
+#include "repository.h"
 #include "server.h"
 #include "session.h"
 #include "spec.h"
@@ -3156,4 +3157,280 @@ TEST_F(ToolTest, ASucceededJobsCursorIsNotResumedFrom) {
                       " WHERE fulfilment_region IS NULL")[0][0]
                 .as<int>(),
             0);
+}
+
+// --- the migration repository ----------------------------------------------
+
+namespace {
+
+class RepoTest : public ToolTest {
+ public:
+  void SetUp() override {
+    ToolTest::SetUp();
+    if (::testing::Test::IsSkipped()) return;
+    dir_ = "/tmp/laswell_repo_" + std::to_string(::getpid()) + "_" +
+           std::to_string(counter_++);
+    std::filesystem::create_directories(dir_);
+  }
+  void TearDown() override {
+    ToolTest::TearDown();
+    std::error_code ec;
+    std::filesystem::remove_all(dir_, ec);
+  }
+
+  // Writes a spec, signed by the suite key so both gates pass.
+  void write_spec(const std::string& file, json doc) {
+    const auto parsed = pglaswell::parse_spec(doc);
+    doc["signatures"] = json::array({{{"key_id", test_key().key_id},
+                                      {"algorithm", "ed25519"},
+                                      {"signature", base64(sign(parsed.canonical_bytes))}}});
+    std::ofstream(dir_ + "/" + file) << doc.dump(2);
+  }
+
+  json scan(bool derive = true) {
+    return payload(call("listMigrations",
+                        json{{"directory", dir_}, {"deriveRelations", derive}}));
+  }
+
+  static json add_column_spec(const std::string& id, const std::string& table,
+                              const std::string& column,
+                              const std::vector<std::string>& deps = {}) {
+    json d{{"laswell_spec_version", 1},
+           {"id", id},
+           {"description", "adds " + column + " to " + table},
+           {"intents", json::array({json{{"kind", "add_column"},
+                                         {"schema", "shop"},
+                                         {"table", table},
+                                         {"column", column},
+                                         {"type", "text"},
+                                         {"nullable", true},
+                                         {"comment", "test column"}}})}};
+    if (!deps.empty()) d["depends_on"] = deps;
+    return d;
+  }
+
+  std::string dir_;
+  static int counter_;
+};
+int RepoTest::counter_ = 0;
+
+const json* entry_for(const json& scan, const std::string& id) {
+  for (const auto& m : scan["migrations"]) {
+    if (m.value("specId", "") == id) return &m;
+  }
+  return nullptr;
+}
+
+}  // namespace
+
+TEST_F(RepoTest, ReportsPendingMigrationsAgainstThisDatabase) {
+  make_shop(cfg());
+  write_spec("0001.json", add_column_spec("0001", "orders", "a"));
+  write_spec("0002.json", add_column_spec("0002", "customers", "b"));
+
+  const auto s = scan(false);
+  ASSERT_EQ(s["migrations"].size(), 2u) << s.dump(2);
+  EXPECT_EQ(entry_for(s, "0001")->value("status", ""), "pending");
+  EXPECT_EQ(entry_for(s, "0002")->value("status", ""), "pending");
+}
+
+TEST_F(RepoTest, AnAppliedSpecThatWasEditedAfterwardsIsFlagged) {
+  // The highest-value check any migration tool has, and here it falls out of
+  // digests for nothing: the database no longer matches the file that claims
+  // to describe it.
+  make_shop(cfg());
+  write_spec("0001.json", add_column_spec("0001", "orders", "a"));
+
+  const auto started = payload(call("startMigration",
+      json{{"spec", json::parse(std::ifstream(dir_ + "/0001.json"),
+                                nullptr, true)}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, started["jobId"], [](const json& x) {
+    return x.value("state", "") == "succeeded";
+  })) << status_of(started["jobId"]).dump(2);
+
+  EXPECT_EQ(scan(false)["migrations"][0].value("status", ""), "applied");
+
+  // Now edit it. The content changes, so the digest changes.
+  auto edited = add_column_spec("0001", "orders", "a");
+  edited["description"] = "adds a to orders (edited after apply)";
+  write_spec("0001.json", edited);
+
+  const auto s = scan(false);
+  const auto* e = entry_for(s, "0001");
+  ASSERT_NE(e, nullptr);
+  EXPECT_EQ(e->value("status", ""), "modified_after_apply") << s.dump(2);
+  EXPECT_FALSE(e->value("appliedDigest", "").empty());
+  EXPECT_NE(e->value("appliedDigest", ""), e->value("digest", ""));
+  EXPECT_NE(e->value("hint", "").find("write a NEW spec"), std::string::npos)
+      << "the hint must say what to do instead of re-applying";
+}
+
+TEST_F(RepoTest, DependenciesEstablishTheOrder) {
+  make_shop(cfg());
+  write_spec("b.json", add_column_spec("b", "orders", "b", {"a"}));
+  write_spec("a.json", add_column_spec("a", "orders", "a"));
+
+  const auto s = scan(false);
+  ASSERT_EQ(s["order"].size(), 2u) << s.dump(2);
+  EXPECT_EQ(s["order"][0]["groups"][0]["specs"][0], "a");
+  EXPECT_EQ(s["order"][1]["groups"][0]["specs"][0], "b");
+}
+
+TEST_F(RepoTest, AMissingDependencyIsReportedRatherThanIgnored) {
+  make_shop(cfg());
+  write_spec("b.json", add_column_spec("b", "orders", "b", {"nonexistent"}));
+  const auto s = scan(false);
+  bool named = false;
+  for (const auto& p : s["problems"]) {
+    if (p.get<std::string>().find("nonexistent") != std::string::npos) named = true;
+  }
+  EXPECT_TRUE(named) << s["problems"].dump(2);
+}
+
+TEST_F(RepoTest, ACycleIsNamedAsACycle) {
+  make_shop(cfg());
+  write_spec("a.json", add_column_spec("a", "orders", "a", {"b"}));
+  write_spec("b.json", add_column_spec("b", "orders", "b", {"a"}));
+  const auto s = scan(false);
+  bool cycle = false;
+  for (const auto& p : s["problems"]) {
+    if (p.get<std::string>().find("cycle") != std::string::npos) cycle = true;
+  }
+  EXPECT_TRUE(cycle) << s["problems"].dump(2);
+}
+
+TEST_F(RepoTest, ADependencyStuckInABadStateIsNotMisreportedAsACycle) {
+  // These are different problems with different fixes. Reporting the first as
+  // the second sends the reader hunting for something that does not exist.
+  make_shop(cfg());
+  write_spec("0001.json", add_column_spec("0001", "orders", "a"));
+  write_spec("0002.json", add_column_spec("0002", "orders", "b", {"0001"}));
+
+  const auto started = payload(call("startMigration",
+      json{{"spec", json::parse(std::ifstream(dir_ + "/0001.json"), nullptr, true)}}));
+  ASSERT_TRUE(wait_for_status(*this, started["jobId"], [](const json& x) {
+    return x.value("state", "") == "succeeded";
+  }));
+  auto edited = add_column_spec("0001", "orders", "a");
+  edited["description"] = "edited";
+  write_spec("0001.json", edited);
+
+  const auto s = scan(false);
+  bool blocked = false, cycle = false;
+  for (const auto& p : s["problems"]) {
+    const auto t = p.get<std::string>();
+    if (t.find("modified_after_apply") != std::string::npos &&
+        t.find("0002") != std::string::npos) {
+      blocked = true;
+    }
+    if (t.find("cycle") != std::string::npos) cycle = true;
+  }
+  EXPECT_TRUE(blocked) << s["problems"].dump(2);
+  EXPECT_FALSE(cycle) << "a blocked dependency was misreported as a cycle";
+}
+
+TEST_F(RepoTest, RelationsHiddenInAnOpaqueExpressionAreDerived) {
+  // The spec declares shop.orders. The set-expression reads shop.region_tax,
+  // which no intent names. EXPLAIN reveals it, which is the whole reason the
+  // derivation asks PostgreSQL rather than parsing the SQL itself.
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/repo-fixture");
+    w.txn().exec("DROP SCHEMA IF EXISTS shop CASCADE");
+    w.txn().exec("CREATE SCHEMA shop");
+    w.txn().exec("CREATE TABLE shop.region_tax(region text PRIMARY KEY, rate numeric)");
+    w.txn().exec("CREATE TABLE shop.orders(id bigint GENERATED ALWAYS AS IDENTITY"
+                 " PRIMARY KEY, r text, tax numeric)");
+    w.txn().exec("INSERT INTO shop.orders(r) SELECT 'x' FROM generate_series(1,50)");
+    w.commit();
+  }
+  write_spec("0001.json",
+             json{{"laswell_spec_version", 1},
+                  {"id", "0001"},
+                  {"description", "fill tax from the region table"},
+                  {"intents", json::array({json{
+                      {"kind", "backfill"}, {"schema", "shop"}, {"table", "orders"},
+                      {"key", "id"},
+                      {"set", {{"tax", "(SELECT rate FROM shop.region_tax t"
+                                       " WHERE t.region = orders.r)"}}},
+                      {"where", "orders.tax IS NULL"}}})}});
+
+  const auto s = scan(true);
+  const auto* e = entry_for(s, "0001");
+  ASSERT_NE(e, nullptr) << s.dump(2);
+  ASSERT_TRUE(e->contains("relations")) << e->dump(2);
+  bool found = false;
+  for (const auto& r : (*e)["relations"]) {
+    if (r.get<std::string>() == "shop.region_tax") found = true;
+  }
+  EXPECT_TRUE(found) << "a relation hidden in an opaque expression was not "
+                        "derived: " << (*e)["relations"].dump();
+}
+
+TEST_F(RepoTest, IndependentMigrationsAreGroupedAndOverlappingOnesAreNot) {
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/two-tables");
+    w.txn().exec("DROP SCHEMA IF EXISTS shop CASCADE");
+    w.txn().exec("CREATE SCHEMA shop");
+    w.txn().exec("CREATE TABLE shop.orders(id bigint PRIMARY KEY)");
+    w.txn().exec("CREATE TABLE shop.customers(id bigint PRIMARY KEY)");
+    w.commit();
+  }
+  write_spec("a.json", add_column_spec("a", "orders", "ca"));
+  write_spec("b.json", add_column_spec("b", "customers", "cb"));
+
+  const auto s = scan(true);
+  ASSERT_EQ(s["order"].size(), 1u) << s.dump(2);
+  EXPECT_TRUE(s["order"][0].value("provenConcurrent", false))
+      << "two migrations on disjoint tables were not grouped: " << s.dump(2);
+
+  // Now make them overlap: both touch shop.orders.
+  write_spec("b.json", add_column_spec("b", "orders", "cb"));
+  const auto s2 = scan(true);
+  EXPECT_FALSE(s2["order"][0].value("provenConcurrent", true))
+      << "overlapping migrations were grouped";
+  ASSERT_TRUE(s2["order"][0].contains("undecided")) << s2["order"][0].dump(2);
+  EXPECT_NE(s2["order"][0]["undecided"][0].get<std::string>().find("shop.orders"),
+            std::string::npos);
+}
+
+TEST_F(RepoTest, AnOpaqueTriggerPreventsProvingIndependence) {
+  // A trigger function can write any table, including the other migration's.
+  // The catalog names the trigger and stops there, so independence is not
+  // provable and the tool says so rather than guessing.
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/trigger");
+    w.txn().exec("DROP SCHEMA IF EXISTS shop CASCADE");
+    w.txn().exec("CREATE SCHEMA shop");
+    w.txn().exec("CREATE TABLE shop.orders(id bigint PRIMARY KEY)");
+    w.txn().exec("CREATE TABLE shop.customers(id bigint PRIMARY KEY)");
+    w.txn().exec("CREATE FUNCTION shop.t() RETURNS trigger LANGUAGE plpgsql AS "
+                 "$$ BEGIN RETURN NEW; END $$");
+    w.txn().exec("CREATE TRIGGER tr AFTER UPDATE ON shop.orders"
+                 " FOR EACH ROW EXECUTE FUNCTION shop.t()");
+    w.commit();
+  }
+  write_spec("a.json", add_column_spec("a", "orders", "ca"));
+  write_spec("b.json", add_column_spec("b", "customers", "cb"));
+
+  const auto s = scan(true);
+  EXPECT_FALSE(s["order"][0].value("provenConcurrent", true))
+      << "independence was claimed despite an opaque trigger: " << s.dump(2);
+  ASSERT_TRUE(s["order"][0].contains("undecided"));
+  EXPECT_NE(s["order"][0]["undecided"][0].get<std::string>().find("trigger"),
+            std::string::npos)
+      << s["order"][0]["undecided"].dump(2);
+}
+
+TEST_F(RepoTest, AnUnreadableSpecIsReportedNotSkipped) {
+  make_shop(cfg());
+  std::ofstream(dir_ + "/broken.json") << R"({"laswell_spec_version":1,"id":"x"})";
+  const auto s = scan(false);
+  const auto* e = entry_for(s, "");
+  ASSERT_NE(e, nullptr) << s.dump(2);
+  EXPECT_EQ(e->value("status", ""), "unreadable");
+  EXPECT_FALSE(e->value("error", "").empty());
 }

@@ -71,5 +71,16 @@ First skeleton. Nothing is applied to a database yet.
   batch, not per commit, so a long transaction is distinguishable from a stuck
   job — and committed rows are reported separately, because only those survive
   a crash.
+- `repository.h` / `listMigrations` — a directory of signed specs, classified
+  against one database's ledger. Reports what is pending, in `depends_on`
+  order, with the groups that may run concurrently.
+- **Edited-after-apply detection.** A spec whose id was applied under a
+  different digest was changed after the fact: the database no longer matches
+  the file that claims to describe it. Falls out of digests for nothing.
+- **Dependencies are derived, not guessed.** `EXPLAIN (GENERIC_PLAN, VERBOSE)`
+  reveals relations hidden inside opaque `set`/`where` expressions that no
+  intent declared; foreign keys are followed both ways. Triggers are *named,
+  never resolved* — a trigger function body is invisible to both the catalog
+  and the plan, so it downgrades confidence instead of being guessed at.
 - `cpp/test/spikes/` — the Phase 0 experiments that settled the design against
   PostgreSQL 18.6. Four of them changed it.
