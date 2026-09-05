@@ -38,6 +38,27 @@ check() {  # check <expected exit> <description> -- <args...>
 }
 
 echo "--- flags that need no database ---"
+# The signing workflow runs where there IS no database: the machine holding the
+# private key is deliberately not the machine that can reach production. This
+# asserts getSpecDigest works with every configuration source removed, and that
+# a tool which does need a connection still fails, and fails informatively.
+NODB_ARGS='{"spec":{"laswell_spec_version":1,"id":"x","description":"d","intents":[{"kind":"add_column","schema":"s","table":"t","column":"c","type":"text","nullable":true,"comment":"c"}]}}'
+if env -u DATABASE_URL -u PGLASWELL_CONFIG HOME=/nonexistent \
+     "$BIN" --call getSpecDigest --args "$NODB_ARGS" 2>/dev/null | grep -q '"digest"'; then
+  echo "  ok   getSpecDigest works with no database configured at all"; pass=$((pass+1))
+else
+  echo "  FAIL getSpecDigest needs a database it does not use"; fail=$((fail+1))
+fi
+nodb=$(env -u DATABASE_URL -u PGLASWELL_CONFIG HOME=/nonexistent \
+         "$BIN" --call checkPrivileges 2>/dev/null || true)
+if grep -q "no connection is configured" <<<"$nodb" &&
+   grep -q "configuration problem" <<<"$nodb"; then
+  echo "  ok   a tool that needs a connection says so, and says it is config"
+  pass=$((pass+1))
+else
+  echo "  FAIL unhelpful failure with no connection: $nodb"; fail=$((fail+1))
+fi
+
 set +e
 "$BIN" --version >/dev/null 2>&1; v=$?
 "$BIN" --help    >/dev/null 2>&1; h=$?

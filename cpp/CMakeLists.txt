@@ -117,13 +117,26 @@ set(CPACK_PACKAGE_VENDOR "sqlambda")
 set(CPACK_PACKAGE_CONTACT "https://github.com/sqlambda/pg_laswell")
 set(CPACK_PACKAGE_HOMEPAGE_URL "https://github.com/sqlambda/pg_laswell")
 
-# libpqxx is linked statically and baked into the binary for releases; libpq
-# remains the only shared runtime dependency we declare. libcrypto is NOT listed
-# separately because libpq5 already depends on it — adding it would be a second
-# claim on the same package, differently named per distro.
-set(CPACK_DEBIAN_PACKAGE_DEPENDS "libpq5")
+# Dependencies are DERIVED from the binary, never listed by hand.
+#
+# The hand-written list said "libpq5" and was wrong in both directions. It
+# missed libpqxx-7.10, which the binary links directly -- measured in a clean
+# debian:13-slim container, the package installed without complaint and the
+# binary then died with "libpqxx-7.10.so: cannot open shared object file". It
+# also missed libstdc++6 (>= 14), which C++23 needs and which no amount of
+# reading the source would have suggested. And it named libpq5 redundantly:
+# dpkg-shlibdeps drops it because libpqxx-7.10 already depends on it.
+#
+# A hardcoded list cannot be right for long -- it is a claim about the link
+# line maintained in a different file from the link line. SHLIBDEPS runs
+# dpkg-shlibdeps over what was actually built, so adding a library to
+# target_link_libraries updates the package by itself.
+set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
 set(CPACK_DEBIAN_PACKAGE_SECTION "database")
-set(CPACK_RPM_PACKAGE_REQUIRES "libpq5")
+# No explicit Requires for RPM: rpmbuild generates them from the ELF sonames
+# the same way, and the previous value was a DEBIAN package name ("libpq5",
+# which is "libpq" on Fedora and RHEL) -- an explicit Requires naming a package
+# that does not exist makes the RPM uninstallable rather than under-specified.
 set(CPACK_RPM_PACKAGE_LICENSE "Apache-2.0")
 set(CPACK_RPM_PACKAGE_GROUP "Applications/Databases")
 

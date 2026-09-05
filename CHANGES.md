@@ -154,5 +154,19 @@ and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
   `AccessExclusiveLock` the statement never names, a unique or exclusion
   constraint takes its index with it, and a NOT NULL constraint leaves the
   column nullable again.
+- **Packages that work.** `cpack -G DEB`/`-G RPM`, with dependencies **derived
+  from the binary** rather than listed by hand. The hand-written list said
+  `libpq5`; installed into a clean `debian:13-slim`, the package reported no
+  problem and the binary then died with `libpqxx-7.10.so: cannot open shared
+  object file`. It also missed `libstdc++6 (>= 14)`, and named `libpq5`
+  redundantly — `libpqxx-7.10` already depends on it. `CPACK_RPM_PACKAGE_REQUIRES`
+  is gone too: it carried a *Debian* package name, which would have made the
+  RPM uninstallable rather than merely under-specified.
+- **`getSpecDigest` no longer demands a database it never uses.** The signing
+  workflow the man page documents runs on the machine holding the private key —
+  deliberately not the machine that can reach production — and refusing to start
+  without a conninfo made that impossible. Tools that do need a connection say
+  so, through a typed `ConfigError` whose hint names the configuration rather
+  than a server log for a statement that never ran.
 - `cpp/test/spikes/` — the Phase 0 experiments that settled the design against
   PostgreSQL 18.6. Four of them changed it.

@@ -28,6 +28,7 @@
 #include <functional>
 #include <iostream>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -66,6 +67,18 @@ inline constexpr int kInvalidParams = -32602;
 // over whatever it needs -- a connection registry, a cache, a job table --
 // without this header knowing those types exist. That is what keeps the
 // transport free of any dependency on the tools, and therefore free of pqxx.
+// A configuration problem, distinct from a database problem.
+//
+// The two need different hints and the generic handler cannot tell them apart
+// from the message alone -- string-sniffing an exception is exactly the mistake
+// this project already made once with insufficient_privilege, where matching on
+// SQLSTATE rather than on type gave the wrong answer for a whole error class. A
+// ConfigError carries its own remedy in its message, so the handler must not
+// replace it with advice about a server log for a statement that never ran.
+struct ConfigError : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+
 struct ToolDef {
   std::string name;         // camelCase on the wire
   std::string description;  // what the model reads when choosing
@@ -225,6 +238,15 @@ class McpServer {
       if (name != t.name) continue;
       try {
         return make_result(id, tool_result(t.invoke(arguments)));
+      } catch (const ConfigError& e) {
+        // Its message already names the thing to change, so the hint points at
+        // where to change it rather than at a database that was never reached.
+        return make_result(
+            id, tool_error(detail::error_payload(
+                    e.what(),
+                    "This is a configuration problem, not a database one: no "
+                    "connection was attempted. See CONFIGURATION in "
+                    "man pg_laswell_mcp.")));
       } catch (const std::exception& e) {
         // A tool that throws produces an isError result rather than a
         // JSON-RPC error: the model can read and act on the former, whereas a

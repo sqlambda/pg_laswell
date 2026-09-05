@@ -1,8 +1,17 @@
 # Installing pg_laswell
 
-**Pre-release. There are no packages yet** — build from source, see
-[BUILD.md](BUILD.md). This file records what installation involves, because
-three parts of it are decisions rather than steps.
+**Pre-release.** Packages build from the source tree and are verified by
+installing into a clean container; they are not yet published anywhere, so
+build them yourself or build from source — see [BUILD.md](BUILD.md).
+
+```bash
+cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release
+cmake --build cpp/build
+cd cpp/build && cpack -G DEB      # or -G RPM
+```
+
+This file records what installation involves, because three parts of it are
+decisions rather than steps.
 
 ## What gets installed
 
@@ -12,9 +21,20 @@ three parts of it are decisions rather than steps.
 | `share/man/man1/pg_laswell_mcp.1` | the authoritative reference — read it |
 | `share/pg_laswell/bootstrap.sql` | run by hand, once, by a DBA |
 
-The only shared runtime dependency is `libpq5`. libcrypto is not listed
-separately because `libpq5` already depends on it; claiming it twice would mean
-two differently-named package requirements per distribution for one library.
+**Dependencies are derived from the binary, never listed by hand.** The DEB
+uses `dpkg-shlibdeps` and the RPM uses rpmbuild's soname scan, so the package
+describes what was actually linked:
+
+```
+libc6 (>= 2.38), libgcc-s1 (>= 3.0), libpqxx-7.10 (>= 7.10.0),
+libssl3t64 (>= 3.0.0), libstdc++6 (>= 14)
+```
+
+The hand-written list this replaced said `libpq5` and was wrong in both
+directions — it missed `libpqxx-7.10`, which the binary links directly, and
+`libstdc++6 (>= 14)`, which C++23 needs; and `libpq5` itself is redundant,
+because `libpqxx-7.10` already depends on it. A package built from that list
+installed without complaint on a clean Debian 13 and then failed to start.
 
 ## 1. Bootstrap, by hand
 

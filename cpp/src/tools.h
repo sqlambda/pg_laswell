@@ -45,7 +45,7 @@ struct ToolContext {
   const ConnConfig& connection(const json& args) const {
     const auto name = args.value("connection", registry.default_name());
     if (name.empty()) {
-      throw std::runtime_error(
+      throw ConfigError(
           "no connection is configured; pass a conninfo argument, set "
           "DATABASE_URL, or use --config");
     }

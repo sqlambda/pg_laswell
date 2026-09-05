@@ -12,8 +12,9 @@ drifted. And it never states a number it cannot derive.
 
 **Status: pre-0.1.0.** The whole path works — repository, signing, planning,
 dry run, paced execution, ledger — with 222 tests green on GCC and Clang, under
-AddressSanitizer/UBSan and ThreadSanitizer. Not yet packaged, and the manual is
-still a stub.
+AddressSanitizer/UBSan and ThreadSanitizer. `cpack` builds a deb and an rpm,
+verified by installing into a clean container; the manual is the authoritative
+reference. Not yet published anywhere.
 
 ## Why
 

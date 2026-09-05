@@ -11,6 +11,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <optional>
 #include <string>
 
 #include "config.h"
@@ -130,7 +131,21 @@ int main(int argc, char* argv[]) {
     const auto fallback = default_config_path();
     if (!fallback.empty() && file_exists(fallback)) config_path = fallback;
   }
-  if (config_path.empty() && db_url.empty()) {
+  // A missing connection is fatal for the stdio server and NOT fatal for
+  // --call, and the asymmetry is deliberate.
+  //
+  // getSpecDigest touches no database -- that is the whole point of it, since
+  // the machine that signs a specification is deliberately not the machine
+  // that can reach production. Refusing here made the signing workflow the man
+  // page documents impossible to follow on the machine it is meant for. The
+  // tools that DO need a connection already fail well: ToolContext::connection
+  // says "no connection is configured; pass a conninfo argument, set
+  // DATABASE_URL, or use --config", which is strictly better than usage text.
+  //
+  // The server keeps the startup refusal because a long-lived MCP server with
+  // no database is a misconfiguration an operator wants to hear about at
+  // startup rather than at the first tool call.
+  if (config_path.empty() && db_url.empty() && call_tool.empty()) {
     usage(argv[0]);
     return 1;
   }
@@ -141,17 +156,28 @@ int main(int argc, char* argv[]) {
     // unusable because one of them is behind a VPN that happens to be down.
     const std::string app = std::string("pg-laswell/") + PGLASWELL_VERSION;
     pglaswell::ToolContext ctx{
-        config_path.empty() ? pglaswell::Registry::from_url(db_url, app)
-                            : pglaswell::Registry::from_ini(config_path, app),
+        !config_path.empty() ? pglaswell::Registry::from_ini(config_path, app)
+        : !db_url.empty()    ? pglaswell::Registry::from_url(db_url, app)
+                             : pglaswell::Registry(),
         nullptr};
     pglaswell::ConnectionCache cache;
     ctx.cache = &cache;
 
     pglaswell::JobRegistry jobs;
     ctx.jobs = &jobs;
-    const auto& first = ctx.registry.get(ctx.registry.default_name());
-    pglaswell::Observer observer(first, &jobs, first.executor.observer_tick_ms);
-    ctx.observer = &observer;
+
+    // No connection means no observer, and nothing is lost: the observer exists
+    // to watch running jobs, and a job cannot start without a connection. Held
+    // in an optional rather than constructed against a placeholder ConnConfig,
+    // because a placeholder conninfo is an empty string and libpq reads that as
+    // "connect to the local socket with defaults" -- an observer thread quietly
+    // connecting to whatever happens to be on this machine.
+    std::optional<pglaswell::Observer> observer;
+    if (!ctx.registry.default_name().empty()) {
+      const auto& first = ctx.registry.get(ctx.registry.default_name());
+      observer.emplace(first, &jobs, first.executor.observer_tick_ms);
+      ctx.observer = &*observer;
+    }
 
     pglaswell::McpServer server(pglaswell::make_tools(ctx));
 
@@ -220,7 +246,7 @@ int main(int argc, char* argv[]) {
 
     // Joined, never abandoned. A worker thread racing PQfinish against static
     // destruction is the classic intermittent crash at shutdown.
-    observer.stop();
+    if (observer) observer->stop();
     jobs.join_all();
   } catch (const std::exception& e) {
     std::cerr << "Fatal: " << e.what() << std::endl;

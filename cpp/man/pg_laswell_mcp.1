@@ -580,6 +580,13 @@ openssl pkeyutl -sign -inkey key.pem -rawin -in canonical.bin \e
   | base64 -w0
 .Ed
 .Pp
+.Cm getSpecDigest
+needs no database and none has to be configured to run it, which is what makes
+the step above possible on the machine that holds the private key -- deliberately
+not the machine that can reach production.
+Every other operation does need a connection, and says so rather than printing
+usage.
+.Pp
 Then add to the specification:
 .Bd -literal -offset indent
 "signatures": [
