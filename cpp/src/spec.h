@@ -35,7 +35,8 @@ inline constexpr int kSpecVersion = 1;
 enum class IntentKind { kAddColumn, kBackfill, kCreateIndex, kDropIndex,
                         kSetNotNull, kAddForeignKey, kAddCheckConstraint,
                         kDropConstraint, kAlterColumnType, kDropColumn,
-                        kReplaceView };
+                        kReplaceView, kAddUniqueConstraint,
+                        kAddPrimaryKey };
 
 inline const std::map<std::string, IntentKind>& intent_kinds() {
   static const std::map<std::string, IntentKind> kKinds = {
@@ -50,6 +51,8 @@ inline const std::map<std::string, IntentKind>& intent_kinds() {
       {"alter_column_type", IntentKind::kAlterColumnType},
       {"drop_column", IntentKind::kDropColumn},
       {"replace_view", IntentKind::kReplaceView},
+      {"add_unique_constraint", IntentKind::kAddUniqueConstraint},
+      {"add_primary_key", IntentKind::kAddPrimaryKey},
   };
   return kKinds;
 }
@@ -416,6 +419,29 @@ inline void parse_add_check_constraint(Intent& in) {
 // A view body is business logic, like backfill's set/where. Enumerating a
 // SELECT grammar as JSON keys is the unbounded-reimplementation trap the intent
 // model exists to avoid, so the definition is written as SQL and signed as SQL.
+// add_unique_constraint and add_primary_key take the same body: both are
+// backed by a unique index, and both are planned through it.
+inline void parse_unique_like(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(in.body, {"kind", "schema", "table", "name", "columns"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
+  // The name is required rather than derived. PostgreSQL renames the backing
+  // index to the constraint name, so a derived name is a name that appears in
+  // the catalog, in pg_stat_user_indexes and in every monitoring dashboard --
+  // without anyone having written it down.
+  detail::require_identifier(detail::require_string(in.body, "name", at), "name", in.ordinal);
+  if (!in.body.contains("columns") || !in.body["columns"].is_array() ||
+      in.body["columns"].empty()) {
+    detail::fail(at + ".columns must be a non-empty array",
+                 "List the columns the constraint covers, in order.");
+  }
+  for (const auto& c : in.body["columns"]) {
+    if (!c.is_string()) detail::fail(at + ".columns must be strings", "");
+    detail::require_identifier(c.get<std::string>(), "columns", in.ordinal);
+  }
+}
+
 inline void parse_replace_view(Intent& in) {
   const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
   detail::reject_unknown_keys(
@@ -602,6 +628,8 @@ inline Spec parse_spec(const json& doc) {
     case IntentKind::kAlterColumnType: parse_alter_column_type(in); break;
     case IntentKind::kDropColumn: parse_drop_column(in); break;
     case IntentKind::kReplaceView: parse_replace_view(in); break;
+    case IntentKind::kAddUniqueConstraint:
+    case IntentKind::kAddPrimaryKey: parse_unique_like(in); break;
     }
     s.intents.push_back(std::move(in));
     ++ordinal;

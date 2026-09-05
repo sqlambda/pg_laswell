@@ -3,7 +3,7 @@
 ## 0.1.0 (unreleased)
 
 The whole path works: repository, signing, planning, dry run, paced execution,
-ledger. 239 tests green on GCC 14.2 and Clang 22, under AddressSanitizer/UBSan
+ledger. 248 tests green on GCC 14.2 and Clang 22, under AddressSanitizer/UBSan
 and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
 `--call` contract test.
 
@@ -207,6 +207,24 @@ and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
   one rewrites. `text`→`varchar(200)` rewrites; `varchar(50)`→`text` does not.
   Anything unproven is reported as a rewrite, because a cautious plan costs
   less than an unplanned outage.
+- **`add_unique_constraint` and `add_primary_key`**, planned through the index
+  that backs them. A plain `ADD CONSTRAINT … UNIQUE` takes `AccessExclusiveLock`
+  *and* `ShareLock` and builds the index under them; `CREATE UNIQUE INDEX
+  CONCURRENTLY` + `ADD CONSTRAINT … USING INDEX` still takes
+  `AccessExclusiveLock` — it removes the *build* under the lock, not the lock.
+  The plan says that rather than the usual overclaim.
+  Two measured behaviours shape it. `USING INDEX` **renames** the index to the
+  constraint name (a NOTICE, nothing more), so the index is named after the
+  constraint from the start and the rename is a no-op — and when an existing
+  index is adopted under another name, the plan warns. And `ADD PRIMARY KEY`
+  sets `NOT NULL` itself, verified by a full scan under the exclusive lock:
+  **75 ms on 2M rows nullable vs 0.6 ms already NOT NULL**. So a primary key
+  over a nullable column runs the existing `set_not_null` recipe first, which
+  does that scan under `ShareUpdateExclusiveLock` instead. The two intents
+  compose rather than restating each other.
+  There is no `NOT VALID` form for unique, so the build *is* the validation: a
+  duplicate leaves an invalid index that `USING INDEX` refuses, and the plan
+  says so up front.
 - **`replace_view`**, and the measured reason it exists. Adding a column is
   never blocked by a view — but the new column reaches *no* existing view,
   including one written `SELECT *`, because the star is expanded at creation

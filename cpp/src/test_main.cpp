@@ -853,7 +853,11 @@ TEST(Spec, KnownKindsAreExactlyTheImplementedKinds) {
                           "column":"c","type":"bigint"},
     "drop_column": {"kind":"drop_column","schema":"s","table":"t","column":"c"},
     "replace_view": {"kind":"replace_view","schema":"s","name":"v",
-                     "definition":"SELECT 1 AS a"}
+                     "definition":"SELECT 1 AS a"},
+    "add_unique_constraint": {"kind":"add_unique_constraint","schema":"s",
+                              "table":"t","name":"t_uq","columns":["c"]},
+    "add_primary_key": {"kind":"add_primary_key","schema":"s","table":"t",
+                        "name":"t_pkey","columns":["c"]}
   })");
   for (const auto& [name, kind] : pglaswell::intent_kinds()) {
     (void)kind;
@@ -3775,6 +3779,208 @@ TEST(Planner, DroppingAnAbsentIndexIsSatisfied) {
 
 
 
+
+// --- add_unique_constraint / add_primary_key -------------------------------
+
+static pglaswell::Spec unique_spec(const char* kind, const char* name,
+                                   std::vector<std::string> cols = {"code"}) {
+  json c = json::array();
+  for (const auto& x : cols) c.push_back(x);
+  return spec_of(json::array({json{{"kind", kind}, {"schema", "shop"},
+                                   {"table", "orders"}, {"name", name},
+                                   {"columns", c}}}));
+}
+
+static pglaswell::Observations obs_for_unique(long long size, int waiters = 0,
+                                              bool not_null = true) {
+  auto obs = observations(size, 100000, waiters);
+  obs.tables["shop.orders"]["columns"]["code"] =
+      json{{"type", "text"}, {"not_null", not_null}};
+  return obs;
+}
+
+TEST(Planner, AddingAUniqueConstraintOnALargeTableBuildsTheIndexConcurrently) {
+  // Measured (S15): plain ADD CONSTRAINT takes AccessExclusiveLock AND
+  // ShareLock and builds the index while holding them.
+  const auto plan = pglaswell::plan_migration(
+      unique_spec("add_unique_constraint", "orders_code_uq"),
+      obs_for_unique(2LL << 30), {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto s = steps_of(plan, "add_unique_constraint");
+  ASSERT_EQ(s.size(), 2u) << plan.render();
+  EXPECT_NE(all_sql(*s[0]).find(
+                "CREATE UNIQUE INDEX CONCURRENTLY orders_code_uq ON shop.orders (code)"),
+            std::string::npos) << all_sql(*s[0]);
+  EXPECT_EQ(s[0]->txn_class, pglaswell::TxnClass::kForbidden);
+  EXPECT_NE(all_sql(*s[1]).find("ADD CONSTRAINT orders_code_uq UNIQUE USING INDEX"),
+            std::string::npos) << all_sql(*s[1]);
+
+  // The index is named after the constraint, so USING INDEX's rename is a
+  // no-op. Any other name and an index someone monitors quietly becomes a
+  // different one.
+  bool rename_warning = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("renames the index") != std::string::npos) rename_warning = true;
+  }
+  EXPECT_FALSE(rename_warning)
+      << "naming the index after the constraint should make the rename a "
+         "non-event, so there is nothing to warn about";
+
+  // And the honest statement about what the recipe does and does not buy.
+  EXPECT_NE(s[1]->lock.find("AccessExclusiveLock"), std::string::npos)
+      << "step 2 still takes the exclusive lock; claiming otherwise would be "
+         "the most misleading sentence in the plan: " << s[1]->lock;
+}
+
+TEST(Planner, ASmallQuietTableGetsOneStatementInstead) {
+  const auto plan = pglaswell::plan_migration(
+      unique_spec("add_unique_constraint", "orders_code_uq"),
+      obs_for_unique(1024), {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto s = steps_of(plan, "add_unique_constraint");
+  ASSERT_EQ(s.size(), 1u) << plan.render();
+  EXPECT_NE(all_sql(*s[0]).find("ADD CONSTRAINT orders_code_uq UNIQUE (code)"),
+            std::string::npos);
+  EXPECT_EQ(all_sql(*s[0]).find("CONCURRENTLY"), std::string::npos);
+
+  // A small table with something already queued on it is not a table to take
+  // AccessExclusiveLock on.
+  const auto contended = pglaswell::plan_migration(
+      unique_spec("add_unique_constraint", "orders_code_uq"),
+      obs_for_unique(1024, /*waiters=*/2), {});
+  EXPECT_EQ(steps_of(contended, "add_unique_constraint").size(), 2u)
+      << contended.render();
+}
+
+TEST(Planner, AnExistingUniqueIndexIsAdoptedRatherThanRebuilt) {
+  auto obs = obs_for_unique(2LL << 30);
+  obs.tables["shop.orders"]["indexes"]["orders_code_key"] =
+      json{{"is_valid", true}, {"is_unique", true}, {"method", "btree"},
+           {"has_expressions", false}, {"predicate", ""},
+           {"columns", json::array({"code"})}, {"leading_column", "code"}};
+  const auto plan = pglaswell::plan_migration(
+      unique_spec("add_unique_constraint", "orders_code_uq"), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto s = steps_of(plan, "add_unique_constraint");
+  ASSERT_EQ(s.size(), 1u) << plan.render();
+  EXPECT_EQ(all_sql(*s[0]).find("CREATE UNIQUE INDEX"), std::string::npos)
+      << "the build is already paid for:\n" << all_sql(*s[0]);
+  EXPECT_NE(all_sql(*s[0]).find("USING INDEX orders_code_key"), std::string::npos);
+
+  // Here the rename IS real, and must be said: an index named in a dashboard
+  // silently becomes something else, and PostgreSQL reports it as a NOTICE.
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("renames the index") != std::string::npos &&
+        w.find("orders_code_key") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned) << plan.render();
+}
+
+TEST(Planner, AnIndexThatDoesNotMatchIsNotAdopted) {
+  // Each of these differs from the spec in one way, and none may be adopted:
+  // an invalid one is refused by USING INDEX, a non-unique one likewise, a
+  // partial one does not cover every row, and different columns are a
+  // different constraint entirely.
+  const json bad[] = {
+      json{{"is_valid", false}, {"is_unique", true}, {"has_expressions", false},
+           {"predicate", ""}, {"columns", json::array({"code"})}},
+      json{{"is_valid", true}, {"is_unique", false}, {"has_expressions", false},
+           {"predicate", ""}, {"columns", json::array({"code"})}},
+      json{{"is_valid", true}, {"is_unique", true}, {"has_expressions", false},
+           {"predicate", "(status = 'open'::text)"},
+           {"columns", json::array({"code"})}},
+      json{{"is_valid", true}, {"is_unique", true}, {"has_expressions", false},
+           {"predicate", ""}, {"columns", json::array({"code", "id"})}},
+  };
+  for (const auto& ix : bad) {
+    auto obs = obs_for_unique(2LL << 30);
+    obs.tables["shop.orders"]["indexes"]["candidate"] = ix;
+    obs.tables["shop.orders"]["indexes"]["candidate"]["method"] = "btree";
+    const auto plan = pglaswell::plan_migration(
+        unique_spec("add_unique_constraint", "orders_code_uq"), obs, {});
+    ASSERT_TRUE(plan.ok) << plan.render();
+    EXPECT_EQ(steps_of(plan, "add_unique_constraint").size(), 2u)
+        << "adopted an unusable index " << ix.dump() << "\n" << plan.render();
+  }
+}
+
+TEST(Planner, APrimaryKeyOverANullableColumnSetsNotNullTheCheapWayFirst) {
+  // Measured (S15): ADD PRIMARY KEY sets attnotnull itself and verifies it with
+  // a scan under AccessExclusiveLock -- 75ms on 2M rows against 0.6ms when the
+  // column is already NOT NULL. The set_not_null recipe does that same scan
+  // under ShareUpdateExclusiveLock, which does not block the application.
+  const auto plan = pglaswell::plan_migration(
+      unique_spec("add_primary_key", "orders_pkey"),
+      obs_for_unique(2LL << 30, 0, /*not_null=*/false), {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+
+  const auto nn = steps_of(plan, "set_not_null");
+  ASSERT_FALSE(nn.empty()) << "a nullable column must be made NOT NULL first:\n"
+                           << plan.render();
+  EXPECT_NE(all_sql(*nn[0]).find("NOT VALID"), std::string::npos);
+
+  const auto pk = steps_of(plan, "add_primary_key");
+  ASSERT_EQ(pk.size(), 2u) << plan.render();
+  EXPECT_NE(all_sql(*pk[1]).find("PRIMARY KEY USING INDEX"), std::string::npos);
+  // Order matters: the NOT NULL must be established before the key is added,
+  // or ADD PRIMARY KEY does the expensive scan itself.
+  EXPECT_LT(nn.back()->ordinal, pk.front()->ordinal) << plan.render();
+
+  // An already-NOT NULL column costs nothing extra.
+  const auto quiet = pglaswell::plan_migration(
+      unique_spec("add_primary_key", "orders_pkey"),
+      obs_for_unique(2LL << 30, 0, /*not_null=*/true), {});
+  EXPECT_TRUE(steps_of(quiet, "set_not_null").empty()) << quiet.render();
+}
+
+TEST(Planner, ASecondPrimaryKeyIsRefusedNamingTheOneThatExists) {
+  auto obs = obs_for_unique(1024);
+  obs.tables["shop.orders"]["constraints"]["orders_old_pkey"] =
+      json{{"type", "p"}, {"has_index", true}, {"depended_on_by", json::array()}};
+  const auto plan = pglaswell::plan_migration(
+      unique_spec("add_primary_key", "orders_pkey"), obs, {});
+  EXPECT_FALSE(plan.ok) << plan.render();
+  EXPECT_NE(plan.conflicts[0].find("orders_old_pkey"), std::string::npos)
+      << plan.conflicts[0];
+}
+
+TEST(Planner, AnAlreadyPresentUniqueConstraintIsSatisfied) {
+  auto obs = obs_for_unique(1024);
+  obs.tables["shop.orders"]["constraints"]["orders_code_uq"] =
+      json{{"type", "u"}, {"has_index", true}, {"depended_on_by", json::array()}};
+  const auto plan = pglaswell::plan_migration(
+      unique_spec("add_unique_constraint", "orders_code_uq"), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  EXPECT_EQ(steps_of(plan, "add_unique_constraint")[0]->action,
+            pglaswell::Action::kSatisfied);
+
+  // The same name holding a different KIND of constraint is a conflict, not a
+  // satisfied step: silently accepting it would report a unique constraint
+  // that is actually a check.
+  obs.tables["shop.orders"]["constraints"]["orders_code_uq"]["type"] = "c";
+  const auto clash = pglaswell::plan_migration(
+      unique_spec("add_unique_constraint", "orders_code_uq"), obs, {});
+  EXPECT_FALSE(clash.ok) << clash.render();
+}
+
+TEST(Planner, TheAbsenceOfANotValidFormForUniqueIsStated) {
+  // There is no deferred validation for a unique constraint -- the index build
+  // IS the check -- so a duplicate fails the build and leaves an INVALID index
+  // that USING INDEX then refuses. Saying so beforehand is the difference
+  // between a stopped job somebody understands and one they do not.
+  const auto plan = pglaswell::plan_migration(
+      unique_spec("add_unique_constraint", "orders_code_uq"),
+      obs_for_unique(2LL << 30), {});
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("no NOT VALID form") != std::string::npos &&
+        w.find("INVALID index") != std::string::npos &&
+        w.find("drop_index") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned) << plan.render();
+}
+
 // --- replace_view, and what add_column does NOT do -------------------------
 
 static pglaswell::Spec replace_spec(const char* def) {
@@ -4868,6 +5074,163 @@ TEST_F(DatabaseTest, ExposingANewColumnThroughAViewKeepsWhatARebuildWouldLose) {
   w.txn().exec("DROP FUNCTION laswell_ex_noop()");
   w.txn().exec("DROP OWNED BY laswell_ex_reader");
   w.txn().exec("DROP ROLE laswell_ex_reader");
+  w.commit();
+}
+
+TEST_F(DatabaseTest, TheUniqueAndPrimaryKeyRecipesRunAndLeaveTheRightCatalog) {
+  // Every step run against PostgreSQL, because the two facts this recipe rests
+  // on are behaviours nobody would infer from the syntax: USING INDEX renames
+  // the index, and ADD PRIMARY KEY sets NOT NULL itself at the cost of a scan.
+  pglaswell::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = url_;
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/uq");
+    w.txn().exec("DROP TABLE IF EXISTS laswell_uq CASCADE");
+    w.txn().exec("CREATE TABLE laswell_uq(id bigint, code text)");
+    w.txn().exec("INSERT INTO laswell_uq SELECT g, 'c'||g"
+                 " FROM generate_series(1,500) g");
+    w.commit();
+  }
+
+  pglaswell::Catalog cat(cfg);
+  auto apply = [&](const json& intent, const char* kind) {
+    const auto obs = cat.observe({"public"}, {"laswell_uq"});
+    json doc = minimal_spec();
+    doc["intents"] = json::array({intent});
+    const auto plan =
+        pglaswell::plan_migration(pglaswell::parse_spec(doc), obs, {});
+    EXPECT_TRUE(plan.ok) << plan.render();
+    (void)kind;
+    for (const auto& step : plan.steps) {
+      for (const auto& q : step.sql) {
+        const std::string stmt = q;
+        // CONCURRENTLY cannot run inside a transaction block, which is exactly
+        // what the plan's txn_class says -- honoured here rather than assumed.
+        if (step.txn_class == pglaswell::TxnClass::kForbidden) {
+          pglaswell::WriteSession w(cfg);
+          w.exec_nontransactional(stmt.substr(0, stmt.size() - 1));
+        } else {
+          pglaswell::WriteSession w(cfg);
+          w.begin("pg_laswell/test/uq-apply");
+          w.txn().exec(stmt.substr(0, stmt.size() - 1));
+          w.commit();
+        }
+      }
+    }
+  };
+
+  // A unique constraint on a table too big for the one-statement path. The
+  // fixture is small, so force the concurrent route with a lock waiter... no:
+  // force it by size is impossible here, so assert the small path instead and
+  // cover the concurrent one through its own index below.
+  apply(json{{"kind", "add_unique_constraint"}, {"schema", "public"},
+             {"table", "laswell_uq"}, {"name", "laswell_uq_code_uq"},
+             {"columns", json::array({"code"})}},
+        "add_unique_constraint");
+
+  {
+    pglaswell::ReadSession r(cfg);
+    auto scalar = [&](const std::string& q) {
+      return r.txn().exec(q)[0][0].as<std::string>();
+    };
+    EXPECT_EQ(scalar("SELECT contype::text FROM pg_constraint"
+                     " WHERE conname='laswell_uq_code_uq'"), "u");
+    // The constraint and its index share a name, which is what USING INDEX
+    // would have forced anyway.
+    EXPECT_EQ(scalar("SELECT conindid::regclass::text FROM pg_constraint"
+                     " WHERE conname='laswell_uq_code_uq'"),
+              "laswell_uq_code_uq");
+  }
+
+  // The primary key over a NULLABLE column: the plan must make it NOT NULL
+  // first, through the recipe, and only then add the key.
+  {
+    pglaswell::ReadSession r(cfg);
+    EXPECT_EQ(r.txn()
+                  .exec("SELECT attnotnull FROM pg_attribute WHERE attrelid="
+                        "'laswell_uq'::regclass AND attname='id'")[0][0]
+                  .as<bool>(),
+              false)
+        << "the fixture must start nullable or this proves nothing";
+  }
+  apply(json{{"kind", "add_primary_key"}, {"schema", "public"},
+             {"table", "laswell_uq"}, {"name", "laswell_uq_pkey"},
+             {"columns", json::array({"id"})}},
+        "add_primary_key");
+
+  {
+    pglaswell::ReadSession r(cfg);
+    auto scalar = [&](const std::string& q) {
+      return r.txn().exec(q)[0][0].as<std::string>();
+    };
+    EXPECT_EQ(scalar("SELECT contype::text FROM pg_constraint"
+                     " WHERE conname='laswell_uq_pkey'"), "p");
+    EXPECT_EQ(scalar("SELECT attnotnull::text FROM pg_attribute"
+                     " WHERE attrelid='laswell_uq'::regclass AND attname='id'"),
+              "true");
+    // The temporary CHECK from the NOT NULL recipe is gone, not left behind to
+    // cost time on every insert forever.
+    EXPECT_EQ(scalar("SELECT count(*)::text FROM pg_constraint"
+                     " WHERE conrelid='laswell_uq'::regclass AND contype='c'"),
+              "0");
+    // Re-planning is satisfied, not a second attempt.
+    const auto obs = cat.observe({"public"}, {"laswell_uq"});
+    json doc = minimal_spec();
+    doc["intents"] = json::array({json{{"kind", "add_primary_key"},
+                                       {"schema", "public"},
+                                       {"table", "laswell_uq"},
+                                       {"name", "laswell_uq_pkey"},
+                                       {"columns", json::array({"id"})}}});
+    const auto again =
+        pglaswell::plan_migration(pglaswell::parse_spec(doc), obs, {});
+    ASSERT_TRUE(again.ok) << again.render();
+    EXPECT_EQ(steps_of(again, "add_primary_key")[0]->action,
+              pglaswell::Action::kSatisfied);
+  }
+
+  // And the failure that has no NOT VALID escape: a duplicate stops the job at
+  // step two rather than producing a constraint nothing verified.
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/uq-dup");
+    w.txn().exec("DROP TABLE IF EXISTS laswell_uq_dup");
+    w.txn().exec("CREATE TABLE laswell_uq_dup(code text)");
+    w.txn().exec("INSERT INTO laswell_uq_dup VALUES ('same'), ('same')");
+    w.commit();
+  }
+  {
+    pglaswell::WriteSession w(cfg);
+    EXPECT_THROW(w.exec_nontransactional(
+                     "CREATE UNIQUE INDEX CONCURRENTLY laswell_uq_dup_uq"
+                     " ON laswell_uq_dup (code)"),
+                 pqxx::sql_error);
+  }
+  {
+    pglaswell::ReadSession r(cfg);
+    EXPECT_EQ(r.txn()
+                  .exec("SELECT indisvalid FROM pg_index WHERE indrelid="
+                        "'laswell_uq_dup'::regclass")[0][0]
+                  .as<bool>(),
+              false)
+        << "a failed concurrent build leaves an index that looks present";
+  }
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/uq-dup-adopt");
+    EXPECT_THROW(w.txn().exec("ALTER TABLE laswell_uq_dup ADD CONSTRAINT"
+                              " laswell_uq_dup_uq UNIQUE USING INDEX"
+                              " laswell_uq_dup_uq"),
+                 pqxx::sql_error)
+        << "USING INDEX must refuse an invalid index, or the constraint would "
+           "exist over data nothing checked";
+  }
+
+  pglaswell::WriteSession w(cfg);
+  w.begin("pg_laswell/test/uq-cleanup");
+  w.txn().exec("DROP TABLE laswell_uq CASCADE");
+  w.txn().exec("DROP TABLE laswell_uq_dup");
   w.commit();
 }
 

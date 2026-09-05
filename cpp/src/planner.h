@@ -368,6 +368,18 @@ inline void project(const Intent& in, const Step& step, Observations& projected)
     case IntentKind::kDropColumn:
       projected.tables[qualified]["columns"].erase(in.body.value("column", ""));
       return;
+    case IntentKind::kAddUniqueConstraint:
+    case IntentKind::kAddPrimaryKey:
+      projected.tables[qualified]["constraints"][in.body.value("name", "")] =
+          json{{"type", in.kind == IntentKind::kAddPrimaryKey ? "p" : "u"},
+               {"has_index", true},
+               {"depended_on_by", json::array()}};
+      for (const auto& c : in.body.value("columns", json::array())) {
+        if (in.kind == IntentKind::kAddPrimaryKey) {
+          projected.tables[qualified]["columns"][c.get<std::string>()]["not_null"] = true;
+        }
+      }
+      return;
     case IntentKind::kReplaceView: {
       const auto v = in.body.value("schema", "") + "." + in.body.value("name", "");
       projected.tables[v]["exists"] = true;
@@ -1366,6 +1378,218 @@ inline void warn_about_rebuild(
 
 }  // namespace detail
 
+// --- add_unique_constraint / add_primary_key -------------------------------
+//
+// Both are backed by a unique index, so both are planned through one, and the
+// decision is which route builds it (spike S15, 18.6).
+//
+// Plain ADD CONSTRAINT ... UNIQUE takes AccessExclusiveLock AND ShareLock and
+// builds the index while holding them. The two-step route -- CREATE UNIQUE
+// INDEX CONCURRENTLY, then ADD CONSTRAINT ... USING INDEX -- still takes
+// AccessExclusiveLock. Stated precisely, because the usual claim is wrong: it
+// does not avoid the lock, it avoids the index BUILD under the lock. Same lock
+// level, duration different by orders of magnitude.
+//
+// Two measured behaviours shape the emitted SQL. USING INDEX renames the index
+// to the constraint name, so the index is named after the constraint from the
+// start and the rename becomes a no-op rather than a surprise. And ADD PRIMARY
+// KEY sets attnotnull itself, verifying it with a full scan under the exclusive
+// lock: 75ms on 2M rows nullable versus 0.6ms already NOT NULL. So a primary
+// key over a nullable column runs the set_not_null recipe first -- which exists
+// precisely to do that scan under a lock that does not block the application.
+// Declared here and defined below: add_primary_key COMPOSES with the NOT NULL
+// recipe rather than restating it, so the two can never drift apart.
+inline void plan_set_not_null(const Intent& in, const Observations& obs,
+                              Plan& plan, std::vector<Step>& out);
+
+inline void plan_unique_like(const Intent& in, const Observations& obs,
+                             Plan& plan, std::vector<Step>& out) {
+  const bool primary = in.kind == IntentKind::kAddPrimaryKey;
+  const auto qualified = in.qualified_table();
+  const auto& t = obs.table(qualified);
+  const auto name = in.body.value("name", "");
+  std::vector<std::string> columns;
+  for (const auto& c : in.body.value("columns", json::array())) {
+    columns.push_back(c.get<std::string>());
+  }
+
+  auto fail = [&](const std::string& why, const std::string& detail) {
+    Step s;
+    s.kind = in.kind_name;
+    s.action = Action::kConflict;
+    s.why = why;
+    plan.conflicts.push_back(detail);
+    out.push_back(std::move(s));
+  };
+
+  if (!t.value("exists", false)) {
+    fail(qualified + " does not exist", qualified + " does not exist");
+    return;
+  }
+  const json cols = t.value("columns", json::object());
+  for (const auto& c : columns) {
+    if (!cols.contains(c)) {
+      fail(qualified + "." + c + " does not exist",
+           qualified + "." + c + " does not exist, so no constraint can cover it");
+      return;
+    }
+  }
+
+  const json constraints = t.value("constraints", json::object());
+  if (constraints.contains(name)) {
+    const auto type = constraints[name].value("type", "");
+    if (type == (primary ? "p" : "u")) {
+      Step s;
+      s.kind = in.kind_name;
+      s.action = Action::kSatisfied;
+      s.why = name + " is already present on " + qualified;
+      out.push_back(std::move(s));
+      return;
+    }
+    fail(name + " exists as a different constraint type",
+         name + " already exists on " + qualified + " as contype '" + type +
+             "', not as " + (primary ? "a primary key" : "a unique constraint") +
+             ". Drop it in an earlier intent if it is to be replaced.");
+    return;
+  }
+  if (primary) {
+    for (const auto& [cname, c] : constraints.items()) {
+      if (c.value("type", "") == "p") {
+        fail(qualified + " already has a primary key",
+             qualified + " already has primary key \"" + cname +
+                 "\". A table has at most one; drop that constraint in an "
+                 "earlier intent before adding another.");
+        return;
+      }
+    }
+  }
+
+  // A primary key sets NOT NULL itself, and pays for it with a scan under
+  // AccessExclusiveLock. Run the recipe that does that scan under a lock the
+  // application survives, rather than letting ADD PRIMARY KEY do it the
+  // expensive way.
+  if (primary) {
+    for (const auto& c : columns) {
+      if (cols[c].value("not_null", false)) continue;
+      Intent nn;
+      nn.kind = IntentKind::kSetNotNull;
+      nn.kind_name = "set_not_null";
+      nn.ordinal = in.ordinal;
+      nn.body = json{{"schema", in.body.value("schema", "")},
+                     {"table", in.body.value("table", "")},
+                     {"column", c}};
+      plan_set_not_null(nn, obs, plan, out);
+      plan.warnings.push_back(
+          qualified + "." + c +
+          " is nullable, and a primary key makes it NOT NULL either way. The "
+          "plan does that first through the NOT VALID check recipe, because "
+          "letting ADD PRIMARY KEY do it costs a full scan under "
+          "AccessExclusiveLock -- measured at 75ms on 2M rows against 0.6ms "
+          "when the column is already NOT NULL, and it grows with the table.");
+    }
+  }
+
+  // An existing valid unique index over exactly these columns is the whole
+  // build, already paid for.
+  std::string backing;
+  const json indexes = t.value("indexes", json::object());
+  for (const auto& [iname, ix] : indexes.items()) {
+    if (!ix.value("is_valid", false) || !ix.value("is_unique", false)) continue;
+    if (ix.value("has_expressions", false)) continue;
+    if (!ix.value("predicate", std::string()).empty()) continue;
+    std::vector<std::string> icols;
+    for (const auto& c : ix.value("columns", json::array())) {
+      icols.push_back(c.get<std::string>());
+    }
+    if (icols == columns) { backing = iname; break; }
+  }
+
+  const long long size = t.value("size_estimate", 0LL);
+  const int waiters = t.value("lock_waiters", 0);
+  const bool small_and_quiet = size < (64LL << 20) && waiters == 0;
+
+  auto emit = [&](TxnClass klass, std::vector<std::string> sql,
+                  const std::string& lock, const std::string& why, bool own) {
+    Step s;
+    s.kind = in.kind_name;
+    s.txn_class = klass;
+    s.sql = std::move(sql);
+    s.lock = lock;
+    s.why = why;
+    s.own_transaction = own;
+    s.detail["constraint"] = name;
+    out.push_back(std::move(s));
+  };
+
+  const std::string kind_sql = primary ? "PRIMARY KEY" : "UNIQUE";
+  const std::string quoted_cols = detail::join(columns, ", ");
+
+  if (!backing.empty()) {
+    if (backing != name) {
+      plan.warnings.push_back(
+          "ADD CONSTRAINT ... USING INDEX renames the index: \"" + backing +
+          "\" becomes \"" + name +
+          "\". Anything naming the old index -- a dashboard, an alert, a "
+          "REINDEX script -- stops matching, and PostgreSQL reports it only as "
+          "a NOTICE.");
+    }
+    emit(TxnClass::kRequired,
+         {"ALTER TABLE " + qualified + " ADD CONSTRAINT " + name + " " +
+          kind_sql + " USING INDEX " + backing + ";"},
+         "AccessExclusiveLock on " + qualified + ", but with no index build "
+         "and no scan under it",
+         "index \"" + backing + "\" already covers (" + quoted_cols +
+             ") and is valid and unique, so the constraint is a catalog change "
+             "over a build that is already paid for",
+         /*own=*/true);
+    return;
+  }
+
+  if (small_and_quiet) {
+    emit(TxnClass::kOptional,
+         {"ALTER TABLE " + qualified + " ADD CONSTRAINT " + name + " " +
+          kind_sql + " (" + quoted_cols + ");"},
+         "AccessExclusiveLock and ShareLock on " + qualified +
+             " while the index builds",
+         "size " + detail::human_bytes(size) +
+             " < 64 MiB and no lock waiters, so one statement is briefer than "
+             "a concurrent build plus a second exclusive lock",
+         /*own=*/false);
+    return;
+  }
+
+  // The index is named after the constraint deliberately: USING INDEX renames
+  // it to that name anyway, so naming it so from the start turns a surprise
+  // into a no-op.
+  emit(TxnClass::kForbidden,
+       {"CREATE UNIQUE INDEX CONCURRENTLY " + name + " ON " + qualified +
+        " (" + quoted_cols + ");"},
+       "ShareUpdateExclusiveLock -- does NOT block reads or writes",
+       "size " + detail::human_bytes(size) +
+           (waiters > 0 ? " with " + std::to_string(waiters) + " lock waiter(s)"
+                        : "") +
+           ": step 1 of 2, build the index without blocking the application. "
+           "It is named after the constraint because USING INDEX would rename "
+           "it to that anyway",
+       /*own=*/true);
+  emit(TxnClass::kRequired,
+       {"ALTER TABLE " + qualified + " ADD CONSTRAINT " + name + " " +
+        kind_sql + " USING INDEX " + name + ";"},
+       "AccessExclusiveLock on " + qualified + ", briefly and with no scan",
+       "step 2 of 2: the lock is the same LEVEL a plain ADD CONSTRAINT takes, "
+       "and that is the point -- what the concurrent build removed is the "
+       "index build held under it, not the lock itself",
+       /*own=*/true);
+  plan.warnings.push_back(
+      "there is no NOT VALID form for a unique constraint, so the index build "
+      "IS the validation. If (" + quoted_cols + ") on " + qualified +
+      " holds duplicates the concurrent build fails and leaves an INVALID "
+      "index named \"" + name +
+      "\"; USING INDEX then refuses it, so the job stops rather than creating "
+      "a constraint nothing checked. Clear it with a drop_index intent before "
+      "retrying.");
+}
+
 // --- replace_view ----------------------------------------------------------
 //
 // The counterpart to the S13 rebuild, and deliberately a separate path because
@@ -2170,6 +2394,9 @@ inline Plan plan_migration(const Spec& spec, const Observations& obs,
         plan_drop_column(in, projected, plan, emitted); break;
       case IntentKind::kReplaceView:
         plan_replace_view(in, projected, plan, emitted); break;
+      case IntentKind::kAddUniqueConstraint:
+      case IntentKind::kAddPrimaryKey:
+        plan_unique_like(in, projected, plan, emitted); break;
     }
     if (!emitted.empty()) project(in, emitted.front(), projected);
 

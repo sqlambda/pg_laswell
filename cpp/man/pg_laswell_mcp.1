@@ -331,9 +331,11 @@ This build implements
 .Cm add_check_constraint ,
 .Cm drop_constraint ,
 .Cm alter_column_type ,
-.Cm drop_column
+.Cm drop_column ,
+.Cm replace_view ,
+.Cm add_unique_constraint
 and
-.Cm replace_view .
+.Cm add_primary_key .
 .Pp
 An intent that creates an object must carry a
 .Va comment ,
@@ -625,6 +627,68 @@ There is no
 measured on 18.6, a cascading drop under a three-level stack left
 .Em zero
 views standing.
+.Ss Unique constraints and primary keys
+Both are backed by a unique index, so both are planned through one.
+A plain
+.Ic ADD CONSTRAINT ... UNIQUE
+takes
+.Va AccessExclusiveLock
+.Em and
+.Va ShareLock
+and builds the index while holding them.
+The two-step route --
+.Ic CREATE UNIQUE INDEX CONCURRENTLY ,
+then
+.Ic ADD CONSTRAINT ... USING INDEX
+-- still takes
+.Va AccessExclusiveLock .
+That is worth stating precisely, because the usual claim is wrong: it does not
+avoid the lock, it avoids the index
+.Em build
+under the lock.
+Same lock level, duration different by orders of magnitude.
+On a small table with nothing queued on it the single statement is chosen
+instead, since a concurrent build plus a second exclusive lock is more work for
+less benefit.
+.Pp
+.Ic USING INDEX
+.Em renames
+the backing index to the constraint name, reporting it only as a NOTICE.
+.Nm
+therefore names the index after the constraint from the start, so the rename is
+a no-op; when it adopts an index that already exists under another name, it
+says so, because an index named in a dashboard or an alert silently becoming a
+different one is exactly the kind of change nobody notices until it matters.
+.Pp
+A primary key carries a trap worth its own paragraph.
+.Ic ADD PRIMARY KEY
+sets
+.Va NOT NULL
+itself and verifies it with a full scan under
+.Va AccessExclusiveLock :
+measured at 75ms on two million rows against 0.6ms when the column is already
+.Va NOT NULL ,
+and it grows with the table.
+So a primary key over a nullable column runs the
+.Cm set_not_null
+recipe first, which does that same scan under
+.Va ShareUpdateExclusiveLock
+and does not block the application.
+.Pp
+There is no
+.Ic NOT VALID
+form for a unique constraint -- the index build
+.Em is
+the validation.
+A duplicate therefore fails the concurrent build and leaves an
+.Va indisvalid
+false index, which
+.Ic USING INDEX
+then refuses, so the job stops rather than creating a constraint nothing
+checked.
+Clear the leftover with a
+.Cm drop_index
+intent before retrying.
 .Ss Adding a column is the opposite case
 .Cm add_column
 is never blocked by a view -- only a type change and a drop are -- so nothing
