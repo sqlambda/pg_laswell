@@ -1,11 +1,19 @@
 # pg_laswell
 
-A PostgreSQL migration executor that decides *how* to apply a change by
+**Intelligent migration for PostgreSQL.** It decides *how* to apply a change by
 measuring the database in front of it, and applies it without blocking the
 application any longer than it has to.
 
-**Status: pre-0.1.0.** The skeleton builds and speaks MCP. Nothing is applied to
-a database yet.
+Intelligent here is a claim with a specific meaning, not a slogan. It measures
+before it chooses and names the reading that decided each choice. It paces on
+contention rather than on a schedule. It refuses what it can prove wrong, and
+says so plainly where it can prove nothing. It converges databases that have
+drifted. And it never states a number it cannot derive.
+
+**Status: pre-0.1.0.** The whole path works — repository, signing, planning,
+dry run, paced execution, ledger — with 193 tests green on GCC and Clang, under
+AddressSanitizer/UBSan and ThreadSanitizer. Not yet packaged, and the manual is
+still a stub.
 
 ## Why
 
@@ -56,7 +64,7 @@ The division of labour is real and worth stating: pg_laswell measures the harm
 harm it inflicts without holding a lock, such as I/O bandwidth, WAL volume and
 replication lag. Those are pg_licht's readings.
 
-## What it will do
+## What it does
 
 - **Signed specifications.** A spec is JSON, canonicalised with RFC 8785, and
   signed with Ed25519. The database itself holds the list of keys it trusts, so
@@ -69,9 +77,22 @@ replication lag. Those are pg_licht's readings.
   elapses, not at a fixed row count, and backs off when it is causing a pile-up.
 - **A ledger.** What ran, what it was signed by, what was measured, and how long
   each step took — readable from the database afterwards, during an incident.
+- **A migration repository.** A directory of specs, classified against one
+  database's ledger: what is pending, in `depends_on` order, and which groups
+  may run concurrently. It also flags a spec that was **edited after it was
+  applied** — the database no longer matches the file that claims to describe
+  it.
+- **Convergence.** The same spec creates an index where it is missing and
+  renames one that was built by hand under a different name, so a repository
+  drives every database to the same state rather than only the clean ones.
 - **Agent operation.** It is an MCP server. Migrations return a job id
-  immediately; `jobStatus` reports progress, contention and an ETA while they
-  run.
+  immediately; `jobStatus` reports progress, contention and per-step results
+  while they run.
+
+Measured on 300 000 rows with an application contending: **48 of 63 commits
+fired on a lock waiter and none on the interval**, finishing in the same wall
+time as an uncontended run. Pacing on contention rather than on a schedule
+costs nothing and bounds the harm.
 
 Signing answers *"did this exact change come from someone we trust?"*, not
 *"should this change be allowed?"*. The second question is `GRANT`'s job.

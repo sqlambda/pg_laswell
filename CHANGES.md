@@ -89,5 +89,13 @@ First skeleton. Nothing is applied to a database yet.
 - A backfill reports **no bloat figure**. Rows updated is not dead tuples:
   autovacuum reclaims some during the run, HOT updates may not bloat indexes at
   all, and other workload contributes. It points at `tableBloat` instead.
+- **Convergence on index names.** When an equivalent index exists under a
+  different name — the usual shape of a database where somebody built it by
+  hand — the default is now to `ALTER INDEX … RENAME` rather than refuse, so
+  one spec drives every database to the same state. Measured: that takes
+  `ShareUpdateExclusiveLock` on the *index* and no lock on the table at all.
+  `on_equivalent_index` selects `rename` (default), `adopt` or `refuse`.
+  A constraint-backed index is never renamed, because renaming it renames the
+  constraint too.
 - `cpp/test/spikes/` — the Phase 0 experiments that settled the design against
   PostgreSQL 18.6. Four of them changed it.

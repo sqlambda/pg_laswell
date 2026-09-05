@@ -3435,10 +3435,11 @@ TEST_F(RepoTest, AnUnreadableSpecIsReportedNotSkipped) {
   EXPECT_FALSE(e->value("error", "").empty());
 }
 
-TEST(Planner, AnIndexIdenticalToAnExistingOneUnderAnotherNameIsAConflict) {
-  // The name check does not catch this, because the name is the one thing that
-  // differs. A redundant index costs write time on every INSERT, UPDATE and
-  // DELETE for as long as it exists.
+TEST(Planner, AnEquivalentIndexUnderAnotherNameIsRenamedNotRebuilt) {
+  // Convergence, which is what a migration repository is for: the same spec
+  // creates the index on a database that lacks it and corrects the name on one
+  // where somebody built it by hand. Refusing forever on that second database
+  // is the worse outcome.
   auto obs = observations(1024, 10);
   // PostgreSQL's OWN rendering, not the spec's string. An earlier version of
   // this test used the spec's text on both sides and therefore could not fail
@@ -3450,12 +3451,91 @@ TEST(Planner, AnIndexIdenticalToAnExistingOneUnderAnotherNameIsAConflict) {
            {"leading_column", "fulfilment_region"}};
 
   const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(minimal_spec()), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto* s = find_step(plan, "create_index");
+  ASSERT_NE(s, nullptr);
+  EXPECT_EQ(s->action, pglaswell::Action::kApply);
+  EXPECT_NE(all_sql(*s).find("ALTER INDEX shop.some_other_name RENAME TO "
+                             "orders_open_by_region_idx"),
+            std::string::npos)
+      << all_sql(*s);
+  EXPECT_EQ(all_sql(*s).find("CREATE INDEX"), std::string::npos)
+      << "a second index was built instead of the name being corrected";
+  // Cheap: measured on 18.6, ALTER INDEX ... RENAME takes
+  // ShareUpdateExclusiveLock on the INDEX and no lock on the table at all.
+  EXPECT_NE(s->lock.find("table is not locked"), std::string::npos) << s->lock;
+  // And the risk this tool cannot see is named rather than hidden.
+  EXPECT_NE(s->detail.value("risk", "").find("monitoring dashboard"),
+            std::string::npos);
+}
+
+TEST(Planner, RenamingAConstraintBackedIndexIsRefused) {
+  // Measured on 18.6: renaming a constraint-backed index renames the
+  // CONSTRAINT too. Turning a primary key called orders_pkey into
+  // orders_open_by_region_idx is not a name correction.
+  auto obs = observations(1024, 10);
+  // A SEPARATE index -- orders_pkey must stay intact, because the fixture's
+  // backfill needs it as the unique key for its keyset walk.
+  obs.tables["shop.orders"]["indexes"]["orders_region_uq"] =
+      json{{"is_valid", true}, {"is_unique", false}, {"method", "btree"},
+           {"predicate", "(status = 'open'::text)"}, {"has_expressions", false},
+           {"constraint_backed", true},
+           {"columns", json::array({"fulfilment_region", "created_at"})},
+           {"leading_column", "fulfilment_region"}};
+  const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(minimal_spec()), obs, {});
   EXPECT_FALSE(plan.ok) << plan.render();
-  ASSERT_FALSE(plan.conflicts.empty());
-  EXPECT_NE(plan.conflicts[0].find("some_other_name"), std::string::npos)
-      << plan.conflicts[0];
-  EXPECT_NE(plan.conflicts[0].find("write time on every"), std::string::npos)
-      << "the refusal should say why a redundant index is not free";
+  bool named = false;
+  for (const auto& c : plan.conflicts) {
+    if (c.find("rename the constraint") != std::string::npos) named = true;
+  }
+  EXPECT_TRUE(named) << json(plan.conflicts).dump(2);
+}
+
+TEST(Planner, OnEquivalentIndexAdoptChangesNothing) {
+  auto obs = observations(1024, 10);
+  obs.tables["shop.orders"]["indexes"]["hand_built"] =
+      json{{"is_valid", true}, {"is_unique", false}, {"method", "btree"},
+           {"predicate", "(status = 'open'::text)"}, {"has_expressions", false},
+           {"columns", json::array({"fulfilment_region", "created_at"})},
+           {"leading_column", "fulfilment_region"}};
+  auto doc = minimal_spec();
+  for (auto& i : doc["intents"]) {
+    if (i["kind"] == "create_index") i["on_equivalent_index"] = "adopt";
+  }
+  const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(doc), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto* s = find_step(plan, "create_index");
+  ASSERT_NE(s, nullptr);
+  EXPECT_EQ(s->action, pglaswell::Action::kSatisfied);
+  EXPECT_TRUE(s->sql.empty()) << "adopt must change nothing";
+  EXPECT_EQ(s->detail.value("adopted", ""), "hand_built");
+}
+
+TEST(Planner, OnEquivalentIndexRefuseRestoresTheConflict) {
+  auto obs = observations(1024, 10);
+  obs.tables["shop.orders"]["indexes"]["hand_built"] =
+      json{{"is_valid", true}, {"is_unique", false}, {"method", "btree"},
+           {"predicate", "(status = 'open'::text)"}, {"has_expressions", false},
+           {"columns", json::array({"fulfilment_region", "created_at"})},
+           {"leading_column", "fulfilment_region"}};
+  auto doc = minimal_spec();
+  for (auto& i : doc["intents"]) {
+    if (i["kind"] == "create_index") i["on_equivalent_index"] = "refuse";
+  }
+  const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(doc), obs, {});
+  EXPECT_FALSE(plan.ok) << plan.render();
+  EXPECT_NE(plan.conflicts[0].find("hand_built"), std::string::npos);
+}
+
+TEST(Spec, AnUnknownOnEquivalentIndexPolicyIsRefused) {
+  auto doc = minimal_spec();
+  for (auto& i : doc["intents"]) {
+    if (i["kind"] == "create_index") i["on_equivalent_index"] = "ignore";
+  }
+  const auto err = spec_error(doc);
+  EXPECT_NE(err.find("on_equivalent_index"), std::string::npos) << err;
+  EXPECT_NE(err.find("adopt"), std::string::npos)
+      << "the hint must list the accepted policies";
 }
 
 TEST(Planner, ADifferentPredicateWarnsRatherThanRefusing) {

@@ -258,7 +258,7 @@ inline void parse_create_index(Intent& in) {
   detail::reject_unknown_keys(
       in.body,
       {"kind", "schema", "table", "name", "columns", "unique", "method",
-       "where", "comment"},
+       "where", "comment", "on_equivalent_index"},
       at);
   detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
   detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
@@ -275,6 +275,22 @@ inline void parse_create_index(Intent& in) {
     detail::require_identifier(c.get<std::string>(), "columns", in.ordinal);
   }
   (void)detail::require_string(in.body, "comment", at);
+
+  // What to do when an index equivalent to this one already exists under a
+  // DIFFERENT name -- the common shape of a database where somebody built it by
+  // hand. Default is to rename it, so the same spec converges every database on
+  // the declared name: it creates the index where it is missing, and corrects
+  // the name where it was made by hand.
+  if (in.body.contains("on_equivalent_index")) {
+    const auto v = in.body["on_equivalent_index"];
+    if (!v.is_string() || (v != "rename" && v != "adopt" && v != "refuse")) {
+      detail::fail(at + ".on_equivalent_index must be \"rename\", \"adopt\" "
+                        "or \"refuse\"",
+                   "rename (the default) renames the existing index to the "
+                   "declared name; adopt accepts it where it is and changes "
+                   "nothing; refuse treats it as a conflict.");
+    }
+  }
 }
 
 // Parses and validates a spec document. Throws SpecError, whose hint names the

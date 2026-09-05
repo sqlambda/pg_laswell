@@ -84,6 +84,13 @@ SELECT COALESCE(
                    -- index as one this tool must not reason about: comparing a
                    -- partial list would be worse than declining to compare.
                    'has_expressions', (0 = ANY(i.indkey)),
+                   -- Renaming a constraint-backed index renames the CONSTRAINT
+                   -- too (measured on 18.6: t_b_key -> t_b_renamed renamed the
+                   -- UNIQUE constraint, and the same for a primary key). That
+                   -- is a far larger change than adopting an index name, so
+                   -- these are never renamed.
+                   'constraint_backed', EXISTS (SELECT 1 FROM pg_constraint k
+                                                 WHERE k.conindid = i.indexrelid),
                    'columns', (SELECT JSONB_AGG(a.attname ORDER BY k.ord)
                                  FROM unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord)
                                  JOIN pg_attribute a ON a.attrelid = t.oid

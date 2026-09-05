@@ -458,16 +458,65 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
       }
       if (same_shape && ex_pred != want_pred) continue;  // definitively different
       if (same_shape) {
-        step.action = Action::kConflict;
-        step.why = "an index identical to this one already exists as " + it.key();
-        plan.conflicts.push_back(
-            "\"" + name + "\" would duplicate the existing index \"" + it.key() +
-            "\" on " + qualified + ": same method, same columns (" +
-            detail::join(columns, ", ") +
-            "), same predicate. A redundant index costs write time on every "
-            "INSERT, UPDATE and DELETE for as long as it exists. Drop this "
-            "intent, or if the intent is to replace " + it.key() +
-            ", say so with a separate spec that drops it.");
+        const auto policy = in.body.value("on_equivalent_index", "rename");
+
+        // Renaming a constraint-backed index renames the CONSTRAINT too --
+        // measured on 18.6. Turning a primary key called orders_pkey into
+        // orders_open_by_region_idx is not a name correction, it is a
+        // different and much larger change, so it is never done implicitly.
+        if (ex.value("constraint_backed", false)) {
+          step.action = Action::kConflict;
+          step.why = "an equivalent index already exists as " + it.key() +
+                     ", and it backs a constraint";
+          plan.conflicts.push_back(
+              "\"" + name + "\" duplicates \"" + it.key() + "\" on " + qualified +
+              ", which backs a constraint. Renaming it would rename the "
+              "constraint as well, which is a larger change than adopting an "
+              "index name, so pg_laswell will not do it implicitly. Drop this "
+              "intent: the constraint's index already serves these lookups.");
+          return;
+        }
+
+        if (policy == "refuse") {
+          step.action = Action::kConflict;
+          step.why = "an index identical to this one already exists as " + it.key();
+          plan.conflicts.push_back(
+              "\"" + name + "\" would duplicate the existing index \"" + it.key() +
+              "\" on " + qualified + ": same method, same columns (" +
+              detail::join(columns, ", ") +
+              "), same predicate. A redundant index costs write time on every "
+              "INSERT, UPDATE and DELETE for as long as it exists.");
+          return;
+        }
+
+        if (policy == "adopt") {
+          step.action = Action::kSatisfied;
+          step.why = "an equivalent index already exists as " + it.key() +
+                     "; adopted where it is, nothing renamed";
+          step.detail["adopted"] = it.key();
+          return;
+        }
+
+        // rename: converge the name. The same spec then creates the index on a
+        // database that lacks it and corrects the name on one where it was
+        // made by hand -- which is the point of a migration repository.
+        step.txn_class = TxnClass::kOptional;
+        step.lock = "ShareUpdateExclusiveLock on the index; the table is not "
+                    "locked at all";
+        step.sql.push_back("ALTER INDEX " + in.schema() + "." + it.key() +
+                           " RENAME TO " + name + ";");
+        step.sql.push_back("COMMENT ON INDEX " + in.schema() + "." + name +
+                           " IS " +
+                           detail::quote_literal(in.body.value("comment", "")) + ";");
+        step.why = "an equivalent index already exists as \"" + it.key() +
+                   "\" (same method, columns and predicate); renaming it to the "
+                   "declared name rather than building a second one";
+        step.detail["renamed_from"] = it.key();
+        step.detail["risk"] =
+            "the old name may be referenced outside the database -- a "
+            "monitoring dashboard, a planner hint, a deployment script. "
+            "pg_laswell cannot see those. Set on_equivalent_index to \"adopt\" "
+            "to leave the name alone.";
         return;
       }
       // The planned index is a prefix of an existing one: the existing index
