@@ -53,11 +53,11 @@ install(TARGETS pg_laswell_mcp RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 # a missing install file.
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/man/pg_laswell_mcp.1
         DESTINATION ${CMAKE_INSTALL_MANDIR}/man1)
-# sql/bootstrap.sql is installed from phase 3.4, when it exists. It is not
-# stubbed here: a placeholder bootstrap script that looked runnable but created
-# no trust table would be worse than an absent one, because the failure would
-# surface as "the tool cannot verify anything" rather than "you have not
-# bootstrapped yet".
+# The bootstrap script ships alongside the binary because the binary must never
+# run it: if pg_laswell created laswell.trusted_key its role would own it, and
+# an owner can INSERT, so the migrating role could grant itself trust.
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../sql/bootstrap.sql
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/pg_laswell)
 
 option(BUILD_TESTING "Build the test suite" ON)
 if(BUILD_TESTING)
@@ -89,6 +89,13 @@ if(BUILD_TESTING)
     else()
         message(STATUS "mandoc not found: skipping the manpage_lint test")
     endif()
+    # The --call contract, at the process level. The exit code is the whole
+    # point of that mode and gtest cannot see it: the suite observes return
+    # values, not process status. Runs without a database too, covering the
+    # flags that need none.
+    add_test(NAME call_mode
+             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/call-mode.sh
+                     $<TARGET_FILE:pg_laswell_mcp> "$ENV{DATABASE_URL}")
 endif()
 
 message(STATUS "Using compiler: ${CMAKE_CXX_COMPILER} (${CMAKE_CXX_COMPILER_ID})")
@@ -99,6 +106,9 @@ set(CPACK_PACKAGE_NAME "pg-laswell")
 set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Lock-aware PostgreSQL migration executor (MCP server)")
 set(CPACK_PACKAGE_VENDOR "sqlambda")
+# Mandatory for the DEB generator, which fails the whole package without it.
+set(CPACK_PACKAGE_CONTACT "https://github.com/sqlambda/pg_laswell")
+set(CPACK_PACKAGE_HOMEPAGE_URL "https://github.com/sqlambda/pg_laswell")
 
 # libpqxx is linked statically and baked into the binary for releases; libpq
 # remains the only shared runtime dependency we declare. libcrypto is NOT listed

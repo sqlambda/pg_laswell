@@ -8,7 +8,9 @@
 #include <sys/stat.h>
 
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <string>
 
 #include "config.h"
@@ -17,6 +19,19 @@
 #include "tools.h"
 
 namespace {
+
+// Reads an --args value: literal JSON, @file, or @- for stdin.
+std::string read_args(const std::string& spec) {
+  if (spec.empty() || spec[0] != '@') return spec;
+  if (spec == "@-") {
+    return std::string(std::istreambuf_iterator<char>(std::cin),
+                       std::istreambuf_iterator<char>());
+  }
+  std::ifstream in(spec.substr(1));
+  if (!in) throw std::runtime_error("cannot read " + spec.substr(1));
+  return std::string(std::istreambuf_iterator<char>(in),
+                     std::istreambuf_iterator<char>());
+}
 
 std::string default_config_path() {
   if (const char* home = std::getenv("HOME")) {
@@ -36,8 +51,14 @@ void usage(const char* argv0) {
       << "Lock-aware PostgreSQL migration executor, speaking MCP over stdio.\n\n"
       << "Usage: " << argv0 << " [options] [conninfo]\n\n"
       << "  -c, --config <file>  connection registry (INI)\n"
+      << "      --call <tool>    run one tool and exit; JSON on stdout\n"
+      << "      --args <json>    arguments for --call; @file reads a file,\n"
+      << "                       @- reads stdin\n"
       << "  -h, --help           this message\n"
       << "  -V, --version        print the version and exit\n\n"
+      << "--call exits 0 when the tool answered and 1 when it reported an\n"
+      << "error, so a pipeline can gate on it. Without it the process speaks\n"
+      << "MCP over stdio and exits 0 whatever the tools reported.\n\n"
       << "Configuration is resolved in this order:\n"
       << "  1. --config <file>\n"
       << "  2. $PGLASWELL_CONFIG\n"
@@ -53,6 +74,8 @@ void usage(const char* argv0) {
 int main(int argc, char* argv[]) {
   std::string config_path;
   std::string db_url;
+  std::string call_tool;
+  std::string call_args = "{}";
 
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -63,6 +86,22 @@ int main(int argc, char* argv[]) {
     if (arg == "-V" || arg == "--version") {
       std::cout << PGLASWELL_VERSION << "\n";
       return 0;
+    }
+    if (arg == "--call") {
+      if (i + 1 >= argc) {
+        std::cerr << "--call requires a tool name\n";
+        return 1;
+      }
+      call_tool = argv[++i];
+      continue;
+    }
+    if (arg == "--args") {
+      if (i + 1 >= argc) {
+        std::cerr << "--args requires a value\n";
+        return 1;
+      }
+      call_args = argv[++i];
+      continue;
     }
     if (arg == "-c" || arg == "--config") {
       if (i + 1 >= argc) {
@@ -115,6 +154,68 @@ int main(int argc, char* argv[]) {
     ctx.observer = &observer;
 
     pglaswell::McpServer server(pglaswell::make_tools(ctx));
+
+    // One tool, one answer, an exit code a pipeline can gate on.
+    //
+    // This exists because CI is the one caller that is neither an agent nor a
+    // person: it wants "is anything pending, and has anything been edited since
+    // it was applied" to fail a build, and an agent in a pipeline is expensive,
+    // nondeterministic and often not permitted. It is deliberately NOT a CLI --
+    // there are no subcommands, no argument parsing per tool, and no second
+    // surface to keep in step with the MCP one. The tool set is the same tool
+    // set; only the framing differs.
+    if (!call_tool.empty()) {
+      pglaswell::json args;
+      try {
+        args = pglaswell::json::parse(read_args(call_args));
+      } catch (const std::exception& e) {
+        std::cerr << "--args: " << e.what() << "\n";
+        return 1;
+      }
+      if (!args.is_object()) {
+        std::cerr << "--args must be a JSON object\n";
+        return 1;
+      }
+      const auto response = server.handle_request(
+          pglaswell::json{{"jsonrpc", "2.0"},
+                          {"id", 1},
+                          {"method", "tools/call"},
+                          {"params", {{"name", call_tool}, {"arguments", args}}}});
+      if (!response) {
+        std::cerr << "no response\n";
+        return 1;
+      }
+      if (response->contains("error")) {
+        std::cout << (*response)["error"].dump() << std::endl;
+        return 1;
+      }
+      const auto& result = (*response)["result"];
+      const auto text = result["content"][0]["text"].get<std::string>();
+      std::cout << text << std::endl;
+
+      // What counts as failure for a pipeline, stated explicitly because the
+      // MCP notion of isError is narrower than the CI one. A plan that
+      // correctly refuses is a successful CALL and an unsuccessful OUTCOME, and
+      // a build must fail on the second.
+      //
+      //   isError            the tool threw
+      //   "error"            the project's uniform failure payload; every tool
+      //                      that fails puts it at the TOP level, and nested
+      //                      ones (a failed job, an unreadable spec) are data
+      //   ok: false          a plan was refused
+      //   accepted: false    a spec was not trusted, or a job was not started
+      //   problems: [...]    a repository has something wrong with it -- which
+      //                      is exactly the listMigrations-as-a-CI-gate case:
+      //                      a spec edited after it was applied must fail a
+      //                      build, not merely be mentioned
+      const auto payload = pglaswell::json::parse(text);
+      const bool failed =
+          result.value("isError", false) || payload.contains("error") ||
+          !payload.value("ok", true) || !payload.value("accepted", true) ||
+          !payload.value("problems", pglaswell::json::array()).empty();
+      return failed ? 1 : 0;
+    }
+
     server.run();
 
     // Joined, never abandoned. A worker thread racing PQfinish against static

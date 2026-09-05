@@ -3,11 +3,15 @@
 .Os
 .Sh NAME
 .Nm pg_laswell_mcp
-.Nd lock-aware PostgreSQL migration executor, speaking MCP over stdio
+.Nd intelligent migration for PostgreSQL, over MCP
 .Sh SYNOPSIS
 .Nm
 .Op Fl c Ar file
 .Op Ar conninfo
+.Nm
+.Fl -call Ar tool
+.Op Fl -args Ar json
+.Op Fl c Ar file
 .Nm
 .Fl h | Fl V
 .Sh DESCRIPTION
@@ -20,7 +24,7 @@ and
 reads the live catalog to decide how to apply it, based on what the target
 table actually is rather than on what the statement says.
 .Pp
-The two properties that motivate it:
+Two properties motivate it.
 .Bl -bullet
 .It
 .Em The safe method is a property of the table, not the statement .
@@ -35,48 +39,549 @@ however long that many rows happens to take today.
 It should instead commit when something starts waiting on it.
 .El
 .Pp
-.Nm
-is the executing half of a pair.
-Its sibling,
-.Xr pg_licht_mcp 1 ,
+Measured on 300 000 rows with an application contending: 48 of 63 commits
+fired on a lock waiter and none on the interval, finishing in the same wall
+time as an uncontended run.
+.Ss What intelligent means here
+It is a claim with a specific meaning rather than a slogan.
+.Bl -bullet -compact
+.It
+It measures before it chooses, and every choice names the reading that decided
+it, so the reasoning can be argued with rather than trusted.
+.It
+It paces on contention rather than on a schedule.
+.It
+It refuses what it can prove wrong, and says plainly where it can prove
+nothing.
+.It
+It converges: one specification creates an index where it is missing and
+corrects the name where somebody built it by hand.
+.It
+It never states a number it cannot derive.
+.El
+.Pp
+Intelligence here is measurement, a refusal to guess, and an honest account of
+the boundary between the two.
+The judgement the tool does not have is supplied by the agent driving it.
+.Ss Its sibling
+.Xr pg_licht_mcp 1
 is read-only by invariant and can only advise; this program is allowed to act.
-Use both: read load, locks and capacity through pg_licht, and apply change
-through
-.Nm .
+Use both.
+.Nm
+measures the harm
+.Em it
+causes, meaning backends transitively blocked by its own backend.
+It is blind to harm it inflicts without holding a lock: I/O bandwidth, WAL
+volume, replication lag, and the vacuum debt a large backfill leaves behind.
+Those are pg_licht's readings, and
+.Nm
+names them where they matter rather than guessing at them.
 .Sh OPTIONS
 .Bl -tag -width Ds
 .It Fl c , Fl -config Ar file
 Connection registry, in INI format.
+.It Fl -call Ar tool
+Run one tool, write its JSON payload to standard output, and exit.
+See
+.Sx EXIT STATUS ,
+which is the point of this mode.
+.It Fl -args Ar json
+Arguments for
+.Fl -call .
+A literal JSON object, or
+.Cm @ Ns Ar file
+to read one from a file, or
+.Cm @-
+to read one from standard input.
+Defaults to
+.Ql {} .
 .It Fl h , Fl -help
 Print a usage summary and exit.
 .It Fl V , Fl -version
 Print the version and exit.
 .El
-.Sh CONFIGURATION
-Configuration is resolved in this order, first match winning:
-.Bl -enum -compact
+.Sh OPERATIONS
+Eight tools.
+Four of them execute nothing.
+.Ss checkPrivileges
+Reports what the connecting role can actually do here: whether the ledger is
+installed, whether this role can read the trust table and write the ledger, and
+whether it can see other backends.
+Worth calling first against an unfamiliar connection, because a
+privilege-filtered answer is easy to mistake for an empty one.
+.Pp
+It distinguishes
+.Em denied
+from
+.Em degraded ,
+and the distinction matters: a role without
+.Va pg_read_all_stats
+cannot see other backends' query text, but
+.Fn pg_blocking_pids
+and the ungranted rows of
+.Va pg_locks
+are visible to any role.
+Pacing therefore works, and the waiter is merely anonymous.
+Reading that as
+.Qq nobody is waiting
+would be wrong.
+.Ss getSpecDigest
+Returns the exact canonical bytes to sign for a specification, and their
+SHA-256 digest.
+.Nm
+verifies signatures and never creates them, so the private key stays outside
+this process.
+See
+.Sx SIGNING .
+.Ss validateSpec
+Parses a specification and checks it against both trust gates.
+Reports the ledger's state too, so
+.Qq you have not bootstrapped
+is distinguishable from
+.Qq your signer is not trusted here .
+.Ss planMigration
+Measures the target tables and produces the ordered plan that would be applied,
+saying which reading decided each choice.
+Executes nothing.
+.Pp
+The plan names its transaction-group boundaries, which is where atomicity ends,
+and carries a
+.Va planDigest
+that
+.Ic startMigration
+must reproduce.
+That is how
+.Qq what ran is what you were shown
+becomes checkable rather than promised.
+.Pp
+By default it also performs a
+.Sx DRY RUN .
+.Ss listMigrations
+Reads a directory of specifications and reports what is pending against this
+database, in dependency order, with the groups that may run concurrently.
+See
+.Sx THE REPOSITORY .
+.Ss startMigration
+Plans and then applies.
+Returns a job id immediately; the work runs in the background, because the
+stdio loop must stay answerable while a migration runs.
+.Ss jobStatus
+Reports every migration this server is running: per-step progress, the
+backfill's commit-reason histogram, and the contention it is causing.
+Also lists jobs that died with their connection.
+.Ss cancelJob
+Asks a running migration to stop.
+Cooperative: it stops at the next batch boundary after committing what it has
+done, and the committed cursor lets a later job resume rather than start over.
+.Sh THE REPOSITORY
+A directory of signed specifications, classified against one database's ledger.
+Note that pending is always relative to a target database: the ledger is per
+database, so the same directory is at a different point on staging than on
+production.
+.Pp
+Statuses are
+.Cm pending ,
+.Cm applied ,
+.Cm in_progress ,
+.Cm failed ,
+.Cm unreadable ,
+and
+.Cm modified_after_apply .
+.Pp
+The last is the one worth having.
+A specification whose id was applied under a
+.Em different
+digest was edited after the fact, so the database no longer matches the file
+that claims to describe it.
+The remedy is never to re-apply it but to write a new specification for the
+difference; the bytes that were applied are kept in
+.Va laswell.migration.canonical_bytes .
+.Ss Order and concurrency
+Order comes from
+.Va depends_on ,
+because business ordering is not derivable by any amount of measurement.
+Concurrency is derived.
+.Pp
+The asymmetry at the heart of it, stated in the tool's own output:
+.Nm
+can prove that two migrations
+.Em conflict ,
+because they touch a shared relation, and cannot prove that they are
+.Em independent .
+.Pp
+What it derives is the union of each specification's declared tables, the
+relations PostgreSQL reports in the rendered SQL's plan
+.Pq which catches tables hidden inside opaque expressions that no intent names ,
+and foreign-key edges in both directions.
+What it cannot derive is what a trigger function writes: the catalog names the
+trigger and the function, and stops there.
+A trigger function can write any table, so one trigger anywhere makes
+concurrency unprovable, and the tool says so rather than guessing.
+.Pp
+Advisory locks refuse an unsafe overlap whatever the caller decides, so a wrong
+call is refused rather than allowed to corrupt.
+.Sh DRY RUN
+.Ic planMigration
+applies the whole plan in a transaction and rolls it back, so later steps are
+checked against the schema the earlier ones produce.
+Almost all PostgreSQL DDL is transactional, which is what makes this possible,
+and nothing weaker works: a backfill referencing a column that step 0 adds does
+not parse until step 0 has run, and that is the ordinary case.
+.Pp
+Three costs, all bounded and all reported:
+.Bl -bullet -compact
 .It
-.Fl -config Ar file
+It takes the real locks, briefly, and rolls them back.
+.Va lock_timeout
+bounds the attempt, so planning can never queue behind anything.
 .It
-.Ev PGLASWELL_CONFIG
+.Ic CREATE INDEX CONCURRENTLY
+cannot run inside a transaction block, so it is listed as unverified rather
+than silently passed.
 .It
-.Pa ~/.config/pg_laswell/laswell.ini ,
-if it exists
-.It
-.Ev DATABASE_URL
-.It
-the first non-option argument
+Statements are planned with
+.Ic EXPLAIN Pq Cm GENERIC_PLAN ,
+never executed, and
+.Cm ANALYZE
+is never used.
 .El
+.Pp
+Pass
+.Va dryRun
+false to decline it.
+.Sh PACING
+A backfill walks the table by keyset and commits on whichever comes first:
+.Bl -tag -width Ds -compact
+.It Cm lock_waiter
+somebody is blocked behind this transaction
+.It Cm interval
+.Va commit_interval_ms
+has elapsed
+.It Cm batch_cap
+.Va batch_cap_rows
+rows since the last commit, a backstop against pathological row widths
+.El
+.Pp
+Two knobs that are easy to conflate and must not be.
+.Va batch_rows
+bounds how long
+.Em one statement
+runs, and therefore worst-case waiter latency.
+The triggers above bound how long
+.Em one transaction
+runs, and therefore how long locks accumulate.
+A fixed row count on a wide table can produce an arbitrarily long transaction.
+.Pp
+The lock-waiter trigger is an
+.Em optimisation, not the mechanism .
+Time-based commit alone already bounds waiter latency; the waiter trigger is
+what lets the interval be raised, buying fewer commits and less WAL, without
+raising worst-case latency.
+.Ss The contention breaker
+On the
+.Em transitive
+count of backends blocked by this job, because a direct-blocker count
+understates a pile-up:
+.Fn pg_blocking_pids
+returns direct blockers only, and second-order waiters are invisible to it.
+Measured, a direct count saw one waiter where the real pile-up was six.
+.Pp
+The ladder throttles before it pauses, deliberately: pausing a backfill that is
+mostly done and mildly contending is worse than slowing it down, and inflicted
+blocking grows quadratically with block duration, so reducing it continuously
+beats stopping late.
+Resume requires the transitive count to
+.Em fall ,
+never merely that this job committed: waiters can remain after a commit,
+because the backend ahead of them in the queue has taken its lock.
+.Sh SPECIFICATIONS
+A specification is JSON, canonicalised with RFC 8785, and signed with Ed25519.
+Reformatting the file does not invalidate the signature; changing any value
+does.
+.Pp
+Top-level keys are an
+.Em allowlist :
+.Va laswell_spec_version ,
+.Va id ,
+.Va description ,
+.Va rationale ,
+.Va target ,
+.Va depends_on ,
+.Va intents ,
+and the unsigned
+.Va signatures .
+An unknown key is refused rather than ignored, because a key one binary skips
+and another honours is a silent difference between what was reviewed and what
+ran.
+.Pp
+Floating-point values are refused anywhere in a specification.
+Nothing a migration intent needs is a float, and refusing removes the one
+genuinely error-prone clause of RFC 8785.
+.Ss Intent kinds
+The set of kinds a binary knows is exactly the set it implements: there is no
+recognised-but-unsupported kind, and an unknown one refuses the whole
+specification rather than skipping a step.
+This build implements
+.Cm add_column ,
+.Cm backfill
+and
+.Cm create_index .
+.Pp
+An intent that creates an object must carry a
+.Va comment ,
+which becomes its
+.Ic COMMENT ON .
+.Pp
+.Cm add_column
+must state
+.Va nullable
+explicitly.
+There is no default, because
+.Ic NOT NULL
+on an existing table is a different risk class from a nullable add.
+.Pp
+.Cm backfill
+takes a single-column
+.Va key
+that must lead a unique index, a
+.Va set
+of column-to-expression mappings, an optional
+.Va from ,
+a mandatory
+.Va where ,
+and an optional
+.Va verify_remaining
+predicate that must select zero rows when the backfill is complete.
+An unfiltered backfill is refused; write
+.Ql true
+to mean it.
+.Pp
+.Sy Naming convention .
+Expressions in
+.Va where ,
+.Va set
+and
+.Va from
+reference the target table
+.Em by its own name ,
+never by an alias:
+.Ql orders.warehouse_id = w.id ,
+not
+.Ql t.warehouse_id = w.id .
+Tables introduced by
+.Va from
+use whatever alias
+.Va from
+gives them.
+.Pp
+.Cm create_index
+requires an explicit
+.Va name ,
+because a derived name is a name nobody can search for during an incident.
+.Va on_equivalent_index
+selects what happens when an equivalent index already exists under a different
+name:
+.Cm rename
+.Pq the default ,
+which renames it to the declared name so one specification converges every
+database;
+.Cm adopt ,
+which accepts it where it is;
+or
+.Cm refuse .
+A constraint-backed index is never renamed, because renaming it renames the
+constraint too.
+.Sh SIGNING
+.Nm
+verifies; it never signs.
+Obtain the bytes, sign them elsewhere, attach the signature:
+.Bd -literal -offset indent
+pg_laswell_mcp --call getSpecDigest --args @args.json \e
+  | jq -r .canonicalBytes > canonical.bin
+
+openssl pkeyutl -sign -inkey key.pem -rawin -in canonical.bin \e
+  | base64 -w0
+.Ed
+.Pp
+Then add to the specification:
+.Bd -literal -offset indent
+"signatures": [
+  { "key_id": "ed25519:<16 hex>",
+    "algorithm": "ed25519",
+    "signature": "<base64>" }
+]
+.Ed
+.Pp
+A key id is the content address of the key, being
+.Ql ed25519:
+followed by the first sixteen hex characters of the SHA-256 of the raw
+thirty-two byte public key.
+It therefore cannot be reassigned to different bytes.
+.Ss What signing protects
+It stops a tampered specification, a mis-signed one, a wrong-environment
+mistake, and a permissive or stale client configuration.
+.Pp
+It does not stop anyone with superuser on the target, who can insert into
+.Va laswell.trusted_key
+or bypass this program entirely.
+Signing answers
+.Qq did this exact change come from someone we trust ,
+not
+.Qq should this change be allowed .
+The second question is
+.Ic GRANT Ns 's
+job.
+.Sh TRUST
+Two gates, and a specification must pass both.
+.Pp
+The client configuration is the first: it fails fast and offline, before a
+connection is opened.
+An absent
+.Bq trust
+section means there is no local policy to check, which is not the same as
+accepting nothing.
+.Pp
+.Va laswell.trusted_key
+in the target database is the second, and the one that decides.
+It survives a wrong, stale or permissive local configuration, it verifies
+against the key bytes
+.Em the database holds
+rather than the caller's copy, and
+.Va laswell.migration.signer_key_id
+is a foreign key to it, so an untrusted signer cannot create a ledger row at
+all.
+That is a constraint rather than a code path: there is no branch to forget.
+.Sh BOOTSTRAP
+.Pa sql/bootstrap.sql
+is run once, by hand, by a superuser or owner role.
+.Nm
+never runs it.
+.Pp
+The reason is a privilege argument, not a convenience one.
+If this program created
+.Va laswell.trusted_key ,
+its role would own it, and a role that owns a table can insert into it, which
+means the migrating role could grant itself trust and the gate would collapse
+into a comment.
+.Bd -literal -offset indent
+psql -v ON_ERROR_STOP=1 \e
+     -v laswell_role=laswell_runner \e
+     -v first_key_id=ed25519:9f2c41b7d0e6a85c \e
+     -v first_key_b64=... \e
+     -v first_key_label=ops-prod \e
+     -f bootstrap.sql
+.Ed
+.Sh CONFIGURATION
+Resolved in this order, first match winning:
+.Fl -config ,
+.Ev PGLASWELL_CONFIG ,
+.Pa ~/.config/pg_laswell/laswell.ini
+if it exists,
+.Ev DATABASE_URL ,
+then the first non-option argument.
+.Pp
+The file must not be group- or world-accessible.
+It may hold a password, as any migration tool's configuration may, and it
+declares which signing keys are trusted; the same rule as
+.Pa ~/.pgpass
+covers both.
+.Bd -literal -offset indent
+[trust]
+accept = ed25519:9f2c41b7d0e6a85c
+
+[key ed25519:9f2c41b7d0e6a85c]
+label      = ops-prod
+public_key = MCowBQYDK2VwAyEA...
+
+[executor]
+batch_rows          = 1000
+commit_interval_ms  = 1000
+batch_cap_rows      = 10000
+lock_timeout_ms     = 3000
+observer_tick_ms    = 250
+max_concurrent_jobs = 2
+throttle_waiters    = 4
+pause_waiters       = 8
+resume_waiters      = 1
+app_pool_size       = 0
+
+[shop_prod]
+service  = shop-prod
+dbname   = shop
+user     = laswell_runner
+password = ...
+.Ed
+.Pp
+Nothing is silently defaulted.
+A key that does not parse, an unknown key, or a trailing comma in a list is an
+error naming the file, the line and the key.
+Settings are checked for consistency too: a
+.Va resume_waiters
+at or above
+.Va pause_waiters
+would make the breaker flap, and is refused when the file is read rather than
+discovered during a migration.
+.Ss The connection budget
+.Va app_pool_size
+is the application's own connection-pool limit.
+It defaults to zero, meaning not configured, and the difference matters: the
+ceiling that decides whether an application survives being blocked is its own
+pool, not
+.Va max_connections ,
+because it collapses when its pool fills.
+That limit is invisible from the server, so when it is not configured the
+budget reports the server's ceiling and says that is what it is reporting.
+.Sh THE LEDGER
+Schema
+.Va laswell ,
+created by the bootstrap script, with a
+.Ic COMMENT ON
+on every table and column so a stranger can read it during an incident.
+.Bl -tag -width Ds -compact
+.It Va trusted_key
+signing keys this database accepts
+.It Va migration
+every specification seen, with the exact bytes that were verified
+.It Va job
+one attempt to apply one migration
+.It Va step
+what each step did, with the statement verbatim and the rule that chose it
+.It Va backfill_cursor
+resume position, written by the worker inside the same transaction as the data
+it describes
+.El
+.Pp
+A job with no
+.Va finished_at
+whose advisory lock is absent from
+.Va pg_locks
+died with its connection.
+A session advisory lock is released the moment its backend goes away, so a
+crashed job is detectable with no heartbeat and no timeout to tune.
+.Ss Operating without an agent
+The ledger is the interface for someone who has only psql.
+.Bd -literal -offset indent
+-- what ran, and why that method
+SELECT ordinal, kind, state, why, sql FROM laswell.step
+ WHERE job_id = '...';
+
+-- find a live job and its backend
+SELECT pid, application_name, query FROM pg_stat_activity
+ WHERE application_name LIKE 'pg_laswell/%';
+
+-- stop it; the cursor is committed, so it resumes
+SELECT pg_cancel_backend(<pid>);
+.Ed
 .Sh POOLERS
 The executor requires a
 .Em direct
 connection.
 This is a departure from
 .Xr pg_licht_mcp 1 ,
-which is deliberately safe behind a transaction-mode pooler, and the reason
-is not stylistic.
+which is deliberately pooler-safe, and the reason is measured rather than
+stylistic.
 .Pp
-Measured against PgBouncer on PostgreSQL 18.6: with
+With
 .Va pool_mode = transaction ,
 a session GUC set by one client was readable by a
 .Em different
@@ -89,9 +594,7 @@ in transaction mode unless
 is enabled, and it is off by default.
 Most operators do not know this.
 .Pp
-Job coordination in
-.Nm
-rests on session advisory locks, and
+Job coordination rests on session advisory locks, and
 .Fn pg_try_advisory_lock
 is re-entrant within a single session.
 Two jobs sharing one server connection would therefore both believe they hold
@@ -102,28 +605,74 @@ Detection at startup is not achievable: comparing
 across two transactions has false negatives at both ends of the pool-size
 range.
 Instead the worker re-reads its backend PID at the start of every transaction
-and aborts the job on any change.
-A startup probe additionally looks for leaked session state across two
-connections; a positive result is conclusive and refuses, but a negative
-result proves nothing and is never reported as a direct connection having
-been confirmed.
+and aborts the job on any change, which fires at the moment the connection is
+actually multiplexed.
+A negative result is never reported as a direct connection having been
+confirmed.
 .Sh ENVIRONMENT
 .Bl -tag -width Ds
 .It Ev DATABASE_URL
 libpq connection string, used when no registry file is given.
 .It Ev PGLASWELL_CONFIG
 Path to the connection registry.
+.It Ev PGLASWELL_REQUIRE_DATABASE
+Test-suite only: turns a skipped database test into a failure.
 .El
 .Sh EXIT STATUS
-.Ex -std
+Without
+.Fl -call ,
+.Nm
+speaks MCP over stdio and exits 0 unless it could not start.
+.Pp
+With
+.Fl -call
+it exits 0 when the tool answered successfully and 1 otherwise, so a pipeline
+can gate on it.
+The MCP notion of an error is narrower than a build's: a plan that correctly
+refuses is a successful call and an unsuccessful outcome, and a build must fail
+on the second.
+Exit 1 therefore covers a thrown tool, an
+.Va error
+payload, a refused plan
+.Pq Ql ok: false ,
+an unaccepted specification
+.Pq Ql accepted: false ,
+and a repository with a non-empty
+.Va problems
+array, which is the case that makes
+.Ic listMigrations
+usable as a build gate.
+.Bd -literal -offset indent
+pg_laswell_mcp --call listMigrations \e
+  --args '{"directory":"db/migrations"}' || exit 1
+.Ed
+.Sh EXAMPLES
+Check what a role can do before trusting an answer from it:
+.Bd -literal -offset indent
+pg_laswell_mcp --call checkPrivileges
+.Ed
+.Pp
+Plan without applying, and read the reasoning:
+.Bd -literal -offset indent
+pg_laswell_mcp --call planMigration --args @spec-args.json \e
+  | jq -r .rendered
+.Ed
 .Sh SEE ALSO
+.Xr openssl 1 ,
+.Xr pg_licht_mcp 1 ,
 .Xr psql 1
 .Sh STANDARDS
 Model Context Protocol, revisions 2024-11-05 through 2025-11-25, over stdio
 using JSON-RPC 2.0.
+Specification canonicalisation follows RFC 8785.
+Signatures are Ed25519, RFC 8032.
 .Sh AUTHORS
 .An Daniel Cristian Cruz
 .Sh CAVEATS
 This is pre-release software.
 The specification format, the ledger schema and the tool surface are all
 expected to change before 1.0.
+.Pp
+PostgreSQL 16 or newer is needed for the relation derivation that
+.Ic listMigrations
+uses for concurrency advice; on older servers it says so and reports less.

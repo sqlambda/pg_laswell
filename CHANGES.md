@@ -2,7 +2,19 @@
 
 ## 0.1.0 (unreleased)
 
-First skeleton. Nothing is applied to a database yet.
+The whole path works: repository, signing, planning, dry run, paced execution,
+ledger. 193 tests green on GCC 14.2 and Clang 22, under AddressSanitizer/UBSan
+and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
+`--call` contract test.
+
+- **`--call <tool>`** runs one tool and **exits non-zero when it reports a
+  problem**, which is what CI wants and the pipe alone did not give. Not a CLI:
+  no subcommands, no per-tool argument parsing, no second surface to keep in
+  step. `--args` takes literal JSON, `@file` or `@-`.
+- **The man page is the authoritative reference** — every tool, the
+  specification format, pacing, trust, bootstrap, poolers, the ledger, and how
+  to operate with nothing but psql.
+- deb, rpm and tarball build; the installed tree is verified end to end.
 
 - MCP server over stdio, JSON-RPC 2.0, protocol revisions 2024-11-05 through
   2025-11-25. `initialize`, `ping`, `tools/list` and `tools/call` answer;
