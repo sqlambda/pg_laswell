@@ -134,5 +134,16 @@ and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
   PostgreSQL requires it to include the partition key and the planner does not
   read it.
 - `add_check_constraint`, the same two-step shape as a foreign key.
+- **`preserve`** captures the pre-image of a lossy backfill into a side table,
+  as a data-modifying CTE of the very statement that updates — so it reads the
+  rows as they were and commits with them, with no window between. This is the
+  durable answer to the pinned-snapshot idea: a snapshot lets you *look* at old
+  values while blocking vacuum throughout; this *keeps* them and doubles as the
+  revert path. Verified exact on 3000 rows.
+- No `drop_constraint`, deliberately: it would emit exactly one possible
+  statement whatever the database looked like, and an intent kind here has to
+  justify itself by the decision its planner makes. The measured hazard is
+  documented instead — dropping a foreign key takes `AccessExclusiveLock` on
+  the referenced table too.
 - `cpp/test/spikes/` — the Phase 0 experiments that settled the design against
   PostgreSQL 18.6. Four of them changed it.

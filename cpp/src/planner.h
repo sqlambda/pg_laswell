@@ -686,7 +686,7 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
     return;
   }
 
-  const auto& columns = t.value("columns", json::object());
+  const json columns = t.value("columns", json::object());
   for (auto it = in.body["set"].begin(); it != in.body["set"].end(); ++it) {
     if (!columns.contains(it.key())) {
       step.action = Action::kConflict;
@@ -772,6 +772,73 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
   // locks on the lookup table it merely reads. That is contention this tool
   // exists to avoid, inflicted by its own batch statement.
   const std::string rel = in.table();
+
+  // The pre-image, captured in the SAME STATEMENT as the update.
+  //
+  // Data-modifying CTEs all see one snapshot, so an INSERT ... SELECT reading
+  // the target inside this statement sees the rows as they were BEFORE the
+  // UPDATE in the same statement. That is what makes the capture atomic with
+  // the change: there is no window in which one committed and the other did
+  // not, and a crash leaves the backup and the data agreeing.
+  //
+  // This is what replaced the pinned-snapshot idea. A snapshot lets you LOOK at
+  // the old values while holding back the xmin horizon for the whole backfill;
+  // this KEEPS them, durably, and doubles as the revert path -- which a
+  // snapshot can never be.
+  std::string preserve_cte;
+  if (in.body.contains("preserve")) {
+    const auto pschema = in.body["preserve"].value("schema", "");
+    const auto ptable = in.body["preserve"].value("table", "");
+    const auto preserved = pschema + "." + ptable;
+
+    std::vector<std::string> saved_cols{key};
+    for (auto it = in.body["set"].begin(); it != in.body["set"].end(); ++it) {
+      saved_cols.push_back(it.key());
+    }
+
+    // The side table is created by its own step, from the target's real column
+    // types -- LIKE would carry constraints and defaults that have no business
+    // on a backup.
+    std::string cols_ddl;
+    for (const auto& c : saved_cols) {
+      const auto type = columns.contains(c)
+                            ? columns[c].value("type", "text")
+                            : std::string("text");
+      if (!cols_ddl.empty()) cols_ddl += ", ";
+      cols_ddl += c + " " + type;
+    }
+    Step create;
+    create.kind = in.kind_name;
+    create.txn_class = TxnClass::kRequired;
+    create.own_transaction = true;
+    create.lock = "AccessExclusiveLock on the new table only";
+    create.sql.push_back("CREATE TABLE IF NOT EXISTS " + preserved + " (" +
+                         cols_ddl + ", laswell_saved_at timestamptz NOT NULL DEFAULT now());");
+    create.sql.push_back("COMMENT ON TABLE " + preserved + " IS " +
+                         detail::quote_literal(
+                             "Pre-image captured by pg_laswell before backfilling " +
+                             qualified + ". Each row is what the target looked "
+                             "like before the change, written in the same "
+                             "transaction as the change itself.") + ";");
+    create.why = "preserve: the pre-image needs somewhere to live, and it must "
+                 "exist before the first batch writes to it";
+    out.push_back(std::move(create));
+
+    std::string select_cols;
+    for (const auto& c : saved_cols) {
+      if (!select_cols.empty()) select_cols += ", ";
+      select_cols += rel + "." + c;
+    }
+    preserve_cte = ", preserved AS (\n"
+                   "  INSERT INTO " + preserved + " (" +
+                   detail::join(saved_cols, ", ") + ")\n"
+                   "  SELECT " + select_cols + "\n"
+                   "    FROM " + qualified + ", batch AS pb\n"
+                   "   WHERE " + rel + "." + key + " = pb." + key + "\n"
+                   ")";
+    step.detail["preserve"] = preserved;
+  }
+
   const std::string batch_sql =
       "WITH batch AS (\n"
       "  SELECT " + rel + "." + key + "\n"
@@ -780,7 +847,7 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
       "   ORDER BY " + rel + "." + key + "\n"
       "   LIMIT $2\n"
       "   FOR UPDATE OF " + rel + "\n"
-      ")\n"
+      ")" + preserve_cte + "\n"
       "UPDATE " + qualified + "\n"
       "   SET " + detail::join(assignments, ", ") + "\n"
       "  FROM batch AS b" + (from.empty() ? "" : ", " + from) + "\n"

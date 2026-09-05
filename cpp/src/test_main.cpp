@@ -4073,3 +4073,107 @@ TEST_F(ToolTest, AnInvariantThatBreaksFailsTheMigrationAndSaysHow) {
   }
   EXPECT_TRUE(named) << st.dump(2);
 }
+
+// --- preserve: the durable pre-image ---------------------------------------
+
+TEST(Planner, PreserveCapturesInTheSameStatementAsTheUpdate) {
+  // Data-modifying CTEs share one snapshot, so the INSERT reads the target as
+  // it was BEFORE the UPDATE in the same statement. That is what makes the
+  // capture atomic with the change: there is no window in which one committed
+  // and the other did not.
+  auto obs = observations(1LL << 30, 100000);
+  json doc = minimal_spec();
+  doc["intents"] = json::array({json{
+      {"kind", "backfill"}, {"schema", "shop"}, {"table", "orders"}, {"key", "id"},
+      {"set", {{"fulfilment_region", "upper(orders.fulfilment_region)"}}},
+      {"where", "orders.fulfilment_region IS NOT NULL"},
+      {"preserve", {{"schema", "archive"}, {"table", "orders_before"}}}}});
+  const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(doc), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+
+  const auto s = steps_of(plan, "backfill");
+  ASSERT_EQ(s.size(), 2u) << plan.render();  // create the side table, then backfill
+
+  // The side table is created from the target's real column types, not LIKE:
+  // LIKE would carry constraints and defaults a backup has no business having.
+  EXPECT_NE(all_sql(*s[0]).find("CREATE TABLE IF NOT EXISTS archive.orders_before"),
+            std::string::npos) << all_sql(*s[0]);
+  EXPECT_NE(all_sql(*s[0]).find("laswell_saved_at"), std::string::npos);
+  EXPECT_NE(all_sql(*s[0]).find("COMMENT ON TABLE"), std::string::npos);
+
+  // One statement, not two: the INSERT is a CTE of the UPDATE.
+  const auto sql = all_sql(*s[1]);
+  EXPECT_NE(sql.find(", preserved AS ("), std::string::npos) << sql;
+  EXPECT_NE(sql.find("INSERT INTO archive.orders_before (id, fulfilment_region)"),
+            std::string::npos) << sql;
+  EXPECT_LT(sql.find("preserved AS ("), sql.find("UPDATE shop.orders"))
+      << "the capture must be part of the same statement as the update";
+}
+
+TEST(Spec, PreservingIntoTheTableBeingBackfilledIsRefused) {
+  json doc = minimal_spec();
+  doc["intents"] = json::array({json{
+      {"kind", "backfill"}, {"schema", "shop"}, {"table", "orders"}, {"key", "id"},
+      {"set", {{"fulfilment_region", "'x'"}}}, {"where", "true"},
+      {"preserve", {{"schema", "shop"}, {"table", "orders"}}}}});
+  const auto err = spec_error(doc);
+  EXPECT_NE(err.find("names the table being backfilled"), std::string::npos) << err;
+}
+
+TEST_F(ToolTest, APreservedBackfillIsExactlyRevertible) {
+  // The property that makes this worth more than a pinned snapshot: the
+  // pre-image survives, so the change can be undone by a join.
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/prices");
+    w.txn().exec("DROP SCHEMA IF EXISTS shop CASCADE");
+    w.txn().exec("DROP SCHEMA IF EXISTS archive CASCADE");
+    w.txn().exec("CREATE SCHEMA shop");
+    w.txn().exec("CREATE SCHEMA archive");
+    w.txn().exec("CREATE TABLE shop.orders(id bigint GENERATED ALWAYS AS IDENTITY"
+                 " PRIMARY KEY, amount numeric(12,2) NOT NULL)");
+    w.txn().exec("INSERT INTO shop.orders(amount)"
+                 " SELECT (g % 900 + 1)::numeric / 7 FROM generate_series(1,2000) g");
+    w.commit();
+  }
+  const auto before = [&] {
+    pglaswell::ReadSession r(cfg());
+    return r.txn().exec("SELECT sum(amount)::text FROM shop.orders")[0][0]
+        .as<std::string>();
+  }();
+
+  json doc = minimal_spec();
+  doc["intents"] = json::array({json{
+      {"kind", "backfill"}, {"schema", "shop"}, {"table", "orders"}, {"key", "id"},
+      {"set", {{"amount", "round(orders.amount * 1.19, 2)"}}},
+      {"where", "orders.amount IS NOT NULL"},
+      {"preserve", {{"schema", "archive"}, {"table", "orders_before"}}}}});
+  const auto parsed = pglaswell::parse_spec(doc);
+  doc["signatures"] = json::array({{{"key_id", test_key().key_id},
+                                    {"algorithm", "ed25519"},
+                                    {"signature", base64(sign(parsed.canonical_bytes))}}});
+
+  const auto p = payload(call("startMigration", json{{"spec", doc}}));
+  ASSERT_TRUE(p.value("accepted", false)) << p.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, p["jobId"], [](const json& s) {
+    return s.value("state", "") == "succeeded" || s.value("state", "") == "failed";
+  }));
+  ASSERT_EQ(status_of(p["jobId"]).value("state", ""), "succeeded")
+      << status_of(p["jobId"]).dump(2);
+
+  pglaswell::ReadSession r(cfg());
+  EXPECT_EQ(r.txn().exec("SELECT count(*) FROM archive.orders_before")[0][0].as<int>(),
+            2000);
+  // Every preserved row is the exact value the update replaced.
+  EXPECT_EQ(r.txn()
+                .exec("SELECT count(*) FROM shop.orders o"
+                      "  JOIN archive.orders_before a ON a.id = o.id"
+                      " WHERE o.amount <> round(a.amount * 1.19, 2)")[0][0]
+                .as<int>(),
+            0)
+      << "a preserved row does not match what the update replaced";
+  // And the revert is a join away.
+  EXPECT_EQ(r.txn().exec("SELECT sum(amount)::text FROM archive.orders_before")[0][0]
+                .as<std::string>(),
+            before);
+}

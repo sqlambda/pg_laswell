@@ -206,7 +206,7 @@ inline void parse_backfill(Intent& in) {
   detail::reject_unknown_keys(
       in.body,
       {"kind", "schema", "table", "key", "set", "from", "where",
-       "verify_remaining", "assert_invariants"},
+       "verify_remaining", "assert_invariants", "preserve"},
       at);
   detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
   detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
@@ -242,6 +242,31 @@ inline void parse_backfill(Intent& in) {
                  "An unfiltered backfill rewrites every row. If that is really "
                  "intended, write \"where\": \"true\" and say so in the "
                  "rationale.");
+  }
+
+  // The durable answer to "what did this row look like before".
+  //
+  // A predicate-driven backfill needs none of this: its own WHERE clause is
+  // the record of what remains. A LOSSY one -- SET amount = amount * 1.1 --
+  // has no such record, and the honest thing is not to VIEW the previous
+  // values from some pinned snapshot but to KEEP them, in the same transaction
+  // as the change, where they survive a crash and double as the revert path.
+  if (in.body.contains("preserve")) {
+    const auto& p = in.body["preserve"];
+    if (!p.is_object()) {
+      detail::fail(at + ".preserve must be an object", "");
+    }
+    detail::reject_unknown_keys(p, {"schema", "table"}, at + ".preserve");
+    detail::require_identifier(detail::require_string(p, "schema", at + ".preserve"),
+                               "preserve.schema", in.ordinal);
+    detail::require_identifier(detail::require_string(p, "table", at + ".preserve"),
+                               "preserve.table", in.ordinal);
+    if (p.value("schema", "") == in.body.value("schema", "") &&
+        p.value("table", "") == in.body.value("table", "")) {
+      detail::fail(at + ".preserve names the table being backfilled",
+                   "The pre-image has to go somewhere else, or the backfill "
+                   "would rewrite the record of what it changed.");
+    }
   }
 
   if (in.body.contains("assert_invariants")) {

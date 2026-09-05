@@ -105,6 +105,23 @@ set -e
 [ "$missing_exit" = 1 ] && { echo "  ok   --args @missing-file is an error"; pass=$((pass+1)); } \
                         || { echo "  FAIL --args @missing-file exit=$missing_exit"; fail=$((fail+1)); }
 
+# The writing tools, which gtest reaches only in-process. A pipeline that can
+# START a migration but cannot tell whether it was accepted is worse than one
+# that cannot start it at all.
+echo "--- the writing tools ---"
+check 1 "startMigration with an unsigned spec"  -- --call startMigration \
+      --args '{"spec":{"laswell_spec_version":1,"id":"x","description":"d","intents":[{"kind":"add_column","schema":"public","table":"nope","column":"c","type":"text","nullable":true,"comment":"c"}]}}'
+check 1 "cancelJob with an unknown job id"      -- --call cancelJob --args '{"jobId":"nope"}'
+check 0 "jobStatus with nothing running"        -- --call jobStatus
+
+# jobStatus must answer with a jobs array even when idle: a caller that cannot
+# distinguish "no jobs" from "the call failed" has to guess.
+if "$BIN" --call jobStatus "$CONN" 2>/dev/null | grep -q '"jobs"'; then
+  echo "  ok   jobStatus reports an empty jobs array rather than nothing"; pass=$((pass+1))
+else
+  echo "  FAIL jobStatus did not carry a jobs array"; fail=$((fail+1))
+fi
+
 echo "--- the payload is on stdout and is JSON ---"
 if "$BIN" --call checkPrivileges "$CONN" 2>/dev/null | head -1 | grep -q '^{'; then
   echo "  ok   stdout carries the payload"; pass=$((pass+1))

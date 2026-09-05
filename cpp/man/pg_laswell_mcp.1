@@ -371,6 +371,25 @@ that one asks whether the work finished, this one asks whether the work broke
 something it should not have.
 A backfill can fill every row and still halve a total.
 .Pp
+.Va preserve
+names a schema and table to capture the pre-image into, for a
+.Em lossy
+backfill -- one like
+.Ql SET amount = amount * 1.19
+where the previous value cannot be recovered from the new one.
+A predicate-driven backfill needs none of it: its own
+.Va where
+clause is the record of what remains.
+.Pp
+The capture is a data-modifying CTE of the very statement that updates, so it
+reads the rows as they were before that update and commits with it.
+There is no window in which one landed and the other did not.
+.Pp
+This is deliberately not a pinned snapshot.
+A snapshot lets you look at the old values while holding back the xmin horizon
+for the whole backfill, blocking vacuum throughout; this keeps them, durably,
+and doubles as the revert path -- which a snapshot can never be.
+.Pp
 .Sy Naming convention .
 Expressions in
 .Va where ,
@@ -493,6 +512,26 @@ transaction block, so the attaches that follow have nothing to attach.
 Those steps are reported as
 .Em unverified ,
 never as wrong.
+.Ss What is deliberately absent
+There is no
+.Cm drop_constraint .
+It would emit exactly one possible statement whatever the database looked like:
+there is no concurrent variant of
+.Ic ALTER TABLE ... DROP CONSTRAINT ,
+and the lock is
+.Va AccessExclusiveLock
+in every case.
+An intent kind here has to justify itself by the decision its planner makes,
+and a kind with no decision is a wrapper around
+.Xr psql 1 .
+.Pp
+One measured fact worth carrying if you do it by hand: dropping a
+.Em foreign key
+takes
+.Va AccessExclusiveLock
+on the referenced table as well, which the statement never names -- a stronger
+lock on the parent than adding the constraint takes.
+Dropping a unique constraint also drops its index.
 .Sh SIGNING
 .Nm
 verifies; it never signs.
