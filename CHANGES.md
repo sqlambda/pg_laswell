@@ -123,5 +123,16 @@ and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
   reported as "unverified beyond this step", not as a failure.
 - CI workflows: both compilers × PostgreSQL 15–18, both sanitizers, Valgrind, a
   pooled run and package verification.
+- **`assert_invariants` is evaluated**, not merely parsed: named scalar queries
+  run before the first batch and after the last, and a difference fails the
+  step naming the invariant and both values. It asks what `verify_remaining`
+  cannot — a backfill can fill every row and still halve a total.
+- **`create_index` on a partitioned table is now a recipe** rather than a
+  refusal: concurrent builds per partition, the parent with `ON ONLY`, an
+  attach each, then a validity check — because the parent index stays INVALID
+  until the last attachment lands. A unique index there is still refused, since
+  PostgreSQL requires it to include the partition key and the planner does not
+  read it.
+- `add_check_constraint`, the same two-step shape as a foreign key.
 - `cpp/test/spikes/` — the Phase 0 experiments that settled the design against
   PostgreSQL 18.6. Four of them changed it.

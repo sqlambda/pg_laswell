@@ -307,6 +307,25 @@ class Executor {
     std::map<std::string, int> reasons{
         {"interval", 0}, {"lock_waiter", 0}, {"batch_cap", 0}, {"final", 0}};
 
+    // Invariants are evaluated BEFORE the first batch and again after the
+    // last, on the worker connection. Both readings are stored, so a failure
+    // says what the value was and what it became rather than merely that
+    // something changed.
+    //
+    // They are not a substitute for verify_remaining: that asks "is the work
+    // finished", this asks "did the work break something it should not have".
+    // A backfill can complete every row and still halve the revenue total.
+    json invariants_before = json::object();
+    const auto invariants = detail_json.value("assert_invariants", json::array());
+    if (!invariants.empty()) {
+      w.begin(app_name(ordinal));
+      for (const auto& inv : invariants) {
+        invariants_before[inv.value("name", "")] =
+            scalar(w, inv.value("query", ""));
+      }
+      w.commit();
+    }
+
     const auto started = detail::steady_ms();
     bool done = false;
 
@@ -461,7 +480,47 @@ class Executor {
       }
     }
 
+    if (!invariants.empty()) {
+      json after = json::object();
+      json broken = json::array();
+      w.begin(app_name(ordinal));
+      for (const auto& inv : invariants) {
+        const auto name = inv.value("name", "");
+        const auto now = scalar(w, inv.value("query", ""));
+        after[name] = now;
+        if (now != invariants_before.value(name, json())) {
+          broken.push_back(json{{"name", name},
+                                {"query", inv.value("query", "")},
+                                {"before", invariants_before.value(name, json())},
+                                {"after", now}});
+        }
+      }
+      w.commit();
+      d["invariantsBefore"] = invariants_before;
+      d["invariantsAfter"] = after;
+      if (!broken.empty()) {
+        d["brokenInvariants"] = broken;
+        d["error"] = "the backfill changed something an invariant said it "
+                     "must not";
+        record_step(ordinal, step, "failed", rows_done, d);
+        throw std::runtime_error(
+            "invariant \"" + broken[0]["name"].get<std::string>() +
+            "\" went from " + broken[0]["before"].dump() + " to " +
+            broken[0]["after"].dump());
+      }
+    }
+
     record_step(ordinal, step, "succeeded", rows_done, d);
+  }
+
+  // One value, as text. Text rather than a typed read because an invariant may
+  // be any scalar -- a count, a sum, a checksum -- and comparing the rendered
+  // form is exactly what "unchanged" means for all of them. numeric in
+  // particular has no lossless C++ type.
+  static json scalar(WriteSession& w, const std::string& query) {
+    const auto r = w.txn().exec(query);
+    if (r.empty() || r[0].size() == 0 || r[0][0].is_null()) return json();
+    return r[0][0].as<std::string>();
   }
 
   static std::string qualified_for(const json& step) {

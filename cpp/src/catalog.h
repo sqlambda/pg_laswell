@@ -104,7 +104,16 @@ SELECT COALESCE(
                   WHERE i.indrelid = t.oid),
                  '{}'::jsonb),
      'lock_waiters', (SELECT COUNT(*) FROM pg_locks l
-                       WHERE l.relation = t.oid AND NOT l.granted)
+                       WHERE l.relation = t.oid AND NOT l.granted),
+     -- Direct partitions, in name order so a plan is stable across runs.
+     -- CREATE INDEX CONCURRENTLY is refused on a partitioned parent, so the
+     -- planner needs the children to build on each of them instead.
+     'partitions', COALESCE((SELECT JSONB_AGG(pn.nspname || '.' || pc.relname
+                                              ORDER BY pn.nspname, pc.relname)
+                               FROM pg_inherits pi
+                               JOIN pg_class pc ON pc.oid = pi.inhrelid
+                               JOIN pg_namespace pn ON pn.oid = pc.relnamespace
+                              WHERE pi.inhparent = t.oid), '[]'::jsonb)
    ) FROM target t),
   JSONB_BUILD_OBJECT('exists', false))
 )SQL";
@@ -244,6 +253,7 @@ class Catalog {
     std::vector<int> unverified_steps;  // could not be included, or not reached
     std::string skipped_reason;
     int timed_out_at = -1;
+    bool depends_on_skipped = false;
   };
 
   DryRun dry_run(const std::vector<std::pair<int, std::vector<std::string>>>& steps,
@@ -269,9 +279,17 @@ class Catalog {
     }
 
     out.ran = true;
+    // Once a step has been skipped, anything after it may depend on what that
+    // step would have created -- a partitioned index recipe attaches the child
+    // indexes its skipped concurrent builds would have made. A failure after a
+    // skip is therefore a gap the DRY RUN created, not a defect in the plan,
+    // and reporting it as a problem would send someone hunting for a fault
+    // that is not there.
+    bool skipped_any = false;
     for (std::size_t i = 0; i < steps.size(); ++i) {
       if (txn_forbidden[i]) {
         out.unverified_steps.push_back(steps[i].first);
+        skipped_any = true;
         continue;
       }
       for (const auto& raw : steps[i].second) {
@@ -306,6 +324,12 @@ class Catalog {
             for (std::size_t k = i; k < steps.size(); ++k) {
               out.unverified_steps.push_back(steps[k].first);
             }
+            session.rollback();
+            return out;
+          }
+          if (skipped_any) {
+            out.unverified_steps.push_back(steps[i].first);
+            out.depends_on_skipped = true;
             session.rollback();
             return out;
           }

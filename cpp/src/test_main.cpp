@@ -816,9 +816,12 @@ TEST(Spec, AnUnknownTopLevelKeyIsAFatalParseError) {
 
 TEST(Spec, AnUnknownIntentKindRefusesTheWholeSpecAndListsWhatIsSupported) {
   json doc = minimal_spec();
-  doc["intents"][1]["kind"] = "add_check_constraint";
+  // Deliberately something no reasonable roadmap would add. An earlier version
+  // of this test used a kind that was later implemented, and the test then
+  // silently stopped testing anything.
+  doc["intents"][1]["kind"] = "make_the_database_faster";
   const auto err = spec_error(doc);
-  EXPECT_NE(err.find("add_check_constraint"), std::string::npos) << err;
+  EXPECT_NE(err.find("make_the_database_faster"), std::string::npos) << err;
   EXPECT_NE(err.find("add_column"), std::string::npos)
       << "the error must list the kinds this binary supports: " << err;
   // And nothing is planned: parse_spec throws, so no partial spec escapes.
@@ -841,7 +844,9 @@ TEST(Spec, KnownKindsAreExactlyTheImplementedKinds) {
     "add_foreign_key": {"kind":"add_foreign_key","schema":"s","table":"t",
                         "name":"fk","columns":["pid"],
                         "references_schema":"s","references_table":"p",
-                        "references_columns":["id"]}
+                        "references_columns":["id"]},
+    "add_check_constraint": {"kind":"add_check_constraint","schema":"s",
+                             "table":"t","name":"ck","expression":"v > 0"}
   })");
   for (const auto& [name, kind] : pglaswell::intent_kinds()) {
     (void)kind;
@@ -1421,6 +1426,21 @@ std::string all_sql(const pglaswell::Step& s) {
   return out;
 }
 
+pglaswell::Spec spec_of(const json& intents) {
+  json doc = minimal_spec();
+  doc["intents"] = intents;
+  return pglaswell::parse_spec(doc);
+}
+
+std::vector<const pglaswell::Step*> steps_of(const pglaswell::Plan& p,
+                                             const std::string& kind) {
+  std::vector<const pglaswell::Step*> out;
+  for (const auto& s : p.steps) {
+    if (s.kind == kind) out.push_back(&s);
+  }
+  return out;
+}
+
 }  // namespace
 
 TEST(Planner, SameObservationsProduceAByteIdenticalPlan) {
@@ -1533,18 +1553,75 @@ TEST(Planner, AValidIndexOfTheSameNameIsSatisfiedNotRebuilt) {
   EXPECT_NE(s->why.find("already present and valid"), std::string::npos);
 }
 
-TEST(Planner, APartitionedTableRefusesTheConcurrentBuildWithARecipe) {
-  // Measured on 18.6: CREATE INDEX CONCURRENTLY is refused outright there.
+TEST(Planner, APartitionedTableGetsThePerPartitionRecipe) {
+  // CREATE INDEX CONCURRENTLY is refused on the parent, measured on 18.6. The
+  // recipe builds concurrently on each partition, creates the parent index ON
+  // ONLY -- no data, no scan -- and attaches each child.
+  auto obs = observations(2LL << 30, 8100000, 0, "partitioned_table");
+  obs.tables["shop.orders"]["partitions"] =
+      json::array({"shop.orders_2024", "shop.orders_2025"});
   const auto plan = pglaswell::plan_migration(
-      pglaswell::parse_spec(minimal_spec()),
-      observations(2LL << 30, 8100000, 0, "partitioned_table"), {});
-  EXPECT_FALSE(plan.ok);
-  ASSERT_FALSE(plan.conflicts.empty());
-  bool mentions_recipe = false;
-  for (const auto& c : plan.conflicts) {
-    if (c.find("ATTACH PARTITION") != std::string::npos) mentions_recipe = true;
+      pglaswell::parse_spec(minimal_spec()), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+
+  const auto s = steps_of(plan, "create_index");
+  ASSERT_EQ(s.size(), 5u) << plan.render();  // 2 builds + parent + 2 attaches
+  EXPECT_NE(all_sql(*s[0]).find("CREATE INDEX CONCURRENTLY orders_2024_orders_open_by_region_idx"
+                                " ON shop.orders_2024"),
+            std::string::npos) << all_sql(*s[0]);
+  EXPECT_EQ(s[0]->txn_class, pglaswell::TxnClass::kForbidden);
+  EXPECT_NE(all_sql(*s[2]).find("ON ONLY shop.orders"), std::string::npos);
+  EXPECT_NE(all_sql(*s[3]).find("ATTACH PARTITION"), std::string::npos);
+  EXPECT_NE(all_sql(*s[4]).find("ATTACH PARTITION"), std::string::npos);
+
+  // The parent index is INVALID until the last attachment lands, so the recipe
+  // must end by checking -- an index that exists, is invalid and is never used
+  // would otherwise pass silently.
+  ASSERT_NE(find_step(plan, "verify_index_valid"), nullptr) << plan.render();
+}
+
+TEST(Planner, AUniqueIndexOnAPartitionedTableIsRefusedRatherThanPlannedToFail) {
+  // PostgreSQL requires such an index to include the partition key, which this
+  // planner does not read. Emitting a recipe whose final ATTACH would fail is
+  // worse than refusing.
+  auto obs = observations(1024, 10, 0, "partitioned_table");
+  obs.tables["shop.orders"]["partitions"] = json::array({"shop.orders_2024"});
+  json doc = minimal_spec();
+  for (auto& i : doc["intents"]) {
+    if (i["kind"] == "create_index") i["unique"] = true;
   }
-  EXPECT_TRUE(mentions_recipe) << "the refusal must name the alternative";
+  const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(doc), obs, {});
+  EXPECT_FALSE(plan.ok) << plan.render();
+  bool named = false;
+  for (const auto& c : plan.conflicts) {
+    if (c.find("partition key") != std::string::npos) named = true;
+  }
+  EXPECT_TRUE(named) << json(plan.conflicts).dump(2);
+}
+
+TEST(Planner, APartitionedTableWithNoPartitionsIsRefused) {
+  auto obs = observations(1024, 10, 0, "partitioned_table");
+  obs.tables["shop.orders"]["partitions"] = json::array();
+  const auto plan = pglaswell::plan_migration(
+      pglaswell::parse_spec(minimal_spec()), obs, {});
+  EXPECT_FALSE(plan.ok) << plan.render();
+}
+
+TEST(Planner, AddCheckConstraintSplitsIntoNotValidThenValidate) {
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "add_check_constraint"},
+                                {"schema", "shop"}, {"table", "orders"},
+                                {"name", "orders_status_ck"},
+                                {"expression", "status IN ('open','closed')"}}})),
+      observations(2LL << 30, 8000000), {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto s = steps_of(plan, "add_check_constraint");
+  ASSERT_EQ(s.size(), 2u);
+  EXPECT_NE(all_sql(*s[0]).find("NOT VALID"), std::string::npos);
+  EXPECT_NE(all_sql(*s[1]).find("VALIDATE CONSTRAINT orders_status_ck"),
+            std::string::npos);
+  EXPECT_GT(s[1]->txn_group, s[0]->txn_group);
+  EXPECT_NE(s[1]->lock.find("does NOT block reads or writes"), std::string::npos);
 }
 
 TEST(Planner, AnExistingCompatibleColumnIsSatisfied) {
@@ -3631,22 +3708,6 @@ TEST(Planner, APartialAndAFullIndexAreDifferentNotAmbiguous) {
 
 // --- drop_index, set_not_null, add_foreign_key ------------------------------
 
-namespace {
-pglaswell::Spec spec_of(const json& intents) {
-  json doc = minimal_spec();
-  doc["intents"] = intents;
-  return pglaswell::parse_spec(doc);
-}
-std::vector<const pglaswell::Step*> steps_of(const pglaswell::Plan& p,
-                                             const std::string& kind) {
-  std::vector<const pglaswell::Step*> out;
-  for (const auto& s : p.steps) {
-    if (s.kind == kind) out.push_back(&s);
-  }
-  return out;
-}
-}  // namespace
-
 TEST(Planner, DroppingAnIndexOnAQuietTableUsesAPlainDrop) {
   // A drop is fast whatever else is true. What costs is ACQUIRING the lock, so
   // the rule reads lock_waiters and ignores the table's size.
@@ -3897,4 +3958,118 @@ TEST_F(DatabaseTest, TheNotNullRecipeLeavesPostgresqlsOwnConstraintName) {
   w.begin("pg_laswell/test/cleanup");
   w.txn().exec("DROP TABLE laswell_nn");
   w.commit();
+}
+
+// --- assert_invariants ------------------------------------------------------
+
+namespace {
+json backfill_spec_with_invariants(const json& invariants, const char* set_expr) {
+  json d = minimal_spec();
+  d["intents"] = json::array({json{
+      {"kind", "backfill"}, {"schema", "shop"}, {"table", "orders"},
+      {"key", "id"},
+      {"set", {{"fulfilment_region", set_expr}}},
+      {"where", "orders.fulfilment_region IS NULL"},
+      {"assert_invariants", invariants}}});
+  return d;
+}
+}  // namespace
+
+TEST_F(ToolTest, AnInvariantThatHoldsLetsTheMigrationSucceed) {
+  make_shop(cfg());
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/col");
+    w.txn().exec("ALTER TABLE shop.orders ADD COLUMN fulfilment_region text");
+    w.commit();
+  }
+  auto doc = backfill_spec_with_invariants(
+      json::array({json{{"name", "row_count_stable"},
+                        {"query", "SELECT count(*) FROM shop.orders"}}}),
+      "'r'");
+  const auto parsed = pglaswell::parse_spec(doc);
+  doc["signatures"] = json::array({{{"key_id", test_key().key_id},
+                                    {"algorithm", "ed25519"},
+                                    {"signature", base64(sign(parsed.canonical_bytes))}}});
+
+  const auto p = payload(call("startMigration", json{{"spec", doc}}));
+  ASSERT_TRUE(p.value("accepted", false)) << p.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, p["jobId"], [](const json& s) {
+    return s.value("state", "") == "succeeded" || s.value("state", "") == "failed";
+  }));
+  const auto st = status_of(p["jobId"]);
+  EXPECT_EQ(st.value("state", ""), "succeeded") << st.dump(2);
+
+  // Both readings are recorded, so the check is auditable rather than merely
+  // passed.
+  bool recorded = false;
+  for (const auto& s : st["steps"]) {
+    if (s["detail"].contains("invariantsBefore")) recorded = true;
+  }
+  EXPECT_TRUE(recorded) << st["steps"].dump(2);
+}
+
+TEST_F(ToolTest, AnInvariantThatBreaksFailsTheMigrationAndSaysHow) {
+  // The case verify_remaining cannot catch: every row is filled, and a total
+  // the change was supposed to leave alone has moved.
+  make_shop(cfg());
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/col");
+    w.txn().exec("ALTER TABLE shop.orders ADD COLUMN fulfilment_region text");
+    // A trigger that deletes a row on every update: the backfill completes and
+    // the row count silently drops.
+    w.txn().exec("CREATE FUNCTION shop.eat() RETURNS trigger LANGUAGE plpgsql AS "
+                 "$$ BEGIN DELETE FROM shop.orders WHERE id = NEW.id + 100000;"
+                 " RETURN NEW; END $$");
+    w.txn().exec("CREATE TRIGGER eat AFTER UPDATE ON shop.orders"
+                 " FOR EACH ROW EXECUTE FUNCTION shop.eat()");
+    w.txn().exec("INSERT INTO shop.orders(warehouse_id) SELECT 1 FROM generate_series(1,50)");
+    w.commit();
+  }
+  // Make the trigger actually delete something.
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/shift");
+    w.txn().exec("CREATE OR REPLACE FUNCTION shop.eat() RETURNS trigger"
+                 " LANGUAGE plpgsql AS $$ BEGIN"
+                 "  DELETE FROM shop.orders WHERE id = (SELECT max(id) FROM shop.orders);"
+                 "  RETURN NEW; END $$");
+    w.commit();
+  }
+
+  auto doc = backfill_spec_with_invariants(
+      json::array({json{{"name", "row_count_stable"},
+                        {"query", "SELECT count(*) FROM shop.orders"}}}),
+      "'r'");
+  const auto parsed = pglaswell::parse_spec(doc);
+  doc["signatures"] = json::array({{{"key_id", test_key().key_id},
+                                    {"algorithm", "ed25519"},
+                                    {"signature", base64(sign(parsed.canonical_bytes))}}});
+
+  const auto p = payload(call("startMigration", json{{"spec", doc}}));
+  if (!p.value("accepted", false)) {
+    SUCCEED() << "refused before starting: " << p.dump(2);
+    return;
+  }
+  ASSERT_TRUE(wait_for_status(*this, p["jobId"], [](const json& s) {
+    const auto st = s.value("state", "");
+    return st == "succeeded" || st == "failed";
+  }));
+  const auto st = status_of(p["jobId"]);
+  EXPECT_EQ(st.value("state", ""), "failed") << st.dump(2);
+
+  // The failure names the invariant and both values, not merely that something
+  // changed.
+  bool named = false;
+  for (const auto& s : st["steps"]) {
+    if (!s["detail"].contains("brokenInvariants")) continue;
+    const auto& b = s["detail"]["brokenInvariants"][0];
+    EXPECT_EQ(b.value("name", ""), "row_count_stable");
+    EXPECT_TRUE(b.contains("before"));
+    EXPECT_TRUE(b.contains("after"));
+    EXPECT_NE(b.value("before", ""), b.value("after", ""));
+    named = true;
+  }
+  EXPECT_TRUE(named) << st.dump(2);
 }

@@ -315,6 +315,13 @@ inline json plan_migration_tool(ToolContext& ctx, const json& args) {
             "transaction block (CREATE INDEX CONCURRENTLY) and were skipped "
             "rather than silently passed."}};
     if (!dry.skipped_reason.empty()) d["skippedReason"] = dry.skipped_reason;
+    if (dry.depends_on_skipped) {
+      d["note"] =
+          "verification stopped at a step that depends on one which cannot run "
+          "inside a transaction block -- a partitioned index recipe attaches "
+          "the child indexes its concurrent builds would have made, and a dry "
+          "run cannot make them. Those steps are unverified rather than wrong.";
+    }
     if (dry.timed_out_at >= 0) {
       d["timedOutAtStep"] = dry.timed_out_at;
       d["note"] =

@@ -188,6 +188,11 @@ inline json compute_budget(const Observations& obs, const ExecutorConfig& cfg) {
 
 // --- per-intent rules ------------------------------------------------------
 
+// Defined below, after the rule that reaches for it: a partitioned parent
+// refuses CREATE INDEX CONCURRENTLY, so the create_index rule hands off here.
+inline void plan_partitioned_index(const Intent& in, const json& t, Plan& plan,
+                                   std::vector<Step>& out, Step& parent_step);
+
 inline void plan_add_column(const Intent& in, const Observations& obs, Plan& plan,
                             std::vector<Step>& out) {
   Step step;
@@ -315,6 +320,7 @@ inline void project(const Intent& in, const Step& step, Observations& projected)
       return;
     }
     case IntentKind::kAddForeignKey:
+    case IntentKind::kAddCheckConstraint:
       // A constraint, not a relation or a column: nothing a later intent in
       // this spec reads through Observations changes.
       return;
@@ -326,7 +332,15 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
                               std::vector<Step>& out) {
   Step step;
   step.kind = in.kind_name;
-  struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
+  // Suppressible, because this rule can hand off: a partitioned parent needs a
+  // whole recipe rather than one step, and the handler emits its own. Without
+  // the flag the guard would also push this now-unused stub, and the plan
+  // would carry a step that does nothing.
+  bool handed_off = false;
+  struct Emit {
+    std::vector<Step>& o; Step& s; const bool& skip;
+    ~Emit() { if (!skip) o.push_back(s); }
+  } emit{out, step, handed_off};
   const auto qualified = in.qualified_table();
   const auto& t = obs.table(qualified);
   const auto name = in.body.value("name", "");
@@ -576,15 +590,19 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
   const bool partitioned = t.value("kind", "") == "partitioned_table";
 
   // S4, measured 2026-09-05 on 18.6: CREATE INDEX CONCURRENTLY is refused
-  // outright on a partitioned table.
+  // outright on a partitioned parent. The recipe builds concurrently on each
+  // partition, creates the parent index ON ONLY -- ShareLock on a relation
+  // holding no data, so brief -- and attaches each child.
+  //
+  // The parent index stays indisvalid = false until EVERY partition is
+  // attached, measured, which is why the last step verifies it: a recipe that
+  // stopped after the attaches would leave an index that exists and is not
+  // used, and nothing would say so.
   if (partitioned) {
-    step.action = Action::kConflict;
-    step.why = qualified + " is partitioned; CREATE INDEX CONCURRENTLY is not supported there";
-    plan.conflicts.push_back(
-        step.why +
-        ". Build the index CONCURRENTLY on each partition, then create it on "
-        "the parent with ONLY and ATTACH PARTITION each one. pg_laswell does "
-        "not yet plan that sequence.");
+    handed_off = true;
+    plan_partitioned_index(in, t, plan, out, step);
+    // A refusal still needs a step to carry it.
+    if (step.action == Action::kConflict) out.push_back(step);
     return;
   }
 
@@ -792,6 +810,10 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
   }
   if (in.body.contains("assert_invariants")) {
     step.detail["assert_invariants"] = in.body["assert_invariants"];
+    step.detail["invariants_run_on"] =
+        "the worker connection, before the first batch and after the last. "
+        "They ask whether the work broke something, which verify_remaining "
+        "does not: a backfill can complete every row and still halve a total.";
   }
 
   step.why = std::to_string(rows) + " rows estimated; keyset walk on " + key +
@@ -818,6 +840,177 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
         " estimated rows each batch may rescan already-updated rows. Consider "
         "a partial index before running this against a live system.");
   }
+}
+
+// The partitioned-index recipe. Emitted as separate steps because each
+// concurrent build must run outside a transaction block, and they run one at a
+// time rather than together: two concurrent builds on one parent's children
+// contend for the same catalog rows without buying any parallelism worth
+// having.
+inline void plan_partitioned_index(const Intent& in, const json& t, Plan& plan,
+                                   std::vector<Step>& out, Step& parent_step) {
+  const auto qualified = in.qualified_table();
+  const auto name = in.body.value("name", "");
+  const auto method = in.body.value("method", "btree");
+  const auto where = in.body.value("where", "");
+  const bool unique = in.body.value("unique", false);
+
+  std::vector<std::string> columns;
+  for (const auto& c : in.body.value("columns", json::array())) {
+    columns.push_back(c.get<std::string>());
+  }
+  const std::string cols = detail::join(columns, ", ");
+  const std::string tail = " USING " + method + " (" + cols + ")" +
+                           (where.empty() ? "" : " WHERE " + where);
+
+  const auto partitions = t.value("partitions", json::array());
+  if (partitions.empty()) {
+    parent_step.action = Action::kConflict;
+    parent_step.why = qualified + " is partitioned but has no partitions";
+    plan.conflicts.push_back(
+        qualified +
+        " is a partitioned table with no partitions. Create the index once "
+        "there is something to build it on, or attach a partition first.");
+    return;
+  }
+
+  // A unique index on a partitioned table must include the partition key, and
+  // this planner does not read the partition key. Refusing beats emitting a
+  // recipe whose last step fails.
+  if (unique) {
+    parent_step.action = Action::kConflict;
+    parent_step.why = "a unique index on a partitioned table must include the "
+                      "partition key, which this planner does not read";
+    plan.conflicts.push_back(
+        "\"" + name + "\" is UNIQUE on the partitioned table " + qualified +
+        ". PostgreSQL requires such an index to include the partition key, and "
+        "pg_laswell does not read the partition key, so it will not emit a "
+        "recipe whose final ATTACH would fail. Add the constraint by hand, or "
+        "make the index non-unique.");
+    return;
+  }
+
+  std::vector<std::string> child_indexes;
+  for (const auto& p : partitions) {
+    const auto part = p.get<std::string>();
+    const auto bare = part.substr(part.find('.') + 1);
+    const auto child = bare + "_" + name;
+    // Deterministic rather than truncated: a truncated name would differ
+    // between two runs that both "succeeded", and the idempotence check keys
+    // on the name.
+    if (child.size() > 63) {
+      parent_step.action = Action::kConflict;
+      parent_step.why = "a per-partition index name would exceed 63 bytes";
+      plan.conflicts.push_back(
+          "the per-partition index for " + part + " would be named \"" + child +
+          "\", which PostgreSQL would truncate at 63 bytes -- and a truncated "
+          "name is not deterministic, so two runs could disagree about whether "
+          "the index exists. Use a shorter index name.");
+      return;
+    }
+    child_indexes.push_back(child);
+
+    Step s;
+    s.kind = in.kind_name;
+    s.txn_class = TxnClass::kForbidden;
+    s.own_transaction = true;
+    s.lock = "ShareUpdateExclusiveLock on " + part;
+    s.sql.push_back("CREATE INDEX CONCURRENTLY " + child + " ON " + part + tail + ";");
+    s.why = "partition " + std::to_string(child_indexes.size()) + " of " +
+            std::to_string(partitions.size()) +
+            ": CREATE INDEX CONCURRENTLY is refused on the parent, so each "
+            "partition is built separately and concurrently";
+    s.detail["partition"] = part;
+    s.detail["index"] = child;
+    s.detail["schema"] = in.schema();
+    out.push_back(std::move(s));
+  }
+
+  Step parent;
+  parent.kind = in.kind_name;
+  parent.txn_class = TxnClass::kOptional;
+  parent.own_transaction = true;
+  parent.lock = "ShareLock on " + qualified + ", which holds no data itself";
+  parent.sql.push_back("CREATE INDEX " + name + " ON ONLY " + qualified + tail + ";");
+  parent.sql.push_back("COMMENT ON INDEX " + in.schema() + "." + name + " IS " +
+                       detail::quote_literal(in.body.value("comment", "")) + ";");
+  parent.why =
+      "ON ONLY means the parent index is a catalog entry with no data, so this "
+      "scans nothing. It stays INVALID until every partition is attached";
+  parent.detail["index"] = name;
+  parent.detail["schema"] = in.schema();
+  out.push_back(std::move(parent));
+
+  for (std::size_t i = 0; i < child_indexes.size(); ++i) {
+    Step s;
+    s.kind = in.kind_name;
+    s.txn_class = TxnClass::kOptional;
+    s.lock = "AccessExclusiveLock on the two indexes, briefly";
+    s.sql.push_back("ALTER INDEX " + in.schema() + "." + name +
+                    " ATTACH PARTITION " + in.schema() + "." + child_indexes[i] + ";");
+    s.why = "attach " + std::to_string(i + 1) + " of " +
+            std::to_string(child_indexes.size()) +
+            "; the parent index becomes valid only when the last one lands";
+    out.push_back(std::move(s));
+  }
+
+  Step verify;
+  verify.kind = "verify_index_valid";
+  verify.txn_class = TxnClass::kOptional;
+  verify.lock = "none (catalog read)";
+  verify.why =
+      "a partitioned index that is missing even one attachment exists, is "
+      "INVALID, and is never used -- and nothing else would say so";
+  verify.detail = json{{"schema", in.schema()}, {"index", name}};
+  out.push_back(std::move(verify));
+}
+
+// --- add_check_constraint --------------------------------------------------
+//
+// The same two-step shape as a foreign key, and for the same measured reason: a
+// validating ADD holds its lock for the whole scan, while NOT VALID plus
+// VALIDATE holds the strong lock for a catalog change only and does the scan
+// under ShareUpdateExclusiveLock, which blocks neither reads nor writes.
+inline void plan_add_check_constraint(const Intent& in, const Observations& obs,
+                                      Plan& plan, std::vector<Step>& out) {
+  const auto qualified = in.qualified_table();
+  const auto& t = obs.table(qualified);
+  const auto name = in.body.value("name", "");
+  const auto expression = in.body.value("expression", "");
+
+  if (!t.value("exists", false)) {
+    Step s;
+    s.kind = in.kind_name;
+    s.action = Action::kConflict;
+    s.why = qualified + " does not exist";
+    plan.conflicts.push_back(s.why);
+    out.push_back(std::move(s));
+    return;
+  }
+
+  Step add;
+  add.kind = in.kind_name;
+  add.txn_class = TxnClass::kRequired;
+  add.own_transaction = true;
+  add.lock = "ShareRowExclusiveLock, briefly; NOT VALID means no scan";
+  add.sql.push_back("ALTER TABLE " + qualified + " ADD CONSTRAINT " + name +
+                    " CHECK (" + expression + ") NOT VALID;");
+  add.why = "step 1 of 2: NOT VALID costs no scan, so the strong lock is held "
+            "for the catalog change only";
+  add.detail["constraint"] = name;
+  out.push_back(std::move(add));
+
+  Step validate;
+  validate.kind = in.kind_name;
+  validate.txn_class = TxnClass::kRequired;
+  validate.own_transaction = true;
+  validate.lock = "ShareUpdateExclusiveLock -- does NOT block reads or writes";
+  validate.sql.push_back("ALTER TABLE " + qualified + " VALIDATE CONSTRAINT " +
+                         name + ";");
+  validate.why = "step 2 of 2: the scan, under a lock the application can work "
+                 "through. Its own transaction, or step 1's lock would span it";
+  validate.detail["constraint"] = name;
+  out.push_back(std::move(validate));
 }
 
 // --- drop_index ------------------------------------------------------------
@@ -1163,6 +1356,8 @@ inline Plan plan_migration(const Spec& spec, const Observations& obs,
       case IntentKind::kDropIndex:   plan_drop_index(in, projected, plan, emitted); break;
       case IntentKind::kSetNotNull:  plan_set_not_null(in, projected, plan, emitted); break;
       case IntentKind::kAddForeignKey: plan_add_foreign_key(in, projected, plan, emitted); break;
+      case IntentKind::kAddCheckConstraint:
+        plan_add_check_constraint(in, projected, plan, emitted); break;
     }
     if (!emitted.empty()) project(in, emitted.front(), projected);
 

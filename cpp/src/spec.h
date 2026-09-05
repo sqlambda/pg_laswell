@@ -33,7 +33,7 @@ namespace pglaswell {
 inline constexpr int kSpecVersion = 1;
 
 enum class IntentKind { kAddColumn, kBackfill, kCreateIndex, kDropIndex,
-                        kSetNotNull, kAddForeignKey };
+                        kSetNotNull, kAddForeignKey, kAddCheckConstraint };
 
 inline const std::map<std::string, IntentKind>& intent_kinds() {
   static const std::map<std::string, IntentKind> kKinds = {
@@ -43,6 +43,7 @@ inline const std::map<std::string, IntentKind>& intent_kinds() {
       {"drop_index", IntentKind::kDropIndex},
       {"set_not_null", IntentKind::kSetNotNull},
       {"add_foreign_key", IntentKind::kAddForeignKey},
+      {"add_check_constraint", IntentKind::kAddCheckConstraint},
   };
   return kKinds;
 }
@@ -371,6 +372,16 @@ inline void parse_add_foreign_key(Intent& in) {
   }
 }
 
+inline void parse_add_check_constraint(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(in.body,
+                              {"kind", "schema", "table", "name", "expression"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "name", at), "name", in.ordinal);
+  (void)detail::require_string(in.body, "expression", at);
+}
+
 // Parses and validates a spec document. Throws SpecError, whose hint names the
 // exact thing to change.
 inline Spec parse_spec(const json& doc) {
@@ -486,6 +497,7 @@ inline Spec parse_spec(const json& doc) {
       case IntentKind::kDropIndex:   parse_drop_index(in);   break;
       case IntentKind::kSetNotNull:  parse_set_not_null(in); break;
       case IntentKind::kAddForeignKey: parse_add_foreign_key(in); break;
+      case IntentKind::kAddCheckConstraint: parse_add_check_constraint(in); break;
     }
     s.intents.push_back(std::move(in));
     ++ordinal;

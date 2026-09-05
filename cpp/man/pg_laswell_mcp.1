@@ -326,9 +326,10 @@ This build implements
 .Cm backfill ,
 .Cm create_index ,
 .Cm drop_index ,
-.Cm set_not_null
+.Cm set_not_null ,
+.Cm add_foreign_key
 and
-.Cm add_foreign_key .
+.Cm add_check_constraint .
 .Pp
 An intent that creates an object must carry a
 .Va comment ,
@@ -358,6 +359,17 @@ predicate that must select zero rows when the backfill is complete.
 An unfiltered backfill is refused; write
 .Ql true
 to mean it.
+.Pp
+.Va assert_invariants
+is a list of named scalar queries, evaluated on the worker connection before
+the first batch and again after the last.
+Both readings are recorded, and a difference fails the step naming the
+invariant and both values.
+This asks a different question from
+.Va verify_remaining :
+that one asks whether the work finished, this one asks whether the work broke
+something it should not have.
+A backfill can fill every row and still halve a total.
 .Pp
 .Sy Naming convention .
 Expressions in
@@ -453,6 +465,34 @@ on the parent, so a statement naming one table locks two, and the table nobody
 mentioned is often the busier one.
 It warns when no index leads with the referencing column, because without one
 every parent update or delete scans the child.
+.Pp
+.Cm add_check_constraint
+takes the same two-step shape as a foreign key, for the same measured reason.
+.Pp
+.Cm create_index
+on a
+.Em partitioned
+table is a recipe rather than a statement, because
+.Ic CREATE INDEX CONCURRENTLY
+is refused outright on a partitioned parent.
+It builds concurrently on each partition, creates the parent index with
+.Ic ON ONLY
+.Pq ShareLock on a relation holding no data, so no scan ,
+attaches each child, and then checks validity: the parent index stays
+.Va indisvalid
+false until the last attachment lands, and an index that exists, is invalid and
+is never used would otherwise pass silently.
+A unique index there is refused rather than planned, because PostgreSQL
+requires it to include the partition key and this planner does not read the
+partition key -- emitting a recipe whose final
+.Ic ATTACH
+would fail is worse than declining.
+.Pp
+A dry run cannot cover such a recipe: the concurrent builds cannot run inside a
+transaction block, so the attaches that follow have nothing to attach.
+Those steps are reported as
+.Em unverified ,
+never as wrong.
 .Sh SIGNING
 .Nm
 verifies; it never signs.
