@@ -63,7 +63,7 @@ option(BUILD_TESTING "Build the test suite" ON)
 if(BUILD_TESTING)
     enable_testing()
     find_package(GTest REQUIRED)
-    add_executable(pg_laswell_mcp_test src/test_main.cpp)
+    add_executable(pg_laswell_mcp_test src/test_main.cpp src/planner_purity_check.cpp)
     target_compile_definitions(pg_laswell_mcp_test PRIVATE
         PGLASWELL_VERSION="${PROJECT_VERSION}")
     target_link_libraries(pg_laswell_mcp_test PRIVATE

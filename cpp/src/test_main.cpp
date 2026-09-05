@@ -29,21 +29,13 @@
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
 
-#if defined(__GNUC__) && !defined(__clang__)
-// GCC-only false positive from std::variant inside pqxx headers; Clang does not
-// have this warning group at all, and with -Werror active an unguarded pragma
-// would hard-fail there on "unknown warning group".
-#  pragma GCC diagnostic push
-#  pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
-#endif
-#include <pqxx/pqxx>
-#if defined(__GNUC__) && !defined(__clang__)
-#  pragma GCC diagnostic pop
-#endif
-
 #include "canonical.h"
+#include "catalog.h"
 #include "config.h"
+#include "observations.h"
+#include "planner.h"
 #include "server.h"
+#include "session.h"
 #include "spec.h"
 #include "trust.h"
 
@@ -1043,18 +1035,49 @@ dbname = shop
   EXPECT_EQ(r.trust().keys.at("ed25519:1111111111111111").label, "daniel-dev");
 }
 
-TEST(Config, RefusesAGroupOrWorldWritableFile) {
-  // pg_licht refuses a group/world-READABLE config because it may hold a
-  // password. This one holds only public keys, so readability is fine -- but
-  // it holds POLICY, and a policy anyone can rewrite is not a policy.
-  const auto err = config_error("[a]\nhost = x\n", 0622);
-  EXPECT_NE(err.find("writable"), std::string::npos) << err;
-  EXPECT_NE(err.find("chmod go-w"), std::string::npos) << err;
+TEST(Config, RefusesAnyGroupOrWorldAccessibleFile) {
+  // Same rule as ~/.pgpass. The file holds credentials (so not readable) and
+  // it holds the trust policy (so not writable). 0077 covers both.
+  for (const mode_t mode : {mode_t(0644), mode_t(0622), mode_t(0604),
+                            mode_t(0640), mode_t(0660)}) {
+    const auto err = config_error("[a]\nhost = x\n", mode);
+    EXPECT_NE(err.find("group- or world-accessible"), std::string::npos)
+        << "mode " << std::oct << mode << ": " << err;
+    EXPECT_NE(err.find("chmod 600"), std::string::npos) << err;
+  }
+  TempIni ok("[a]\nhost = x\n", 0600);
+  EXPECT_NO_THROW(pglaswell::Registry::from_ini(ok.path(), "t"));
 }
 
-TEST(Config, AGroupReadableFileIsFineUnlikePgLicht) {
-  TempIni ini("[a]\nhost = x\n", 0644);
-  EXPECT_NO_THROW(pglaswell::Registry::from_ini(ini.path(), "t"));
+TEST(Config, CarriesCredentialsAndKeepsThePasswordOutOfTheEchoFields) {
+  // dbname/user/password belong here, as in any other migration tool. The
+  // password reaches libpq through the conninfo and is deliberately NOT copied
+  // into the struct's echo fields, so nothing that prints a ConnConfig for
+  // diagnostics can leak it.
+  TempIni ini(R"(
+[shop_prod]
+host     = db.internal
+port     = 5432
+dbname   = shop
+user     = laswell_runner
+password = s3cr3t p@ss
+)");
+  const auto r = pglaswell::Registry::from_ini(ini.path(), "t");
+  const auto& c = r.get("shop_prod");
+  EXPECT_EQ(c.dbname, "shop");
+  EXPECT_EQ(c.user, "laswell_runner");
+  EXPECT_NE(c.conninfo.find("password='s3cr3t p@ss'"), std::string::npos)
+      << c.conninfo;
+  // The echo fields carry no password field at all, by construction.
+  EXPECT_EQ(c.host, "db.internal");
+  EXPECT_EQ(c.port, "5432");
+}
+
+TEST(Config, AServiceEntryIsCarriedThroughForPgserviceUsers) {
+  TempIni ini("[prod]\nservice = shop-prod\n");
+  const auto r = pglaswell::Registry::from_ini(ini.path(), "t");
+  EXPECT_EQ(r.get("prod").service, "shop-prod");
+  EXPECT_NE(r.get("prod").conninfo.find("service=shop-prod"), std::string::npos);
 }
 
 TEST(Config, ErrorsNameTheFileAndLineAndTheOffendingKey) {
@@ -1171,8 +1194,847 @@ TEST(Config, FromUrlNeedsNoFileAndConnectsToNothing) {
 }
 
 TEST(Config, ConninfoValuesNeedingQuotingAreQuoted) {
-  TempIni ini("[a]\nhost = x\napplication_name_hint = a b\n");
+  TempIni ini("[a]\nhost = x\npassword = a b\n");
   const auto r = pglaswell::Registry::from_ini(ini.path(), "t");
   EXPECT_NE(r.get("a").conninfo.find("'a b'"), std::string::npos)
       << r.get("a").conninfo;
+}
+
+// --- sessions -------------------------------------------------------------
+
+TEST(ConnectionCache, HoldsOnlyIdleConnectionsSoTheReaperCannotRaceAUser) {
+  // The design's whole safety argument: take() erases, so an in-use
+  // connection is not in the map at all.
+  pglaswell::ConnectionCache cache(std::chrono::seconds(60));
+  EXPECT_EQ(cache.idle_count(), 0u);
+  EXPECT_EQ(cache.take("absent"), nullptr);
+}
+
+TEST_F(DatabaseTest, ReadSessionIsReadOnlyAndAlwaysRollsBack) {
+  pglaswell::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = url_;
+  pglaswell::ReadSession s(cfg);
+  EXPECT_GT(s.server_version(), 140000);
+  EXPECT_GT(s.backend_pid(), 0);
+  EXPECT_FALSE(s.in_recovery());
+
+  // A write must fail. libpqxx maps SQLSTATE 25006 (write in a read-only
+  // transaction) onto insufficient_privilege -- the SAME class it uses for a
+  // missing grant, and with an empty sqlstate() on that class. A writing tool
+  // must never report this shape as "you need a GRANT".
+  EXPECT_THROW(s.txn().exec("CREATE TEMP TABLE t_readonly_probe(i int)"),
+               pqxx::sql_error);
+}
+
+TEST_F(DatabaseTest, ReadSessionAppliesItsStatementTimeoutInOneRoundTrip) {
+  pglaswell::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = url_;
+  cfg.statement_timeout_ms = 250;
+  pglaswell::ReadSession s(cfg);
+  EXPECT_EQ(s.txn().exec("SELECT current_setting('statement_timeout')")[0][0]
+                .as<std::string>(),
+            "250ms");
+}
+
+TEST_F(DatabaseTest, ConnectionCacheReusesAConnectionBetweenSessions) {
+  pglaswell::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = url_;
+  pglaswell::ConnectionCache cache(std::chrono::seconds(60));
+  int first_pid = 0;
+  {
+    pglaswell::ReadSession s(cfg, std::nullopt, &cache);
+    first_pid = s.backend_pid();
+  }
+  EXPECT_EQ(cache.idle_count(), 1u);
+  {
+    pglaswell::ReadSession s(cfg, std::nullopt, &cache);
+    EXPECT_EQ(s.backend_pid(), first_pid) << "the cached connection was not reused";
+  }
+}
+
+TEST_F(DatabaseTest, WriteSessionCommitsOnlyWhenAsked) {
+  pglaswell::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = url_;
+  pglaswell::WriteSession w(cfg);
+
+  w.begin("pg_laswell/test/setup");
+  w.txn().exec("DROP TABLE IF EXISTS laswell_ws_probe");
+  w.txn().exec("CREATE TABLE laswell_ws_probe(i int)");
+  w.commit();
+
+  // Rolled back: the row must not survive.
+  w.begin("pg_laswell/test/rollback");
+  w.txn().exec("INSERT INTO laswell_ws_probe VALUES (1)");
+  w.rollback();
+
+  w.begin("pg_laswell/test/check");
+  EXPECT_EQ(w.txn().exec("SELECT count(*) FROM laswell_ws_probe")[0][0].as<int>(), 0);
+  w.commit();
+
+  // Committed: the row must survive.
+  w.begin("pg_laswell/test/commit");
+  w.txn().exec("INSERT INTO laswell_ws_probe VALUES (2)");
+  w.commit();
+
+  w.begin("pg_laswell/test/check2");
+  EXPECT_EQ(w.txn().exec("SELECT count(*) FROM laswell_ws_probe")[0][0].as<int>(), 1);
+  w.txn().exec("DROP TABLE laswell_ws_probe");
+  w.commit();
+}
+
+TEST_F(DatabaseTest, WriteSessionSetsLockTimeoutAndApplicationNameOnEveryTransaction) {
+  pglaswell::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = url_;
+  cfg.executor.lock_timeout_ms = 1234;
+  cfg.executor.commit_interval_ms = 1000;
+  pglaswell::WriteSession w(cfg);
+
+  w.begin("pg_laswell/job-abc/step-2");
+  const auto r = w.txn().exec(
+      "SELECT current_setting('lock_timeout'), current_setting('application_name'),"
+      "       current_setting('idle_in_transaction_session_timeout')");
+  EXPECT_EQ(r[0][0].as<std::string>(), "1234ms");
+  EXPECT_EQ(r[0][1].as<std::string>(), "pg_laswell/job-abc/step-2");
+  // A self-guard: if this process hangs, the server tears the transaction
+  // down rather than leaving it holding locks.
+  EXPECT_EQ(r[0][2].as<std::string>(), "3s");
+  w.commit();
+}
+
+TEST_F(DatabaseTest, WriteSessionRefusesToOpenTwoTransactionsAtOnce) {
+  pglaswell::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = url_;
+  pglaswell::WriteSession w(cfg);
+  w.begin("pg_laswell/test");
+  EXPECT_THROW(w.begin("pg_laswell/test"), std::runtime_error);
+  w.rollback();
+}
+
+TEST_F(DatabaseTest, ExecNontransactionalRefusesWhileATransactionIsOpen) {
+  // Otherwise the statement fails with "cannot run inside a transaction
+  // block", several layers away from the mistake.
+  pglaswell::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = url_;
+  pglaswell::WriteSession w(cfg);
+  w.begin("pg_laswell/test");
+  EXPECT_THROW(w.exec_nontransactional("SELECT 1"), std::runtime_error);
+  w.rollback();
+  EXPECT_NO_THROW(w.exec_nontransactional("SELECT 1"));
+}
+
+TEST_F(DatabaseTest, WithSessionSettingAppliesAndResetsEvenOnAnExceptionPath) {
+  // This is the CIC path: statement_timeout must be lifted for a build that
+  // legitimately runs for hours, and must not stay lifted afterwards.
+  pglaswell::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = url_;
+  pglaswell::WriteSession w(cfg);
+
+  const auto inside = w.with_session_setting("statement_timeout", "4321", [&] {
+    return w.exec_nontransactional("SELECT current_setting('statement_timeout')")[0][0]
+        .as<std::string>();
+  });
+  EXPECT_EQ(inside, "4321ms");
+  EXPECT_EQ(w.exec_nontransactional("SELECT current_setting('statement_timeout')")[0][0]
+                .as<std::string>(),
+            "0");
+
+  EXPECT_THROW(w.with_session_setting("statement_timeout", "4321",
+                                      [&]() -> int { throw std::runtime_error("boom"); }),
+               std::runtime_error);
+  EXPECT_EQ(w.exec_nontransactional("SELECT current_setting('statement_timeout')")[0][0]
+                .as<std::string>(),
+            "0")
+      << "the session setting leaked past an exception";
+}
+
+// --- the planner (pure: no server involved) -------------------------------
+
+namespace {
+
+// A fixed Observations literal. This is what makes plan determinism testable:
+// no catalog, no clock, no connection.
+pglaswell::Observations observations(long long size_bytes, long long rows,
+                                     int waiters = 0,
+                                     const char* kind = "table") {
+  pglaswell::Observations obs;
+  obs.server_version = 180006;
+  obs.server = json::parse(R"({
+    "max_connections": 100, "reserved_connections": 3,
+    "current_backends": 9, "active_backends": 1,
+    "ungranted_locks": 0, "is_in_recovery": false
+  })");
+  obs.tables["shop.orders"] = json{
+      {"exists", true},
+      {"kind", kind},
+      {"reltuples", rows},
+      {"size_estimate", size_bytes},
+      {"estimated_from", "2026-09-05T09:00:00Z"},
+      {"lock_waiters", waiters},
+      {"columns",
+       json{{"id", {{"type", "bigint"}, {"not_null", true}}},
+            {"warehouse_id", {{"type", "bigint"}, {"not_null", false}}},
+            {"created_at", {{"type", "timestamp with time zone"}, {"not_null", true}}},
+            {"fulfilment_region", {{"type", "text"}, {"not_null", false}}}}},
+      {"indexes",
+       json{{"orders_pkey",
+             {{"is_valid", true}, {"is_unique", true}, {"is_primary", true},
+              {"leading_column", "id"},
+              {"definition", "CREATE UNIQUE INDEX orders_pkey ON shop.orders USING btree (id)"}}}}}};
+  return obs;
+}
+
+pglaswell::Spec spec_with(const json& intents) {
+  json doc = minimal_spec();
+  doc["intents"] = intents;
+  return pglaswell::parse_spec(doc);
+}
+
+const pglaswell::Step* find_step(const pglaswell::Plan& p, const std::string& kind) {
+  for (const auto& s : p.steps) {
+    if (s.kind == kind) return &s;
+  }
+  return nullptr;
+}
+
+std::string all_sql(const pglaswell::Step& s) {
+  std::string out;
+  for (const auto& q : s.sql) out += q + "\n";
+  return out;
+}
+
+}  // namespace
+
+TEST(Planner, SameObservationsProduceAByteIdenticalPlan) {
+  // The determinism receipt. If this ever drifts, "the plan you were shown is
+  // the plan that ran" stops being checkable.
+  const auto spec = pglaswell::parse_spec(minimal_spec());
+  const pglaswell::ExecutorConfig cfg;
+  const auto obs = observations(2LL * 1024 * 1024 * 1024, 8100000);
+
+  const auto a = pglaswell::plan_migration(spec, obs, cfg);
+  const auto b = pglaswell::plan_migration(spec, obs, cfg);
+  EXPECT_EQ(a.to_json().dump(), b.to_json().dump());
+  EXPECT_EQ(a.digest(), b.digest());
+  EXPECT_FALSE(a.digest().empty());
+}
+
+TEST(Planner, ADifferentMeasurementProducesADifferentPlanDigest) {
+  const auto spec = pglaswell::parse_spec(minimal_spec());
+  const pglaswell::ExecutorConfig cfg;
+  const auto small = pglaswell::plan_migration(spec, observations(1024, 10), cfg);
+  const auto large =
+      pglaswell::plan_migration(spec, observations(2LL << 30, 8100000), cfg);
+  EXPECT_NE(small.digest(), large.digest());
+}
+
+TEST(Planner, ALargeTableChoosesAConcurrentIndexBuild) {
+  const auto spec = pglaswell::parse_spec(minimal_spec());
+  const auto plan = pglaswell::plan_migration(
+      spec, observations(2LL * 1024 * 1024 * 1024, 8100000), {});
+  const auto* s = find_step(plan, "create_index");
+  ASSERT_NE(s, nullptr);
+  EXPECT_EQ(s->txn_class, pglaswell::TxnClass::kForbidden);
+  EXPECT_NE(all_sql(*s).find("CREATE INDEX CONCURRENTLY"), std::string::npos);
+  EXPECT_NE(s->why.find("64 MiB ceiling"), std::string::npos) << s->why;
+}
+
+TEST(Planner, ASmallQuietTableChoosesAPlainIndexBuild) {
+  // CIC on a small table is machinery for nothing: two scans, a longer lock
+  // than the plain build would have taken, and a failure mode the plain path
+  // does not have.
+  const auto spec = pglaswell::parse_spec(minimal_spec());
+  const auto plan = pglaswell::plan_migration(spec, observations(1024 * 1024, 500), {});
+  const auto* s = find_step(plan, "create_index");
+  ASSERT_NE(s, nullptr);
+  EXPECT_EQ(s->txn_class, pglaswell::TxnClass::kOptional);
+  EXPECT_NE(all_sql(*s).find("CREATE INDEX orders_open_by_region_idx"),
+            std::string::npos);
+  EXPECT_EQ(all_sql(*s).find("CONCURRENTLY"), std::string::npos);
+  EXPECT_NE(s->lock.find("ShareLock"), std::string::npos);
+}
+
+TEST(Planner, ALockWaiterOnASmallTableForcesTheConcurrentPath) {
+  // The check that makes the size ceiling safe: a small table with something
+  // already queued on it is not a table to take ShareLock on.
+  const auto spec = pglaswell::parse_spec(minimal_spec());
+  const auto plan =
+      pglaswell::plan_migration(spec, observations(1024 * 1024, 500, /*waiters=*/1), {});
+  const auto* s = find_step(plan, "create_index");
+  ASSERT_NE(s, nullptr);
+  EXPECT_EQ(s->txn_class, pglaswell::TxnClass::kForbidden);
+  EXPECT_NE(s->why.find("lock waiters"), std::string::npos) << s->why;
+}
+
+TEST(Planner, EveryConcurrentBuildGainsAValidityCheck) {
+  // A CIC can return without error and leave an invalid index. Reporting it
+  // as succeeded because the statement returned is the failure that looks
+  // like a success (spike S5).
+  const auto spec = pglaswell::parse_spec(minimal_spec());
+  const auto plan = pglaswell::plan_migration(spec, observations(2LL << 30, 8100000), {});
+  ASSERT_NE(find_step(plan, "verify_index_valid"), nullptr)
+      << "a concurrent build with no validity check";
+  EXPECT_EQ(find_step(plan, "create_index")->detail.value("must_verify_valid", false),
+            true);
+}
+
+TEST(Planner, APlainBuildNeedsNoValidityCheck) {
+  const auto spec = pglaswell::parse_spec(minimal_spec());
+  const auto plan = pglaswell::plan_migration(spec, observations(1024, 10), {});
+  EXPECT_EQ(find_step(plan, "verify_index_valid"), nullptr);
+}
+
+TEST(Planner, AnInvalidIndexIsDroppedConcurrentlyBeforeRebuilding) {
+  // Never a plain DROP INDEX: that takes AccessExclusiveLock, which is exactly
+  // what CIC was chosen to avoid, and would turn a retry into the outage the
+  // original build prevented.
+  auto obs = observations(2LL << 30, 8100000);
+  obs.tables["shop.orders"]["indexes"]["orders_open_by_region_idx"] =
+      json{{"is_valid", false}, {"is_unique", false},
+           {"definition", "CREATE INDEX ..."}, {"leading_column", "fulfilment_region"}};
+  const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(minimal_spec()), obs, {});
+  const auto* s = find_step(plan, "create_index");
+  ASSERT_NE(s, nullptr);
+  const auto sql = all_sql(*s);
+  EXPECT_NE(sql.find("DROP INDEX CONCURRENTLY"), std::string::npos) << sql;
+  EXPECT_EQ(sql.find("\nDROP INDEX orders"), std::string::npos) << "plain DROP: " << sql;
+  EXPECT_EQ(s->detail.value("recovering_invalid_index", false), true);
+}
+
+TEST(Planner, AValidIndexOfTheSameNameIsSatisfiedNotRebuilt) {
+  auto obs = observations(2LL << 30, 8100000);
+  obs.tables["shop.orders"]["indexes"]["orders_open_by_region_idx"] =
+      json{{"is_valid", true}, {"is_unique", false},
+           {"definition", "CREATE INDEX ..."}, {"leading_column", "fulfilment_region"}};
+  const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(minimal_spec()), obs, {});
+  const auto* s = find_step(plan, "create_index");
+  ASSERT_NE(s, nullptr);
+  // "satisfied" is a success recorded with its justification, not a skip.
+  EXPECT_EQ(s->action, pglaswell::Action::kSatisfied);
+  EXPECT_TRUE(plan.ok);
+  EXPECT_NE(s->why.find("already present and valid"), std::string::npos);
+}
+
+TEST(Planner, APartitionedTableRefusesTheConcurrentBuildWithARecipe) {
+  // Measured on 18.6: CREATE INDEX CONCURRENTLY is refused outright there.
+  const auto plan = pglaswell::plan_migration(
+      pglaswell::parse_spec(minimal_spec()),
+      observations(2LL << 30, 8100000, 0, "partitioned_table"), {});
+  EXPECT_FALSE(plan.ok);
+  ASSERT_FALSE(plan.conflicts.empty());
+  bool mentions_recipe = false;
+  for (const auto& c : plan.conflicts) {
+    if (c.find("ATTACH PARTITION") != std::string::npos) mentions_recipe = true;
+  }
+  EXPECT_TRUE(mentions_recipe) << "the refusal must name the alternative";
+}
+
+TEST(Planner, AnExistingCompatibleColumnIsSatisfied) {
+  const auto plan = pglaswell::plan_migration(
+      pglaswell::parse_spec(minimal_spec()), observations(1024, 10), {});
+  const auto* s = find_step(plan, "add_column");
+  ASSERT_NE(s, nullptr);
+  EXPECT_EQ(s->action, pglaswell::Action::kSatisfied);
+}
+
+TEST(Planner, AnIncompatibleColumnTypeIsAConflictAndNothingRuns) {
+  auto obs = observations(1024, 10);
+  obs.tables["shop.orders"]["columns"]["fulfilment_region"] =
+      json{{"type", "integer"}, {"not_null", false}};
+  const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(minimal_spec()), obs, {});
+  EXPECT_FALSE(plan.ok);
+  ASSERT_FALSE(plan.conflicts.empty());
+  EXPECT_NE(plan.conflicts[0].find("exists as integer"), std::string::npos)
+      << plan.conflicts[0];
+}
+
+TEST(Planner, AddColumnIsPlannedWhenTheColumnIsAbsent) {
+  auto obs = observations(1024, 10);
+  obs.tables["shop.orders"]["columns"].erase("fulfilment_region");
+  const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(minimal_spec()), obs, {});
+  const auto* s = find_step(plan, "add_column");
+  ASSERT_NE(s, nullptr);
+  EXPECT_EQ(s->action, pglaswell::Action::kApply);
+  EXPECT_NE(all_sql(*s).find("ALTER TABLE shop.orders ADD COLUMN fulfilment_region text"),
+            std::string::npos);
+  // The COMMENT rides in the same transaction group as the ALTER.
+  EXPECT_NE(all_sql(*s).find("COMMENT ON COLUMN"), std::string::npos);
+  EXPECT_EQ(s->txn_class, pglaswell::TxnClass::kRequired);
+}
+
+TEST(Planner, NotNullWithNoDefaultIsRefusedWithTheThreeStepAlternative) {
+  auto obs = observations(1024, 10);
+  obs.tables["shop.orders"]["columns"].erase("fulfilment_region");
+  const auto spec = spec_with(json::array({json::parse(R"({
+      "kind":"add_column","schema":"shop","table":"orders","column":"fulfilment_region",
+      "type":"text","nullable":false,"comment":"c"})")}));
+  const auto plan = pglaswell::plan_migration(spec, obs, {});
+  EXPECT_FALSE(plan.ok);
+  EXPECT_NE(plan.conflicts[0].find("backfill it, then set NOT NULL"), std::string::npos)
+      << plan.conflicts[0];
+}
+
+TEST(Planner, BackfillWithoutAUniqueKeyIsRefusedNamingTheIndexNeeded) {
+  auto obs = observations(1024, 10);
+  obs.tables["shop.orders"]["indexes"] = json::object();  // no unique index on id
+  const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(minimal_spec()), obs, {});
+  EXPECT_FALSE(plan.ok);
+  bool names_the_fix = false;
+  for (const auto& c : plan.conflicts) {
+    if (c.find("CREATE UNIQUE INDEX CONCURRENTLY") != std::string::npos) {
+      names_the_fix = true;
+    }
+  }
+  EXPECT_TRUE(names_the_fix) << "the refusal must name the index to create";
+}
+
+TEST(Planner, TheBackfillBatchUsesForUpdateWithoutSkipLocked) {
+  // SKIP LOCKED would silently skip contended rows while the cursor advanced
+  // past them, leaving a backfill that reports complete and is not.
+  const auto plan = pglaswell::plan_migration(
+      pglaswell::parse_spec(minimal_spec()), observations(1LL << 30, 8100000), {});
+  const auto* s = find_step(plan, "backfill");
+  ASSERT_NE(s, nullptr);
+  const auto sql = all_sql(*s);
+  EXPECT_NE(sql.find("FOR UPDATE"), std::string::npos) << sql;
+  EXPECT_EQ(sql.find("SKIP LOCKED"), std::string::npos)
+      << "SKIP LOCKED would make the cursor lie: " << sql;
+  EXPECT_NE(sql.find("ORDER BY t.id"), std::string::npos) << sql;
+  EXPECT_NE(sql.find("t.id > $1"), std::string::npos) << sql;
+  EXPECT_EQ(s->txn_class, pglaswell::TxnClass::kOwnTxnPerBatch);
+}
+
+TEST(Planner, BackfillOnAHugeTableWithoutAPartialIndexWarnsButProceeds) {
+  const auto plan = pglaswell::plan_migration(
+      pglaswell::parse_spec(minimal_spec()), observations(1LL << 30, 8100000), {});
+  EXPECT_TRUE(plan.ok);
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("no partial index") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned) << "each batch may rescan; that should be said";
+}
+
+TEST(Planner, TransactionGroupsBreakAtEveryNonAtomicStep) {
+  // The rendered boundary is exactly where atomicity ends, which is what a
+  // reader needs to see before approving a plan.
+  auto obs = observations(2LL << 30, 8100000);
+  obs.tables["shop.orders"]["columns"].erase("fulfilment_region");
+  const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(minimal_spec()), obs, {});
+  ASSERT_GE(plan.steps.size(), 3u);
+  const auto* add = find_step(plan, "add_column");
+  const auto* back = find_step(plan, "backfill");
+  const auto* idx = find_step(plan, "create_index");
+  ASSERT_NE(add, nullptr);
+  ASSERT_NE(back, nullptr);
+  ASSERT_NE(idx, nullptr);
+  EXPECT_LT(add->txn_group, back->txn_group) << "a paced backfill must start a new group";
+  EXPECT_LT(back->txn_group, idx->txn_group) << "CIC must start a new group";
+}
+
+TEST(Planner, TheRenderedPlanNamesTheAtomicityBoundaries) {
+  auto obs = observations(2LL << 30, 8100000);
+  obs.tables["shop.orders"]["columns"].erase("fulfilment_region");
+  const auto text =
+      pglaswell::plan_migration(pglaswell::parse_spec(minimal_spec()), obs, {}).render();
+  EXPECT_NE(text.find("NOT atomic: paced, many commits"), std::string::npos) << text;
+  EXPECT_NE(text.find("NOT atomic: cannot run inside a transaction block"),
+            std::string::npos)
+      << text;
+  EXPECT_NE(text.find("why:"), std::string::npos) << text;
+}
+
+TEST(Planner, ARefusedPlanRendersAsRefusedAndRunsNothing) {
+  auto obs = observations(1024, 10);
+  obs.tables["shop.orders"]["columns"]["fulfilment_region"] = json{{"type", "integer"}};
+  const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(minimal_spec()), obs, {});
+  EXPECT_FALSE(plan.ok);
+  EXPECT_NE(plan.render().find("REFUSED. Nothing will run."), std::string::npos);
+}
+
+TEST(Planner, RefusesToPlanAgainstAStandby) {
+  auto obs = observations(1024, 10);
+  obs.server["is_in_recovery"] = true;
+  const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(minimal_spec()), obs, {});
+  EXPECT_FALSE(plan.ok);
+  EXPECT_NE(plan.conflicts[0].find("standby"), std::string::npos);
+}
+
+TEST(Planner, RefusesWhenTheServerIsOlderThanTheSpecRequires) {
+  auto obs = observations(1024, 10);
+  obs.server_version = 140000;
+  const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(minimal_spec()), obs, {});
+  EXPECT_FALSE(plan.ok);
+  EXPECT_NE(plan.conflicts[0].find("150000"), std::string::npos);
+}
+
+TEST(Planner, TheBudgetSaysWhoseCeilingItIsMeasuring) {
+  // max_connections is the SERVER's ceiling. The application usually collapses
+  // at its own pool limit first, and that is invisible from here -- so an
+  // unconfigured budget must say so rather than imply a precision it lacks.
+  const auto spec = pglaswell::parse_spec(minimal_spec());
+  const auto unconfigured = pglaswell::plan_migration(spec, observations(1024, 10), {});
+  EXPECT_EQ(unconfigured.budget["headroomSource"], "max_connections");
+  EXPECT_TRUE(unconfigured.budget.contains("caveat"));
+  EXPECT_EQ(unconfigured.budget["effectiveHeadroom"], 88);  // 100 - 3 - 9
+
+  pglaswell::ExecutorConfig cfg;
+  cfg.app_pool_size = 20;
+  const auto configured = pglaswell::plan_migration(spec, observations(1024, 10), cfg);
+  EXPECT_EQ(configured.budget["headroomSource"], "app_pool_size");
+  EXPECT_EQ(configured.budget["effectiveHeadroom"], 20);
+  EXPECT_FALSE(configured.budget.contains("caveat"));
+}
+
+TEST(Planner, ExecutorTuningReachesTheBackfillStep) {
+  pglaswell::ExecutorConfig cfg;
+  cfg.batch_rows = 50;
+  cfg.commit_interval_ms = 100;
+  cfg.observer_tick_ms = 25;
+  const auto plan = pglaswell::plan_migration(
+      pglaswell::parse_spec(minimal_spec()), observations(1LL << 30, 8100000), cfg);
+  const auto* s = find_step(plan, "backfill");
+  ASSERT_NE(s, nullptr);
+  EXPECT_EQ(s->detail["batch_rows"], 50);
+  EXPECT_EQ(s->detail["commit_interval_ms"], 100);
+  EXPECT_NE(s->why.find("50 rows per batch"), std::string::npos) << s->why;
+}
+
+TEST(Planner, AnIntentIsPlannedAgainstTheStateItsPredecessorsWillLeave) {
+  // The commonest spec there is: add a column, then backfill it. The backfill
+  // must be planned against the catalog as step 0 will leave it, not as it is
+  // now -- otherwise the plan refuses its own first step's work.
+  auto obs = observations(1LL << 30, 8100000);
+  obs.tables["shop.orders"]["columns"].erase("fulfilment_region");
+
+  const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(minimal_spec()), obs, {});
+  EXPECT_TRUE(plan.ok) << (plan.conflicts.empty() ? "" : plan.conflicts[0]);
+
+  const auto* add = find_step(plan, "add_column");
+  const auto* back = find_step(plan, "backfill");
+  ASSERT_NE(add, nullptr);
+  ASSERT_NE(back, nullptr);
+  EXPECT_EQ(add->action, pglaswell::Action::kApply);
+  EXPECT_EQ(back->action, pglaswell::Action::kApply);
+}
+
+TEST(Planner, ProjectionDoesNotHideAGenuinelyMissingColumn) {
+  // The projection must not become a way for a backfill to reference anything
+  // it likes: only what an earlier intent actually adds.
+  auto obs = observations(1LL << 30, 8100000);
+  obs.tables["shop.orders"]["columns"].erase("fulfilment_region");
+  auto doc = minimal_spec();
+  doc["intents"][1]["set"] = json{{"nonexistent_column", "1"}};
+  const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(doc), obs, {});
+  EXPECT_FALSE(plan.ok);
+  EXPECT_NE(plan.conflicts[0].find("nonexistent_column"), std::string::npos)
+      << plan.conflicts[0];
+}
+
+TEST(Planner, ProjectionOnlyAppliesToStepsThatWillActuallyRun) {
+  // A conflicted or satisfied step must not project. If add_column conflicts,
+  // the backfill that depends on it must conflict too rather than being
+  // planned against a column that will never exist.
+  auto obs = observations(1LL << 30, 8100000);
+  obs.tables["shop.orders"]["columns"]["fulfilment_region"] =
+      json{{"type", "integer"}, {"not_null", false}};  // incompatible -> conflict
+  const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(minimal_spec()), obs, {});
+  EXPECT_FALSE(plan.ok);
+}
+
+TEST(Planner, AnIndexCreatedByAnEarlierIntentCanSupportALaterBackfillKey) {
+  // The projection covers indexes too: a unique index built in step 0 makes
+  // the keyset walk in step 1 admissible.
+  auto obs = observations(1LL << 30, 8100000);
+  obs.tables["shop.orders"]["indexes"] = json::object();  // no unique index at all
+
+  const auto spec = spec_with(json::array({
+      json::parse(R"({"kind":"create_index","schema":"shop","table":"orders",
+                      "name":"orders_id_uq","columns":["id"],"unique":true,
+                      "comment":"keyset support"})"),
+      json::parse(R"({"kind":"backfill","schema":"shop","table":"orders","key":"id",
+                      "set":{"fulfilment_region":"'x'"},"where":"fulfilment_region IS NULL"})")}));
+
+  const auto plan = pglaswell::plan_migration(spec, obs, {});
+  EXPECT_TRUE(plan.ok) << (plan.conflicts.empty() ? "" : plan.conflicts[0]);
+  const auto* back = find_step(plan, "backfill");
+  ASSERT_NE(back, nullptr);
+  EXPECT_EQ(back->detail.value("supporting_index", ""), "orders_id_uq");
+}
+
+TEST(Planner, TheRenderedPlanIsStableAcrossRuns) {
+  // render() feeds a human's approval decision; it must not reorder or
+  // reword itself between two calls on the same inputs.
+  auto obs = observations(2LL << 30, 8100000);
+  obs.tables["shop.orders"]["columns"].erase("fulfilment_region");
+  const auto spec = pglaswell::parse_spec(minimal_spec());
+  EXPECT_EQ(pglaswell::plan_migration(spec, obs, {}).render(),
+            pglaswell::plan_migration(spec, obs, {}).render());
+}
+
+// --- catalog: observation against a live server ---------------------------
+
+TEST_F(DatabaseTest, ObservesStructureSizeAndLockStateOfARealTable) {
+  pglaswell::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = url_;
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/catalog-fixture");
+    w.txn().exec("DROP TABLE IF EXISTS laswell_obs CASCADE");
+    w.txn().exec(
+        "CREATE TABLE laswell_obs("
+        "  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"
+        "  region text,"
+        "  created_at timestamptz NOT NULL DEFAULT now())");
+    w.txn().exec("INSERT INTO laswell_obs(region) "
+                 "SELECT 'r'||(g%5) FROM generate_series(1,500) g");
+    w.commit();
+  }
+
+  pglaswell::Catalog cat(cfg);
+  const auto obs = cat.observe({"public"}, {"laswell_obs"});
+  ASSERT_TRUE(obs.has_table("public.laswell_obs")) << obs.tables.dump();
+  const auto& t = obs.table("public.laswell_obs");
+  EXPECT_EQ(t["kind"], "table");
+  EXPECT_TRUE(t["columns"].contains("region"));
+  EXPECT_EQ(t["columns"]["created_at"]["not_null"], true);
+  EXPECT_EQ(t["columns"]["region"]["type"], "text");
+  EXPECT_EQ(t["columns"]["id"]["type"], "bigint");
+  // The primary key is the unique index a keyset backfill needs.
+  EXPECT_EQ(t["indexes"]["laswell_obs_pkey"]["is_unique"], true);
+  EXPECT_EQ(t["indexes"]["laswell_obs_pkey"]["leading_column"], "id");
+  EXPECT_EQ(t["lock_waiters"], 0);
+  EXPECT_GT(obs.server["max_connections"].get<int>(), 0);
+  EXPECT_EQ(obs.server["is_in_recovery"], false);
+  EXPECT_GT(obs.server_version, 140000);
+
+  // A table that does not exist is an absence, not an error.
+  const auto missing = cat.observe({"public"}, {"laswell_no_such_table"});
+  EXPECT_FALSE(missing.has_table("public.laswell_no_such_table"));
+
+  pglaswell::WriteSession w(cfg);
+  w.begin("pg_laswell/test/cleanup");
+  w.txn().exec("DROP TABLE laswell_obs");
+  w.commit();
+}
+
+TEST_F(DatabaseTest, SizeEscalationIsSeparateFromObservationBecauseItTakesALock) {
+  pglaswell::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = url_;
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/size-fixture");
+    w.txn().exec("DROP TABLE IF EXISTS laswell_size");
+    w.txn().exec("CREATE TABLE laswell_size(id int primary key, pad text)");
+    w.txn().exec("INSERT INTO laswell_size SELECT g, repeat('x',200) "
+                 "FROM generate_series(1,2000) g");
+    w.txn().exec("ANALYZE laswell_size");
+    w.commit();
+  }
+
+  pglaswell::Catalog cat(cfg);
+  auto obs = cat.observe({"public"}, {"laswell_size"});
+  // observe() takes no AccessShareLock on the heap for sizing: it reads
+  // relpages only.
+  EXPECT_TRUE(obs.table("public.laswell_size").contains("size_estimate"));
+  EXPECT_FALSE(obs.table("public.laswell_size").contains("size_measured"));
+
+  cat.escalate_size(obs, "public", "laswell_size");
+  EXPECT_TRUE(obs.table("public.laswell_size").contains("size_measured"));
+  EXPECT_GT(obs.table("public.laswell_size")["size_measured"].get<long long>(), 0);
+
+  pglaswell::WriteSession w(cfg);
+  w.begin("pg_laswell/test/cleanup");
+  w.txn().exec("DROP TABLE laswell_size");
+  w.commit();
+}
+
+TEST_F(DatabaseTest, ObservationSeesALockWaiterAppear) {
+  // The reading the index rule depends on: a table with something already
+  // queued on it must not be built plainly, whatever its size.
+  //
+  // The holder takes RowExclusiveLock (an ordinary write) rather than
+  // AccessExclusiveLock, deliberately: AccessExclusive would also block the
+  // observation itself, which is a different behaviour covered by the next
+  // test. RowExclusive is compatible with the AccessShareLock that
+  // pg_get_indexdef() needs, so observation stays free to report.
+  pglaswell::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = url_;
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/waiter-fixture");
+    w.txn().exec("DROP TABLE IF EXISTS laswell_waiters");
+    w.txn().exec("CREATE TABLE laswell_waiters(id int primary key)");
+    w.txn().exec("INSERT INTO laswell_waiters SELECT generate_series(1,10)");
+    w.commit();
+  }
+
+  pglaswell::Catalog cat(cfg);
+  EXPECT_EQ(cat.observe({"public"}, {"laswell_waiters"})
+                .table("public.laswell_waiters")["lock_waiters"],
+            0);
+
+  // Hold RowExclusiveLock on a plain connection, so no idle-in-transaction
+  // timeout can release it underneath the test.
+  pqxx::connection holder(url_);
+  pqxx::work holder_txn(holder);
+  holder_txn.exec("UPDATE laswell_waiters SET id = id WHERE id = 1");
+
+  std::atomic<bool> victim_blocked{false};
+  std::thread victim([&] {
+    try {
+      pqxx::connection c(url_);
+      pqxx::work tx(c);
+      victim_blocked = true;
+      tx.exec("LOCK TABLE laswell_waiters IN SHARE MODE");  // conflicts, waits
+      tx.commit();
+    } catch (...) {
+    }
+  });
+
+  int seen = 0;
+  for (int i = 0; i < 120 && seen == 0; ++i) {
+    seen = cat.observe({"public"}, {"laswell_waiters"})
+               .table("public.laswell_waiters")
+               .value("lock_waiters", 0);
+    if (seen == 0) std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  }
+  holder_txn.abort();
+  victim.join();
+
+  EXPECT_TRUE(victim_blocked.load());
+  if (seen == 0) {
+    GTEST_SKIP() << "the queued lock request was never observed; on a loaded "
+                    "machine the waiter can come and go between polls";
+  }
+  EXPECT_GT(seen, 0);
+
+  pglaswell::WriteSession w(cfg);
+  w.begin("pg_laswell/test/cleanup");
+  w.txn().exec("DROP TABLE laswell_waiters");
+  w.commit();
+}
+
+TEST_F(DatabaseTest, ObservationUnderAStrongLockReportsRatherThanHangs) {
+  // pg_get_indexdef() opens the index relation and so takes AccessShareLock.
+  // Measured 2026-09-05 on 18.6: it blocks outright behind AccessExclusiveLock,
+  // while plain pg_class/pg_index/pg_attribute reads and format_type() do not.
+  //
+  // Without a bound, observing a table mid-ALTER would hang for the length of
+  // the ALTER -- the planner's own measurement blocking on the thing it is
+  // planning around. That is the hazard already documented for pg_table_size(),
+  // and this is the same hazard arriving through a different door.
+  pglaswell::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = url_;
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/strong-lock-fixture");
+    w.txn().exec("DROP TABLE IF EXISTS laswell_strong");
+    w.txn().exec("CREATE TABLE laswell_strong(id int primary key, x text)");
+    w.txn().exec("CREATE INDEX laswell_strong_x ON laswell_strong(x)");
+    w.commit();
+  }
+
+  pqxx::connection holder(url_);
+  pqxx::work holder_txn(holder);
+  holder_txn.exec("LOCK TABLE laswell_strong IN ACCESS EXCLUSIVE MODE");
+
+  const auto started = std::chrono::steady_clock::now();
+  pglaswell::Catalog cat(cfg);
+  const auto obs = cat.observe({"public"}, {"laswell_strong"});
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+
+  const auto& t = obs.table("public.laswell_strong");
+  EXPECT_TRUE(t.value("observation_blocked", false))
+      << "observation should report the lock, not read through it: " << t.dump();
+  EXPECT_NE(t.value("blocked_reason", "").find("currentLocks"), std::string::npos)
+      << "the reason should point at the tool that names the blocker";
+  EXPECT_LT(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count(), 10)
+      << "observation hung instead of timing out";
+
+  // And the planner refuses outright rather than planning on a blind reading.
+  const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(minimal_spec()),
+                                              obs, {});
+  auto doc = minimal_spec();
+  for (auto& i : doc["intents"]) i["table"] = "laswell_strong";
+  const auto plan2 = pglaswell::plan_migration(
+      pglaswell::parse_spec(doc),
+      [&] {
+        auto o = obs;
+        o.tables["shop.laswell_strong"] = t;
+        return o;
+      }(),
+      {});
+  EXPECT_FALSE(plan2.ok);
+
+  holder_txn.abort();
+  pglaswell::WriteSession w(cfg);
+  w.begin("pg_laswell/test/cleanup");
+  w.txn().exec("DROP TABLE laswell_strong");
+  w.commit();
+  (void)plan;
+}
+
+TEST_F(DatabaseTest, PlanningEndToEndAgainstARealCatalog) {
+  // Observation and planning joined up: the plan for a real, small, quiet
+  // table must choose the plain build, and must not run anything.
+  pglaswell::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = url_;
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/e2e-fixture");
+    w.txn().exec("DROP TABLE IF EXISTS orders CASCADE");
+    w.txn().exec("DROP SCHEMA IF EXISTS shop CASCADE");
+    w.txn().exec("CREATE SCHEMA shop");
+    w.txn().exec(
+        "CREATE TABLE shop.orders("
+        "  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"
+        "  warehouse_id bigint,"
+        "  status text NOT NULL DEFAULT 'open',"
+        "  created_at timestamptz NOT NULL DEFAULT now())");
+    w.txn().exec("CREATE TABLE shop.warehouse(id bigint PRIMARY KEY, region text)");
+    w.txn().exec("INSERT INTO shop.orders(warehouse_id) "
+                 "SELECT (g%5)+1 FROM generate_series(1,200) g");
+    w.commit();
+  }
+
+  pglaswell::Catalog cat(cfg);
+  const auto spec = pglaswell::parse_spec(minimal_spec());
+  const auto obs = cat.observe({"shop", "shop"}, {"orders", "warehouse"});
+  const auto plan = pglaswell::plan_migration(spec, obs, {});
+
+  ASSERT_TRUE(plan.ok) << plan.render();
+  // fulfilment_region does not exist yet -> planned; the backfill that
+  // follows is planned against the projected column.
+  EXPECT_EQ(find_step(plan, "add_column")->action, pglaswell::Action::kApply);
+  EXPECT_EQ(find_step(plan, "backfill")->action, pglaswell::Action::kApply);
+  // 200 rows, nothing waiting -> the plain build is correct here.
+  EXPECT_EQ(find_step(plan, "create_index")->txn_class, pglaswell::TxnClass::kOptional);
+
+  // Planning ran nothing.
+  pglaswell::ReadSession r(cfg);
+  EXPECT_EQ(r.txn()
+                .exec("SELECT count(*) FROM information_schema.columns "
+                      "WHERE table_schema='shop' AND table_name='orders' "
+                      "AND column_name='fulfilment_region'")[0][0]
+                .as<int>(),
+            0)
+      << "planMigration must never execute";
+
+  pglaswell::WriteSession w(cfg);
+  w.begin("pg_laswell/test/cleanup");
+  w.txn().exec("DROP SCHEMA shop CASCADE");
+  w.commit();
 }

@@ -36,5 +36,16 @@ First skeleton. Nothing is applied to a database yet.
 - `spec.h` — change intents, not desired state. Top-level keys are an
   allowlist, so a key outside the signed projection cannot be smuggled past
   verification. An unknown intent kind refuses the whole spec.
+- `session.h` — `ReadSession` (read-only, always rolls back) and `WriteSession`,
+  its writing counterpart. Every write transaction carries `lock_timeout` and
+  `idle_in_transaction_session_timeout`, and re-reads `pg_backend_pid()` so a
+  multiplexed connection aborts the job at the moment it is multiplexed.
+- `catalog.h` — observation, bounded by `lock_timeout`. `pg_get_indexdef()`
+  takes AccessShareLock and blocks behind an `ALTER TABLE`; without a bound the
+  planner's own measurement would hang on the thing it is planning around.
+  A blocked observation is reported as a fact, and the planner refuses.
+- `planner.h` — pure, and `planner_purity_check.cpp` fails the build if pqxx
+  ever reaches it. Each intent is planned against the catalog as its
+  predecessors will leave it, so "add a column, then backfill it" works.
 - `cpp/test/spikes/` — the Phase 0 experiments that settled the design against
   PostgreSQL 18.6. Four of them changed it.

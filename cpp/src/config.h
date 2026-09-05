@@ -387,21 +387,27 @@ class Registry {
   const ExecutorConfig& executor() const { return executor_; }
 
  private:
-  // pg_licht refuses a group/world-READABLE config file, because that file may
-  // hold a password. This one holds only public keys, so readability is fine.
-  // What it holds instead is POLICY, and a policy anyone can rewrite is not a
-  // policy -- so the check here is on WRITABILITY. Copying pg_licht's check
-  // verbatim would be wrong in a way nobody would notice.
+  // Same rule as ~/.pgpass, and for both of the reasons this file carries.
+  //
+  // It holds CREDENTIALS: dbname, user and password, like any other migration
+  // tool's configuration, so it must not be readable by anyone else. It also
+  // holds POLICY -- which signing keys this machine will accept -- and a policy
+  // anyone can rewrite is not a policy, so it must not be writable either.
+  //
+  // Checking 0077 covers both: it refuses any group or other permission at all.
+  // An earlier version checked only 0022, on the mistaken belief that this file
+  // held nothing secret. That was wrong, and it was wrong in the quiet
+  // direction -- a world-readable password would have passed.
   void check_permissions(const std::string& path) const {
     struct stat st {};
     if (::stat(path.c_str(), &st) != 0) {
       throw std::runtime_error("cannot stat config file " + path);
     }
-    if ((st.st_mode & static_cast<mode_t>(0022)) != 0) {
+    if ((st.st_mode & static_cast<mode_t>(0077)) != 0) {
       throw std::runtime_error(
           "config file " + path +
-          " is group- or world-writable; it declares which signing keys are "
-          "trusted. Run: chmod go-w " + path);
+          " is group- or world-accessible; it may hold a password, and it "
+          "declares which signing keys are trusted. Run: chmod 600 " + path);
     }
   }
 
