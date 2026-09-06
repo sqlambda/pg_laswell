@@ -303,6 +303,13 @@ inline json compute_budget(const Observations& obs, const ExecutorConfig& cfg) {
 inline void plan_partitioned_index(const Intent& in, const json& t, Plan& plan,
                                    std::vector<Step>& out, Step& parent_step);
 
+// Likewise: add_primary_key and set_identity both COMPOSE with the NOT NULL
+// recipe rather than restating it, because PostgreSQL refuses both over a
+// nullable column and the recipe does that scan under a lock the application
+// survives. One definition, so the two can never drift apart.
+inline void plan_set_not_null(const Intent& in, const Observations& obs,
+                              Plan& plan, std::vector<Step>& out);
+
 inline void plan_add_column(const Intent& in, const Observations& obs, Plan& plan,
                             std::vector<Step>& out) {
   Step step;
@@ -606,6 +613,15 @@ inline void project(const Intent& in, const Step& step, Observations& projected)
     case IntentKind::kDropNotNull:
       projected.tables[qualified]["columns"][in.body.value("column", "")]["not_null"] = false;
       return;
+    case IntentKind::kSetIdentity:
+    case IntentKind::kDropExpression:
+    case IntentKind::kSetColumnOptions:
+    case IntentKind::kSetTableOptions:
+    case IntentKind::kSetLogged:
+    case IntentKind::kSetTablespace:
+    case IntentKind::kSetAccessMethod:
+    case IntentKind::kSetReplicaIdentity:
+    case IntentKind::kClusterOn:
     case IntentKind::kAlterColumnDefault:
     case IntentKind::kAlterSequence:
     case IntentKind::kAlterSchema:
@@ -1639,6 +1655,292 @@ inline void warn_about_rebuild(
 }
 
 }  // namespace detail
+
+// --- identity, generated columns, storage and physical layout --------------
+//
+// Measured by relfilenode on 300 000 rows (spike S20, 18.6). Three of these
+// rewrite the table and the rest are catalog-only, and predicting that is the
+// entire job of this batch:
+//
+//   SET UNLOGGED / SET LOGGED       REWRITE -- and SET LOGGED writes the whole
+//                                   table to WAL as it goes
+//   ALTER COLUMN SET EXPRESSION     REWRITE
+//   identity add/drop, DROP EXPRESSION, SET STATISTICS / STORAGE /
+//   COMPRESSION, storage parameters, REPLICA IDENTITY   no rewrite
+inline void plan_physical(const Intent& in, const Observations& obs, Plan& plan,
+                          std::vector<Step>& out) {
+  const auto qualified = in.qualified_table();
+  const auto& t = obs.table(qualified);
+  const auto column = in.body.value("column", "");
+  const long long size = t.value("size_estimate", 0LL);
+
+  auto emit = [&](std::vector<std::string> sql, const std::string& lock,
+                  const std::string& why, bool own = false) {
+    Step s;
+    s.kind = in.kind_name;
+    s.txn_class = TxnClass::kRequired;
+    s.sql = std::move(sql);
+    s.lock = lock;
+    s.why = why;
+    s.own_transaction = own;
+    out.push_back(std::move(s));
+  };
+  auto refuse = [&](const std::string& why, const std::string& detail) {
+    Step s;
+    s.kind = in.kind_name;
+    s.action = Action::kConflict;
+    s.why = why;
+    plan.conflicts.push_back(detail);
+    out.push_back(std::move(s));
+  };
+
+  if (!t.value("exists", false)) {
+    refuse(qualified + " does not exist", qualified + " does not exist");
+    return;
+  }
+  const json columns = t.value("columns", json::object());
+  if (!column.empty() && !columns.contains(column)) {
+    refuse(qualified + "." + column + " does not exist",
+           qualified + "." + column + " does not exist");
+    return;
+  }
+
+  switch (in.kind) {
+    case IntentKind::kSetIdentity: {
+      const bool adding = in.body.contains("identity");
+      if (adding) {
+        // Measured: PostgreSQL refuses outright unless the column is already
+        // NOT NULL -- "must be declared NOT NULL before identity can be added".
+        // The set_not_null recipe does that scan under a lock the application
+        // survives, so it is run first rather than letting the author discover
+        // the prerequisite from an error.
+        if (!columns[column].value("not_null", false)) {
+          Intent nn;
+          nn.kind = IntentKind::kSetNotNull;
+          nn.kind_name = "set_not_null";
+          nn.ordinal = in.ordinal;
+          nn.body = json{{"schema", in.body.value("schema", "")},
+                         {"table", in.body.value("table", "")},
+                         {"column", column}};
+          plan_set_not_null(nn, obs, plan, out);
+          plan.warnings.push_back(
+              qualified + "." + column +
+              " must be NOT NULL before an identity can be added -- measured, "
+              "PostgreSQL refuses otherwise. The plan runs the NOT VALID check "
+              "recipe first, which does that scan under "
+              "ShareUpdateExclusiveLock instead of blocking the table.");
+        }
+        emit({"ALTER TABLE " + qualified + " ALTER COLUMN " +
+              detail::quote_identifier(column) + " ADD GENERATED " +
+              in.body.value("identity", "") + " AS IDENTITY;"},
+             "AccessExclusiveLock on " + qualified + ", but no rewrite",
+             "measured: relfilenode unchanged, so this is catalog-only plus a "
+             "sequence, whatever the table's size",
+             /*own=*/true);
+        if (in.body.value("identity", "") == "BY DEFAULT") {
+          plan.warnings.push_back(
+              "BY DEFAULT lets a caller supply the value, so inserts that pass "
+              "one do not advance the sequence -- which is how a sequence ends "
+              "up behind its column and every later insert collides. ALWAYS "
+              "refuses such a value.");
+        }
+        // A new identity starts at 1 regardless of what is already there.
+        plan.warnings.push_back(
+            "the identity sequence starts from 1, not from the largest value "
+            "already in " + qualified + "." + column +
+            ". If the column holds data, follow this with an alter_sequence "
+            "restart above the maximum, or the first insert collides.");
+      } else {
+        emit({"ALTER TABLE " + qualified + " ALTER COLUMN " +
+              detail::quote_identifier(column) + " DROP IDENTITY;"},
+             "AccessExclusiveLock on " + qualified + ", no rewrite",
+             "measured: catalog-only. The backing sequence goes with it");
+      }
+      return;
+    }
+
+    case IntentKind::kDropExpression:
+      emit({"ALTER TABLE " + qualified + " ALTER COLUMN " +
+            detail::quote_identifier(column) + " DROP EXPRESSION;"},
+           "AccessExclusiveLock on " + qualified + ", no rewrite",
+           "measured: catalog-only. The values already computed stay in the "
+           "table and simply stop being maintained");
+      plan.warnings.push_back(
+          qualified + "." + column +
+          " keeps the values it has but stops being recomputed, so it becomes "
+          "an ordinary column that silently drifts from whatever it was derived "
+          "from. Nothing will report the drift.");
+      return;
+
+    case IntentKind::kSetColumnOptions: {
+      std::vector<std::string> sql;
+      const std::string head = "ALTER TABLE " + qualified + " ALTER COLUMN " +
+                               detail::quote_identifier(column) + " SET ";
+      if (in.body.contains("statistics")) {
+        sql.push_back(head + "STATISTICS " +
+                      std::to_string(in.body.value("statistics", 100)) + ";");
+      }
+      if (in.body.contains("storage")) {
+        sql.push_back(head + "STORAGE " + in.body.value("storage", "") + ";");
+      }
+      if (in.body.contains("compression")) {
+        sql.push_back(head + "COMPRESSION " + in.body.value("compression", "") + ";");
+      }
+      emit(std::move(sql), "AccessExclusiveLock on " + qualified + ", no rewrite",
+           "measured: all three are catalog-only");
+      if (in.body.contains("storage") || in.body.contains("compression")) {
+        plan.warnings.push_back(
+            "storage and compression apply to values written AFTER this "
+            "commits. Everything already in " + qualified +
+            " keeps its current representation indefinitely, so the setting "
+            "and the table disagree until the rows are rewritten -- which "
+            "nothing here does.");
+      }
+      if (in.body.contains("statistics")) {
+        plan.warnings.push_back(
+            "a new statistics target does nothing until the column is analysed. "
+            "Run ANALYZE afterwards, outside this migration: it is maintenance, "
+            "and not something this tool schedules.");
+      }
+      return;
+    }
+
+    case IntentKind::kSetTableOptions: {
+      std::vector<std::string> sql;
+      const json options = in.body.value("options", json::object());
+      if (!options.empty()) {
+        std::vector<std::string> pairs;
+        for (const auto& [k, v] : options.items()) {
+          pairs.push_back(k + " = " + (v.is_string() ? v.get<std::string>() : v.dump()));
+        }
+        sql.push_back("ALTER TABLE " + qualified + " SET (" +
+                      detail::join(pairs, ", ") + ");");
+      }
+      if (in.body.contains("reset")) {
+        std::vector<std::string> names;
+        for (const auto& r : in.body["reset"]) names.push_back(r.get<std::string>());
+        sql.push_back("ALTER TABLE " + qualified + " RESET (" +
+                      detail::join(names, ", ") + ");");
+      }
+      emit(std::move(sql), "AccessExclusiveLock on " + qualified + ", no rewrite",
+           "measured: setting a storage parameter such as fillfactor is "
+           "catalog-only; it changes how FUTURE writes lay out pages and "
+           "reorganises nothing already there");
+      return;
+    }
+
+    case IntentKind::kSetLogged: {
+      const bool logged = in.body.value("logged", true);
+      emit({"ALTER TABLE " + qualified + (logged ? " SET LOGGED;" : " SET UNLOGGED;")},
+           "AccessExclusiveLock on " + qualified + " for the whole rewrite",
+           std::string("measured: this REWRITES the table -- relfilenode "
+                       "changes in both directions -- so ") +
+               detail::human_bytes(size) +
+               " is copied under an exclusive lock" +
+               (logged ? ", and every byte of it is written to WAL as it goes"
+                       : ""),
+           /*own=*/true);
+      if (!logged) {
+        plan.warnings.push_back(
+            "UNLOGGED means " + qualified +
+            " is not written to WAL: it is not replicated to any standby, it is "
+            "not in any physical backup taken from one, and its contents are "
+            "TRUNCATED after a crash. That is a durability decision, not a "
+            "performance setting.");
+      } else {
+        plan.warnings.push_back(
+            "SET LOGGED writes the entire table to WAL as it rewrites it, so a "
+            "replica must receive " + detail::human_bytes(size) +
+            " of WAL and archiving must absorb it. On a large table that is "
+            "the dominant cost, and it lands on the replication link rather "
+            "than on this connection.");
+      }
+      return;
+    }
+
+    case IntentKind::kSetTablespace:
+      emit({"ALTER TABLE " + qualified + " SET TABLESPACE " +
+            detail::quote_identifier(in.body.value("tablespace", "")) + ";"},
+           "AccessExclusiveLock on " + qualified + " for the whole move",
+           "moving a table copies every page to the new location under an "
+           "exclusive lock: " + detail::human_bytes(size) + " to write",
+           /*own=*/true);
+      plan.warnings.push_back(
+          "the move needs " + detail::human_bytes(size) +
+          " free in the destination tablespace WHILE the source still holds "
+          "it -- both at once, since the old files are removed only at commit. "
+          "pg_laswell cannot see either filesystem's free space; that is a "
+          "check to make before starting, not one it can make for you.");
+      return;
+
+    case IntentKind::kSetAccessMethod:
+      emit({"ALTER TABLE " + qualified + " SET ACCESS METHOD " +
+            detail::quote_identifier(in.body.value("method", "")) + ";"},
+           "AccessExclusiveLock on " + qualified + " for the whole rewrite",
+           "changing access method rewrites the table in the new method's "
+           "format: " + detail::human_bytes(size) + " under an exclusive lock",
+           /*own=*/true);
+      plan.warnings.push_back(
+          "measured only for a no-op change (heap to heap, which does not "
+          "rewrite). A real change of access method does rewrite, and this plan "
+          "assumes it will rather than claiming a measurement it does not have.");
+      return;
+
+    case IntentKind::kSetReplicaIdentity: {
+      const auto form = in.body.value("identity", "DEFAULT");
+      std::string sql = "ALTER TABLE " + qualified + " REPLICA IDENTITY " + form;
+      if (form == "USING INDEX") {
+        sql += " " + detail::quote_identifier(in.body.value("index", ""));
+      }
+      emit({sql + ";"}, "AccessExclusiveLock on " + qualified + ", no rewrite",
+           "measured: catalog-only whatever the table's size");
+      // This is the quietest dangerous change in the tool: nothing local
+      // changes at all, and a subscriber starts behaving differently.
+      if (form == "NOTHING") {
+        plan.warnings.push_back(
+            "REPLICA IDENTITY NOTHING means UPDATE and DELETE on " + qualified +
+            " are replicated with no way to identify the row, so a logical "
+            "subscriber cannot apply them -- it errors, or with "
+            "publish_via_partition_root it silently diverges. Nothing on THIS "
+            "server will report it.");
+      } else if (form == "FULL") {
+        plan.warnings.push_back(
+            "REPLICA IDENTITY FULL puts every column of the old row into WAL "
+            "for each UPDATE and DELETE, and a subscriber matches rows by "
+            "scanning. It is correct and it is expensive on both sides, "
+            "proportionally to the row's width.");
+      } else {
+        plan.warnings.push_back(
+            "replica identity decides what logical replication can identify a "
+            "row by. Changing it changes what subscribers receive, with no "
+            "error and nothing visible on this server -- check the subscriber, "
+            "not this database.");
+      }
+      return;
+    }
+
+    case IntentKind::kClusterOn: {
+      const bool setting = in.body.contains("index");
+      emit({"ALTER TABLE " + qualified +
+            (setting ? " CLUSTER ON " +
+                           detail::quote_identifier(in.body.value("index", "")) + ";"
+                     : " SET WITHOUT CLUSTER;")},
+           "AccessExclusiveLock on " + qualified + ", no rewrite",
+           "this only RECORDS which index a future CLUSTER would use; it does "
+           "not reorder anything now");
+      if (setting) {
+        plan.warnings.push_back(
+            "CLUSTER ON reorders nothing by itself -- it marks the index for a "
+            "later CLUSTER command, which is maintenance and is not a "
+            "migration this tool runs. Nothing about " + qualified +
+            "'s physical order changes at this commit.");
+      }
+      return;
+    }
+
+    default: break;
+  }
+}
 
 // --- the ALTER forms for objects we can already create ---------------------
 //
@@ -3573,11 +3875,6 @@ inline void plan_detach_partition(const Intent& in, const Observations& obs,
 // lock: 75ms on 2M rows nullable versus 0.6ms already NOT NULL. So a primary
 // key over a nullable column runs the set_not_null recipe first -- which exists
 // precisely to do that scan under a lock that does not block the application.
-// Declared here and defined below: add_primary_key COMPOSES with the NOT NULL
-// recipe rather than restating it, so the two can never drift apart.
-inline void plan_set_not_null(const Intent& in, const Observations& obs,
-                              Plan& plan, std::vector<Step>& out);
-
 inline void plan_unique_like(const Intent& in, const Observations& obs,
                              Plan& plan, std::vector<Step>& out) {
   const bool primary = in.kind == IntentKind::kAddPrimaryKey;
@@ -4590,6 +4887,16 @@ inline Plan plan_migration(const Spec& spec, const Observations& obs,
         plan_drop_table(in, projected, plan, emitted); break;
       case IntentKind::kDeleteRows:
         plan_delete_rows(in, projected, cfg, plan, emitted); break;
+      case IntentKind::kSetIdentity:
+      case IntentKind::kDropExpression:
+      case IntentKind::kSetColumnOptions:
+      case IntentKind::kSetTableOptions:
+      case IntentKind::kSetLogged:
+      case IntentKind::kSetTablespace:
+      case IntentKind::kSetAccessMethod:
+      case IntentKind::kSetReplicaIdentity:
+      case IntentKind::kClusterOn:
+        plan_physical(in, projected, plan, emitted); break;
       case IntentKind::kAlterColumnDefault:
       case IntentKind::kDropNotNull:
       case IntentKind::kAlterSequence:

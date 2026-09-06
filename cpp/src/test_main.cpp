@@ -930,7 +930,22 @@ TEST(Spec, KnownKindsAreExactlyTheImplementedKinds) {
     "set_comment": {"kind":"set_comment","object_type":"TABLE","schema":"s",
                     "name":"t","comment":"d"},
     "set_owner": {"kind":"set_owner","object_type":"TABLE","schema":"s",
-                  "name":"t","owner":"app"}
+                  "name":"t","owner":"app"},
+    "set_identity": {"kind":"set_identity","schema":"s","table":"t",
+                     "column":"c","identity":"ALWAYS"},
+    "drop_expression": {"kind":"drop_expression","schema":"s","table":"t","column":"c"},
+    "set_column_options": {"kind":"set_column_options","schema":"s","table":"t",
+                           "column":"c","statistics":500},
+    "set_table_options": {"kind":"set_table_options","schema":"s","table":"t",
+                          "options":{"fillfactor":70}},
+    "set_logged": {"kind":"set_logged","schema":"s","table":"t","logged":false},
+    "set_tablespace": {"kind":"set_tablespace","schema":"s","table":"t",
+                       "tablespace":"fast"},
+    "set_access_method": {"kind":"set_access_method","schema":"s","table":"t",
+                          "method":"heap"},
+    "set_replica_identity": {"kind":"set_replica_identity","schema":"s",
+                             "table":"t","identity":"FULL"},
+    "cluster_on": {"kind":"cluster_on","schema":"s","table":"t","index":"i"}
   })JSON");
   for (const auto& [name, kind] : pglaswell::intent_kinds()) {
     (void)kind;
@@ -7011,6 +7026,95 @@ TEST_F(DatabaseTest, TheAlterKindsRunAndTheDomainRecipeDefersItsScan) {
   w.commit();
 }
 
+TEST_F(DatabaseTest, ThePhysicalKindsRunAndTheRewritesReallyRewrite) {
+  // The batch's claim is a relfilenode claim, so it is checked as one: the
+  // forms called catalog-only must leave it alone and the ones called rewrites
+  // must change it.
+  pglaswell::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = url_;
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/phys");
+    w.txn().exec("DROP TABLE IF EXISTS lw_phys CASCADE");
+    w.txn().exec("CREATE TABLE lw_phys(id bigint NOT NULL, note text)");
+    w.txn().exec("INSERT INTO lw_phys SELECT g, 'x'||g"
+                 " FROM generate_series(1,2000) g");
+    w.commit();
+  }
+
+  pglaswell::Catalog cat(cfg);
+  auto apply_and_watch = [&](const json& intent) {
+    const auto obs = cat.observe({"public"}, {"lw_phys"});
+    json doc = minimal_spec();
+    doc["intents"] = json::array({intent});
+    const auto plan =
+        pglaswell::plan_migration(pglaswell::parse_spec(doc), obs, {});
+    EXPECT_TRUE(plan.ok) << plan.render();
+    long long before = 0, after = 0;
+    {
+      pglaswell::ReadSession r(cfg);
+      before = r.txn().exec("SELECT relfilenode FROM pg_class"
+                            " WHERE oid='lw_phys'::regclass")[0][0].as<long long>();
+    }
+    for (const auto& step : plan.steps) {
+      for (const auto& q : step.sql) {
+        const std::string stmt = q;
+        pglaswell::WriteSession w(cfg);
+        w.begin("pg_laswell/test/phys-apply");
+        w.txn().exec(stmt.substr(0, stmt.size() - 1));
+        w.commit();
+      }
+    }
+    {
+      pglaswell::ReadSession r(cfg);
+      after = r.txn().exec("SELECT relfilenode FROM pg_class"
+                           " WHERE oid='lw_phys'::regclass")[0][0].as<long long>();
+    }
+    return before != after;
+  };
+
+  // Catalog-only, by the plan's own claim.
+  EXPECT_FALSE(apply_and_watch(json{{"kind", "set_column_options"},
+                                    {"schema", "public"}, {"table", "lw_phys"},
+                                    {"column", "note"}, {"statistics", 500}}));
+  EXPECT_FALSE(apply_and_watch(json{{"kind", "set_table_options"},
+                                    {"schema", "public"}, {"table", "lw_phys"},
+                                    {"options", json{{"fillfactor", 70}}}}));
+  EXPECT_FALSE(apply_and_watch(json{{"kind", "set_replica_identity"},
+                                    {"schema", "public"}, {"table", "lw_phys"},
+                                    {"identity", "FULL"}}));
+  EXPECT_FALSE(apply_and_watch(json{{"kind", "set_identity"},
+                                    {"schema", "public"}, {"table", "lw_phys"},
+                                    {"column", "id"}, {"identity", "BY DEFAULT"}}));
+
+  // And a rewrite really rewrites -- if this ever stops being true the plan is
+  // over-warning, which is its own kind of wrong.
+  EXPECT_TRUE(apply_and_watch(json{{"kind", "set_logged"},
+                                   {"schema", "public"}, {"table", "lw_phys"},
+                                   {"logged", false}}))
+      << "SET UNLOGGED was measured as a rewrite";
+
+  {
+    pglaswell::ReadSession r(cfg);
+    EXPECT_EQ(r.txn().exec("SELECT relpersistence::text FROM pg_class"
+                           " WHERE oid='lw_phys'::regclass")[0][0].as<std::string>(),
+              "u");
+    EXPECT_EQ(r.txn().exec("SELECT attidentity::text FROM pg_attribute"
+                           " WHERE attrelid='lw_phys'::regclass AND attname='id'")[0][0]
+                  .as<std::string>(), "d")
+        << "BY DEFAULT is recorded as 'd'";
+    EXPECT_EQ(r.txn().exec("SELECT relreplident::text FROM pg_class"
+                           " WHERE oid='lw_phys'::regclass")[0][0].as<std::string>(),
+              "f");
+  }
+
+  pglaswell::WriteSession w(cfg);
+  w.begin("pg_laswell/test/phys-cleanup");
+  w.txn().exec("DROP TABLE lw_phys");
+  w.commit();
+}
+
 TEST_F(DatabaseTest, ObjectDependantsMatchWhatPostgresqlRefusesToDrop) {
   // The safeguard these object kinds are built on. Measured (S18): PostgreSQL
   // refuses to drop a type, function or sequence anything uses, and names the
@@ -7762,5 +7866,185 @@ TEST(Planner, RestartingASequenceWarnsAboutCollidingWithExistingRows) {
     if (w.find("collide") != std::string::npos) warned = true;
   }
   EXPECT_TRUE(warned) << plan.render();
+}
+
+// --- identity, generated columns and physical layout -----------------------
+
+TEST(Planner, TheFormsThatRewriteSayTheBytesAndTheOnesThatDoNotSaySo) {
+  // Measured by relfilenode on 300 000 rows (S20). This is the batch's whole
+  // job: three of these copy the table and the rest are catalog-only, and the
+  // plan must not confuse them.
+  struct Case { json body; bool rewrites; };
+  const Case cases[] = {
+      {json{{"kind", "set_logged"}, {"schema", "shop"}, {"table", "orders"},
+            {"logged", false}}, true},
+      {json{{"kind", "set_logged"}, {"schema", "shop"}, {"table", "orders"},
+            {"logged", true}}, true},
+      {json{{"kind", "set_tablespace"}, {"schema", "shop"}, {"table", "orders"},
+            {"tablespace", "fast"}}, true},
+      {json{{"kind", "set_access_method"}, {"schema", "shop"}, {"table", "orders"},
+            {"method", "heap"}}, true},
+      {json{{"kind", "set_column_options"}, {"schema", "shop"}, {"table", "orders"},
+            {"column", "amount"}, {"statistics", 500}}, false},
+      {json{{"kind", "set_table_options"}, {"schema", "shop"}, {"table", "orders"},
+            {"options", json{{"fillfactor", 70}}}}, false},
+      {json{{"kind", "set_replica_identity"}, {"schema", "shop"},
+            {"table", "orders"}, {"identity", "FULL"}}, false},
+      {json{{"kind", "cluster_on"}, {"schema", "shop"}, {"table", "orders"},
+            {"index", "orders_pkey"}}, false},
+  };
+  for (const auto& c : cases) {
+    const auto plan =
+        pglaswell::plan_migration(spec_of(json::array({c.body})), obs_alter(), {});
+    ASSERT_TRUE(plan.ok) << plan.render();
+    const auto* step = only_step(plan, c.body["kind"].get<std::string>().c_str());
+    ASSERT_NE(step, nullptr);
+    if (c.rewrites) {
+      EXPECT_NE(step->why.find("rewrit") + step->why.find("copie") + 1, 0u)
+          << c.body.dump() << " must say it rewrites: " << step->why;
+      EXPECT_TRUE(step->own_transaction)
+          << c.body.dump() << " rewrites the table and must own its transaction";
+    } else {
+      EXPECT_NE(step->lock.find("no rewrite"), std::string::npos)
+          << c.body.dump() << " is catalog-only and should say so: " << step->lock;
+    }
+  }
+}
+
+TEST(Planner, SetLoggedSaysTheWalCostAndSetUnloggedSaysTheDurabilityCost) {
+  const auto off = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "set_logged"}, {"schema", "shop"},
+                                {"table", "orders"}, {"logged", false}}})),
+      obs_alter(), {});
+  bool durability = false;
+  for (const auto& w : off.warnings) {
+    if (w.find("TRUNCATED after a crash") != std::string::npos) durability = true;
+  }
+  EXPECT_TRUE(durability)
+      << "UNLOGGED is a durability decision, not a performance setting: "
+      << off.render();
+
+  const auto on = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "set_logged"}, {"schema", "shop"},
+                                {"table", "orders"}, {"logged", true}}})),
+      obs_alter(), {});
+  bool wal = false;
+  for (const auto& w : on.warnings) {
+    if (w.find("of WAL") != std::string::npos &&
+        w.find("replication link") != std::string::npos) wal = true;
+  }
+  EXPECT_TRUE(wal)
+      << "the cost lands on the replica, not on this connection: " << on.render();
+}
+
+TEST(Planner, AddingAnIdentitySetsNotNullFirstAndWarnsAboutTheStartValue) {
+  // Measured: PostgreSQL refuses outright over a nullable column. Same
+  // composition add_primary_key uses, and for the same reason.
+  auto obs = obs_alter();
+  obs.tables["shop.orders"]["columns"]["amount"]["not_null"] = false;
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "set_identity"}, {"schema", "shop"},
+                                {"table", "orders"}, {"column", "amount"},
+                                {"identity", "BY DEFAULT"}}})),
+      obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto nn = steps_of(plan, "set_not_null");
+  ASSERT_FALSE(nn.empty()) << "a nullable column cannot take an identity:\n"
+                           << plan.render();
+  const auto id = steps_of(plan, "set_identity");
+  ASSERT_EQ(id.size(), 1u);
+  EXPECT_LT(nn.back()->ordinal, id.front()->ordinal) << plan.render();
+
+  bool start = false, by_default = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("starts from 1") != std::string::npos) start = true;
+    if (w.find("behind its column") != std::string::npos) by_default = true;
+  }
+  EXPECT_TRUE(start)
+      << "an identity on a populated column collides on its first insert: "
+      << plan.render();
+  EXPECT_TRUE(by_default) << plan.render();
+
+  // Already NOT NULL costs nothing extra.
+  const auto quiet = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "set_identity"}, {"schema", "shop"},
+                                {"table", "orders"}, {"column", "amount"},
+                                {"identity", "ALWAYS"}}})),
+      obs_alter(), {});
+  EXPECT_TRUE(steps_of(quiet, "set_not_null").empty()) << quiet.render();
+}
+
+TEST(Planner, ReplicaIdentityIsTheQuietestDangerousChange) {
+  // Nothing local changes at all, and a subscriber starts behaving
+  // differently -- with no error on this server.
+  const auto nothing = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "set_replica_identity"}, {"schema", "shop"},
+                                {"table", "orders"}, {"identity", "NOTHING"}}})),
+      obs_alter(), {});
+  bool warned = false;
+  for (const auto& w : nothing.warnings) {
+    if (w.find("cannot apply them") != std::string::npos &&
+        w.find("Nothing on THIS server") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned) << nothing.render();
+
+  const auto full = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "set_replica_identity"}, {"schema", "shop"},
+                                {"table", "orders"}, {"identity", "FULL"}}})),
+      obs_alter(), {});
+  bool cost = false;
+  for (const auto& w : full.warnings) {
+    if (w.find("every column of the old row into WAL") != std::string::npos) cost = true;
+  }
+  EXPECT_TRUE(cost) << full.render();
+}
+
+TEST(Planner, SettingsThatOnlyAffectFutureWritesSayThatTheyDo) {
+  // The correctness surprise in this batch: storage and compression apply to
+  // values written afterwards, so the setting and the table disagree until the
+  // rows are rewritten -- and nothing here rewrites them.
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "set_column_options"}, {"schema", "shop"},
+                                {"table", "orders"}, {"column", "amount"},
+                                {"compression", "lz4"}}})),
+      obs_alter(), {});
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("written AFTER this") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned) << plan.render();
+
+  // And CLUSTER ON reorders nothing, which its name does not suggest.
+  const auto clus = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "cluster_on"}, {"schema", "shop"},
+                                {"table", "orders"}, {"index", "orders_pkey"}}})),
+      obs_alter(), {});
+  bool reorder = false;
+  for (const auto& w : clus.warnings) {
+    if (w.find("reorders nothing by itself") != std::string::npos) reorder = true;
+  }
+  EXPECT_TRUE(reorder) << clus.render();
+}
+
+TEST(Spec, PhysicalLayoutValuesAreCheckedNotPassedThrough) {
+  struct Case { json body; const char* expect; };
+  const Case cases[] = {
+      {json{{"kind", "set_identity"}, {"schema", "s"}, {"table", "t"},
+            {"column", "c"}, {"identity", "SOMETIMES"}}, "ALWAYS or BY DEFAULT"},
+      {json{{"kind", "set_column_options"}, {"schema", "s"}, {"table", "t"},
+            {"column", "c"}, {"storage", "HUGE"}}, "PLAIN, EXTERNAL"},
+      {json{{"kind", "set_column_options"}, {"schema", "s"}, {"table", "t"},
+            {"column", "c"}, {"compression", "zstd"}}, "pglz, lz4"},
+      {json{{"kind", "set_replica_identity"}, {"schema", "s"}, {"table", "t"},
+            {"identity", "SOME"}}, "DEFAULT, FULL, NOTHING"},
+      {json{{"kind", "set_logged"}, {"schema", "s"}, {"table", "t"}},
+       "stated as a boolean"},
+  };
+  for (const auto& c : cases) {
+    json doc = minimal_spec();
+    doc["intents"] = json::array({c.body});
+    EXPECT_NE(spec_error(doc).find(c.expect), std::string::npos)
+        << c.body.dump() << " -> " << spec_error(doc);
+  }
 }
 

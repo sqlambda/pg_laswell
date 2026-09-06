@@ -48,7 +48,10 @@ enum class IntentKind { kAddColumn, kBackfill, kCreateIndex, kDropIndex,
                         kDropView, kAlterColumnDefault, kDropNotNull,
                         kAlterSequence, kAlterSchema, kAlterExtension,
                         kAlterDomain, kAlterFunction, kAlterView,
-                        kAlterPolicy, kSetComment, kSetOwner };
+                        kAlterPolicy, kSetComment, kSetOwner,
+                        kSetIdentity, kDropExpression, kSetColumnOptions,
+                        kSetTableOptions, kSetLogged, kSetTablespace,
+                        kSetAccessMethod, kSetReplicaIdentity, kClusterOn };
 
 inline const std::map<std::string, IntentKind>& intent_kinds() {
   static const std::map<std::string, IntentKind> kKinds = {
@@ -104,6 +107,15 @@ inline const std::map<std::string, IntentKind>& intent_kinds() {
       {"alter_policy", IntentKind::kAlterPolicy},
       {"set_comment", IntentKind::kSetComment},
       {"set_owner", IntentKind::kSetOwner},
+      {"set_identity", IntentKind::kSetIdentity},
+      {"drop_expression", IntentKind::kDropExpression},
+      {"set_column_options", IntentKind::kSetColumnOptions},
+      {"set_table_options", IntentKind::kSetTableOptions},
+      {"set_logged", IntentKind::kSetLogged},
+      {"set_tablespace", IntentKind::kSetTablespace},
+      {"set_access_method", IntentKind::kSetAccessMethod},
+      {"set_replica_identity", IntentKind::kSetReplicaIdentity},
+      {"cluster_on", IntentKind::kClusterOn},
   };
   return kKinds;
 }
@@ -606,6 +618,136 @@ inline void parse_add_check_constraint(Intent& in) {
 // --- the non-relation object kinds -----------------------------------------
 
 // --- the ALTER forms for objects we can already create ---------------------
+
+// --- identity, generated columns, storage and physical layout --------------
+
+inline void parse_set_identity(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(in.body, {"kind", "schema", "table", "column", "identity"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "column", at), "column", in.ordinal);
+  // Absent means DROP IDENTITY. Present must be one of the two forms, upper
+  // case, because the value becomes DDL verbatim.
+  if (in.body.contains("identity")) {
+    const auto v = detail::require_string(in.body, "identity", at);
+    if (v != "ALWAYS" && v != "BY DEFAULT") {
+      detail::fail(at + ".identity must be ALWAYS or BY DEFAULT",
+                   "Omit the key entirely to DROP IDENTITY. ALWAYS refuses a "
+                   "caller-supplied value; BY DEFAULT accepts one, which is "
+                   "how a sequence gets out of step with its column.");
+    }
+  }
+}
+
+inline void parse_set_column_options(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(
+      in.body, {"kind", "schema", "table", "column", "statistics", "storage",
+                "compression"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "column", at), "column", in.ordinal);
+  if (in.body.contains("statistics") && !in.body["statistics"].is_number_integer()) {
+    detail::fail(at + ".statistics must be an integer", "");
+  }
+  static const std::set<std::string> kStorage = {"PLAIN", "EXTERNAL", "EXTENDED", "MAIN"};
+  if (in.body.contains("storage") &&
+      kStorage.count(in.body.value("storage", "")) == 0) {
+    detail::fail(at + ".storage must be PLAIN, EXTERNAL, EXTENDED or MAIN", "");
+  }
+  static const std::set<std::string> kComp = {"pglz", "lz4", "default"};
+  if (in.body.contains("compression") &&
+      kComp.count(in.body.value("compression", "")) == 0) {
+    detail::fail(at + ".compression must be pglz, lz4 or default",
+                 "lz4 needs a server built with it; the plan checks nothing "
+                 "here, PostgreSQL refuses at execution if it is unavailable.");
+  }
+  if (!in.body.contains("statistics") && !in.body.contains("storage") &&
+      !in.body.contains("compression")) {
+    detail::fail(at + " changes nothing", "Give statistics, storage or compression.");
+  }
+}
+
+inline void parse_set_table_options(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(in.body, {"kind", "schema", "table", "options", "reset"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
+  if (in.body.contains("options") && !in.body["options"].is_object()) {
+    detail::fail(at + ".options must be an object of name to value", "");
+  }
+  const json options = in.body.value("options", json::object());
+  for (const auto& [k, v] : options.items()) {
+    detail::require_identifier(k, "options", in.ordinal);
+    if (!v.is_string() && !v.is_number()) {
+      detail::fail(at + ".options." + k + " must be a string or a number", "");
+    }
+  }
+  if (in.body.contains("reset")) {
+    if (!in.body["reset"].is_array()) detail::fail(at + ".reset must be an array", "");
+    for (const auto& r : in.body["reset"]) {
+      detail::require_identifier(r.get<std::string>(), "reset", in.ordinal);
+    }
+  }
+  if (!in.body.contains("options") && !in.body.contains("reset")) {
+    detail::fail(at + " changes nothing", "Give options or reset.");
+  }
+}
+
+inline void parse_set_logged(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(in.body, {"kind", "schema", "table", "logged"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
+  if (!in.body.contains("logged") || !in.body["logged"].is_boolean()) {
+    detail::fail(at + ".logged must be stated as a boolean",
+                 "There is no default: UNLOGGED discards durability and "
+                 "replication for the table, and both directions rewrite it.");
+  }
+}
+
+inline void parse_set_tablespace(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(in.body, {"kind", "schema", "table", "tablespace"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "tablespace", at),
+                             "tablespace", in.ordinal);
+}
+
+inline void parse_set_access_method(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(in.body, {"kind", "schema", "table", "method"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "method", at), "method", in.ordinal);
+}
+
+inline void parse_set_replica_identity(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(in.body, {"kind", "schema", "table", "identity", "index"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
+  static const std::set<std::string> kForms = {"DEFAULT", "FULL", "NOTHING", "USING INDEX"};
+  const auto v = detail::require_string(in.body, "identity", at);
+  if (kForms.count(v) == 0) {
+    detail::fail(at + ".identity must be DEFAULT, FULL, NOTHING or USING INDEX", "");
+  }
+  if (v == "USING INDEX") {
+    detail::require_identifier(detail::require_string(in.body, "index", at), "index", in.ordinal);
+  }
+}
+
+inline void parse_cluster_on(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(in.body, {"kind", "schema", "table", "index"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
+  if (in.body.contains("index")) {
+    detail::require_identifier(in.body.value("index", ""), "index", in.ordinal);
+  }
+}
 
 inline void parse_alter_column_default(Intent& in) {
   const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
@@ -1458,6 +1600,15 @@ inline Spec parse_spec(const json& doc) {
     case IntentKind::kAlterPolicy: parse_alter_policy(in); break;
     case IntentKind::kSetComment: parse_set_comment(in); break;
     case IntentKind::kSetOwner: parse_set_owner(in); break;
+    case IntentKind::kSetIdentity: parse_set_identity(in); break;
+    case IntentKind::kDropExpression: parse_drop_not_null(in); break;
+    case IntentKind::kSetColumnOptions: parse_set_column_options(in); break;
+    case IntentKind::kSetTableOptions: parse_set_table_options(in); break;
+    case IntentKind::kSetLogged: parse_set_logged(in); break;
+    case IntentKind::kSetTablespace: parse_set_tablespace(in); break;
+    case IntentKind::kSetAccessMethod: parse_set_access_method(in); break;
+    case IntentKind::kSetReplicaIdentity: parse_set_replica_identity(in); break;
+    case IntentKind::kClusterOn: parse_cluster_on(in); break;
     }
     s.intents.push_back(std::move(in));
     ++ordinal;

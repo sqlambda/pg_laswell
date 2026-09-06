@@ -3,7 +3,7 @@
 ## 0.1.0 (unreleased)
 
 The whole path works: repository, signing, planning, dry run, paced execution,
-ledger. 307 tests green on GCC 14.2 and Clang 22, under AddressSanitizer/UBSan
+ledger. 313 tests green on GCC 14.2 and Clang 22, under AddressSanitizer/UBSan
 and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
 `--call` contract test.
 
@@ -207,6 +207,25 @@ and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
   one rewrites. `text`→`varchar(200)` rewrites; `varchar(50)`→`text` does not.
   Anything unproven is reported as a rewrite, because a cautious plan costs
   less than an unplanned outage.
+- **Identity, generated columns and physical layout** — `set_identity`,
+  `drop_expression`, `set_column_options`, `set_table_options`, `set_logged`,
+  `set_tablespace`, `set_access_method`, `set_replica_identity`, `cluster_on`.
+  62 kinds; `ALTER TABLE` goes from 14 of 52 actions to **33**.
+  Measured by relfilenode on 300 000 rows, because predicting the rewrite is
+  the entire job: **`SET LOGGED`, `SET UNLOGGED` and `SET EXPRESSION` rewrite**;
+  identity add/drop, `SET STATISTICS`/`STORAGE`/`COMPRESSION`, storage
+  parameters and `REPLICA IDENTITY` do not. `SET LOGGED` additionally writes
+  the whole table to WAL — a cost that lands on the replication link, not this
+  connection.
+  Two prerequisites the spike found by failing: an identity needs the column
+  `NOT NULL` first, so the plan runs the `set_not_null` recipe (the same
+  composition `add_primary_key` uses); and `SET EXPRESSION` only applies to an
+  already-generated column.
+  The quiet ones are named too: `REPLICA IDENTITY NOTHING` leaves a logical
+  subscriber unable to apply updates with **no error on this server**; storage
+  and compression apply only to values written afterwards; `CLUSTER ON`
+  reorders nothing; a new identity starts at 1 regardless of what is in the
+  column.
 - **The ALTER forms for objects that could only be created or dropped** —
   `alter_column_default`, `drop_not_null`, `alter_sequence`, `alter_schema`,
   `alter_extension`, `alter_domain`, `alter_function`, `alter_view`,
