@@ -3,7 +3,7 @@
 ## 0.1.0 (unreleased)
 
 The whole path works: repository, signing, planning, dry run, paced execution,
-ledger. 329 tests green on GCC 14.2 and Clang 22, under AddressSanitizer/UBSan
+ledger. 332 tests green on GCC 14.2 and Clang 22, under AddressSanitizer/UBSan
 and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
 `--call` contract test.
 
@@ -207,6 +207,19 @@ and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
   one rewrites. `text`→`varchar(200)` rewrites; `varchar(50)`→`text` does not.
   Anything unproven is reported as a rewrite, because a cautious plan costs
   less than an unplanned outage.
+- **Structured prerequisites**, so an agent can act rather than read. Some
+  migrations need something this tool cannot do, usually on a machine it is not
+  connected to — a replication slot on the publisher, a package on the host,
+  free space in a destination tablespace, a credential in `pg_service.conf`.
+  Those now come back as `prerequisites`, each with a `kind`, `target`,
+  `where`, `requirement`, `verify` and `blocking`. A warning tells a person
+  something; a prerequisite tells a skill what must be true, on which machine,
+  and how to check whether it already is. An ordinary migration has none.
+  **A credential is still never generated**, and the reasons are in the man
+  page: the direction is wrong (the password must exist on the *publisher*), it
+  would land in the ledger anyway since every statement is stored verbatim, and
+  a fresh random value per run would break the byte-identical-plan guarantee
+  that makes `planMigration` a promise about `startMigration`.
 - **Logical replication, foreign data and the long tail.** `create_publication`
   and friends, `create_subscription` and friends, plus generic
   `create_object`/`drop_object`/`alter_object` covering aggregates, casts,

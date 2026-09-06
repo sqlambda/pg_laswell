@@ -1000,6 +1000,69 @@ to a wider precision at the same scale, and a widened timestamp precision --
 and assumes a rewrite otherwise, because reporting one that does not happen
 costs a cautious plan while missing one is an unplanned outage under
 .Va AccessExclusiveLock .
+.Sh PREREQUISITES
+Some migrations need something done that this program cannot do, often on a
+machine it is not connected to: a replication slot on the publisher, a package
+on the database host, free space in a destination tablespace, a credential in
+.Pa pg_service.conf .
+.Pp
+Those are reported as
+.Va prerequisites
+on the plan, separately from warnings, and structured rather than written out:
+each carries a
+.Va kind ,
+a
+.Va target ,
+.Va where
+it must be done, the
+.Va requirement
+itself, a
+.Va verify
+query or command, and whether it is
+.Va blocking .
+A warning tells a person something; a prerequisite tells an agent what must be
+true, on which machine, and how to find out whether it already is.
+That difference is what lets a skill act on one -- provision the file, open the
+ticket, send the mail -- and then check.
+.Pp
+An ordinary migration has none.
+They are meant to be rare enough to be worth reading.
+.Ss Why a credential is never generated
+It would be convenient for
+.Nm
+to invent a password and hand it back.
+It will not, for three reasons that are worth stating because the idea is a
+reasonable one.
+.Pp
+The direction is wrong: a subscription connects
+.Em to
+the publisher, so the password must already exist for that role
+.Em there ,
+and this program is connected to the subscriber.
+A generated one produces a subscription that cannot connect and looks
+configured.
+.Pp
+It would still reach the ledger.
+Every statement is stored verbatim in
+.Va laswell.step.sql ,
+so a generated password would sit in the ledger exactly as an author's would --
+the leak moved rather than removed.
+.Pp
+And it would break determinism.
+The same specification against the same observations must produce byte-identical
+SQL; that is what makes
+.Cm planMigration
+a promise about what
+.Cm startMigration
+will run.
+A fresh random value each time destroys it.
+.Pp
+So the credential stays outside: the specification names a service, the secret
+lives in
+.Pa pg_service.conf
+or
+.Pa ~/.pgpass ,
+and the prerequisite says what must be there and how to check it.
 .Sh CAPACITY
 The migrations run inside PostgreSQL, not on the machine
 .Nm

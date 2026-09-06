@@ -97,6 +97,20 @@ struct Plan {
   std::vector<Step> steps;
   std::vector<std::string> warnings;
   std::vector<std::string> conflicts;
+  // Out-of-band actions this migration needs, structured so something can ACT
+  // on them rather than read them.
+  //
+  // A warning tells a person something. A prerequisite tells an agent -- or a
+  // skill, or a provisioning script -- what must be true, WHERE, and how to
+  // check it. The difference matters because several of these are on a machine
+  // pg_laswell is not connected to: a replication slot on the publisher, a
+  // package on the host, free space in a tablespace. Prose cannot be acted on
+  // reliably; a shape can.
+  //
+  // Each entry: {kind, target, where, requirement, verify, blocking}.
+  // `blocking` says whether the migration fails without it or merely does
+  // less than it appears to.
+  std::vector<json> prerequisites;
   json budget = json::object();
 
   json to_json() const {
@@ -108,6 +122,7 @@ struct Plan {
                 {"steps", std::move(steps_json)},
                 {"warnings", warnings},
                 {"conflicts", conflicts},
+                {"prerequisites", prerequisites},
                 {"budget", budget}};
   }
 
@@ -120,6 +135,22 @@ struct Plan {
 };
 
 namespace detail {
+
+// Records an out-of-band prerequisite. Every field is required because a
+// half-filled one is worse than none: a skill that cannot tell WHERE to act, or
+// how to check whether it already did, will act on the wrong machine or twice.
+inline void require_out_of_band(Plan& plan, const std::string& kind,
+                                const std::string& target,
+                                const std::string& where,
+                                const std::string& requirement,
+                                const std::string& verify, bool blocking) {
+  plan.prerequisites.push_back(json{{"kind", kind},
+                                    {"target", target},
+                                    {"where", where},
+                                    {"requirement", requirement},
+                                    {"verify", verify},
+                                    {"blocking", blocking}});
+}
 
 inline std::string human_bytes(long long b) {
   const char* units[] = {"B", "KiB", "MiB", "GiB", "TiB"};
@@ -1788,6 +1819,28 @@ inline void plan_replication(const Intent& in, const Observations& obs,
 
     case IntentKind::kCreateSubscription: {
       const bool connect = in.body.value("connect", true);
+      // The credential is deliberately not in the spec -- see spec.h, where a
+      // password is refused rather than redacted. That leaves an out-of-band
+      // step, so it is RECORDED as one rather than left as advice: a skill can
+      // provision the service file, or open a ticket, or send the mail, and
+      // check afterwards whether it worked.
+      const auto conn = in.body.value("connection", "");
+      const bool by_service = conn.find("service=") != std::string::npos;
+      detail::require_out_of_band(
+          plan, "credential", in.body.value("name", ""),
+          "this server, as the postgres OS user",
+          by_service
+              ? "the connection service named in \"" + conn +
+                    "\" must exist in pg_service.conf with a password for the "
+                    "publisher"
+              : "the role in \"" + conn +
+                    "\" must have a password in ~/.pgpass on this host, or the "
+                    "subscription cannot connect -- pg_laswell will not carry "
+                    "the credential, because everything it runs is stored "
+                    "verbatim in the ledger",
+          "SELECT srsubstate FROM pg_subscription_rel, or check that "
+          "pg_stat_subscription reports a worker for this subscription",
+          /*blocking=*/connect);
       std::vector<std::string> pubs;
       for (const auto& p : in.body.value("publications", json::array())) {
         pubs.push_back(detail::quote_identifier(p.get<std::string>()));
@@ -1825,6 +1878,15 @@ inline void plan_replication(const Intent& in, const Observations& obs,
             "cause of a publisher filling its disk, and nothing on this server "
             "will report it. pg_licht replicationSlots, pointed at the "
             "publisher, is the reading that would.");
+        detail::require_out_of_band(
+            plan, "monitor", in.body.value("name", ""), "the publisher",
+            "the replication slot this creates must be consumed or dropped; "
+            "while it exists and is inactive the publisher retains every WAL "
+            "segment it has not sent",
+            "pg_licht replicationSlots against the publisher, or SELECT "
+            "slot_name, active, pg_size_pretty(pg_wal_lsn_diff("
+            "pg_current_wal_lsn(), restart_lsn)) FROM pg_replication_slots",
+            /*blocking=*/false);
       } else {
         step.lock = "no lock; nothing is contacted";
         step.why =
@@ -1983,6 +2045,16 @@ inline void plan_final_kinds(const Intent& in, const Observations& obs,
       step.lock = "no lock here; it queries the REMOTE server's catalog";
       step.why = "importing contacts the foreign server and creates one foreign "
                  "table per remote table it finds";
+      detail::require_out_of_band(
+          plan, "reachability", in.body.value("server", ""),
+          "the foreign server",
+          "the foreign server must be reachable with valid credentials when "
+          "this runs, and the remote schema must contain what the spec assumes "
+          "-- neither is visible to pg_laswell before it starts",
+          "SELECT 1 FROM information_schema.foreign_tables WHERE "
+          "foreign_table_schema = " +
+              detail::quote_literal(in.body.value("schema", "")),
+          /*blocking=*/true);
       plan.warnings.push_back(
           "what this creates depends on the REMOTE schema at the moment it "
           "runs, so the same signed spec produces different objects on "
@@ -2472,6 +2544,15 @@ inline void plan_physical(const Intent& in, const Observations& obs, Plan& plan,
           "it -- both at once, since the old files are removed only at commit. "
           "pg_laswell cannot see either filesystem's free space; that is a "
           "check to make before starting, not one it can make for you.");
+      detail::require_out_of_band(
+          plan, "capacity", in.body.value("tablespace", ""),
+          "the database host's filesystem",
+          "at least " + detail::human_bytes(size) +
+              " must be free in the destination tablespace at the same time as "
+              "the source still holds its copy",
+          "df on the tablespace directory from pg_tablespace_location(), or "
+          "pg_licht hostCapacity",
+          /*blocking=*/true);
       return;
 
     case IntentKind::kSetAccessMethod:
@@ -3113,6 +3194,14 @@ inline void plan_object(const Intent& in, const Observations& obs, Plan& plan,
             "this server, so CREATE EXTENSION would fail. Its files are "
             "installed on the host by a package, not by a migration -- this is "
             "an infrastructure prerequisite, not something the spec can fix.");
+        detail::require_out_of_band(
+            plan, "package", ext, "the database host",
+            "the extension's files must be installed by a package -- typically "
+            "postgresql-<version>-" + ext + " or a vendor build -- before any "
+            "migration can create it",
+            "SELECT 1 FROM pg_available_extensions WHERE name = " +
+                detail::quote_literal(ext),
+            /*blocking=*/true);
         return;
       }
       std::string sql = "CREATE EXTENSION " + detail::quote_identifier(ext);
@@ -5687,6 +5776,19 @@ inline std::string Plan::render() const {
     if (!s.why.empty()) out += "    why:  " + s.why + "\n";
   }
   for (const auto& w : warnings) out += "\n warn: " + w + "\n";
+  // Prerequisites last and set apart, because they are the only lines here
+  // that ask somebody to go and DO something -- often on another machine --
+  // rather than to know something.
+  if (!prerequisites.empty()) {
+    out += "\n-- before this can run ------------------------------------------\n";
+    for (const auto& p : prerequisites) {
+      out += std::string(p.value("blocking", false) ? " REQUIRED  " : " advised  ") +
+             p.value("kind", "") + ": " + p.value("target", "") + "\n" +
+             "    where:  " + p.value("where", "") + "\n" +
+             "    needs:  " + p.value("requirement", "") + "\n" +
+             "    check:  " + p.value("verify", "") + "\n";
+    }
+  }
   return out;
 }
 

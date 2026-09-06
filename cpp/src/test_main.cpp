@@ -8483,3 +8483,111 @@ TEST(Spec, DefaultPrivilegesTakeThePluralFormBecauseTheyApplyToAClass) {
   EXPECT_NE(spec_error(doc).find("Plural"), std::string::npos) << spec_error(doc);
 }
 
+// --- out-of-band prerequisites ---------------------------------------------
+
+TEST(Planner, APrerequisiteSaysWhatWhereAndHowToCheckIt) {
+  // The difference between a warning and a prerequisite: a warning tells a
+  // person something, a prerequisite tells an AGENT what must be true, on
+  // WHICH machine, and how to find out whether it already is. Several of these
+  // are on a host pg_laswell is not connected to, so prose cannot be acted on.
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "create_subscription"}, {"name", "sub"},
+                                {"connection", "service=pub1"},
+                                {"publications", json::array({"p"})}}})),
+      obs_alter(), {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  ASSERT_FALSE(plan.prerequisites.empty()) << plan.render();
+
+  bool credential = false, slot = false;
+  for (const auto& p : plan.prerequisites) {
+    // Every field is required: a half-filled prerequisite is worse than none,
+    // because a skill that cannot tell WHERE to act will act somewhere else.
+    for (const char* k : {"kind", "target", "where", "requirement", "verify"}) {
+      EXPECT_FALSE(p.value(k, "").empty())
+          << k << " is empty in " << p.dump();
+    }
+    EXPECT_TRUE(p.contains("blocking"));
+    if (p.value("kind", "") == "credential") {
+      credential = true;
+      EXPECT_TRUE(p.value("blocking", false))
+          << "without the credential the subscription cannot connect";
+      EXPECT_NE(p.value("requirement", "").find("pg_service.conf"),
+                std::string::npos) << p.dump();
+      EXPECT_NE(p.value("where", "").find("this server"), std::string::npos);
+    }
+    if (p.value("kind", "") == "monitor") {
+      slot = true;
+      EXPECT_NE(p.value("where", "").find("publisher"), std::string::npos)
+          << "the slot is on the OTHER machine, which is the whole point: "
+          << p.dump();
+      EXPECT_FALSE(p.value("blocking", true))
+          << "an unconsumed slot is a hazard to watch, not a reason to refuse";
+    }
+  }
+  EXPECT_TRUE(credential) << plan.render();
+  EXPECT_TRUE(slot) << plan.render();
+
+  // It reaches the JSON an agent reads, and the text a person reads.
+  EXPECT_TRUE(plan.to_json().contains("prerequisites"));
+  EXPECT_NE(plan.render().find("before this can run"), std::string::npos);
+  EXPECT_NE(plan.render().find("REQUIRED"), std::string::npos);
+}
+
+TEST(Planner, PrerequisitesCoverTheOtherThingsOffThisMachine) {
+  // A tablespace move needs space on a filesystem we cannot see; an extension
+  // needs a package on the host; an import needs the remote reachable. All
+  // three are outside the database and none can be checked from here.
+  const auto space = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "set_tablespace"}, {"schema", "shop"},
+                                {"table", "orders"}, {"tablespace", "fast"}}})),
+      obs_alter(), {});
+  bool capacity = false;
+  for (const auto& p : space.prerequisites) {
+    if (p.value("kind", "") == "capacity") {
+      capacity = true;
+      EXPECT_NE(p.value("verify", "").find("pg_tablespace_location"),
+                std::string::npos) << p.dump();
+    }
+  }
+  EXPECT_TRUE(capacity) << space.render();
+
+  auto obs = obs_alter();
+  obs.objects["extension:postgis"] =
+      json{{"exists", false}, {"kind", "extension"}, {"available", false}};
+  const auto pkg = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "create_extension"}, {"name", "postgis"}}})),
+      obs, {});
+  EXPECT_FALSE(pkg.ok) << "an unavailable extension is still a refusal";
+  bool package = false;
+  for (const auto& p : pkg.prerequisites) {
+    if (p.value("kind", "") == "package") {
+      package = true;
+      EXPECT_TRUE(p.value("blocking", false));
+      EXPECT_NE(p.value("where", "").find("host"), std::string::npos);
+    }
+  }
+  EXPECT_TRUE(package)
+      << "a refusal should still say what would fix it, in an actionable form: "
+      << pkg.render();
+
+  const auto imp = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "import_foreign_schema"},
+                                {"server", "remote"}, {"remote_schema", "public"},
+                                {"schema", "staging"}}})),
+      obs_alter(), {});
+  bool reach = false;
+  for (const auto& p : imp.prerequisites) {
+    if (p.value("kind", "") == "reachability") reach = true;
+  }
+  EXPECT_TRUE(reach) << imp.render();
+}
+
+TEST(Planner, AnOrdinaryMigrationHasNoPrerequisites) {
+  // They must be rare enough to be worth reading. If every plan carried one,
+  // a skill would learn to ignore them.
+  const auto plan = pglaswell::plan_migration(
+      pglaswell::parse_spec(minimal_spec()), observations(1024, 10), {});
+  EXPECT_TRUE(plan.prerequisites.empty()) << plan.render();
+  EXPECT_EQ(plan.render().find("before this can run"), std::string::npos);
+}
+
