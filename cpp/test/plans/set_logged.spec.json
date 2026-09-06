@@ -1,0 +1,3 @@
+{"laswell_spec_version":1,"id":"0006-set-logged",
+ "description":"Make the staging table durable.",
+ "intents":[{"kind":"set_logged","schema":"shop","table":"orders","logged":true}]}

@@ -107,6 +107,21 @@ if(BUILD_TESTING)
     # them away, so it touches no existing server -- and SKIPs cleanly when
     # initdb is not installed, since that is a missing tool rather than a
     # failing behaviour.
+    # Renders a plan from a spec and a fixed observation file. Links the pure
+    # headers only -- no libpq, no database -- which is what makes the golden
+    # output deterministic and is itself a check that planner.h stays pure.
+    add_executable(render_plan ${CMAKE_CURRENT_SOURCE_DIR}/test/render_plan.cpp)
+    target_include_directories(render_plan PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(render_plan PRIVATE nlohmann_json::nlohmann_json
+                                              OpenSSL::Crypto)
+    target_compile_definitions(render_plan PRIVATE PGLASWELL_VERSION="${PROJECT_VERSION}")
+    pglaswell_harden(render_plan)
+
+    add_test(NAME plans
+             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/plan-tests.sh
+                     $<TARGET_FILE:render_plan>
+                     ${CMAKE_CURRENT_SOURCE_DIR}/test/plans)
+
     add_test(NAME replication
              COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/replication-tests.sh)
 

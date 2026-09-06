@@ -1,0 +1,3 @@
+{"laswell_spec_version":1,"id":"0003-enum-value",
+ "description":"Add a cancelled state.",
+ "intents":[{"kind":"add_enum_value","schema":"shop","name":"status","value":"cancelled"}]}

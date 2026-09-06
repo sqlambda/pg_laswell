@@ -1,0 +1,2 @@
+SPEC REFUSED: intents[0].connection must not carry a password
+        hint: A subscription's connection string is stored in pg_subscription in the clear, and pg_laswell stores every statement it runs verbatim in the ledger -- so a password here would be in the signed spec, in git and in laswell.step.sql. Put the credential in the server's ~/.pgpass or a connection service file and name the service here. It is refused rather than redacted because a redacted ledger entry would no longer be what ran.

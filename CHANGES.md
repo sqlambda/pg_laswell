@@ -207,6 +207,17 @@ and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
   one rewrites. `text`→`varchar(200)` rewrites; `varchar(50)`→`text` does not.
   Anything unproven is reported as a rewrite, because a cautious plan costs
   less than an unplanned outage.
+- **Plan transcripts**, in the shape of PostgreSQL's own regression suite:
+  `cpp/test/plans/NAME.spec.json` in, `expected/NAME.out` committed, a diff on
+  change, and `results/` + a unified diff on failure. The property worth
+  copying most is that **errors are output** — a refused spec's text lives in an
+  expected file, so a refusal is reviewable content rather than an exception
+  nobody reads. The suite exists because ninety-odd unit assertions check that
+  a warning *contains a phrase*; none shows what the warning says, and a
+  rewrite that keeps the phrase passes however much worse it became.
+  Observations come from a file, not a database: `plan_migration` is a pure
+  function of (spec, observations), so the output is deterministic by
+  construction and `render_plan` links no libpq at all.
 - **A conformance suite: every intent kind planned and EXECUTED.** 70 cases
   driven from a table, each one planned through the real observation path,
   applied to a database, then checked against the catalog — and

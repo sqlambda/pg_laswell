@@ -1,0 +1,4 @@
+{"laswell_spec_version":1,"id":"0002-row-security",
+ "description":"Turn on row-level security for orders.",
+ "intents":[{"kind":"set_row_security","schema":"shop","table":"orders",
+             "enabled":true}]}

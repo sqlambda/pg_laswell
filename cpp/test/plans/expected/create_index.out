@@ -1,0 +1,11 @@
+Plan for 0001-create-index  (digest 6984b3c130cf…)
+
+-- transaction group 1 ---------------- NOT atomic: cannot run inside a transaction block --
+ 0. create_index
+    CREATE INDEX CONCURRENTLY orders_status_idx ON shop.orders USING btree (status);
+    COMMENT ON INDEX shop.orders_status_idx IS 'Serves the fulfilment queue.';
+    lock: ShareUpdateExclusiveLock (two table scans)
+    why:  size 2.0 GiB >= 64 MiB ceiling -> concurrent build
+ 1. verify_index_valid
+    lock: none (catalog read)
+    why:  a concurrent build can return without error and leave an invalid index

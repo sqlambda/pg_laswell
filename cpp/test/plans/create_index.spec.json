@@ -1,0 +1,6 @@
+{"laswell_spec_version":1,"id":"0001-create-index",
+ "description":"Index the fulfilment queue.",
+ "rationale":"The queue scans orders on every page load.",
+ "intents":[{"kind":"create_index","schema":"shop","table":"orders",
+             "name":"orders_status_idx","columns":["status"],
+             "comment":"Serves the fulfilment queue."}]}

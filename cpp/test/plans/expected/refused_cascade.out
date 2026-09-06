@@ -1,0 +1,4 @@
+Plan for 0004-drop-in-use  (digest 820f62fd84a6…)
+
+REFUSED. Nothing will run.
+  conflict: cannot drop type shop.status: column status of table shop.orders, function shop.summarise(shop.status) depend on it. PostgreSQL would refuse this and suggest CASCADE; pg_laswell will not emit CASCADE, because it drops objects the spec never named. Remove them in earlier intents.

@@ -17,3 +17,7 @@ docs/
 *.swp
 *.log
 .env
+
+# Golden-file plan tests write actual output and diffs here on failure, the way
+# pg_regress writes results/. They are for looking at, never for committing.
+/cpp/test/plans/results/

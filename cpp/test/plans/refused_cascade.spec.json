@@ -1,0 +1,3 @@
+{"laswell_spec_version":1,"id":"0004-drop-in-use",
+ "description":"Drop a type that a column still uses.",
+ "intents":[{"kind":"drop_type","schema":"shop","name":"status"}]}

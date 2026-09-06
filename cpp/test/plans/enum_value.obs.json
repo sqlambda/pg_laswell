@@ -1,0 +1,8 @@
+{"serverVersion":180006,
+ "server":{"max_connections":100,"reserved_connections":3,"current_backends":12,
+           "max_parallel_workers":8,"max_parallel_maintenance_workers":2,
+           "max_worker_processes":8,"parallel_workers_active":0,
+           "maintenance_work_mem_kb":65536,"is_in_recovery":false},
+ "tables":{},
+ "objects":{"type:shop.status":{"exists":true,"kind":"type","type_kind":"enum",
+                                "enum_labels":["open","closed"],"depended_on_by":[]}}}

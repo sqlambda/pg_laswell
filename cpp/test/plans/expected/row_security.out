@@ -1,0 +1,12 @@
+Plan for 0002-row-security  (digest aa7831188178…)
+
+-- transaction group 1 ---------------- atomic --
+ 0. set_row_security
+    ALTER TABLE shop.orders ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE shop.orders NO FORCE ROW LEVEL SECURITY;
+    lock: AccessExclusiveLock on shop.orders
+    why:  enabling row-level security is a catalog change, and its effect is immediate for every session already connected
+
+ warn: enabling row-level security on shop.orders with NO POLICY hides every row from every non-owner. Measured on 18.6: an application role reading the table went from 1000 rows to 0, with no error -- the query succeeds and returns nothing. Create the policies in EARLIER intents than this one.
+
+ warn: you will probably not be able to see this working. Measured: a table's OWNER bypasses row-level security unless FORCE is also set, and a SUPERUSER bypasses it whatever either flag says. Verifying an RLS change from a superuser session shows no change at all, however wrong the policy is. Check it as the application role, with SET ROLE.

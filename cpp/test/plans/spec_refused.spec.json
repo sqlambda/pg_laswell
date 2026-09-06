@@ -1,0 +1,5 @@
+{"laswell_spec_version":1,"id":"0005-password",
+ "description":"A subscription carrying a credential.",
+ "intents":[{"kind":"create_subscription","name":"billing",
+             "connection":"host=pub dbname=d user=rep password=NOT_A_REAL_PASSWORD",
+             "publications":["billing"]}]}
