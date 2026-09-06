@@ -2283,8 +2283,16 @@ inline void plan_relation_extras(const Intent& in, const Observations& obs,
       std::string sql = "CREATE RULE " + detail::quote_identifier(name) +
                         " AS ON " + event + " TO " + qualified_tbl;
       if (in.body.contains("where")) sql += " WHERE " + in.body.value("where", "");
+      // NOTHING is not a command and must not be parenthesised: the
+      // parentheses in DO [INSTEAD] (...) are for a command LIST, so
+      // "DO INSTEAD (NOTHING)" is a syntax error. Found by the conformance
+      // suite, which is the only test that runs what the planner emits.
+      auto action = in.body.value("action", "");
+      std::string upper = action;
+      for (auto& c : upper) c = static_cast<char>(std::toupper(c));
+      while (!upper.empty() && upper.back() == ' ') upper.pop_back();
       sql += " DO " + std::string(in.body.value("instead", false) ? "INSTEAD " : "") +
-             "(" + in.body.value("action", "") + ");";
+             (upper == "NOTHING" ? "NOTHING" : "(" + action + ")") + ";";
       step.sql.push_back(sql);
       step.lock = "AccessExclusiveLock on " + qualified_tbl;
       step.why = "a rule rewrites queries at parse time, so it is a catalog "

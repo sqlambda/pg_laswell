@@ -350,8 +350,13 @@ SELECT COALESCE((
     'depended_on_by', COALESCE((
        SELECT JSONB_AGG(DISTINCT PG_DESCRIBE_OBJECT(d.classid, d.objid, d.objsubid))
          FROM pg_depend d
-        WHERE d.refobjid = t.oid AND d.refclassid = t.classid
-          AND d.deptype IN ('n', 'a')
+        -- deptype 'n' (normal) ONLY. An 'a' (auto) dependency is dropped WITH
+       -- the object rather than blocking it -- a domain's own CHECK
+       -- constraints, a sequence owned by a column -- so counting those made
+       -- pg_laswell refuse to drop any domain that had a constraint, which is
+       -- very nearly every domain. Found by the conformance suite.
+       WHERE d.refobjid = t.oid AND d.refclassid = t.classid
+          AND d.deptype = 'n'
           AND NOT (d.classid = t.classid AND d.objid = t.oid)), '[]'::jsonb),
     -- Enum labels, so add_enum_value can report satisfied instead of failing
     -- on a duplicate, and so the plan can show the resulting order.

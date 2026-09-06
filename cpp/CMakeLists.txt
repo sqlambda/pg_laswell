@@ -101,6 +101,15 @@ if(BUILD_TESTING)
              COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/no-dangling-items.sh
                      ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
+    # The intent kinds that need a second cluster: subscriptions, foreign data,
+    # and default privileges, which only affect objects created LATER. The
+    # script builds two clusters with initdb under a temp directory and throws
+    # them away, so it touches no existing server -- and SKIPs cleanly when
+    # initdb is not installed, since that is a missing tool rather than a
+    # failing behaviour.
+    add_test(NAME replication
+             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/replication-tests.sh)
+
     # DATABASE_URL is read by the script at RUN time, not baked in here.
     # $ENV{} is evaluated during configure, so a conninfo captured then
     # outlives the database it names: the suite went on "passing" against a

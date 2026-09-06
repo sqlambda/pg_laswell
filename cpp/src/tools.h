@@ -283,15 +283,30 @@ inline json plan_migration_tool(ToolContext& ctx, const json& args) {
 
   // Observe only the tables the spec names. Nothing else is measured, so the
   // reading cannot be blamed on a table the change does not touch.
+  // What to measure comes from conflict_keys(), the same function the
+  // repository groups by and the executor locks on.
+  //
+  // Deriving it from in.table() alone was wrong, and wrong silently: an intent
+  // that names a second relation somewhere other than "table" -- the candidate
+  // in attach_partition, the view in replace_view, the referenced table in
+  // add_foreign_key -- never had that relation observed, so the planner saw it
+  // as absent. attach_partition refused every time it was used for real; the
+  // end-to-end test had passed the child explicitly and hidden it.
   std::vector<std::string> schemas, tables, object_keys;
+  std::set<std::string> seen;
   for (const auto& in : spec.intents) {
-    schemas.push_back(in.schema());
-    tables.push_back(in.table());
-    // Types, functions, sequences, schemas and extensions are not relations and
-    // are measured separately -- without this the planner sees every one of
-    // them as absent and happily plans a CREATE over something that is there.
-    const auto key = object_key_for(in);
-    if (!key.empty()) object_keys.push_back(key);
+    for (const auto& key : conflict_keys(in)) {
+      if (!seen.insert(key).second) continue;
+      const auto colon = key.find(':');
+      if (colon != std::string::npos) {
+        object_keys.push_back(key);   // "type:...", "function:...", and so on
+        continue;
+      }
+      const auto dot = key.find('.');
+      if (dot == std::string::npos) continue;
+      schemas.push_back(key.substr(0, dot));
+      tables.push_back(key.substr(dot + 1));
+    }
   }
   Catalog cat(cfg, ctx.cache);
   const auto obs = cat.observe(schemas, tables, object_keys);

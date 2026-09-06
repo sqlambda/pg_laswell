@@ -3,7 +3,7 @@
 ## 0.1.0 (unreleased)
 
 The whole path works: repository, signing, planning, dry run, paced execution,
-ledger. 332 tests green on GCC 14.2 and Clang 22, under AddressSanitizer/UBSan
+ledger. 334 tests green on GCC 14.2 and Clang 22, under AddressSanitizer/UBSan
 and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
 `--call` contract test.
 
@@ -207,6 +207,25 @@ and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
   one rewrites. `text`→`varchar(200)` rewrites; `varchar(50)`→`text` does not.
   Anything unproven is reported as a rewrite, because a cautious plan costs
   less than an unplanned outage.
+- **A conformance suite: every intent kind planned and EXECUTED.** 70 cases
+  driven from a table, each one planned through the real observation path,
+  applied to a database, then checked against the catalog — and
+  `Conformance.CoversEveryIntentKind` fails the build if a kind is added
+  without a case or an explicit reason for not having one. Seven kinds that
+  genuinely need a second cluster (subscriptions, foreign data, default
+  privileges) are covered by `cpp/test/replication-tests.sh`, which builds two
+  clusters with `initdb` under a temp directory and throws them away.
+  **It found four real bugs on its first run**, all invisible to unit tests
+  that hand-build observations:
+  `attach_partition` refused **every time** in real use — `tools.h` derived
+  what to observe from `schema.table`, so the candidate partition was never
+  measured; `alter_view` and `create_materialized_view` had the same defect;
+  `CREATE RULE … DO INSTEAD (NOTHING)` was a syntax error, since `NOTHING`
+  isn't a command and mustn't be parenthesised; and `drop_type` refused **any
+  domain with a CHECK constraint**, because the dependant reading counted
+  `deptype = 'a'` (auto — dropped *with* the object) as a blocker.
+  Observation targets now come from `conflict_keys()`, the same function the
+  repository groups by and the executor locks on.
 - **Structured prerequisites**, so an agent can act rather than read. Some
   migrations need something this tool cannot do, usually on a machine it is not
   connected to — a replication slot on the publisher, a package on the host,

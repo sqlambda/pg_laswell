@@ -267,8 +267,15 @@ inline std::vector<std::string> conflict_keys(const Intent& in) {
       add(in.body.value("references_schema", "") + "." +
           in.body.value("references_table", ""));
       return keys;
+    // Kinds whose RELATION is named in "name" rather than "table". Missing one
+    // here does not just weaken the locking -- tools.h derives what to observe
+    // from this function, so the relation is never measured and the planner
+    // sees it as absent. attach_partition refused every time for exactly that
+    // reason until the conformance suite ran it.
     case IntentKind::kReplaceView:
     case IntentKind::kDropView:
+    case IntentKind::kAlterView:
+    case IntentKind::kCreateMaterializedView:
       add(schema + "." + in.body.value("name", ""));
       return keys;
     default:

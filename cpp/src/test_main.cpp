@@ -8591,3 +8591,160 @@ TEST(Planner, AnOrdinaryMigrationHasNoPrerequisites) {
   EXPECT_EQ(plan.render().find("before this can run"), std::string::npos);
 }
 
+// --- conformance: every kind, executed ------------------------------------
+
+#include "conformance.inc"
+
+TEST_F(DatabaseTest, EveryIntentKindPlansAndRunsAgainstARealDatabase) {
+  // Plan each case through the real observation path, apply the SQL the plan
+  // emits, and ask the catalog whether it did what the plan said. That is a
+  // different question from what the unit tests ask, and the gap between them
+  // has already cost this project a column grant with the clause in the wrong
+  // order and a whole batch of ALTER kinds that silently refused.
+  pglaswell::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = url_;
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/conformance/reset");
+    for (const char* sql : {"DROP SCHEMA IF EXISTS cf CASCADE",
+                            "DROP SCHEMA IF EXISTS cfp CASCADE",
+                            "DROP SCHEMA IF EXISTS cfq CASCADE",
+                            "DROP PUBLICATION IF EXISTS cf_pub"}) {
+      w.txn().exec(sql);
+    }
+    w.txn().exec("DO $$BEGIN IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname='cf_app')"
+                 " THEN EXECUTE 'DROP OWNED BY cf_app'; EXECUTE 'DROP ROLE cf_app';"
+                 " END IF; END$$");
+    w.commit();
+  }
+
+  pglaswell::Catalog cat(cfg);
+  int ran = 0;
+  for (const auto& c : conformance::cases()) {
+    SCOPED_TRACE(std::string("conformance case: ") + c.kind);
+    for (const char* sql : c.setup) {
+      pglaswell::WriteSession w(cfg);
+      w.begin("pg_laswell/conformance/setup");
+      w.txn().exec(sql);
+      w.commit();
+    }
+
+    json doc = minimal_spec();
+    doc["intents"] = json::array({c.body});
+    const auto spec = pglaswell::parse_spec(doc);
+    // Exactly what tools.h does, from the same function -- a conformance
+    // suite that observed differently from the product would prove nothing
+    // about the product.
+    std::vector<std::string> schemas, tables, keys;
+    for (const auto& in : spec.intents) {
+      for (const auto& key : pglaswell::conflict_keys(in)) {
+        const auto colon = key.find(':');
+        if (colon != std::string::npos) { keys.push_back(key); continue; }
+        const auto dot = key.find('.');
+        if (dot == std::string::npos) continue;
+        schemas.push_back(key.substr(0, dot));
+        tables.push_back(key.substr(dot + 1));
+      }
+    }
+    const auto obs = cat.observe(schemas, tables, keys);
+    const auto plan = pglaswell::plan_migration(spec, obs, {});
+    ASSERT_TRUE(plan.ok) << c.kind << " was refused:\n" << plan.render();
+
+    for (const auto& step : plan.steps) {
+      for (const auto& q : step.sql) {
+        const std::string stmt = q;
+        const auto trimmed = stmt.substr(0, stmt.size() - 1);
+        pglaswell::WriteSession w(cfg);
+        // A paced step's statement is a batch: $1 is the cursor and $2 the
+        // batch size, and it is meant to be run repeatedly until it returns
+        // nothing. Driving it here the way the executor does is part of what
+        // is being tested -- a batch statement that only works inside the
+        // executor is a batch statement nobody can check.
+        if (step.txn_class == pglaswell::TxnClass::kOwnTxnPerBatch) {
+          std::string cursor = "0";
+          for (int pass = 0; pass < 100; ++pass) {
+            pglaswell::WriteSession b(cfg);
+            b.begin("pg_laswell/conformance/batch");
+            const auto rows =
+                b.txn().exec(trimmed, pqxx::params{cursor, 1000});
+            for (const auto& row : rows) cursor = row[0].as<std::string>();
+            b.commit();
+            if (rows.empty()) break;
+          }
+          continue;
+        }
+        // The plan says which statements cannot run in a transaction block;
+        // honouring that here is part of what is being tested.
+        if (step.txn_class == pglaswell::TxnClass::kForbidden) {
+          w.exec_nontransactional(trimmed);
+        } else {
+          w.begin("pg_laswell/conformance/apply");
+          w.txn().exec(trimmed);
+          w.commit();
+        }
+      }
+    }
+
+    pglaswell::ReadSession r(cfg);
+    const auto got = r.txn().exec(c.verify);
+    ASSERT_FALSE(got.empty()) << c.kind << ": verify query returned no row";
+    const std::string value =
+        got[0][0].is_null() ? std::string() : got[0][0].as<std::string>();
+    EXPECT_EQ(value, c.expect)
+        << c.kind << " ran but the catalog does not agree.\n"
+        << "  verify: " << c.verify << "\n  plan:\n" << plan.render();
+    ++ran;
+  }
+  EXPECT_GT(ran, 60) << "the conformance table shrank unexpectedly";
+
+  pglaswell::WriteSession w(cfg);
+  w.begin("pg_laswell/conformance/cleanup");
+  for (const char* sql : {"DROP SCHEMA IF EXISTS cf CASCADE",
+                          "DROP SCHEMA IF EXISTS cfp CASCADE",
+                          "DROP SCHEMA IF EXISTS cfq CASCADE",
+                          "DROP PUBLICATION IF EXISTS cf_pub"}) {
+    w.txn().exec(sql);
+  }
+  w.txn().exec("DO $$BEGIN IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname='cf_app')"
+               " THEN EXECUTE 'DROP OWNED BY cf_app'; EXECUTE 'DROP ROLE cf_app';"
+               " END IF; END$$");
+  w.commit();
+}
+
+TEST(Conformance, CoversEveryIntentKind) {
+  // The invariant that makes the suite above worth having. Without it a kind
+  // can be added, unit-tested against a hand-built observation, and never once
+  // executed -- which is exactly how the ALTER batch shipped silently refusing
+  // every change it was given.
+  std::set<std::string> covered;
+  for (const auto& c : conformance::cases()) {
+    // The table keys cases by intent kind, except where one kind needs two
+    // cases; those carry a descriptive label and name their kind in the body.
+    covered.insert(c.body.value("kind", c.kind));
+  }
+  for (const auto& [k, why] : conformance::deferred_to_two_clusters()) {
+    (void)why;
+    covered.insert(k);
+  }
+
+  std::set<std::string> missing;
+  for (const auto& [name, kind] : pglaswell::intent_kinds()) {
+    (void)kind;
+    if (covered.count(name) == 0) missing.insert(name);
+  }
+  std::string list;
+  for (const auto& m : missing) { if (!list.empty()) list += ", "; list += m; }
+  EXPECT_TRUE(missing.empty())
+      << "these intent kinds are never executed against a database: " << list
+      << ".\nAdd a case to conformance.inc, or a reason to "
+         "deferred_to_two_clusters() if it genuinely needs a second cluster.";
+
+  // And the deferral list must not rot: a kind listed there must still exist.
+  for (const auto& [k, why] : conformance::deferred_to_two_clusters()) {
+    (void)why;
+    EXPECT_EQ(pglaswell::intent_kinds().count(k), 1u)
+        << k << " is deferred but is no longer an intent kind";
+  }
+}
+
