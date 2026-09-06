@@ -954,7 +954,33 @@ TEST(Spec, KnownKindsAreExactlyTheImplementedKinds) {
     "drop_statistics": {"kind":"drop_statistics","schema":"s","name":"st"},
     "create_rule": {"kind":"create_rule","schema":"s","table":"t","name":"r",
                     "event":"INSERT","action":"NOTHING"},
-    "drop_rule": {"kind":"drop_rule","schema":"s","table":"t","name":"r"}
+    "drop_rule": {"kind":"drop_rule","schema":"s","table":"t","name":"r"},
+    "create_publication": {"kind":"create_publication","name":"p",
+                           "tables":["s.t"]},
+    "alter_publication": {"kind":"alter_publication","name":"p",
+                          "add_tables":["s.t2"]},
+    "drop_publication": {"kind":"drop_publication","name":"p"},
+    "create_subscription": {"kind":"create_subscription","name":"sub",
+                            "connection":"host=pub dbname=d user=rep",
+                            "publications":["p"]},
+    "alter_subscription": {"kind":"alter_subscription","name":"sub",
+                           "enabled":false},
+    "drop_subscription": {"kind":"drop_subscription","name":"sub"},
+    "create_object": {"kind":"create_object","object_type":"COLLATION",
+                      "name":"s.c","definition":"(locale = 'en_US.utf8')"},
+    "drop_object": {"kind":"drop_object","object_type":"COLLATION","name":"s.c"},
+    "alter_object": {"kind":"alter_object","object_type":"COLLATION",
+                     "name":"s.c","owner":"app"},
+    "create_table_as": {"kind":"create_table_as","schema":"s","table":"t2",
+                        "definition":"SELECT 1 AS a","comment":"d"},
+    "import_foreign_schema": {"kind":"import_foreign_schema","server":"srv",
+                              "remote_schema":"public","schema":"s"},
+    "security_label": {"kind":"security_label","object_type":"TABLE",
+                       "schema":"s","name":"t","provider":"selinux",
+                       "label":"system_u:object_r:sepgsql_table_t:s0"},
+    "alter_default_privileges": {"kind":"alter_default_privileges","schema":"s",
+                                 "object_type":"TABLES",
+                                 "privileges":["SELECT"],"to":["app"]}
   })JSON");
   for (const auto& [name, kind] : pglaswell::intent_kinds()) {
     (void)kind;
@@ -8209,5 +8235,251 @@ TEST(Planner, GrantsReachBeyondTablesAndCheckThePrivilegeAgainstTheObject) {
   const auto err = spec_error(doc);
   EXPECT_NE(err.find("a SCHEMA does not accept"), std::string::npos) << err;
   EXPECT_NE(err.find("already committed"), std::string::npos) << err;
+}
+
+// --- logical replication, and the long tail --------------------------------
+
+TEST(Spec, ASubscriptionPasswordIsRefusedRatherThanRedacted) {
+  // Measured: pg_subscription.subconninfo stores the connection string in the
+  // clear, and this tool stores every statement it runs verbatim in the
+  // ledger. A password in the spec would therefore be in the signed spec, in
+  // git and in laswell.step.sql. Redaction is not the answer -- a redacted
+  // ledger entry would no longer be what ran, which is the one property this
+  // tool will not trade.
+  json doc = minimal_spec();
+  doc["intents"] = json::array(
+      {json{{"kind", "create_subscription"}, {"name", "sub"},
+            {"connection", "host=pub dbname=d user=rep password=hunter2"},
+            {"publications", json::array({"p"})}}});
+  const auto err = spec_error(doc);
+  EXPECT_NE(err.find("must not carry a password"), std::string::npos) << err;
+  EXPECT_NE(err.find(".pgpass"), std::string::npos)
+      << "the refusal must name the alternative: " << err;
+  EXPECT_NE(err.find("no longer be what ran"), std::string::npos) << err;
+  // The password itself must not be echoed back in the error.
+  EXPECT_EQ(err.find("hunter2"), std::string::npos)
+      << "the refusal repeated the credential it was refusing: " << err;
+}
+
+TEST(Planner, CreateSubscriptionOwnsItsTransactionAndNamesTheSlotHazard) {
+  // Measured: CREATE SUBSCRIPTION with create_slot cannot run inside a
+  // transaction block -- the same shape as CIC and DETACH CONCURRENTLY.
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "create_subscription"}, {"name", "sub"},
+                                {"connection", "host=pub dbname=d user=rep"},
+                                {"publications", json::array({"p"})}}})),
+      obs_alter(), {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto* step = only_step(plan, "create_subscription");
+  EXPECT_EQ(step->txn_class, pglaswell::TxnClass::kForbidden);
+  EXPECT_TRUE(step->own_transaction);
+  bool slot = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("holds WAL on the publisher") != std::string::npos &&
+        w.find("pg_licht replicationSlots") != std::string::npos) slot = true;
+  }
+  EXPECT_TRUE(slot)
+      << "an inactive slot fills the publisher's disk and nothing here reports "
+         "it: " << plan.render();
+
+  // connect = false runs inside a transaction -- measured -- and leaves the
+  // subscription unusable, which PostgreSQL says only as a NOTICE.
+  const auto offline = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "create_subscription"}, {"name", "sub"},
+                                {"connection", "host=pub dbname=d user=rep"},
+                                {"publications", json::array({"p"})},
+                                {"connect", false}}})),
+      obs_alter(), {});
+  EXPECT_EQ(only_step(offline, "create_subscription")->txn_class,
+            pglaswell::TxnClass::kRequired);
+  bool not_connected = false;
+  for (const auto& w : offline.warnings) {
+    if (w.find("NOT connected") != std::string::npos) not_connected = true;
+  }
+  EXPECT_TRUE(not_connected) << offline.render();
+}
+
+TEST(Planner, ReplicationChangesThatAreSilentOnThisServerAreNamed) {
+  // Every one of these does nothing visible here and something important
+  // elsewhere, which is the whole reason they are worth planning.
+  const auto disabled = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "alter_subscription"}, {"name", "sub"},
+                                {"enabled", false}}})),
+      obs_alter(), {});
+  bool wal = false;
+  for (const auto& w : disabled.warnings) {
+    if (w.find("disk-full on the publisher") != std::string::npos) wal = true;
+  }
+  EXPECT_TRUE(wal) << disabled.render();
+
+  const auto dropped_pub = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "drop_publication"}, {"name", "p"}}})),
+      obs_alter(), {});
+  bool silent = false;
+  for (const auto& w : dropped_pub.warnings) {
+    if (w.find("falls behind, silently") != std::string::npos) silent = true;
+  }
+  EXPECT_TRUE(silent) << dropped_pub.render();
+
+  const auto pub = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "create_publication"}, {"name", "p"},
+                                {"tables", json::array({"shop.orders"})}}})),
+      obs_alter(), {});
+  bool identity = false;
+  for (const auto& w : pub.warnings) {
+    if (w.find("replica identity") != std::string::npos) identity = true;
+  }
+  EXPECT_TRUE(identity)
+      << "a published table without a replica identity fails on the first "
+         "UPDATE: " << pub.render();
+}
+
+TEST(Planner, TheGenericObjectKindsSayWhatTheyDoNotDo) {
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "create_object"},
+                                {"object_type", "COLLATION"},
+                                {"name", "shop.numeric_ci"},
+                                {"definition", "(provider = icu, locale = 'en-u-ks-level2')"},
+                                {"comment", "Case-insensitive."}}})),
+      obs_alter(), {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto sql = all_sql(*only_step(plan, "create_object"));
+  EXPECT_NE(sql.find("CREATE COLLATION shop.numeric_ci (provider = icu"),
+            std::string::npos) << sql;
+  EXPECT_NE(only_step(plan, "create_object")->why.find("no planning decision"),
+            std::string::npos);
+
+  // The drop says plainly that it is NOT pre-checked, unlike drop_type and
+  // friends -- claiming a safeguard it does not have would be worse than
+  // having none.
+  const auto dropped = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "drop_object"},
+                                {"object_type", "COLLATION"},
+                                {"name", "shop.numeric_ci"}}})),
+      obs_alter(), {});
+  bool honest = false;
+  for (const auto& w : dropped.warnings) {
+    if (w.find("not pre-checked") != std::string::npos) honest = true;
+  }
+  EXPECT_TRUE(honest) << dropped.render();
+
+  // A type with its own intent kind is refused here, so the generic path
+  // cannot be used to route around a planner that has something to say.
+  json doc = minimal_spec();
+  doc["intents"] = json::array({json{{"kind", "create_object"},
+                                     {"object_type", "TABLE"}, {"name", "t"},
+                                     {"definition", "(id int)"}}});
+  EXPECT_NE(spec_error(doc).find("has its own intent kind"), std::string::npos)
+      << spec_error(doc);
+}
+
+// --- the final kinds -------------------------------------------------------
+
+TEST(Planner, DefaultPrivilegesSayTheTwoThingsThatMakeThemLookBroken) {
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "alter_default_privileges"},
+                                {"schema", "shop"}, {"object_type", "TABLES"},
+                                {"privileges", json::array({"SELECT"})},
+                                {"to", json::array({"app"})}}})),
+      obs_alter(), {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  EXPECT_NE(all_sql(*only_step(plan, "alter_default_privileges"))
+                .find("ALTER DEFAULT PRIVILEGES IN SCHEMA \"shop\" GRANT SELECT "
+                      "ON TABLES TO \"app\";"),
+            std::string::npos) << all_sql(*only_step(plan, "alter_default_privileges"));
+  bool for_role = false, existing = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("created by the role they") != std::string::npos) for_role = true;
+    if (w.find("Objects created before this") != std::string::npos) existing = true;
+  }
+  EXPECT_TRUE(for_role)
+      << "the commonest way this appears not to work: " << plan.render();
+  EXPECT_TRUE(existing) << plan.render();
+}
+
+TEST(Planner, CreateTableAsSaysWhatItDoesNotCopy) {
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "create_table_as"}, {"schema", "shop"},
+                                {"table", "totals"},
+                                {"definition", "SELECT 1 AS a"},
+                                {"comment", "d"}}})),
+      obs_alter(), {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("no primary key, no indexes") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned) << plan.render();
+  EXPECT_TRUE(only_step(plan, "create_table_as")->own_transaction)
+      << "WITH DATA runs the query and holds read locks throughout";
+}
+
+TEST(Planner, ImportForeignSchemaAdmitsItsOutcomeIsNotInTheSpec) {
+  // The one place in the repository where the same signed spec produces
+  // different objects on different days. Saying so is the whole value.
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "import_foreign_schema"},
+                                {"server", "remote"}, {"remote_schema", "public"},
+                                {"schema", "staging"}}})),
+      obs_alter(), {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("not determined by the spec") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned) << plan.render();
+}
+
+TEST(Planner, AProcedureIsTheFunctionKindsWithARoutineKind) {
+  // Rather than two more intent kinds for something that differs only in
+  // having no return type and being CALLed.
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "create_function"}, {"schema", "shop"},
+                                {"name", "reconcile"},
+                                {"routine_kind", "PROCEDURE"},
+                                {"arguments", json::array()},
+                                {"language", "plpgsql"},
+                                {"body", "BEGIN NULL; END"},
+                                {"comment", "d"}}})),
+      obs_alter(), {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto sql = all_sql(*only_step(plan, "create_function"));
+  EXPECT_NE(sql.find("CREATE OR REPLACE PROCEDURE shop.reconcile()"), std::string::npos)
+      << sql;
+  EXPECT_EQ(sql.find("RETURNS"), std::string::npos)
+      << "a procedure has no return type: " << sql;
+
+  // And declaring one is refused rather than silently dropped.
+  json doc = minimal_spec();
+  doc["intents"] = json::array({json{{"kind", "create_function"}, {"schema", "s"},
+                                     {"name", "p"}, {"routine_kind", "PROCEDURE"},
+                                     {"arguments", json::array()},
+                                     {"returns", "int"}, {"language", "sql"},
+                                     {"body", "SELECT 1"}, {"comment", "d"}}});
+  EXPECT_NE(spec_error(doc).find("cannot declare a return type"), std::string::npos);
+}
+
+TEST(Planner, ASecurityLabelSaysItDoesNothingWithoutAProvider) {
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "security_label"},
+                                {"object_type", "TABLE"}, {"schema", "shop"},
+                                {"name", "orders"}, {"provider", "selinux"},
+                                {"label", "u:object_r:sepgsql_table_t:s0"}}})),
+      obs_alter(), {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("label provider loaded") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned) << plan.render();
+}
+
+TEST(Spec, DefaultPrivilegesTakeThePluralFormBecauseTheyApplyToAClass) {
+  json doc = minimal_spec();
+  doc["intents"] = json::array({json{{"kind", "alter_default_privileges"},
+                                     {"schema", "s"}, {"object_type", "TABLE"},
+                                     {"privileges", json::array({"SELECT"})},
+                                     {"to", json::array({"app"})}}});
+  EXPECT_NE(spec_error(doc).find("Plural"), std::string::npos) << spec_error(doc);
 }
 

@@ -3,7 +3,7 @@
 ## 0.1.0 (unreleased)
 
 The whole path works: repository, signing, planning, dry run, paced execution,
-ledger. 318 tests green on GCC 14.2 and Clang 22, under AddressSanitizer/UBSan
+ledger. 329 tests green on GCC 14.2 and Clang 22, under AddressSanitizer/UBSan
 and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
 `--call` contract test.
 
@@ -207,6 +207,27 @@ and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
   one rewrites. `text`→`varchar(200)` rewrites; `varchar(50)`→`text` does not.
   Anything unproven is reported as a rewrite, because a cautious plan costs
   less than an unplanned outage.
+- **Logical replication, foreign data and the long tail.** `create_publication`
+  and friends, `create_subscription` and friends, plus generic
+  `create_object`/`drop_object`/`alter_object` covering aggregates, casts,
+  collations, conversions, operators and their classes and families, all four
+  text-search types, transforms, access methods, languages, and the whole
+  foreign-data set. Then `create_table_as`, `import_foreign_schema`,
+  `security_label`, `alter_default_privileges`, and procedures folded into the
+  function kinds behind `routine_kind`. **80 kinds.**
+  **A subscription password is refused, not redacted.** `pg_subscription`
+  stores the connection string in the clear and pg_laswell stores every
+  statement verbatim in the ledger — so a password in a spec would be in the
+  signed spec, in git and in `laswell.step.sql`. Redacting it would make the
+  ledger untrue, which is the one property this tool will not trade; the
+  refusal names `.pgpass` instead, and does not echo the credential back.
+  **`CREATE SUBSCRIPTION` cannot run in a transaction block** (measured), so it
+  owns its own — the same shape as CIC. It also warns that the replication slot
+  it creates lives on the *publisher* and holds WAL there indefinitely, which
+  nothing on this server reports.
+  `import_foreign_schema` admits the thing that makes it unusual: its outcome
+  depends on the remote schema at the moment it runs, so the same signed spec
+  produces different objects on different days.
 - **Materialized views, extended statistics and rules**, plus **grants beyond
   tables**. 67 kinds. `create_materialized_view` says whether it runs its query
   now (`WITH DATA`) or leaves the view *unreadable until refreshed* — a query

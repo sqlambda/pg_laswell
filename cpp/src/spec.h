@@ -53,7 +53,13 @@ enum class IntentKind { kAddColumn, kBackfill, kCreateIndex, kDropIndex,
                         kSetTableOptions, kSetLogged, kSetTablespace,
                         kSetAccessMethod, kSetReplicaIdentity, kClusterOn,
                         kCreateMaterializedView, kCreateStatistics,
-                        kDropStatistics, kCreateRule, kDropRule };
+                        kDropStatistics, kCreateRule, kDropRule,
+                        kCreatePublication, kAlterPublication,
+                        kDropPublication, kCreateSubscription,
+                        kAlterSubscription, kDropSubscription,
+                        kCreateObject, kDropObject, kAlterObject,
+                        kCreateTableAs, kImportForeignSchema, kSecurityLabel,
+                        kAlterDefaultPrivileges };
 
 inline const std::map<std::string, IntentKind>& intent_kinds() {
   static const std::map<std::string, IntentKind> kKinds = {
@@ -123,6 +129,19 @@ inline const std::map<std::string, IntentKind>& intent_kinds() {
       {"drop_statistics", IntentKind::kDropStatistics},
       {"create_rule", IntentKind::kCreateRule},
       {"drop_rule", IntentKind::kDropRule},
+      {"create_publication", IntentKind::kCreatePublication},
+      {"alter_publication", IntentKind::kAlterPublication},
+      {"drop_publication", IntentKind::kDropPublication},
+      {"create_subscription", IntentKind::kCreateSubscription},
+      {"alter_subscription", IntentKind::kAlterSubscription},
+      {"drop_subscription", IntentKind::kDropSubscription},
+      {"create_object", IntentKind::kCreateObject},
+      {"drop_object", IntentKind::kDropObject},
+      {"alter_object", IntentKind::kAlterObject},
+      {"create_table_as", IntentKind::kCreateTableAs},
+      {"import_foreign_schema", IntentKind::kImportForeignSchema},
+      {"security_label", IntentKind::kSecurityLabel},
+      {"alter_default_privileges", IntentKind::kAlterDefaultPrivileges},
   };
   return kKinds;
 }
@@ -630,6 +649,204 @@ inline void parse_add_check_constraint(Intent& in) {
 
 // --- materialized views, extended statistics, rules ------------------------
 
+// --- logical replication, and the long tail --------------------------------
+
+inline void parse_replication_name(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(in.body, {"kind", "name"}, at);
+  detail::require_identifier(detail::require_string(in.body, "name", at), "name", in.ordinal);
+}
+
+inline void parse_publication(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(
+      in.body, {"kind", "name", "tables", "all_tables", "operations", "add_tables",
+                "drop_tables"}, at);
+  detail::require_identifier(detail::require_string(in.body, "name", at), "name", in.ordinal);
+  for (const char* k : {"tables", "add_tables", "drop_tables"}) {
+    if (!in.body.contains(k)) continue;
+    if (!in.body[k].is_array() || in.body[k].empty()) {
+      detail::fail(std::string(at) + "." + k + " must be a non-empty array",
+                   "Each entry is a schema-qualified table name.");
+    }
+  }
+  static const std::set<std::string> kOps = {"insert", "update", "delete", "truncate"};
+  for (const auto& o : in.body.value("operations", json::array())) {
+    if (!o.is_string() || kOps.count(o.get<std::string>()) == 0) {
+      detail::fail(at + ".operations has an unknown operation: " + o.dump(),
+                   "Lower case, one of insert, update, delete, truncate.");
+    }
+  }
+}
+
+inline void parse_subscription(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(
+      in.body, {"kind", "name", "connection", "publications", "enabled",
+                "connect", "slot_name", "refresh"}, at);
+  detail::require_identifier(detail::require_string(in.body, "name", at), "name", in.ordinal);
+  if (in.body.contains("connection")) {
+    const auto conn = detail::require_string(in.body, "connection", at);
+    // A subscription's connection string is stored in pg_subscription in the
+    // CLEAR -- verified 2026-09-05 -- and this tool stores every statement it
+    // runs verbatim in laswell.step.sql, which is the whole point of the
+    // ledger. A password in the spec would therefore be in the signed
+    // specification, in git, and in the ledger, three places it must not be.
+    //
+    // Refused rather than redacted: redaction would make the ledger's record
+    // of what ran untrue, and that record is the one thing this tool will not
+    // compromise.
+    auto lower = conn;
+    for (auto& c : lower) c = static_cast<char>(std::tolower(c));
+    if (lower.find("password") != std::string::npos) {
+      detail::fail(
+          at + ".connection must not carry a password",
+          "A subscription's connection string is stored in pg_subscription in "
+          "the clear, and pg_laswell stores every statement it runs verbatim in "
+          "the ledger -- so a password here would be in the signed spec, in "
+          "git and in laswell.step.sql. Put the credential in the server's "
+          "~/.pgpass or a connection service file and name the service here. "
+          "It is refused rather than redacted because a redacted ledger entry "
+          "would no longer be what ran.");
+    }
+  }
+  if (in.kind == IntentKind::kCreateSubscription) {
+    detail::require_string(in.body, "connection", at);
+    if (!in.body.contains("publications") || !in.body["publications"].is_array() ||
+        in.body["publications"].empty()) {
+      detail::fail(at + ".publications must be a non-empty array", "");
+    }
+  }
+  for (const char* k : {"enabled", "connect", "refresh"}) {
+    if (in.body.contains(k) && !in.body[k].is_boolean()) {
+      detail::fail(std::string(at) + "." + k + " must be a boolean", "");
+    }
+  }
+}
+
+// The object types with no planning decision beyond existence and dependants.
+// Two kinds cover all of them; anything later found to have a real decision is
+// promoted to its own kind.
+inline const std::set<std::string>& generic_object_types() {
+  static const std::set<std::string> kTypes = {
+      "AGGREGATE", "CAST", "COLLATION", "CONVERSION", "OPERATOR",
+      "OPERATOR CLASS", "OPERATOR FAMILY", "TEXT SEARCH CONFIGURATION",
+      "TEXT SEARCH DICTIONARY", "TEXT SEARCH PARSER", "TEXT SEARCH TEMPLATE",
+      "TRANSFORM", "ACCESS METHOD", "LANGUAGE", "FOREIGN DATA WRAPPER",
+      "SERVER", "USER MAPPING", "FOREIGN TABLE"};
+  return kTypes;
+}
+
+inline void parse_alter_object(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(
+      in.body, {"kind", "object_type", "schema", "name", "to", "owner",
+                "set_schema"}, at);
+  const auto ot = detail::require_string(in.body, "object_type", at);
+  if (generic_object_types().count(ot) == 0) {
+    detail::fail(at + ".object_type is not one alter_object handles: " + ot,
+                 "Object types with their own planner have their own ALTER "
+                 "intent, which says what that change costs.");
+  }
+  detail::require_string(in.body, "name", at);
+  if (!in.body.contains("to") && !in.body.contains("owner") &&
+      !in.body.contains("set_schema")) {
+    detail::fail(at + " changes nothing", "Give to, owner or set_schema.");
+  }
+}
+
+inline void parse_create_table_as(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(
+      in.body, {"kind", "schema", "table", "definition", "comment", "with_data",
+                "unlogged"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
+  detail::require_string(in.body, "definition", at);
+  detail::require_string(in.body, "comment", at);
+  if (in.body.contains("with_data") && !in.body["with_data"].is_boolean()) {
+    detail::fail(at + ".with_data must be a boolean", "");
+  }
+}
+
+inline void parse_import_foreign_schema(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(
+      in.body, {"kind", "server", "remote_schema", "schema", "limit_to", "except"}, at);
+  detail::require_identifier(detail::require_string(in.body, "server", at), "server", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "remote_schema", at),
+                             "remote_schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  if (in.body.contains("limit_to") && in.body.contains("except")) {
+    detail::fail(at + " cannot state both limit_to and except", "They are mutually exclusive.");
+  }
+}
+
+inline void parse_security_label(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(
+      in.body, {"kind", "object_type", "schema", "name", "provider", "label"}, at);
+  detail::require_string(in.body, "object_type", at);
+  detail::require_string(in.body, "name", at);
+  detail::require_string(in.body, "provider", at);
+  if (in.body.contains("label") && !in.body["label"].is_string()) {
+    detail::fail(at + ".label must be a string, or absent to remove it", "");
+  }
+}
+
+inline void parse_alter_default_privileges(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  const bool granting = in.body.value("grant", true);
+  const std::string who = granting ? "to" : "from";
+  detail::reject_unknown_keys(
+      in.body, {"kind", "schema", "for_role", "object_type", "privileges",
+                "grant", who}, at);
+  static const std::set<std::string> kFor = {"TABLES", "SEQUENCES", "FUNCTIONS",
+                                             "TYPES", "SCHEMAS"};
+  if (kFor.count(detail::require_string(in.body, "object_type", at)) == 0) {
+    detail::fail(at + ".object_type must be TABLES, SEQUENCES, FUNCTIONS, "
+                      "TYPES or SCHEMAS",
+                 "Plural: default privileges apply to a CLASS of future "
+                 "objects, not to one.");
+  }
+  if (!in.body.contains("privileges") || !in.body["privileges"].is_array() ||
+      in.body["privileges"].empty()) {
+    detail::fail(at + ".privileges must be a non-empty array", "");
+  }
+  if (!in.body.contains(who) || !in.body[who].is_array() || in.body[who].empty()) {
+    detail::fail(at + "." + who + " must be a non-empty array of roles", "");
+  }
+}
+
+inline void parse_create_object(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(
+      in.body, {"kind", "object_type", "schema", "name", "definition", "comment"}, at);
+  const auto ot = detail::require_string(in.body, "object_type", at);
+  if (generic_object_types().count(ot) == 0) {
+    detail::fail(at + ".object_type is not one create_object handles: " + ot,
+                 "This kind is for object types with no planning decision "
+                 "beyond existence and dependants. Anything with a lock to "
+                 "name or a scan to avoid has its own intent kind -- if this "
+                 "type needs one, that is the bug, not the spec.");
+  }
+  detail::require_string(in.body, "name", at);
+  // The definition is the SQL after CREATE <type> <name>. This is the one
+  // place the project accepts a fragment, and it is bounded: an operator class
+  // definition has no JSON shape anybody would read.
+  detail::require_string(in.body, "definition", at);
+}
+
+inline void parse_drop_object(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(in.body, {"kind", "object_type", "schema", "name"}, at);
+  const auto ot = detail::require_string(in.body, "object_type", at);
+  if (generic_object_types().count(ot) == 0) {
+    detail::fail(at + ".object_type is not one drop_object handles: " + ot, "");
+  }
+  detail::require_string(in.body, "name", at);
+}
+
 inline void parse_create_matview(Intent& in) {
   const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
   detail::reject_unknown_keys(
@@ -1101,10 +1318,21 @@ inline void parse_create_function(Intent& in) {
   const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
   detail::reject_unknown_keys(
       in.body, {"kind", "schema", "name", "arguments", "returns", "language",
-                "body", "volatility", "strict", "security_definer", "comment"}, at);
+                "body", "volatility", "strict", "security_definer", "comment",
+                "routine_kind"}, at);
+  // A procedure differs from a function only in having no return type and
+  // being CALLed, so it is a key here rather than two more intent kinds.
+  const auto rk = in.body.value("routine_kind", "FUNCTION");
+  if (rk != "FUNCTION" && rk != "PROCEDURE") {
+    detail::fail(at + ".routine_kind must be FUNCTION or PROCEDURE", "");
+  }
+  if (rk == "PROCEDURE" && in.body.contains("returns")) {
+    detail::fail(at + " is a PROCEDURE and cannot declare a return type",
+                 "A procedure returns nothing and is invoked with CALL.");
+  }
   detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
   detail::require_identifier(detail::require_string(in.body, "name", at), "name", in.ordinal);
-  detail::require_string(in.body, "returns", at);
+  if (rk == "FUNCTION") detail::require_string(in.body, "returns", at);
   detail::require_string(in.body, "language", at);
   detail::require_string(in.body, "body", at);
   detail::require_string(in.body, "comment", at);
@@ -1123,7 +1351,8 @@ inline void parse_create_function(Intent& in) {
 
 inline void parse_drop_function(Intent& in) {
   const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
-  detail::reject_unknown_keys(in.body, {"kind", "schema", "name", "arguments"}, at);
+  detail::reject_unknown_keys(in.body, {"kind", "schema", "name", "arguments",
+                                        "routine_kind"}, at);
   detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
   detail::require_identifier(detail::require_string(in.body, "name", at), "name", in.ordinal);
   if (!in.body.contains("arguments") || !in.body["arguments"].is_array()) {
@@ -1727,6 +1956,19 @@ inline Spec parse_spec(const json& doc) {
     case IntentKind::kDropStatistics: parse_named_object(in); break;
     case IntentKind::kCreateRule: parse_create_rule(in); break;
     case IntentKind::kDropRule: parse_drop_rule(in); break;
+    case IntentKind::kCreatePublication:
+    case IntentKind::kAlterPublication: parse_publication(in); break;
+    case IntentKind::kDropPublication: parse_replication_name(in); break;
+    case IntentKind::kCreateSubscription:
+    case IntentKind::kAlterSubscription: parse_subscription(in); break;
+    case IntentKind::kDropSubscription: parse_replication_name(in); break;
+    case IntentKind::kCreateObject: parse_create_object(in); break;
+    case IntentKind::kDropObject: parse_drop_object(in); break;
+    case IntentKind::kAlterObject: parse_alter_object(in); break;
+    case IntentKind::kCreateTableAs: parse_create_table_as(in); break;
+    case IntentKind::kImportForeignSchema: parse_import_foreign_schema(in); break;
+    case IntentKind::kSecurityLabel: parse_security_label(in); break;
+    case IntentKind::kAlterDefaultPrivileges: parse_alter_default_privileges(in); break;
     }
     s.intents.push_back(std::move(in));
     ++ordinal;

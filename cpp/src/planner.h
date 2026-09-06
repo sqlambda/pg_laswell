@@ -617,6 +617,23 @@ inline void project(const Intent& in, const Step& step, Observations& projected)
       projected.tables[in.body.value("schema", "") + "." + in.body.value("name", "")] =
           json{{"exists", true}, {"kind", "materialized_view"}};
       return;
+    case IntentKind::kCreateTableAs:
+      projected.tables[qualified] =
+          json{{"exists", true}, {"kind", "table"}, {"columns", json::object()},
+               {"indexes", json::object()}, {"constraints", json::object()}};
+      return;
+    case IntentKind::kCreatePublication:
+    case IntentKind::kAlterPublication:
+    case IntentKind::kDropPublication:
+    case IntentKind::kCreateSubscription:
+    case IntentKind::kAlterSubscription:
+    case IntentKind::kDropSubscription:
+    case IntentKind::kAlterObject:
+    case IntentKind::kImportForeignSchema:
+    case IntentKind::kSecurityLabel:
+    case IntentKind::kAlterDefaultPrivileges:
+    case IntentKind::kCreateObject:
+    case IntentKind::kDropObject:
     case IntentKind::kCreateStatistics:
     case IntentKind::kDropStatistics:
     case IntentKind::kCreateRule:
@@ -1664,6 +1681,420 @@ inline void warn_about_rebuild(
 }
 
 }  // namespace detail
+
+// --- logical replication, and the long tail --------------------------------
+//
+// Measured (spike S21, 18.6):
+//
+//   CREATE PUBLICATION                       runs inside a transaction
+//   CREATE SUBSCRIPTION (create_slot = true) ERROR: cannot be executed inside
+//                                            a transaction block
+//   CREATE SUBSCRIPTION WITH (connect=false) runs, and warns the subscription
+//                                            is not connected
+//   pg_subscription.subconninfo              stores the password IN THE CLEAR
+//
+// The last one shapes the whole kind. This tool stores every statement it runs
+// verbatim in laswell.step.sql -- that is the ledger's point -- so a password
+// in the spec would be in the signed specification, in git and in the ledger.
+// It is refused at parse time rather than redacted, because a redacted ledger
+// entry would no longer be what ran, and that is the one property this tool
+// will not trade.
+inline void plan_replication(const Intent& in, const Observations& obs,
+                             Plan& plan, std::vector<Step>& out) {
+  Step step;
+  step.kind = in.kind_name;
+  struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
+  step.txn_class = TxnClass::kRequired;
+  (void)obs;
+  const auto name = detail::quote_identifier(in.body.value("name", ""));
+
+  auto tables_clause = [&](const char* key) {
+    std::vector<std::string> ts;
+    for (const auto& t : in.body.value(key, json::array())) {
+      ts.push_back(t.get<std::string>());
+    }
+    return detail::join(ts, ", ");
+  };
+
+  switch (in.kind) {
+    case IntentKind::kCreatePublication: {
+      std::string sql = "CREATE PUBLICATION " + name;
+      if (in.body.value("all_tables", false)) {
+        sql += " FOR ALL TABLES";
+      } else if (in.body.contains("tables")) {
+        sql += " FOR TABLE " + tables_clause("tables");
+      }
+      if (in.body.contains("operations")) {
+        std::vector<std::string> ops;
+        for (const auto& o : in.body["operations"]) ops.push_back(o.get<std::string>());
+        sql += " WITH (publish = '" + detail::join(ops, ", ") + "')";
+      }
+      step.sql.push_back(sql + ";");
+      step.lock = "ShareUpdateExclusiveLock on each published table";
+      step.why = "measured: a publication is created inside a transaction like "
+                 "any other catalog change";
+      plan.warnings.push_back(
+          "a publication only decides what is SENT. Every table in it must have "
+          "a replica identity a subscriber can match rows by -- the default is "
+          "the primary key, and a table without one replicates INSERTs and then "
+          "fails on the first UPDATE or DELETE. set_replica_identity is the "
+          "intent that fixes that, and nothing here checks it.");
+      if (in.body.value("all_tables", false)) {
+        plan.warnings.push_back(
+            "FOR ALL TABLES includes tables created later, which is usually "
+            "what is wanted and means every future migration adds to what this "
+            "publication sends -- including tables nobody intended to "
+            "replicate.");
+      }
+      return;
+    }
+
+    case IntentKind::kAlterPublication: {
+      std::vector<std::string> sql;
+      if (in.body.contains("add_tables")) {
+        sql.push_back("ALTER PUBLICATION " + name + " ADD TABLE " +
+                      tables_clause("add_tables") + ";");
+      }
+      if (in.body.contains("drop_tables")) {
+        sql.push_back("ALTER PUBLICATION " + name + " DROP TABLE " +
+                      tables_clause("drop_tables") + ";");
+      }
+      if (in.body.contains("operations")) {
+        std::vector<std::string> ops;
+        for (const auto& o : in.body["operations"]) ops.push_back(o.get<std::string>());
+        sql.push_back("ALTER PUBLICATION " + name + " SET (publish = '" +
+                      detail::join(ops, ", ") + "');");
+      }
+      step.sql = std::move(sql);
+      step.lock = "ShareUpdateExclusiveLock on each table added or removed";
+      step.why = "catalog-only on this server";
+      plan.warnings.push_back(
+          "a subscriber does not pick up a publication change by itself: it "
+          "needs ALTER SUBSCRIPTION ... REFRESH PUBLICATION, run THERE. Until "
+          "that happens the two sides disagree about what is replicated, with "
+          "no error on either.");
+      return;
+    }
+
+    case IntentKind::kDropPublication:
+      step.sql.push_back("DROP PUBLICATION " + name + ";");
+      step.lock = "ShareUpdateExclusiveLock on the published tables";
+      step.why = "the publication stops sending at commit";
+      plan.warnings.push_back(
+          "any subscriber to this publication stops receiving changes and does "
+          "NOT error -- it simply falls behind, silently and permanently, until "
+          "someone looks at the subscriber.");
+      return;
+
+    case IntentKind::kCreateSubscription: {
+      const bool connect = in.body.value("connect", true);
+      std::vector<std::string> pubs;
+      for (const auto& p : in.body.value("publications", json::array())) {
+        pubs.push_back(detail::quote_identifier(p.get<std::string>()));
+      }
+      std::vector<std::string> opts;
+      if (!connect) opts.push_back("connect = false");
+      if (in.body.contains("enabled")) {
+        opts.push_back(std::string("enabled = ") +
+                       (in.body.value("enabled", true) ? "true" : "false"));
+      }
+      if (in.body.contains("slot_name")) {
+        opts.push_back("slot_name = " +
+                       detail::quote_literal(in.body.value("slot_name", "")));
+      }
+      step.sql.push_back(
+          "CREATE SUBSCRIPTION " + name + " CONNECTION " +
+          detail::quote_literal(in.body.value("connection", "")) +
+          " PUBLICATION " + detail::join(pubs, ", ") +
+          (opts.empty() ? "" : " WITH (" + detail::join(opts, ", ") + ")") + ";");
+      if (connect) {
+        // Measured: it cannot run inside a transaction block. Same shape as
+        // CREATE INDEX CONCURRENTLY and DETACH ... CONCURRENTLY.
+        step.txn_class = TxnClass::kForbidden;
+        step.own_transaction = true;
+        step.lock = "no lock here; it connects to the publisher and creates a "
+                    "replication slot THERE";
+        step.why =
+            "measured on 18.6: CREATE SUBSCRIPTION with create_slot cannot run "
+            "inside a transaction block, so this step owns its own and cannot "
+            "be rolled back with its neighbours";
+        plan.warnings.push_back(
+            "this connects to the publisher and creates a replication slot on "
+            "IT. The slot then holds WAL on the publisher until this "
+            "subscription consumes it -- an inactive slot is the most common "
+            "cause of a publisher filling its disk, and nothing on this server "
+            "will report it. pg_licht replicationSlots, pointed at the "
+            "publisher, is the reading that would.");
+      } else {
+        step.lock = "no lock; nothing is contacted";
+        step.why =
+            "connect = false creates the catalog entry only, so it runs inside "
+            "a transaction -- measured, the connecting form does not";
+        plan.warnings.push_back(
+            "connect = false leaves the subscription NOT connected: the "
+            "replication slot must be created on the publisher by hand, then "
+            "the subscription enabled and refreshed. PostgreSQL says so as a "
+            "NOTICE, which is easy to miss in a migration log.");
+      }
+      return;
+    }
+
+    case IntentKind::kAlterSubscription: {
+      std::vector<std::string> sql;
+      if (in.body.contains("connection")) {
+        sql.push_back("ALTER SUBSCRIPTION " + name + " CONNECTION " +
+                      detail::quote_literal(in.body.value("connection", "")) + ";");
+      }
+      if (in.body.contains("publications")) {
+        std::vector<std::string> pubs;
+        for (const auto& p : in.body["publications"]) {
+          pubs.push_back(detail::quote_identifier(p.get<std::string>()));
+        }
+        sql.push_back("ALTER SUBSCRIPTION " + name + " SET PUBLICATION " +
+                      detail::join(pubs, ", ") + ";");
+      }
+      if (in.body.value("refresh", false)) {
+        sql.push_back("ALTER SUBSCRIPTION " + name + " REFRESH PUBLICATION;");
+      }
+      if (in.body.contains("enabled")) {
+        sql.push_back("ALTER SUBSCRIPTION " + name +
+                      (in.body.value("enabled", true) ? " ENABLE;" : " DISABLE;"));
+      }
+      step.sql = std::move(sql);
+      step.lock = "no table lock";
+      step.why = "altering a subscription changes what this server asks for";
+      if (in.body.contains("enabled") && !in.body.value("enabled", true)) {
+        plan.warnings.push_back(
+            "disabling a subscription does NOT drop its replication slot, so "
+            "the publisher keeps every WAL segment this subscription has not "
+            "consumed -- indefinitely, until it is enabled again or the slot is "
+            "dropped there. That is a disk-full on the publisher, caused from "
+            "here.");
+      }
+      return;
+    }
+
+    case IntentKind::kDropSubscription:
+      step.sql.push_back("DROP SUBSCRIPTION " + name + ";");
+      step.txn_class = TxnClass::kForbidden;
+      step.own_transaction = true;
+      step.lock = "no table lock; it contacts the publisher to drop the slot";
+      step.why =
+          "dropping a subscription that still has a slot must contact the "
+          "publisher to remove it, which cannot happen inside a transaction "
+          "block";
+      plan.warnings.push_back(
+          "if the publisher is unreachable this fails, and the fix is to "
+          "disable the subscription, SET (slot_name = NONE), then drop -- which "
+          "leaves the slot ORPHANED on the publisher, still holding WAL. That "
+          "is a deliberate choice with a cost, not a workaround, and it has to "
+          "be made on the publisher afterwards.");
+      return;
+
+    default: break;
+  }
+}
+
+// The remaining one-offs. None has a lock to weigh or a scan to avoid; each is
+// here because a repository that cannot express it describes a database that
+// does not exist, and each carries what its statement does not say.
+inline void plan_final_kinds(const Intent& in, const Observations& obs,
+                             Plan& plan, std::vector<Step>& out) {
+  Step step;
+  step.kind = in.kind_name;
+  struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
+  step.txn_class = TxnClass::kRequired;
+
+  const auto ot = in.body.value("object_type", "");
+  const auto schema = in.body.value("schema", "");
+  const auto name = in.body.value("name", "");
+
+  switch (in.kind) {
+    case IntentKind::kAlterObject: {
+      const std::string target = schema.empty() ? name : schema + "." + name;
+      std::vector<std::string> sql;
+      if (in.body.contains("to")) {
+        sql.push_back("ALTER " + ot + " " + target + " RENAME TO " +
+                      detail::quote_identifier(in.body.value("to", "")) + ";");
+      }
+      if (in.body.contains("owner")) {
+        sql.push_back("ALTER " + ot + " " + target + " OWNER TO " +
+                      detail::quote_identifier(in.body.value("owner", "")) + ";");
+      }
+      if (in.body.contains("set_schema")) {
+        sql.push_back("ALTER " + ot + " " + target + " SET SCHEMA " +
+                      detail::quote_identifier(in.body.value("set_schema", "")) + ";");
+      }
+      step.sql = std::move(sql);
+      step.lock = "AccessExclusiveLock on the object";
+      step.why = "catalog-only";
+      return;
+    }
+
+    case IntentKind::kCreateTableAs: {
+      const auto qualified = in.qualified_table();
+      const auto& t = obs.table(qualified);
+      if (t.value("exists", false)) {
+        step.action = Action::kSatisfied;
+        step.why = qualified + " already exists";
+        return;
+      }
+      const bool with_data = in.body.value("with_data", true);
+      step.sql.push_back(std::string("CREATE ") +
+                         (in.body.value("unlogged", false) ? "UNLOGGED " : "") +
+                         "TABLE " + qualified + " AS " +
+                         in.body.value("definition", "") +
+                         (with_data ? " WITH DATA;" : " WITH NO DATA;"));
+      step.sql.push_back("COMMENT ON TABLE " + qualified + " IS " +
+                         detail::quote_literal(in.body.value("comment", "")) + ";");
+      step.own_transaction = with_data;
+      step.lock = with_data
+          ? "AccessShareLock on every relation the query reads, for as long as "
+            "the query takes"
+          : "no lock beyond the catalog";
+      step.why = with_data
+          ? "the query runs in full at creation, so this costs whatever it "
+            "costs and holds read locks throughout"
+          : "WITH NO DATA creates the shape and nothing else";
+      plan.warnings.push_back(
+          "CREATE TABLE AS copies the query's result and its column types, and "
+          "nothing else: no primary key, no indexes, no constraints, no "
+          "defaults, no identity. " + qualified +
+          " is a heap of rows until later intents give it a shape.");
+      return;
+    }
+
+    case IntentKind::kImportForeignSchema: {
+      std::string sql = "IMPORT FOREIGN SCHEMA " +
+                        detail::quote_identifier(in.body.value("remote_schema", ""));
+      if (in.body.contains("limit_to")) {
+        std::vector<std::string> ts;
+        for (const auto& t : in.body["limit_to"]) ts.push_back(t.get<std::string>());
+        sql += " LIMIT TO (" + detail::join(ts, ", ") + ")";
+      } else if (in.body.contains("except")) {
+        std::vector<std::string> ts;
+        for (const auto& t : in.body["except"]) ts.push_back(t.get<std::string>());
+        sql += " EXCEPT (" + detail::join(ts, ", ") + ")";
+      }
+      sql += " FROM SERVER " + detail::quote_identifier(in.body.value("server", "")) +
+             " INTO " + detail::quote_identifier(schema) + ";";
+      step.sql.push_back(sql);
+      step.own_transaction = true;
+      step.lock = "no lock here; it queries the REMOTE server's catalog";
+      step.why = "importing contacts the foreign server and creates one foreign "
+                 "table per remote table it finds";
+      plan.warnings.push_back(
+          "what this creates depends on the REMOTE schema at the moment it "
+          "runs, so the same signed spec produces different objects on "
+          "different days. That is the one place in this repository where the "
+          "outcome is not determined by the spec, and the ledger will record "
+          "the statement rather than the tables it made. Prefer explicit "
+          "create_object FOREIGN TABLE intents where the set matters.");
+      return;
+    }
+
+    case IntentKind::kSecurityLabel: {
+      const std::string target = schema.empty() ? name : schema + "." + name;
+      const bool removing = !in.body.contains("label");
+      step.sql.push_back(
+          "SECURITY LABEL FOR " +
+          detail::quote_literal(in.body.value("provider", "")) + " ON " + ot +
+          " " + target + " IS " +
+          (removing ? "NULL" : detail::quote_literal(in.body.value("label", ""))) + ";");
+      step.lock = "AccessShareLock";
+      step.why = "a security label is metadata this server stores and does not "
+                 "interpret";
+      plan.warnings.push_back(
+          "a security label means nothing without a label provider loaded to "
+          "enforce it -- typically an extension such as sepgsql. If none is "
+          "loaded the statement fails; if one is, the label changes what that "
+          "provider permits, which is not visible in the catalog.");
+      return;
+    }
+
+    case IntentKind::kAlterDefaultPrivileges: {
+      const bool granting = in.body.value("grant", true);
+      std::vector<std::string> privs, roles;
+      for (const auto& p : in.body.value("privileges", json::array())) {
+        privs.push_back(p.get<std::string>());
+      }
+      for (const auto& r : in.body.value(granting ? "to" : "from", json::array())) {
+        const auto rn = r.get<std::string>();
+        roles.push_back(rn == "PUBLIC" ? "PUBLIC" : detail::quote_identifier(rn));
+      }
+      std::string sql = "ALTER DEFAULT PRIVILEGES";
+      if (in.body.contains("for_role")) {
+        sql += " FOR ROLE " +
+               detail::quote_identifier(in.body.value("for_role", ""));
+      }
+      if (!schema.empty()) sql += " IN SCHEMA " + detail::quote_identifier(schema);
+      sql += std::string(granting ? " GRANT " : " REVOKE ") +
+             detail::join(privs, ", ") + " ON " + ot +
+             (granting ? " TO " : " FROM ") + detail::join(roles, ", ") + ";";
+      step.sql.push_back(sql);
+      step.lock = "no lock on any table";
+      step.why = "this governs objects created LATER and changes nothing that "
+                 "exists now";
+      plan.warnings.push_back(
+          "default privileges apply only to objects created by the role they "
+          "are recorded FOR -- by default the role running this statement, not "
+          "every role. A table created later by a different role gets nothing "
+          "from this, which is the single most common way an ALTER DEFAULT "
+          "PRIVILEGES appears not to work. Name for_role deliberately.");
+      plan.warnings.push_back(
+          "nothing that already exists is changed. Objects created before this "
+          "commits keep whatever privileges they have -- a grant intent is what "
+          "fixes those.");
+      return;
+    }
+
+    default: break;
+  }
+}
+
+// The long tail: object types whose only decisions are existence and what
+// depends on them. Two kinds rather than forty, and they still refuse a drop
+// that something depends on -- which is the safeguard, not the statement.
+inline void plan_generic_object(const Intent& in, const Observations& obs,
+                                Plan& plan, std::vector<Step>& out) {
+  Step step;
+  step.kind = in.kind_name;
+  struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
+  step.txn_class = TxnClass::kRequired;
+  (void)obs;
+
+  const auto ot = in.body.value("object_type", "");
+  const auto schema = in.body.value("schema", "");
+  const auto raw_name = in.body.value("name", "");
+  // Some of these name themselves in ways an identifier quote would break --
+  // an operator is "+(int,int)", a cast is "(int AS text)" -- so the name is
+  // taken as written. It is inside a signed specification, which is the same
+  // trust boundary the definition below sits behind.
+  const auto name = schema.empty() ? raw_name : schema + "." + raw_name;
+
+  if (in.kind == IntentKind::kCreateObject) {
+    step.sql.push_back("CREATE " + ot + " " + name + " " +
+                       in.body.value("definition", "") + ";");
+    if (in.body.contains("comment")) {
+      step.sql.push_back("COMMENT ON " + ot + " " + name + " IS " +
+                         detail::quote_literal(in.body.value("comment", "")) + ";");
+    }
+    step.lock = "no lock on any existing object";
+    step.why = ot +
+        " has no planning decision beyond whether it is already there: no "
+        "lock to weigh, no scan to avoid, no rewrite to predict. It is here so "
+        "the repository can express it, not because there is a choice to make";
+  } else {
+    step.sql.push_back("DROP " + ot + " " + name + ";");
+    step.lock = "AccessExclusiveLock on the object";
+    step.why = "dropping " + ot + " " + name;
+    plan.warnings.push_back(
+        "pg_laswell does not read dependants for " + ot +
+        " as it does for a type, function or sequence, so this drop is not "
+        "pre-checked: PostgreSQL will refuse it if something depends on it, at "
+        "execution rather than at plan time. No CASCADE is emitted either way.");
+  }
+}
 
 // --- materialized views, extended statistics, rules ------------------------
 inline void plan_relation_extras(const Intent& in, const Observations& obs,
@@ -2883,15 +3314,17 @@ inline void plan_object(const Intent& in, const Observations& obs, Plan& plan,
             "replace.");
         return;
       }
-      std::string sql = "CREATE OR REPLACE FUNCTION " + qualified + "(" +
-                        detail::join(args, ", ") + ")\n  RETURNS " + returns +
+      const auto routine = in.body.value("routine_kind", "FUNCTION");
+      std::string sql = "CREATE OR REPLACE " + routine + " " + qualified + "(" +
+                        detail::join(args, ", ") +
+                        (routine == "PROCEDURE" ? ")" : ")\n  RETURNS " + returns) +
                         "\n  LANGUAGE " + in.body.value("language", "");
       if (in.body.contains("volatility")) sql += "\n  " + in.body.value("volatility", "");
       if (in.body.value("strict", false)) sql += "\n  STRICT";
       if (in.body.value("security_definer", false)) sql += "\n  SECURITY DEFINER";
       sql += "\nAS $laswell$" + in.body.value("body", "") + "$laswell$;";
       step.sql.push_back(sql);
-      step.sql.push_back("COMMENT ON FUNCTION " + signature + " IS " +
+      step.sql.push_back("COMMENT ON " + routine + " " + signature + " IS " +
                          detail::quote_literal(in.body.value("comment", "")) + ";");
       step.lock = "no lock on any table";
       step.why = exists
@@ -2919,7 +3352,8 @@ inline void plan_object(const Intent& in, const Observations& obs, Plan& plan,
         return;
       }
       if (refuse_if_depended_on(o, "function " + signature)) return;
-      step.sql.push_back("DROP FUNCTION " + signature + ";");
+      step.sql.push_back("DROP " + in.body.value("routine_kind", "FUNCTION") +
+                         " " + signature + ";");
       step.lock = "AccessExclusiveLock on the function";
       step.why = "nothing depends on " + signature;
       return;
@@ -5086,6 +5520,22 @@ inline Plan plan_migration(const Spec& spec, const Observations& obs,
         plan_drop_table(in, projected, plan, emitted); break;
       case IntentKind::kDeleteRows:
         plan_delete_rows(in, projected, cfg, plan, emitted); break;
+      case IntentKind::kCreatePublication:
+      case IntentKind::kAlterPublication:
+      case IntentKind::kDropPublication:
+      case IntentKind::kCreateSubscription:
+      case IntentKind::kAlterSubscription:
+      case IntentKind::kDropSubscription:
+        plan_replication(in, projected, plan, emitted); break;
+      case IntentKind::kCreateObject:
+      case IntentKind::kDropObject:
+        plan_generic_object(in, projected, plan, emitted); break;
+      case IntentKind::kAlterObject:
+      case IntentKind::kCreateTableAs:
+      case IntentKind::kImportForeignSchema:
+      case IntentKind::kSecurityLabel:
+      case IntentKind::kAlterDefaultPrivileges:
+        plan_final_kinds(in, projected, plan, emitted); break;
       case IntentKind::kCreateMaterializedView:
       case IntentKind::kCreateStatistics:
       case IntentKind::kDropStatistics:
