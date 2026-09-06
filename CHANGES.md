@@ -3,7 +3,7 @@
 ## 0.1.0 (unreleased)
 
 The whole path works: repository, signing, planning, dry run, paced execution,
-ledger. 313 tests green on GCC 14.2 and Clang 22, under AddressSanitizer/UBSan
+ledger. 318 tests green on GCC 14.2 and Clang 22, under AddressSanitizer/UBSan
 and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
 `--call` contract test.
 
@@ -207,6 +207,19 @@ and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
   one rewrites. `text`→`varchar(200)` rewrites; `varchar(50)`→`text` does not.
   Anything unproven is reported as a rewrite, because a cautious plan costs
   less than an unplanned outage.
+- **Materialized views, extended statistics and rules**, plus **grants beyond
+  tables**. 67 kinds. `create_materialized_view` says whether it runs its query
+  now (`WITH DATA`) or leaves the view *unreadable until refreshed* — a query
+  against an unpopulated matview fails outright rather than returning nothing.
+  `create_statistics` warns that extended statistics do nothing until `ANALYZE`.
+  `create_rule` carries the strongest warning after RLS: a rule rewrites
+  matching queries for every session with nothing in the query text to say so,
+  and `DO INSTEAD` reports success having done nothing.
+  `grant`/`revoke` now take an `object_type` — schema, sequence, function, type,
+  domain, database — and **check the privilege against it at parse time**,
+  because PostgreSQL rejects a wrong one at execution, by which point earlier
+  steps have committed. `ALL TABLES IN SCHEMA` warns that it covers what exists
+  now and nothing created later.
 - **Identity, generated columns and physical layout** — `set_identity`,
   `drop_expression`, `set_column_options`, `set_table_options`, `set_logged`,
   `set_tablespace`, `set_access_method`, `set_replica_identity`, `cluster_on`.

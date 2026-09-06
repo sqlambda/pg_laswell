@@ -613,6 +613,15 @@ inline void project(const Intent& in, const Step& step, Observations& projected)
     case IntentKind::kDropNotNull:
       projected.tables[qualified]["columns"][in.body.value("column", "")]["not_null"] = false;
       return;
+    case IntentKind::kCreateMaterializedView:
+      projected.tables[in.body.value("schema", "") + "." + in.body.value("name", "")] =
+          json{{"exists", true}, {"kind", "materialized_view"}};
+      return;
+    case IntentKind::kCreateStatistics:
+    case IntentKind::kDropStatistics:
+    case IntentKind::kCreateRule:
+    case IntentKind::kDropRule:
+      return;
     case IntentKind::kSetIdentity:
     case IntentKind::kDropExpression:
     case IntentKind::kSetColumnOptions:
@@ -1655,6 +1664,167 @@ inline void warn_about_rebuild(
 }
 
 }  // namespace detail
+
+// --- materialized views, extended statistics, rules ------------------------
+inline void plan_relation_extras(const Intent& in, const Observations& obs,
+                                 Plan& plan, std::vector<Step>& out) {
+  Step step;
+  step.kind = in.kind_name;
+  struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
+  step.txn_class = TxnClass::kRequired;
+
+  const auto schema = in.body.value("schema", "");
+  const auto name = in.body.value("name", "");
+  const auto qualified_obj = schema + "." + name;
+  const auto qualified_tbl = in.qualified_table();
+
+  switch (in.kind) {
+    case IntentKind::kCreateMaterializedView: {
+      const auto& t = obs.table(qualified_obj);
+      if (t.value("exists", false)) {
+        step.action = Action::kSatisfied;
+        step.why = qualified_obj + " already exists";
+        plan.warnings.push_back(
+            qualified_obj +
+            " already exists, so this is reported satisfied WITHOUT comparing "
+            "its query to the spec. replace_view is the intent that changes an "
+            "existing one, and it says what a matview rebuild costs.");
+        return;
+      }
+      const bool with_data = in.body.value("with_data", true);
+      step.sql.push_back("CREATE MATERIALIZED VIEW " + qualified_obj + " AS " +
+                         in.body.value("definition", "") +
+                         (with_data ? " WITH DATA;" : " WITH NO DATA;"));
+      step.sql.push_back("COMMENT ON MATERIALIZED VIEW " + qualified_obj + " IS " +
+                         detail::quote_literal(in.body.value("comment", "")) + ";");
+      step.own_transaction = with_data;
+      step.lock = with_data
+          ? "AccessShareLock on every relation the query reads, for as long as "
+            "it takes to run"
+          : "no lock beyond the catalog -- nothing is read";
+      step.why = with_data
+          ? "WITH DATA runs the query in full at creation, so this step costs "
+            "whatever that query costs and holds read locks throughout"
+          : "WITH NO DATA creates the definition and nothing else, so it is "
+            "instant";
+      if (!with_data) {
+        plan.warnings.push_back(
+            qualified_obj +
+            " is created WITH NO DATA, so it is unreadable until REFRESH -- a "
+            "query against it fails outright rather than returning nothing. "
+            "REFRESH is maintenance and not a migration this tool runs, so "
+            "something else must do it before anything reads the view.");
+      }
+      plan.warnings.push_back(
+          "a materialized view does not track its sources: " + qualified_obj +
+          " is a snapshot, and it is stale from the moment the next write lands "
+          "until something refreshes it. Nothing in the database will say so.");
+      return;
+    }
+
+    case IntentKind::kCreateStatistics: {
+      const auto& t = obs.table(qualified_tbl);
+      if (!t.value("exists", false)) {
+        step.action = Action::kConflict;
+        step.why = qualified_tbl + " does not exist";
+        plan.conflicts.push_back(step.why);
+        return;
+      }
+      std::vector<std::string> cols;
+      for (const auto& c : in.body.value("columns", json::array())) {
+        cols.push_back(detail::quote_identifier(c.get<std::string>()));
+      }
+      const json columns = t.value("columns", json::object());
+      for (const auto& c : in.body.value("columns", json::array())) {
+        if (!columns.contains(c.get<std::string>())) {
+          step.action = Action::kConflict;
+          step.why = qualified_tbl + "." + c.get<std::string>() + " does not exist";
+          plan.conflicts.push_back(step.why);
+          return;
+        }
+      }
+      std::string kinds;
+      if (in.body.contains("kinds")) {
+        std::vector<std::string> ks;
+        for (const auto& k : in.body["kinds"]) ks.push_back(k.get<std::string>());
+        kinds = " (" + detail::join(ks, ", ") + ")";
+      }
+      step.sql.push_back("CREATE STATISTICS " + qualified_obj + kinds + " ON " +
+                         detail::join(cols, ", ") + " FROM " + qualified_tbl + ";");
+      if (in.body.contains("comment")) {
+        step.sql.push_back("COMMENT ON STATISTICS " + qualified_obj + " IS " +
+                           detail::quote_literal(in.body.value("comment", "")) + ";");
+      }
+      step.lock = "ShareUpdateExclusiveLock on " + qualified_tbl +
+                  " -- does NOT block reads or writes";
+      step.why =
+          "creating extended statistics records what to collect; it collects "
+          "nothing now and scans nothing";
+      plan.warnings.push_back(
+          "extended statistics do nothing until the table is ANALYZEd -- until "
+          "then the planner's estimates are exactly what they were. ANALYZE is "
+          "maintenance and not something this tool schedules, so a plan that "
+          "depends on the new estimates should not assume they exist yet.");
+      return;
+    }
+
+    case IntentKind::kCreateRule: {
+      const auto& t = obs.table(qualified_tbl);
+      if (!t.value("exists", false)) {
+        step.action = Action::kConflict;
+        step.why = qualified_tbl + " does not exist";
+        plan.conflicts.push_back(step.why);
+        return;
+      }
+      const auto event = in.body.value("event", "");
+      std::string sql = "CREATE RULE " + detail::quote_identifier(name) +
+                        " AS ON " + event + " TO " + qualified_tbl;
+      if (in.body.contains("where")) sql += " WHERE " + in.body.value("where", "");
+      sql += " DO " + std::string(in.body.value("instead", false) ? "INSTEAD " : "") +
+             "(" + in.body.value("action", "") + ");";
+      step.sql.push_back(sql);
+      step.lock = "AccessExclusiveLock on " + qualified_tbl;
+      step.why = "a rule rewrites queries at parse time, so it is a catalog "
+                 "change with no scan";
+      // Rules deserve the strongest warning in the tool after RLS: they change
+      // what a statement MEANS, invisibly, for everyone.
+      plan.warnings.push_back(
+          "a rule REWRITES matching queries before they run, for every session "
+          "and with nothing in the query text to say so. An " + event +
+          " against " + qualified_tbl +
+          " will no longer do what it appears to do. Rules interact badly with "
+          "RETURNING, with statement-level counts and with triggers, and the "
+          "PostgreSQL documentation itself recommends a trigger instead for "
+          "everything except a view's _RETURN rule. Consider create_trigger.");
+      if (in.body.value("instead", false)) {
+        plan.warnings.push_back(
+            "DO INSTEAD means the original statement does not run at all. A "
+            "caller's INSERT reports success having inserted nothing, unless "
+            "the rule's own action happens to do it.");
+      }
+      return;
+    }
+
+    case IntentKind::kDropRule: {
+      step.sql.push_back("DROP RULE " + detail::quote_identifier(name) + " ON " +
+                         qualified_tbl + ";");
+      step.lock = "AccessExclusiveLock on " + qualified_tbl;
+      step.why = "dropping a rule restores what the statements it matched "
+                 "actually mean";
+      return;
+    }
+
+    case IntentKind::kDropStatistics: {
+      step.sql.push_back("DROP STATISTICS " + qualified_obj + ";");
+      step.lock = "AccessExclusiveLock on the statistics object";
+      step.why = "the planner's estimates revert to per-column ones at the next "
+                 "plan, which may change query plans immediately";
+      return;
+    }
+
+    default: break;
+  }
+}
 
 // --- identity, generated columns, storage and physical layout --------------
 //
@@ -2870,7 +3040,11 @@ inline void plan_security(const Intent& in, const Observations& obs, Plan& plan,
 
   const auto qualified = in.qualified_table();
   const auto& t = obs.table(qualified);
-  if (!t.value("exists", false)) {
+  // A grant or revoke may name something that is not a relation at all, so the
+  // table guard applies to the kinds that really are table-scoped.
+  const bool table_scoped =
+      in.kind != IntentKind::kGrant && in.kind != IntentKind::kRevoke;
+  if (table_scoped && !t.value("exists", false)) {
     step.action = Action::kConflict;
     step.why = qualified + " does not exist";
     plan.conflicts.push_back(step.why);
@@ -3099,6 +3273,7 @@ inline void plan_security(const Intent& in, const Observations& obs, Plan& plan,
 
   // grant / revoke
   const bool granting = in.kind == IntentKind::kGrant;
+  const auto object_type = in.body.value("object_type", "TABLE");
   std::vector<std::string> privs;
   for (const auto& pv : in.body.value("privileges", json::array())) {
     privs.push_back(pv.get<std::string>());
@@ -3118,12 +3293,36 @@ inline void plan_security(const Intent& in, const Observations& obs, Plan& plan,
     // other order is a syntax error -- found once already, by running it.
     cols = " (" + detail::join(cs, ", ") + ")";
   }
+  // What the privileges are ON. A table grant names schema.table; every other
+  // object type names itself, and ALL ... IN SCHEMA is a third shape again.
+  std::string target;
+  if (object_type == "TABLE") {
+    target = in.body.value("all_in_schema", false)
+                 ? "ALL TABLES IN SCHEMA " +
+                       detail::quote_identifier(in.body.value("schema", ""))
+                 : "TABLE " + qualified;
+  } else if (object_type == "FUNCTION") {
+    target = "FUNCTION " + detail::function_signature(in);
+  } else if (object_type == "SCHEMA" || object_type == "DATABASE") {
+    target = object_type + " " +
+             detail::quote_identifier(in.body.value("name", ""));
+  } else {
+    target = object_type + " " + in.body.value("schema", "") + "." +
+             in.body.value("name", "");
+  }
   step.sql.push_back(std::string(granting ? "GRANT " : "REVOKE ") +
                      detail::join(privs, ", ") + cols +
-                     " ON " + qualified + (granting ? " TO " : " FROM ") +
+                     " ON " + target + (granting ? " TO " : " FROM ") +
                      detail::join(roles, ", ") + ";");
-  step.lock = "AccessShareLock on " + qualified +
+  step.lock = "AccessShareLock on " + target +
               " -- measured; a privilege change does not block anything";
+  if (in.body.value("all_in_schema", false)) {
+    plan.warnings.push_back(
+        "ALL TABLES IN SCHEMA applies to the tables that exist RIGHT NOW. A "
+        "table created afterwards gets nothing, and the repository will not "
+        "notice -- alter_default_privileges is what governs future objects, "
+        "and this intent is not it.");
+  }
   step.why = std::string(granting ? "granting" : "revoking") +
              " takes only AccessShareLock, so this is safe on a busy table at "
              "any size";
@@ -4887,6 +5086,12 @@ inline Plan plan_migration(const Spec& spec, const Observations& obs,
         plan_drop_table(in, projected, plan, emitted); break;
       case IntentKind::kDeleteRows:
         plan_delete_rows(in, projected, cfg, plan, emitted); break;
+      case IntentKind::kCreateMaterializedView:
+      case IntentKind::kCreateStatistics:
+      case IntentKind::kDropStatistics:
+      case IntentKind::kCreateRule:
+      case IntentKind::kDropRule:
+        plan_relation_extras(in, projected, plan, emitted); break;
       case IntentKind::kSetIdentity:
       case IntentKind::kDropExpression:
       case IntentKind::kSetColumnOptions:

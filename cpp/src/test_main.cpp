@@ -945,7 +945,16 @@ TEST(Spec, KnownKindsAreExactlyTheImplementedKinds) {
                           "method":"heap"},
     "set_replica_identity": {"kind":"set_replica_identity","schema":"s",
                              "table":"t","identity":"FULL"},
-    "cluster_on": {"kind":"cluster_on","schema":"s","table":"t","index":"i"}
+    "cluster_on": {"kind":"cluster_on","schema":"s","table":"t","index":"i"},
+    "create_materialized_view": {"kind":"create_materialized_view","schema":"s",
+                                 "name":"mv","definition":"SELECT 1 AS a",
+                                 "comment":"d"},
+    "create_statistics": {"kind":"create_statistics","schema":"s","name":"st",
+                          "table":"t","columns":["a","b"]},
+    "drop_statistics": {"kind":"drop_statistics","schema":"s","name":"st"},
+    "create_rule": {"kind":"create_rule","schema":"s","table":"t","name":"r",
+                    "event":"INSERT","action":"NOTHING"},
+    "drop_rule": {"kind":"drop_rule","schema":"s","table":"t","name":"r"}
   })JSON");
   for (const auto& [name, kind] : pglaswell::intent_kinds()) {
     (void)kind;
@@ -5051,7 +5060,10 @@ TEST(Planner, GrantIsCheapAndRevokeHitsLiveConnections) {
   const auto sql = all_sql(*only_step(g, "grant"));
   // The column list goes after the PRIVILEGES, not after the relation -- the
   // syntax error this project already made once and found by running it.
-  EXPECT_NE(sql.find("GRANT SELECT, UPDATE (\"amount\") ON shop.orders "
+  // "ON TABLE ..." rather than "ON ...": the keyword is optional in
+  // PostgreSQL and stating it keeps the table form indistinguishable from the
+  // schema, sequence and function forms only by the word that says which.
+  EXPECT_NE(sql.find("GRANT SELECT, UPDATE (\"amount\") ON TABLE shop.orders "
                      "TO \"app\", PUBLIC;"),
             std::string::npos) << sql;
   EXPECT_NE(only_step(g, "grant")->lock.find("AccessShareLock"), std::string::npos);
@@ -5063,8 +5075,9 @@ TEST(Planner, GrantIsCheapAndRevokeHitsLiveConnections) {
                                 {"from", json::array({"app"})}}})),
       obs_rich(), {});
   ASSERT_TRUE(r.ok) << r.render();
-  EXPECT_NE(all_sql(*only_step(r, "revoke")).find("REVOKE SELECT ON shop.orders FROM \"app\";"),
-            std::string::npos);
+  EXPECT_NE(all_sql(*only_step(r, "revoke")).find(
+                "REVOKE SELECT ON TABLE shop.orders FROM \"app\";"),
+            std::string::npos) << all_sql(*only_step(r, "revoke"));
   bool warned = false;
   for (const auto& w : r.warnings) {
     if (w.find("ALREADY CONNECTED") != std::string::npos) warned = true;
@@ -5079,7 +5092,7 @@ TEST(Spec, APrivilegeTypoIsCaughtRatherThanSentToTheDatabase) {
                                      {"privileges", json::array({"SELCT"})},
                                      {"to", json::array({"app"})}}});
   const auto err = spec_error(doc);
-  EXPECT_NE(err.find("unknown privilege"), std::string::npos) << err;
+  EXPECT_NE(err.find("a TABLE does not accept"), std::string::npos) << err;
 }
 
 
@@ -8046,5 +8059,155 @@ TEST(Spec, PhysicalLayoutValuesAreCheckedNotPassedThrough) {
     EXPECT_NE(spec_error(doc).find(c.expect), std::string::npos)
         << c.body.dump() << " -> " << spec_error(doc);
   }
+}
+
+// --- materialized views, extended statistics, rules ------------------------
+
+TEST(Planner, AMaterializedViewSaysWhetherItRunsItsQueryNow) {
+  const auto with_data = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "create_materialized_view"},
+                                {"schema", "shop"}, {"name", "totals"},
+                                {"definition", "SELECT 1 AS a"},
+                                {"comment", "d"}}})),
+      obs_alter(), {});
+  ASSERT_TRUE(with_data.ok) << with_data.render();
+  const auto* d = only_step(with_data, "create_materialized_view");
+  EXPECT_NE(all_sql(*d).find("WITH DATA"), std::string::npos);
+  EXPECT_TRUE(d->own_transaction)
+      << "populating runs the query in full and holds read locks throughout";
+
+  const auto no_data = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "create_materialized_view"},
+                                {"schema", "shop"}, {"name", "totals"},
+                                {"definition", "SELECT 1 AS a"},
+                                {"with_data", false}, {"comment", "d"}}})),
+      obs_alter(), {});
+  bool unreadable = false, stale = false;
+  for (const auto& w : no_data.warnings) {
+    if (w.find("fails outright") != std::string::npos) unreadable = true;
+    if (w.find("stale from the moment") != std::string::npos) stale = true;
+  }
+  EXPECT_TRUE(unreadable)
+      << "WITH NO DATA makes the view error, not return nothing: "
+      << no_data.render();
+  EXPECT_TRUE(stale) << no_data.render();
+}
+
+TEST(Planner, ExtendedStatisticsDoNothingUntilAnalyzeAndSaySo) {
+  auto obs = obs_alter();
+  obs.tables["shop.orders"]["columns"]["status"] =
+      json{{"type", "text"}, {"not_null", false}};
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "create_statistics"}, {"schema", "shop"},
+                                {"name", "orders_corr"}, {"table", "orders"},
+                                {"columns", json::array({"amount", "status"})},
+                                {"kinds", json::array({"ndistinct", "mcv"})}}})),
+      obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto* step = only_step(plan, "create_statistics");
+  EXPECT_NE(all_sql(*step).find("CREATE STATISTICS shop.orders_corr "
+                                "(ndistinct, mcv) ON \"amount\", \"status\" "
+                                "FROM shop.orders"),
+            std::string::npos) << all_sql(*step);
+  EXPECT_NE(step->lock.find("does NOT block"), std::string::npos) << step->lock;
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("until the table is ANALYZEd") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned) << plan.render();
+
+  // A column that is not there is a conflict, not a statement that fails.
+  const auto bad = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "create_statistics"}, {"schema", "shop"},
+                                {"name", "s"}, {"table", "orders"},
+                                {"columns", json::array({"amount", "nope"})}}})),
+      obs, {});
+  EXPECT_FALSE(bad.ok) << bad.render();
+}
+
+TEST(Planner, ARuleGetsTheStrongestWarningShortOfRowSecurity) {
+  // A rule changes what a statement MEANS, for every session, with nothing in
+  // the query text to say so. PostgreSQL's own documentation recommends a
+  // trigger for everything except a view's _RETURN rule.
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "create_rule"}, {"schema", "shop"},
+                                {"table", "orders"}, {"name", "no_insert"},
+                                {"event", "INSERT"}, {"instead", true},
+                                {"action", "NOTHING"}}})),
+      obs_alter(), {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  bool rewrite = false, instead = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("no longer do what it appears to do") != std::string::npos &&
+        w.find("create_trigger") != std::string::npos) rewrite = true;
+    if (w.find("inserted nothing") != std::string::npos) instead = true;
+  }
+  EXPECT_TRUE(rewrite) << plan.render();
+  EXPECT_TRUE(instead)
+      << "DO INSTEAD reports success having done nothing: " << plan.render();
+}
+
+TEST(Spec, ExtendedStatisticsNeedMoreThanOneColumn) {
+  json doc = minimal_spec();
+  doc["intents"] = json::array({json{{"kind", "create_statistics"},
+                                     {"schema", "s"}, {"name", "st"},
+                                     {"table", "t"},
+                                     {"columns", json::array({"a"})}}});
+  const auto err = spec_error(doc);
+  EXPECT_NE(err.find("CORRELATION"), std::string::npos) << err;
+}
+
+TEST(Planner, GrantsReachBeyondTablesAndCheckThePrivilegeAgainstTheObject) {
+  // Each object type accepts a different privilege set, and PostgreSQL rejects
+  // the wrong one at execution -- by which point earlier steps have committed.
+  struct Case { json body; const char* expect; };
+  const Case cases[] = {
+      {json{{"kind", "grant"}, {"object_type", "SCHEMA"}, {"name", "reporting"},
+            {"privileges", json::array({"USAGE"})}, {"to", json::array({"app"})}},
+       "GRANT USAGE ON SCHEMA \"reporting\" TO \"app\";"},
+      {json{{"kind", "grant"}, {"object_type", "SEQUENCE"}, {"schema", "shop"},
+            {"name", "seq"}, {"privileges", json::array({"USAGE"})},
+            {"to", json::array({"app"})}},
+       "GRANT USAGE ON SEQUENCE shop.seq TO \"app\";"},
+      {json{{"kind", "grant"}, {"object_type", "FUNCTION"}, {"schema", "shop"},
+            {"name", "f"}, {"arguments", json::array({json{{"type", "integer"}}})},
+            {"privileges", json::array({"EXECUTE"})}, {"to", json::array({"app"})}},
+       "GRANT EXECUTE ON FUNCTION shop.f(integer) TO \"app\";"},
+      {json{{"kind", "grant"}, {"object_type", "TABLE"}, {"schema", "shop"},
+            {"all_in_schema", true}, {"privileges", json::array({"SELECT"})},
+            {"to", json::array({"app"})}},
+       "GRANT SELECT ON ALL TABLES IN SCHEMA \"shop\" TO \"app\";"},
+  };
+  for (const auto& c : cases) {
+    const auto plan =
+        pglaswell::plan_migration(spec_of(json::array({c.body})), obs_alter(), {});
+    ASSERT_TRUE(plan.ok) << c.body.dump() << "\n" << plan.render();
+    EXPECT_NE(all_sql(*only_step(plan, "grant")).find(c.expect), std::string::npos)
+        << c.body.dump() << " -> " << all_sql(*only_step(plan, "grant"));
+  }
+
+  // ALL TABLES IN SCHEMA covers what exists now and nothing created later,
+  // which is the trap it is famous for.
+  const auto all = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "grant"}, {"object_type", "TABLE"},
+                                {"schema", "shop"}, {"all_in_schema", true},
+                                {"privileges", json::array({"SELECT"})},
+                                {"to", json::array({"app"})}}})),
+      obs_alter(), {});
+  bool warned = false;
+  for (const auto& w : all.warnings) {
+    if (w.find("created afterwards gets nothing") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned) << all.render();
+
+  // A privilege the object type does not accept is refused at parse time.
+  json doc = minimal_spec();
+  doc["intents"] = json::array({json{{"kind", "grant"}, {"object_type", "SCHEMA"},
+                                     {"name", "reporting"},
+                                     {"privileges", json::array({"SELECT"})},
+                                     {"to", json::array({"app"})}}});
+  const auto err = spec_error(doc);
+  EXPECT_NE(err.find("a SCHEMA does not accept"), std::string::npos) << err;
+  EXPECT_NE(err.find("already committed"), std::string::npos) << err;
 }
 
