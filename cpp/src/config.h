@@ -53,6 +53,22 @@ struct ExecutorConfig {
   int observer_tick_ms = 250;
   int max_concurrent_jobs = 2;
 
+  // Declared by an operator, never measured, and reported as such. PostgreSQL
+  // exposes no CPU count in SQL -- the only cpu-named settings are planner cost
+  // constants -- so this is configuration or nothing. pg_licht reached the same
+  // conclusion for its own host_vcpus, and a tool that guessed here would be
+  // guessing about the resource whose exhaustion is least graceful.
+  int host_vcpus = 0;
+
+  // Ceiling for maintenance_work_mem, per step that uses it. Divided by
+  // max_concurrent_jobs before it is applied: PostgreSQL treats
+  // maintenance_work_mem as a limit per OPERATION, not a budget across them,
+  // and the documentation's own justification for setting it high -- "an
+  // installation normally doesn't have many of them running concurrently" -- is
+  // exactly what concurrent migrations void. Zero leaves the server's setting
+  // alone.
+  int maintenance_work_mem_mb = 0;
+
   // Contention circuit breaker, on the TRANSITIVE count of backends blocked by
   // us. Measured 2026-09-05 (spike S11): a direct-blocker count sees 1 waiter
   // where the real pile-up is 6, because pg_blocking_pids() returns direct
@@ -230,6 +246,8 @@ inline bool apply_executor_key(ExecutorConfig& e, const std::string& key,
   if (key == "dry_run_statement_timeout_ms") { e.dry_run_statement_timeout_ms = detail::positive_int(value, key, w); return true; }
   if (key == "observer_tick_ms") { e.observer_tick_ms = detail::positive_int(value, key, w); return true; }
   if (key == "max_concurrent_jobs") { e.max_concurrent_jobs = detail::positive_int(value, key, w); return true; }
+  if (key == "host_vcpus") { e.host_vcpus = detail::positive_int(value, key, w); return true; }
+  if (key == "maintenance_work_mem_mb") { e.maintenance_work_mem_mb = detail::positive_int(value, key, w); return true; }
   if (key == "throttle_waiters") { e.throttle_waiters = detail::positive_int(value, key, w); return true; }
   if (key == "pause_waiters") { e.pause_waiters = detail::positive_int(value, key, w); return true; }
   if (key == "resume_waiters") { e.resume_waiters = detail::non_negative_int(value, key, w); return true; }

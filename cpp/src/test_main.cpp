@@ -5050,6 +5050,116 @@ TEST(Spec, APrivilegeTypoIsCaughtRatherThanSentToTheDatabase) {
   EXPECT_NE(err.find("unknown privilege"), std::string::npos) << err;
 }
 
+// --- capacity and maintenance_work_mem -------------------------------------
+
+static pglaswell::Observations obs_capacity(int max_workers, int busy,
+                                            int headroom) {
+  auto obs = observations(1024, 10);
+  obs.server["max_connections"] = headroom + 10;
+  obs.server["reserved_connections"] = 0;
+  obs.server["current_backends"] = 10;
+  obs.server["max_parallel_workers"] = max_workers;
+  obs.server["max_parallel_maintenance_workers"] = 2;
+  obs.server["max_worker_processes"] = max_workers;
+  obs.server["parallel_workers_active"] = busy;
+  obs.server["maintenance_work_mem_kb"] = 65536;
+  return obs;
+}
+
+TEST(Planner, TheCapacityVerdictNamesTheNumberThatDecidedIt) {
+  // A bare boolean makes the caller guess at the reason, and the reason is the
+  // useful half -- especially here, where "yes" and "yes but your index build
+  // will be single-threaded" are very different answers.
+  pglaswell::ExecutorConfig cfg;
+  const auto plenty = pglaswell::plan_migration(
+      pglaswell::parse_spec(minimal_spec()), obs_capacity(8, 0, 40), cfg);
+  const auto w = plenty.budget["workers"];
+  EXPECT_TRUE(w.value("canStartAnotherJob", false)) << w.dump(2);
+  EXPECT_NE(w.value("verdict", "").find("8"), std::string::npos) << w.dump(2);
+
+  // Worker slots exhausted is not a refusal -- a job with no index build needs
+  // none -- but the silence is the danger and must be named.
+  const auto busy = pglaswell::plan_migration(
+      pglaswell::parse_spec(minimal_spec()), obs_capacity(8, 8, 40), cfg);
+  const auto bw = busy.budget["workers"];
+  EXPECT_TRUE(bw.value("canStartAnotherJob", false));
+  EXPECT_NE(bw.value("verdict", "").find("single-threaded"), std::string::npos)
+      << bw.dump(2);
+
+  // Connections are a refusal: a job needs three and cannot start with two.
+  const auto starved = pglaswell::plan_migration(
+      pglaswell::parse_spec(minimal_spec()), obs_capacity(8, 0, 2), cfg);
+  const auto sw = starved.budget["workers"];
+  EXPECT_FALSE(sw.value("canStartAnotherJob", true)) << sw.dump(2);
+  EXPECT_NE(sw.value("verdict", "").find("connection"), std::string::npos);
+}
+
+TEST(Planner, HostVcpusIsNeverGuessedAndSaysWhyWhenAbsent) {
+  // PostgreSQL exposes no CPU count in SQL -- the only cpu-named settings are
+  // planner cost constants -- so this is configuration or nothing.
+  pglaswell::ExecutorConfig cfg;
+  const auto none = pglaswell::plan_migration(
+      pglaswell::parse_spec(minimal_spec()), obs_capacity(8, 0, 40), cfg);
+  EXPECT_FALSE(none.budget["workers"].contains("hostVcpus"));
+  EXPECT_NE(none.budget["workers"].value("hostVcpusSource", "").find("never a guess"),
+            std::string::npos);
+
+  cfg.host_vcpus = 32;
+  const auto declared = pglaswell::plan_migration(
+      pglaswell::parse_spec(minimal_spec()), obs_capacity(8, 0, 40), cfg);
+  EXPECT_EQ(declared.budget["workers"].value("hostVcpus", 0), 32);
+  EXPECT_NE(declared.budget["workers"].value("hostVcpusSource", "").find("declared"),
+            std::string::npos);
+}
+
+TEST(Planner, MoreJobsThanWorkerSlotsIsCalledOut) {
+  // The 32-way case: worker slots run out long before connections do, and a
+  // job count larger than the server's total slots means concurrent index
+  // builds contend however many jobs are permitted.
+  pglaswell::ExecutorConfig cfg;
+  cfg.max_concurrent_jobs = 32;
+  const auto plan = pglaswell::plan_migration(
+      pglaswell::parse_spec(minimal_spec()), obs_capacity(8, 0, 200), cfg);
+  const auto note = plan.budget["workers"].value("note", "");
+  EXPECT_NE(note.find("32"), std::string::npos) << plan.budget["workers"].dump(2);
+  EXPECT_NE(note.find("8"), std::string::npos) << note;
+}
+
+TEST(Planner, MaintenanceWorkMemIsDividedByTheJobCountAndOnlyOnStepsThatUseIt) {
+  // Checked in the documentation rather than assumed, in both directions: it
+  // is NOT multiplied by parallel workers ("a limit to be applied to the
+  // entire utility command"), and it IS allocated per concurrent operation --
+  // which is the assumption the docs' own advice to set it high depends on.
+  pglaswell::ExecutorConfig cfg;
+  cfg.maintenance_work_mem_mb = 2048;
+  cfg.max_concurrent_jobs = 8;
+  const auto plan = pglaswell::plan_migration(
+      pglaswell::parse_spec(minimal_spec()), obs_capacity(8, 0, 40), cfg);
+  EXPECT_EQ(plan.budget["maintenanceWorkMem"].value("perStepMb", 0), 256)
+      << "2048MB across 8 jobs is 256MB each: " << plan.budget.dump(2);
+
+  // It lands on the index build and nowhere else -- a number on a step that
+  // does not use the setting is decoration.
+  const auto* index = steps_of(plan, "create_index")[0];
+  EXPECT_EQ(index->detail.value("maintenance_work_mem_mb", 0), 256)
+      << all_sql(*index);
+  for (const auto& step : plan.steps) {
+    if (step.kind == "add_column") {
+      EXPECT_EQ(step.detail.value("maintenance_work_mem_mb", 0), 0)
+          << "add_column does not use maintenance_work_mem";
+    }
+  }
+
+  // Unconfigured leaves the server's setting alone and says so, rather than
+  // guessing at memory it cannot see.
+  pglaswell::ExecutorConfig bare;
+  const auto quiet = pglaswell::plan_migration(
+      pglaswell::parse_spec(minimal_spec()), obs_capacity(8, 0, 40), bare);
+  EXPECT_EQ(quiet.budget["maintenanceWorkMem"].value("perStepMb", 0), 0);
+  EXPECT_NE(quiet.budget["maintenanceWorkMem"].value("why", "").find("will not guess"),
+            std::string::npos);
+}
+
 // --- conflict keys ---------------------------------------------------------
 
 static std::set<std::string> keys_of(const json& body) {
@@ -6713,6 +6823,52 @@ TEST_F(DatabaseTest, ARepositoryCanNowBuildADatabaseFromNothing) {
   w.begin("pg_laswell/test/scratch-cleanup");
   w.txn().exec("DROP SCHEMA lw_shop CASCADE");
   w.commit();
+}
+
+TEST_F(DatabaseTest, ASessionSettingReallyTakesAndReallyResets) {
+  // The planner deciding a value is worth nothing if it does not reach the
+  // server. This checks the whole path, and the two ways it could quietly not
+  // work: the setting never applying, and the setting never coming back off --
+  // which on a pooled or reused connection would leak into the next job.
+  pglaswell::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = url_;
+  pglaswell::WriteSession w(cfg);
+
+  const auto before = w.exec_nontransactional(
+      "SELECT current_setting('maintenance_work_mem')")[0][0].as<std::string>();
+
+  const auto inside = w.with_session_setting("maintenance_work_mem", "192MB", [&] {
+    return w.exec_nontransactional(
+        "SELECT current_setting('maintenance_work_mem')")[0][0].as<std::string>();
+  });
+  EXPECT_EQ(inside, "192MB") << "the setting never reached the server";
+
+  const auto after = w.exec_nontransactional(
+      "SELECT current_setting('maintenance_work_mem')")[0][0].as<std::string>();
+  EXPECT_EQ(after, before)
+      << "the setting was not reset, so it would leak into the next step";
+
+  // An empty value means "leave it alone", so a caller with an optional
+  // setting needs no second code path -- and does not set the GUC to '',
+  // which is an error for every numeric one.
+  const auto untouched = w.with_session_setting("maintenance_work_mem", "", [&] {
+    return w.exec_nontransactional(
+        "SELECT current_setting('maintenance_work_mem')")[0][0].as<std::string>();
+  });
+  EXPECT_EQ(untouched, before);
+
+  // And it resets even when the body throws, which is the path that matters:
+  // an index build that fails must not leave the session altered.
+  EXPECT_THROW(w.with_session_setting("maintenance_work_mem", "192MB", [&] {
+                 return w.exec_nontransactional("SELECT 1/0");
+               }),
+               pqxx::sql_error);
+  EXPECT_EQ(w.exec_nontransactional(
+                "SELECT current_setting('maintenance_work_mem')")[0][0]
+                .as<std::string>(),
+            before)
+      << "the setting survived an exception path";
 }
 
 TEST_F(DatabaseTest, ObjectDependantsMatchWhatPostgresqlRefusesToDrop) {

@@ -197,6 +197,100 @@ inline json compute_budget(const Observations& obs, const ExecutorConfig& cfg) {
         "the application's. An application collapses when its own pool fills, "
         "which usually happens first and is invisible from here.";
   }
+
+  // Worker capacity, which is what actually limits concurrent migrations --
+  // and it is a server-side limit, not a client one. The migrations run inside
+  // PostgreSQL; this process contributes three connections and a poll loop per
+  // job, so the machine pg_laswell runs on is very nearly irrelevant to how
+  // many can run at once.
+  const int max_workers = obs.server.value("max_parallel_workers", 0);
+  const int max_maint = obs.server.value("max_parallel_maintenance_workers", 0);
+  const int workers_busy = obs.server.value("parallel_workers_active", 0);
+  const int jobs = std::max(1, cfg.max_concurrent_jobs);
+  json w{{"maxParallelWorkers", max_workers},
+         {"maxParallelMaintenanceWorkers", max_maint},
+         {"maxWorkerProcesses", obs.server.value("max_worker_processes", 0)},
+         {"parallelWorkersActive", workers_busy},
+         {"parallelWorkersFree", std::max(0, max_workers - workers_busy)},
+         {"maxConcurrentJobs", jobs}};
+  if (cfg.host_vcpus > 0) {
+    w["hostVcpus"] = cfg.host_vcpus;
+    w["hostVcpusSource"] = "configuration -- declared by an operator";
+  } else {
+    w["hostVcpusSource"] =
+        "not declared. PostgreSQL exposes no CPU count in SQL -- the only "
+        "cpu-named settings are planner cost constants -- so this is "
+        "configuration or nothing, never a guess.";
+  }
+
+  // The verdict, with the number that decided it. A bare boolean would make
+  // the caller guess at the reason, and the reason is the useful half.
+  const int connections_per_job = 3;
+  const int free = b.value("effectiveHeadroom", 0);
+  if (free < connections_per_job) {
+    w["canStartAnotherJob"] = false;
+    w["verdict"] = "no: " + std::to_string(free) +
+                   " connection(s) free and a job needs " +
+                   std::to_string(connections_per_job) +
+                   " (worker, observer, coordination)";
+  } else if (max_workers > 0 && workers_busy >= max_workers) {
+    // Not a refusal: a job with no index build does not need a worker slot.
+    w["canStartAnotherJob"] = true;
+    w["verdict"] = "yes, but all " + std::to_string(max_workers) +
+                   " parallel worker slots are in use -- an index build in the "
+                   "new job will run single-threaded, and silently, so any "
+                   "duration estimated from a measured build will be wrong";
+  } else {
+    w["canStartAnotherJob"] = true;
+    w["verdict"] = "yes: " + std::to_string(free) + " connection(s) and " +
+                   std::to_string(std::max(0, max_workers - workers_busy)) +
+                   " parallel worker slot(s) free";
+  }
+  if (jobs > 1 && max_workers > 0 && jobs > max_workers) {
+    w["note"] = "max_concurrent_jobs is " + std::to_string(jobs) +
+                " and the server has " + std::to_string(max_workers) +
+                " parallel worker slots in total, so concurrent index builds "
+                "will contend for them regardless of how many jobs are "
+                "allowed. Worker slots run out long before connections do.";
+  }
+  b["workers"] = w;
+
+  // maintenance_work_mem, divided by the job count.
+  //
+  // PostgreSQL applies it as a limit per OPERATION, not as a budget across
+  // them -- and, checked in the documentation rather than assumed, NOT per
+  // parallel worker: "parallel utility commands treat the resource limit
+  // maintenance_work_mem as a limit to be applied to the entire utility
+  // command, regardless of the number of parallel worker processes". So a
+  // parallel build does not multiply it and an estimate assuming otherwise
+  // would be three times too pessimistic.
+  //
+  // What DOES multiply it is concurrency, and the documentation's own
+  // justification for setting it high is the assumption concurrent migrations
+  // void: "an installation normally doesn't have many of them running
+  // concurrently". Thirty-two jobs is precisely that, so the configured
+  // ceiling is divided by how many may run at once.
+  if (cfg.maintenance_work_mem_mb > 0) {
+    const int per_job = std::max(1, cfg.maintenance_work_mem_mb / jobs);
+    b["maintenanceWorkMem"] =
+        json{{"configuredCeilingMb", cfg.maintenance_work_mem_mb},
+             {"perStepMb", per_job},
+             {"serverDefaultKb", obs.server.value("maintenance_work_mem_kb", 0)},
+             {"why", "the ceiling divided by max_concurrent_jobs (" +
+                         std::to_string(jobs) +
+                         "), because PostgreSQL limits it per operation and "
+                         "not across concurrent ones"}};
+  } else {
+    b["maintenanceWorkMem"] =
+        json{{"perStepMb", 0},
+             {"serverDefaultKb", obs.server.value("maintenance_work_mem_kb", 0)},
+             {"why", "maintenance_work_mem_mb is not configured, so the "
+                     "server's own setting is left alone. Raising it is the "
+                     "cheapest speed-up available for an index build, a "
+                     "foreign-key validation or a table rewrite -- but the "
+                     "host's free memory is not visible from SQL, so this tool "
+                     "will not guess at it."}};
+  }
   return b;
 }
 
@@ -3961,6 +4055,9 @@ inline Plan plan_migration(const Spec& spec, const Observations& obs,
   plan.spec_id = spec.id;
   plan.spec_digest = spec.digest;
   plan.budget = detail::compute_budget(obs, cfg);
+  const int maintenance_mb = plan.budget.contains("maintenanceWorkMem")
+                                 ? plan.budget["maintenanceWorkMem"].value("perStepMb", 0)
+                                 : 0;
 
   if (spec.min_server_version > 0 && obs.server_version > 0 &&
       obs.server_version < spec.min_server_version) {
@@ -4069,6 +4166,24 @@ inline Plan plan_migration(const Spec& spec, const Observations& obs,
 
     for (auto& step : emitted) {
       step.ordinal = ordinal++;
+      // The operations PostgreSQL documents as using maintenance_work_mem:
+      // CREATE INDEX, VACUUM, and ALTER TABLE ADD FOREIGN KEY -- which is the
+      // validation step add_foreign_key already emits. Marked here so the
+      // executor applies it and the plan shows what it chose; a step that does
+      // not use it must not carry it, or the number becomes decoration.
+      if (maintenance_mb > 0 && step.action == Action::kApply) {
+        const auto sql = detail::join(step.sql, " ");
+        if (sql.find("CREATE INDEX") != std::string::npos ||
+            sql.find("CREATE UNIQUE INDEX") != std::string::npos ||
+            sql.find("VALIDATE CONSTRAINT") != std::string::npos ||
+            sql.find("ALTER COLUMN") != std::string::npos) {
+          step.detail["maintenance_work_mem_mb"] = maintenance_mb;
+          step.why += "; maintenance_work_mem raised to " +
+                      std::to_string(maintenance_mb) +
+                      "MB for this step (the configured ceiling divided by "
+                      "max_concurrent_jobs)";
+        }
+      }
       // Grouping: consecutive required/optional steps share a transaction, and
       // anything forbidden, self-committing, or explicitly wanting its own
       // transaction forces a boundary.

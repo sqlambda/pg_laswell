@@ -393,6 +393,11 @@ class WriteSession {
         }
       }
     };
+    // An empty value means "leave this setting alone and just run the body",
+    // so a caller with an optional setting does not need two code paths --
+    // and, more to the point, does not accidentally set the GUC to the empty
+    // string, which is an error for every numeric one.
+    if (value.empty()) return body();
     {
       pqxx::nontransaction tx(*conn_);
       // The GUC name is from a fixed internal set, never from a spec; the

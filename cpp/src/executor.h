@@ -210,14 +210,25 @@ class Executor {
     // explicit RESET, never SET LOCAL: measured 2026-09-05 (spike S6), SET
     // LOCAL is silently a no-op on a nontransaction -- PostgreSQL warns and
     // libpqxx does not raise, so the timeout would appear set and would not be.
+    // maintenance_work_mem, when the planner decided this step uses it. Nested
+    // inside the statement_timeout guard and for the same reason: SET LOCAL is
+    // silently a no-op on a nontransaction (spike S6), so both must be
+    // session-level SETs with explicit RESETs, which with_session_setting does.
+    const int mwm = step.value("detail", json::object())
+                        .value("maintenance_work_mem_mb", 0);
     try {
       w.with_session_setting("statement_timeout", "0", [&] {
+        return w.with_session_setting(
+            "maintenance_work_mem",
+            mwm > 0 ? std::to_string(mwm) + "MB" : std::string(),
+            [&] {
         for (const auto& raw : step.value("sql", json::array())) {
           const auto stmt = detail::strip_semicolon(raw.get<std::string>());
           if (stmt.empty()) continue;
           w.exec_nontransactional(stmt);
         }
         return 0;
+            });
       });
     } catch (const pqxx::sql_error& e) {
       record_step(ordinal, step, "failed", 0,

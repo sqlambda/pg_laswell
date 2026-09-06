@@ -1000,6 +1000,76 @@ to a wider precision at the same scale, and a widened timestamp precision --
 and assumes a rewrite otherwise, because reporting one that does not happen
 costs a cautious plan while missing one is an unplanned outage under
 .Va AccessExclusiveLock .
+.Sh CAPACITY
+The migrations run inside PostgreSQL, not on the machine
+.Nm
+runs on: this process contributes three connections and a poll loop per job.
+So the client's core count is very nearly irrelevant to how many migrations can
+run at once, and the readings below are all server-side.
+.Pp
+What actually limits concurrency is parallel worker slots, and they run out
+long before connections do.
+Measured on a stock 18.6,
+.Va max_parallel_workers
+is 8 and
+.Va max_parallel_maintenance_workers
+is 2 -- so thirty-two concurrent migrations each wanting a concurrent index
+build share eight slots, and past them a build does not queue.
+It falls back to single-threaded,
+.Em silently ,
+and every duration estimated from a measured build is then wrong with nothing
+reporting it.
+That is what this reading exists to prevent.
+.Pp
+.Cm planMigration
+and
+.Cm jobStatus
+report, under
+.Va budget.workers :
+the worker limits, how many parallel workers are in use
+.Em right now
+-- the only live reading among them -- the free connection headroom, and a
+verdict naming the number that decided it, such as
+.Qq yes, but all 8 parallel worker slots are in use .
+An agent deciding whether to start another job should read that rather than a
+core count.
+.Pp
+.Va host_vcpus
+is
+.Em configuration ,
+never a measurement, and is reported as such.
+PostgreSQL exposes no CPU count in SQL at all -- the only cpu-named settings
+are planner cost constants -- so it is declared by an operator or it is absent.
+.Ss maintenance_work_mem
+Raising it is the cheapest speed-up available for an index build, a foreign-key
+validation or a table rewrite, and
+.Nm
+sets it per step for exactly those.
+Two facts about it were checked in the documentation rather than assumed,
+because the obvious guess is wrong in both directions.
+.Pp
+It is
+.Em not
+per worker:
+.Qq parallel utility commands treat the resource limit maintenance_work_mem as
+.Qq a limit to be applied to the entire utility command, regardless of the
+.Qq number of parallel worker processes .
+A parallel build does not multiply it.
+.Pp
+It
+.Em is
+per concurrent operation, and the documentation's own justification for setting
+it high is the assumption concurrent migrations void:
+.Qq an installation normally doesn't have many of them running concurrently .
+Thirty-two jobs is precisely that.
+So
+.Va maintenance_work_mem_mb
+is a ceiling and the value applied per step is that ceiling divided by
+.Va max_concurrent_jobs ,
+with the division shown in the plan.
+Leave it unset and the server's own setting is used: the host's free memory is
+not visible from SQL, and this tool will not guess at the one resource whose
+exhaustion is not graceful.
 .Sh SIGNING
 .Nm
 verifies; it never signs.

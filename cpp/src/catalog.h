@@ -416,6 +416,28 @@ SELECT JSONB_BUILD_OBJECT(
   'oldest_xact_age_s', (SELECT ROUND(EXTRACT(EPOCH FROM now() - MIN(xact_start))::numeric, 1)
                           FROM pg_stat_activity
                          WHERE xact_start IS NOT NULL AND pid <> pg_backend_pid()),
+  -- Parallel worker capacity, which runs out long before connections do.
+  --
+  -- Measured on a stock 18.6: max_parallel_workers is 8 and
+  -- max_parallel_maintenance_workers is 2. Thirty-two concurrent migrations
+  -- each wanting a concurrent index build share those eight slots, and past
+  -- them a build does not queue -- it silently falls back to single-threaded,
+  -- and every duration the plan estimated is wrong with nothing reporting it.
+  --
+  -- 'parallel_workers_active' is the only live reading here; the rest are
+  -- settings. There is NO cpu count available in SQL at all: the only
+  -- cpu-named settings are planner cost constants, which is why host vCPUs is
+  -- configuration in this tool exactly as it is in pg_licht.
+  'max_worker_processes', CURRENT_SETTING('max_worker_processes')::int,
+  'max_parallel_workers', CURRENT_SETTING('max_parallel_workers')::int,
+  'max_parallel_maintenance_workers',
+      CURRENT_SETTING('max_parallel_maintenance_workers')::int,
+  'parallel_workers_active', (SELECT COUNT(*) FROM pg_stat_activity
+                               WHERE backend_type = 'parallel worker'),
+  -- pg_settings.setting, not current_setting(): the latter returns "256MB"
+  -- with units and does not cast to a number.
+  'maintenance_work_mem_kb', (SELECT setting::bigint FROM pg_settings
+                               WHERE name = 'maintenance_work_mem'),
   'is_in_recovery', pg_is_in_recovery(),
   'now', now()
 )
