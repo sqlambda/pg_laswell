@@ -423,12 +423,16 @@ inline json start_migration(ToolContext& ctx, const json& args) {
   job->plan = planned;
   job->plan_digest = planned.value("planDigest", "");
 
-  // One lock per spec and one per target table, so two different specs
-  // touching the same table serialise.
+  // One lock per spec and one per target, so two specs touching the same thing
+  // serialise. The targets come from conflict_keys() -- the SAME function the
+  // repository groups by -- because a grouping that says two migrations may run
+  // together and a lock set that does not agree is worse than either alone.
   std::vector<long long> keys{advisory_key("laswell:spec:" + spec.id)};
   std::set<std::string> targets;
-  for (const auto& in : spec.intents) targets.insert(in.qualified_table());
-  for (const auto& t : targets) keys.push_back(advisory_key("laswell:table:" + t));
+  for (const auto& in : spec.intents) {
+    for (const auto& k : conflict_keys(in)) targets.insert(k);
+  }
+  for (const auto& t : targets) keys.push_back(advisory_key("laswell:target:" + t));
   job->lock_key = keys.front();
 
   auto ledger = std::make_shared<Ledger>(cfg, nullptr);

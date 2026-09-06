@@ -103,7 +103,12 @@ class RelationAnalyzer {
 
   RelationSet analyze(const Spec& spec, const json& plan) {
     RelationSet out;
-    for (const auto& in : spec.intents) out.relations.insert(in.qualified_table());
+    // conflict_keys(), not qualified_table(): an object intent carries `name`,
+    // not `table`, so the old seed produced "public." for every type in a
+    // schema -- serialising unrelated migrations while missing real conflicts.
+    for (const auto& in : spec.intents) {
+      for (const auto& k : conflict_keys(in)) out.relations.insert(k);
+    }
 
     ReadSession s(cfg_, std::nullopt, cache_, 2000);
     const int version = s.server_version();

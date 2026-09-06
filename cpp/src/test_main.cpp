@@ -5050,6 +5050,106 @@ TEST(Spec, APrivilegeTypoIsCaughtRatherThanSentToTheDatabase) {
   EXPECT_NE(err.find("unknown privilege"), std::string::npos) << err;
 }
 
+// --- conflict keys ---------------------------------------------------------
+
+static std::set<std::string> keys_of(const json& body) {
+  json doc = minimal_spec();
+  doc["intents"] = json::array({body});
+  const auto spec = pglaswell::parse_spec(doc);
+  std::set<std::string> out;
+  for (const auto& k : pglaswell::conflict_keys(spec.intents[0])) out.insert(k);
+  return out;
+}
+
+TEST(Spec, ConflictKeysNeverProduceTheEmptyRelationThatUsedToSerialiseEverything) {
+  // The measured defect: object intents carry `name`, not `table`, so
+  // qualified_table() returned "public." for every type in a schema and "." for
+  // an extension. Unrelated migrations serialised against each other, and a
+  // real conflict between a type and a column of that type was missed.
+  for (const auto& body : {
+           json{{"kind", "create_type"}, {"schema", "public"}, {"name", "a"},
+                {"type_kind", "enum"}, {"labels", json::array({"x"})},
+                {"comment", "c"}},
+           json{{"kind", "create_extension"}, {"name", "pg_trgm"}},
+           json{{"kind", "create_schema"}, {"schema", "rep"}, {"comment", "c"}},
+           json{{"kind", "create_sequence"}, {"schema", "public"}, {"name", "s"},
+                {"comment", "c"}}}) {
+    for (const auto& k : keys_of(body)) {
+      EXPECT_NE(k, ".") << body.dump();
+      EXPECT_NE(k.back(), '.')
+          << "a key ending in '.' matches every other object in that schema: "
+          << k << " from " << body.dump();
+    }
+  }
+}
+
+TEST(Spec, TwoUnrelatedObjectsShareNoKeyAndTwoRelatedOnesDo) {
+  const auto a = keys_of(json{{"kind", "create_type"}, {"schema", "public"},
+                              {"name", "status_a"}, {"type_kind", "enum"},
+                              {"labels", json::array({"x"})}, {"comment", "c"}});
+  const auto b = keys_of(json{{"kind", "create_type"}, {"schema", "public"},
+                              {"name", "status_b"}, {"type_kind", "enum"},
+                              {"labels", json::array({"y"})}, {"comment", "c"}});
+  std::set<std::string> shared;
+  std::set_intersection(a.begin(), a.end(), b.begin(), b.end(),
+                        std::inserter(shared, shared.begin()));
+  EXPECT_TRUE(shared.empty())
+      << "two unrelated types must be free to run concurrently";
+
+  // ... and a column of that type must NOT be, which is the direction that was
+  // silently wrong: the drop and the use could have run at the same time.
+  const auto uses = keys_of(json{{"kind", "add_column"}, {"schema", "public"},
+                                 {"table", "orders"}, {"column", "st"},
+                                 {"type", "public.status_a"}, {"nullable", true},
+                                 {"comment", "c"}});
+  EXPECT_EQ(uses.count("type:public.status_a"), 1u)
+      << "a column of a user type must serialise against that type";
+  EXPECT_EQ(uses.count("public.orders"), 1u);
+
+  const auto dropped = keys_of(json{{"kind", "drop_type"}, {"schema", "public"},
+                                    {"name", "status_a"}});
+  EXPECT_EQ(dropped.count("type:public.status_a"), 1u);
+}
+
+TEST(Spec, ConflictKeysCarryTheEdgesAnIntentDoesNotName) {
+  // A key set that only ever names the obvious object catches nothing a human
+  // would not already have spotted.
+  EXPECT_EQ(keys_of(json{{"kind", "create_trigger"}, {"schema", "shop"},
+                         {"table", "orders"}, {"name", "trg"},
+                         {"timing", "AFTER"}, {"events", json::array({"INSERT"})},
+                         {"function", "shop.touch()"}})
+                .count("function:shop.touch"), 1u)
+      << "a trigger must serialise against the function it calls";
+
+  EXPECT_EQ(keys_of(json{{"kind", "add_foreign_key"}, {"schema", "shop"},
+                         {"table", "orders"}, {"name", "fk"},
+                         {"columns", json::array({"wid"})},
+                         {"references_schema", "shop"},
+                         {"references_table", "warehouse"},
+                         {"references_columns", json::array({"id"})}})
+                .count("shop.warehouse"), 1u)
+      << "adding a foreign key locks the referenced table, so it must "
+         "serialise against it";
+
+  EXPECT_EQ(keys_of(json{{"kind", "attach_partition"}, {"schema", "shop"},
+                         {"table", "events"}, {"partition", "events_2026"},
+                         {"from", "'2026-01-01'"}, {"to", "'2027-01-01'"}})
+                .count("shop.events_2026"), 1u)
+      << "the partition being attached is a target as much as the parent is";
+
+  EXPECT_EQ(keys_of(json{{"kind", "rename_table"}, {"schema", "shop"},
+                         {"table", "orders"}, {"to", "purchases"}})
+                .count("shop.purchases"), 1u)
+      << "the NEW name must be held too, or two renames could race for it";
+
+  // A built-in type produces no type key: inventing a schema for "text" would
+  // make a key that matches nothing and serialise against nothing.
+  EXPECT_EQ(keys_of(json{{"kind", "add_column"}, {"schema", "shop"},
+                         {"table", "orders"}, {"column", "note"},
+                         {"type", "text"}, {"nullable", true}, {"comment", "c"}})
+                .size(), 1u);
+}
+
 // --- the object kinds, and the safeguards on them --------------------------
 
 static pglaswell::Observations obs_objects() {

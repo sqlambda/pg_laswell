@@ -137,6 +137,88 @@ inline std::string object_key_for(const Intent& in) {
   }
 }
 
+// Everything an intent serialises against.
+//
+// This is the single answer used by BOTH the repository's concurrency grouping
+// and the executor's advisory locks. They must not disagree, and before this
+// existed they agreed only by sharing a bug: both keyed on qualified_table(),
+// which is schema() + "." + table() -- and object intents carry `name`, not
+// `table`. Measured 2026-09-05, create_type public.status_a and
+// create_type public.status_b both came back as the relation "public.", and
+// create_extension pg_trgm as ".". Two wrong directions at once: unrelated
+// objects serialised against each other, and a drop of a type did NOT share a
+// key with a column using it, so they could run at the same time.
+//
+// Relations keep their bare "schema.table" form so the repository's
+// EXPLAIN-derived relations and foreign-key edges merge with these directly.
+// Objects are "kind:name", which cannot collide with a qualified relation.
+inline std::vector<std::string> conflict_keys(const Intent& in) {
+  std::vector<std::string> keys;
+  const auto schema = in.body.value("schema", "");
+  const auto add = [&](const std::string& k) {
+    if (!k.empty() && k != "." && k.back() != '.') keys.push_back(k);
+  };
+
+  const auto object = object_key_for(in);
+  if (!object.empty()) add(object);
+  if (!in.table().empty()) add(in.qualified_table());
+
+  // The edges. A key is only useful if it catches the conflict that is NOT
+  // between two intents naming the same thing -- a column of a type against a
+  // drop of that type, a trigger against the function it calls.
+  switch (in.kind) {
+    case IntentKind::kAddColumn:
+    case IntentKind::kAlterColumnType: {
+      // A column's type may be a user-defined one in any schema. Unqualified
+      // names are left alone: they are built-in types or resolve by
+      // search_path, and inventing a schema for them would produce a key that
+      // matches nothing.
+      const auto type = in.body.value("type", "");
+      const auto dot = type.find('.');
+      if (dot != std::string::npos) {
+        auto base = type.substr(0, type.find('('));
+        while (!base.empty() && (base.back() == ' ' || base.back() == '[')) base.pop_back();
+        add("type:" + base);
+      }
+      return keys;
+    }
+    case IntentKind::kCreateTable: {
+      for (const auto& c : in.body.value("columns", json::array())) {
+        const auto type = c.value("type", "");
+        if (type.find('.') != std::string::npos) {
+          add("type:" + type.substr(0, type.find('(')));
+        }
+      }
+      return keys;
+    }
+    case IntentKind::kCreateTrigger: {
+      // "shop.touch()" -> function:shop.touch
+      auto fn = in.body.value("function", "");
+      const auto paren = fn.find('(');
+      if (paren != std::string::npos) fn = fn.substr(0, paren);
+      if (fn.find('.') != std::string::npos) add("function:" + fn);
+      return keys;
+    }
+    case IntentKind::kAttachPartition:
+    case IntentKind::kDetachPartition:
+      add(schema + "." + in.body.value("partition", ""));
+      return keys;
+    case IntentKind::kRenameTable:
+      add(schema + "." + in.body.value("to", ""));
+      return keys;
+    case IntentKind::kAddForeignKey:
+      add(in.body.value("references_schema", "") + "." +
+          in.body.value("references_table", ""));
+      return keys;
+    case IntentKind::kReplaceView:
+    case IntentKind::kDropView:
+      add(schema + "." + in.body.value("name", ""));
+      return keys;
+    default:
+      return keys;
+  }
+}
+
 struct Spec {
   json document;              // the whole file, as parsed
   json signed_projection;     // the allowlisted subset that is signed
