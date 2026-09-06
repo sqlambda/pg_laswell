@@ -45,7 +45,10 @@ enum class IntentKind { kAddColumn, kBackfill, kCreateIndex, kDropIndex,
                         kDropExtension, kCreateType, kDropType, kAddEnumValue,
                         kCreateFunction, kDropFunction, kCreateTrigger,
                         kDropTrigger, kCreateSequence, kDropSequence,
-                        kDropView };
+                        kDropView, kAlterColumnDefault, kDropNotNull,
+                        kAlterSequence, kAlterSchema, kAlterExtension,
+                        kAlterDomain, kAlterFunction, kAlterView,
+                        kAlterPolicy, kSetComment, kSetOwner };
 
 inline const std::map<std::string, IntentKind>& intent_kinds() {
   static const std::map<std::string, IntentKind> kKinds = {
@@ -90,6 +93,17 @@ inline const std::map<std::string, IntentKind>& intent_kinds() {
       {"create_sequence", IntentKind::kCreateSequence},
       {"drop_sequence", IntentKind::kDropSequence},
       {"drop_view", IntentKind::kDropView},
+      {"alter_column_default", IntentKind::kAlterColumnDefault},
+      {"drop_not_null", IntentKind::kDropNotNull},
+      {"alter_sequence", IntentKind::kAlterSequence},
+      {"alter_schema", IntentKind::kAlterSchema},
+      {"alter_extension", IntentKind::kAlterExtension},
+      {"alter_domain", IntentKind::kAlterDomain},
+      {"alter_function", IntentKind::kAlterFunction},
+      {"alter_view", IntentKind::kAlterView},
+      {"alter_policy", IntentKind::kAlterPolicy},
+      {"set_comment", IntentKind::kSetComment},
+      {"set_owner", IntentKind::kSetOwner},
   };
   return kKinds;
 }
@@ -123,16 +137,21 @@ inline std::string object_key_for(const Intent& in) {
   const auto name = in.body.value("name", "");
   switch (in.kind) {
     case IntentKind::kCreateSchema:
-    case IntentKind::kDropSchema:      return "schema:" + schema;
+    case IntentKind::kDropSchema:
+    case IntentKind::kAlterSchema:     return "schema:" + schema;
     case IntentKind::kCreateExtension:
-    case IntentKind::kDropExtension:   return "extension:" + name;
+    case IntentKind::kDropExtension:
+    case IntentKind::kAlterExtension:  return "extension:" + name;
     case IntentKind::kCreateType:
     case IntentKind::kDropType:
-    case IntentKind::kAddEnumValue:    return "type:" + schema + "." + name;
+    case IntentKind::kAddEnumValue:
+    case IntentKind::kAlterDomain:     return "type:" + schema + "." + name;
     case IntentKind::kCreateFunction:
-    case IntentKind::kDropFunction:    return "function:" + schema + "." + name;
+    case IntentKind::kDropFunction:
+    case IntentKind::kAlterFunction:   return "function:" + schema + "." + name;
     case IntentKind::kCreateSequence:
-    case IntentKind::kDropSequence:    return "sequence:" + schema + "." + name;
+    case IntentKind::kDropSequence:
+    case IntentKind::kAlterSequence:   return "sequence:" + schema + "." + name;
     default:                           return {};
   }
 }
@@ -585,6 +604,196 @@ inline void parse_add_check_constraint(Intent& in) {
 // applied once. It is paced exactly as a backfill is, because a single DELETE
 // over a retention window is the same outage a single UPDATE would be.
 // --- the non-relation object kinds -----------------------------------------
+
+// --- the ALTER forms for objects we can already create ---------------------
+
+inline void parse_alter_column_default(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(in.body, {"kind", "schema", "table", "column", "default"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "column", at), "column", in.ordinal);
+  // Absent means DROP DEFAULT, present means SET DEFAULT. Null is refused
+  // rather than guessed at: "default": null could mean either, and the two are
+  // different changes.
+  if (in.body.contains("default") && !in.body["default"].is_string()) {
+    detail::fail(at + ".default must be a string, or absent to drop it",
+                 "Write the SQL expression as it would appear after DEFAULT. "
+                 "Omit the key entirely to DROP DEFAULT; null is refused "
+                 "because it reads as both.");
+  }
+}
+
+inline void parse_drop_not_null(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(in.body, {"kind", "schema", "table", "column"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "column", at), "column", in.ordinal);
+}
+
+inline void parse_alter_sequence(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(
+      in.body, {"kind", "schema", "name", "restart", "increment", "owned_by", "to"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "name", at), "name", in.ordinal);
+  for (const char* k : {"restart", "increment"}) {
+    if (in.body.contains(k) && !in.body[k].is_number_integer()) {
+      detail::fail(std::string(at) + "." + k + " must be an integer", "");
+    }
+  }
+  if (!in.body.contains("restart") && !in.body.contains("increment") &&
+      !in.body.contains("owned_by") && !in.body.contains("to")) {
+    detail::fail(at + " changes nothing",
+                 "Give at least one of restart, increment, owned_by or to.");
+  }
+}
+
+inline void parse_alter_schema(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(in.body, {"kind", "schema", "to", "owner"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  if (!in.body.contains("to") && !in.body.contains("owner")) {
+    detail::fail(at + " changes nothing", "Give \"to\" to rename, or \"owner\".");
+  }
+}
+
+inline void parse_alter_extension(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(in.body, {"kind", "name", "version", "schema"}, at);
+  detail::require_identifier(detail::require_string(in.body, "name", at), "name", in.ordinal);
+  if (!in.body.contains("version") && !in.body.contains("schema")) {
+    detail::fail(at + " changes nothing",
+                 "Give \"version\" to update, or \"schema\" to move it.");
+  }
+}
+
+inline void parse_alter_domain(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(
+      in.body, {"kind", "schema", "name", "add_check", "constraint_name",
+                "drop_constraint", "not_null", "default"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "name", at), "name", in.ordinal);
+  if (in.body.contains("add_check")) {
+    detail::require_string(in.body, "add_check", at);
+    detail::require_identifier(detail::require_string(in.body, "constraint_name", at),
+                               "constraint_name", in.ordinal);
+  }
+  if (!in.body.contains("add_check") && !in.body.contains("drop_constraint") &&
+      !in.body.contains("not_null") && !in.body.contains("default")) {
+    detail::fail(at + " changes nothing",
+                 "Give add_check with constraint_name, drop_constraint, "
+                 "not_null, or default.");
+  }
+}
+
+inline void parse_alter_function(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(
+      in.body, {"kind", "schema", "name", "arguments", "to", "owner",
+                "search_path", "volatility"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "name", at), "name", in.ordinal);
+  if (!in.body.contains("arguments") || !in.body["arguments"].is_array()) {
+    detail::fail(at + ".arguments is required, even when empty",
+                 "A function is identified by its argument types, not its "
+                 "name: overloads share a name.");
+  }
+  if (!in.body.contains("to") && !in.body.contains("owner") &&
+      !in.body.contains("search_path") && !in.body.contains("volatility")) {
+    detail::fail(at + " changes nothing",
+                 "Give to, owner, search_path or volatility.");
+  }
+}
+
+inline void parse_alter_view(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(in.body, {"kind", "schema", "name", "to", "owner", "options"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "name", at), "name", in.ordinal);
+  if (!in.body.contains("to") && !in.body.contains("owner") &&
+      !in.body.contains("options")) {
+    detail::fail(at + " changes nothing", "Give to, owner or options.");
+  }
+}
+
+inline void parse_alter_policy(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(
+      in.body, {"kind", "schema", "table", "name", "using", "check", "roles"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "name", at), "name", in.ordinal);
+  if (!in.body.contains("using") && !in.body.contains("check") &&
+      !in.body.contains("roles")) {
+    detail::fail(at + " changes nothing", "Give using, check or roles.");
+  }
+}
+
+// The object types COMMENT ON and OWNER TO accept here. Deliberately a closed
+// set rather than free text: the value goes straight into DDL, and a typo would
+// otherwise reach the database as SQL.
+inline const std::set<std::string>& commentable_object_types() {
+  static const std::set<std::string> kTypes = {
+      "TABLE", "COLUMN", "VIEW", "MATERIALIZED VIEW", "INDEX", "SEQUENCE",
+      "SCHEMA", "TYPE", "DOMAIN", "FUNCTION", "TRIGGER", "CONSTRAINT",
+      "POLICY", "EXTENSION"};
+  return kTypes;
+}
+
+inline void parse_set_comment(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(
+      in.body, {"kind", "object_type", "schema", "name", "table", "comment"}, at);
+  const auto ot = detail::require_string(in.body, "object_type", at);
+  if (commentable_object_types().count(ot) == 0) {
+    detail::fail(at + ".object_type is not one this tool comments on: " + ot,
+                 "Upper case, one of TABLE, COLUMN, VIEW, MATERIALIZED VIEW, "
+                 "INDEX, SEQUENCE, SCHEMA, TYPE, DOMAIN, FUNCTION, TRIGGER, "
+                 "CONSTRAINT, POLICY, EXTENSION. Not passed through unchecked: "
+                 "it becomes DDL verbatim.");
+  }
+  detail::require_identifier(detail::require_string(in.body, "name", at), "name", in.ordinal);
+  detail::require_string(in.body, "comment", at);
+  // Three different shapes, and mixing them up produces valid SQL for the
+  // wrong object rather than an error:
+  //   most types      "schema" + "name"   -> COMMENT ON TABLE shop.orders
+  //   SCHEMA/EXTENSION "name" alone       -> COMMENT ON SCHEMA reporting
+  //   COLUMN/TRIGGER/CONSTRAINT/POLICY    -> named relative to "table"
+  if ((ot == "SCHEMA" || ot == "EXTENSION") && in.body.contains("schema")) {
+    detail::fail(at + " should not carry \"schema\" for a " + ot + " comment",
+                 "A schema or extension IS the object: put its name in "
+                 "\"name\". Passing both produces a comment on whatever "
+                 "\"name\" happens to be, which is valid SQL for the wrong "
+                 "object.");
+  }
+  // COLUMN, TRIGGER, CONSTRAINT and POLICY are qualified BY a table, which is
+  // a different shape from the rest and easy to leave out.
+  if ((ot == "COLUMN" || ot == "TRIGGER" || ot == "CONSTRAINT" || ot == "POLICY") &&
+      !in.body.contains("table")) {
+    detail::fail(at + " needs \"table\" for a " + ot + " comment",
+                 "A column, trigger, constraint or policy is named relative to "
+                 "its table.");
+  }
+}
+
+inline void parse_set_owner(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(in.body, {"kind", "object_type", "schema", "name", "owner"}, at);
+  const auto ot = detail::require_string(in.body, "object_type", at);
+  static const std::set<std::string> kOwnable = {
+      "TABLE", "VIEW", "MATERIALIZED VIEW", "SEQUENCE", "SCHEMA", "TYPE",
+      "DOMAIN", "FUNCTION"};
+  if (kOwnable.count(ot) == 0) {
+    detail::fail(at + ".object_type cannot be given an owner here: " + ot,
+                 "Upper case, one of TABLE, VIEW, MATERIALIZED VIEW, SEQUENCE, "
+                 "SCHEMA, TYPE, DOMAIN, FUNCTION.");
+  }
+  detail::require_identifier(detail::require_string(in.body, "name", at), "name", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "owner", at), "owner", in.ordinal);
+}
 
 inline void parse_schema_like(Intent& in, bool creating) {
   const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
@@ -1238,6 +1447,17 @@ inline Spec parse_spec(const json& doc) {
     case IntentKind::kCreateSequence: parse_create_sequence(in); break;
     case IntentKind::kDropSequence: parse_named_object(in); break;
     case IntentKind::kDropView: parse_named_object(in); break;
+    case IntentKind::kAlterColumnDefault: parse_alter_column_default(in); break;
+    case IntentKind::kDropNotNull: parse_drop_not_null(in); break;
+    case IntentKind::kAlterSequence: parse_alter_sequence(in); break;
+    case IntentKind::kAlterSchema: parse_alter_schema(in); break;
+    case IntentKind::kAlterExtension: parse_alter_extension(in); break;
+    case IntentKind::kAlterDomain: parse_alter_domain(in); break;
+    case IntentKind::kAlterFunction: parse_alter_function(in); break;
+    case IntentKind::kAlterView: parse_alter_view(in); break;
+    case IntentKind::kAlterPolicy: parse_alter_policy(in); break;
+    case IntentKind::kSetComment: parse_set_comment(in); break;
+    case IntentKind::kSetOwner: parse_set_owner(in); break;
     }
     s.intents.push_back(std::move(in));
     ++ordinal;

@@ -3,7 +3,7 @@
 ## 0.1.0 (unreleased)
 
 The whole path works: repository, signing, planning, dry run, paced execution,
-ledger. 287 tests green on GCC 14.2 and Clang 22, under AddressSanitizer/UBSan
+ledger. 307 tests green on GCC 14.2 and Clang 22, under AddressSanitizer/UBSan
 and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
 `--call` contract test.
 
@@ -207,6 +207,35 @@ and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
   one rewrites. `text`→`varchar(200)` rewrites; `varchar(50)`→`text` does not.
   Anything unproven is reported as a rewrite, because a cautious plan costs
   less than an unplanned outage.
+- **The ALTER forms for objects that could only be created or dropped** —
+  `alter_column_default`, `drop_not_null`, `alter_sequence`, `alter_schema`,
+  `alter_extension`, `alter_domain`, `alter_function`, `alter_view`,
+  `alter_policy`, plus standalone `set_comment` and `set_owner`. 53 kinds.
+  **`alter_domain` is a recipe, not a statement**, and measurement decided it:
+  adding a domain constraint took **37.377 ms** on 1.5M values across two
+  tables against **0.502 ms** for the same constraint `NOT VALID`. Same shape
+  as `add_check_constraint` — and worse, because the scan covers every column
+  of that type in *every* table and grows with each new use of the domain.
+  Warnings carry what the statements don't: a default reaches no existing row;
+  `DROP NOT NULL` widens what the data may contain; an extension update runs
+  scripts pg_laswell cannot see and generally cannot reverse; changing a
+  function's volatility can make an index over it return wrong answers; an
+  owner change decides who bypasses RLS.
+- **Conflict keys and advisory locks now come from one function.** They keyed on
+  `qualified_table()`, which is empty for object intents — so unrelated types
+  serialised against each other while a `drop_type` and an `add_column` of that
+  type did **not**, and could run concurrently. Measured on the real binary.
+- **Capacity an agent can act on.** `budget.workers` reports worker limits,
+  live parallel workers in use, connection headroom, and a verdict naming the
+  number behind it. The correction it encodes: migrations run inside
+  PostgreSQL, so the client's core count is nearly irrelevant — a stock server
+  has **8** parallel worker slots and **2** per maintenance operation, and past
+  them an index build silently drops to single-threaded.
+- **`maintenance_work_mem` per step**, sized as the configured ceiling divided
+  by `max_concurrent_jobs`. Checked in the docs rather than assumed: it is
+  *not* multiplied by parallel workers, and it *is* allocated per concurrent
+  operation — which is exactly the assumption the docs' advice to raise it
+  depends on.
 - **Fourteen object kinds, so a repository can describe a database from
   nothing** — `create_schema`/`drop_schema`, `create_extension`/`drop_extension`,
   `create_type`/`drop_type`/`add_enum_value`, `create_function`/`drop_function`,

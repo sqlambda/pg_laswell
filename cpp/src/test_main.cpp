@@ -913,7 +913,24 @@ TEST(Spec, KnownKindsAreExactlyTheImplementedKinds) {
     "create_sequence": {"kind":"create_sequence","schema":"s","name":"seq",
                         "comment":"d"},
     "drop_sequence": {"kind":"drop_sequence","schema":"s","name":"seq"},
-    "drop_view": {"kind":"drop_view","schema":"s","name":"v"}
+    "drop_view": {"kind":"drop_view","schema":"s","name":"v"},
+    "alter_column_default": {"kind":"alter_column_default","schema":"s",
+                             "table":"t","column":"c","default":"7"},
+    "drop_not_null": {"kind":"drop_not_null","schema":"s","table":"t","column":"c"},
+    "alter_sequence": {"kind":"alter_sequence","schema":"s","name":"seq","restart":1},
+    "alter_schema": {"kind":"alter_schema","schema":"s","to":"s2"},
+    "alter_extension": {"kind":"alter_extension","name":"pg_trgm","version":"1.6"},
+    "alter_domain": {"kind":"alter_domain","schema":"s","name":"d",
+                     "add_check":"VALUE < 10","constraint_name":"lt"},
+    "alter_function": {"kind":"alter_function","schema":"s","name":"f",
+                       "arguments":[{"type":"int"}],"owner":"app"},
+    "alter_view": {"kind":"alter_view","schema":"s","name":"v","owner":"app"},
+    "alter_policy": {"kind":"alter_policy","schema":"s","table":"t","name":"p",
+                     "using":"true"},
+    "set_comment": {"kind":"set_comment","object_type":"TABLE","schema":"s",
+                    "name":"t","comment":"d"},
+    "set_owner": {"kind":"set_owner","object_type":"TABLE","schema":"s",
+                  "name":"t","owner":"app"}
   })JSON");
   for (const auto& [name, kind] : pglaswell::intent_kinds()) {
     (void)kind;
@@ -5050,6 +5067,7 @@ TEST(Spec, APrivilegeTypoIsCaughtRatherThanSentToTheDatabase) {
   EXPECT_NE(err.find("unknown privilege"), std::string::npos) << err;
 }
 
+
 // --- capacity and maintenance_work_mem -------------------------------------
 
 static pglaswell::Observations obs_capacity(int max_workers, int busy,
@@ -5169,6 +5187,36 @@ static std::set<std::string> keys_of(const json& body) {
   std::set<std::string> out;
   for (const auto& k : pglaswell::conflict_keys(spec.intents[0])) out.insert(k);
   return out;
+}
+
+TEST(Spec, EveryKindThatPlansAgainstAnObjectHasAnObjectKey) {
+  // object_key_for() decides what the catalog is asked to measure. A kind
+  // missing from it plans against an object that always reads as absent -- and
+  // the planner unit tests do not catch that, because they hand-build the
+  // observation. It cost a whole batch of ALTER kinds silently refusing every
+  // change, found only by an end-to-end test.
+  //
+  // The list is explicit rather than inferred from the name, so adding a kind
+  // means deciding whether it belongs here.
+  const std::set<std::string> needs_object = {
+      "create_schema", "drop_schema", "alter_schema",
+      "create_extension", "drop_extension", "alter_extension",
+      "create_type", "drop_type", "add_enum_value", "alter_domain",
+      "create_function", "drop_function", "alter_function",
+      "create_sequence", "drop_sequence", "alter_sequence"};
+
+  std::set<std::string> actually;
+  for (const auto& [name, kind] : pglaswell::intent_kinds()) {
+    pglaswell::Intent probe;
+    probe.kind = kind;
+    probe.kind_name = name;
+    probe.body = json{{"schema", "s"}, {"name", "n"}};
+    if (!pglaswell::object_key_for(probe).empty()) actually.insert(name);
+  }
+  EXPECT_EQ(actually, needs_object)
+      << "object_key_for() and this list disagree. A kind that plans against a "
+         "type, function, sequence, schema or extension must be in both, or it "
+         "will see that object as absent every time.";
 }
 
 TEST(Spec, ConflictKeysNeverProduceTheEmptyRelationThatUsedToSerialiseEverything) {
@@ -6871,6 +6919,98 @@ TEST_F(DatabaseTest, ASessionSettingReallyTakesAndReallyResets) {
       << "the setting survived an exception path";
 }
 
+TEST_F(DatabaseTest, TheAlterKindsRunAndTheDomainRecipeDefersItsScan) {
+  pglaswell::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = url_;
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/alter");
+    w.txn().exec("DROP TABLE IF EXISTS lw_alt CASCADE");
+    w.txn().exec("DROP DOMAIN IF EXISTS lw_pos CASCADE");
+    w.txn().exec("DROP SEQUENCE IF EXISTS lw_altseq CASCADE");
+    w.txn().exec("CREATE DOMAIN lw_pos AS int CHECK (VALUE > 0)");
+    w.txn().exec("CREATE SEQUENCE lw_altseq");
+    w.txn().exec("CREATE TABLE lw_alt(id bigint NOT NULL, v lw_pos)");
+    w.txn().exec("INSERT INTO lw_alt SELECT g, g FROM generate_series(1,200) g");
+    w.commit();
+  }
+
+  pglaswell::Catalog cat(cfg);
+  auto apply = [&](const json& intent) {
+    std::vector<std::string> schemas, tables, keys;
+    json doc = minimal_spec();
+    doc["intents"] = json::array({intent});
+    const auto spec = pglaswell::parse_spec(doc);
+    for (const auto& in : spec.intents) {
+      schemas.push_back(in.schema());
+      tables.push_back(in.table());
+      const auto k = pglaswell::object_key_for(in);
+      if (!k.empty()) keys.push_back(k);
+    }
+    const auto obs = cat.observe(schemas, tables, keys);
+    const auto plan = pglaswell::plan_migration(spec, obs, {});
+    EXPECT_TRUE(plan.ok) << plan.render();
+    for (const auto& step : plan.steps) {
+      for (const auto& q : step.sql) {
+        const std::string stmt = q;
+        pglaswell::WriteSession w(cfg);
+        w.begin("pg_laswell/test/alter-apply");
+        w.txn().exec(stmt.substr(0, stmt.size() - 1));
+        w.commit();
+      }
+    }
+    return plan;
+  };
+
+  apply(json{{"kind", "alter_column_default"}, {"schema", "public"},
+             {"table", "lw_alt"}, {"column", "v"}, {"default", "1"}});
+  apply(json{{"kind", "drop_not_null"}, {"schema", "public"},
+             {"table", "lw_alt"}, {"column", "id"}});
+  apply(json{{"kind", "set_comment"}, {"object_type", "TABLE"},
+             {"schema", "public"}, {"name", "lw_alt"}, {"comment", "Altered."}});
+  apply(json{{"kind", "alter_sequence"}, {"schema", "public"},
+             {"name", "lw_altseq"}, {"increment", 5}});
+
+  // The domain recipe: two steps, and the scan in the second.
+  const auto dom = apply(json{{"kind", "alter_domain"}, {"schema", "public"},
+                              {"name", "lw_pos"}, {"add_check", "VALUE < 100000"},
+                              {"constraint_name", "lw_pos_lt"}});
+  EXPECT_EQ(steps_of(dom, "alter_domain").size(), 2u) << dom.render();
+
+  {
+    pglaswell::ReadSession r(cfg);
+    auto scalar = [&](const std::string& q) {
+      return r.txn().exec(q)[0][0].as<std::string>();
+    };
+    EXPECT_EQ(scalar("SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef"
+                     " WHERE adrelid='lw_alt'::regclass"), "1");
+    EXPECT_EQ(scalar("SELECT attnotnull::text FROM pg_attribute"
+                     " WHERE attrelid='lw_alt'::regclass AND attname='id'"), "false");
+    EXPECT_EQ(scalar("SELECT obj_description('lw_alt'::regclass)"), "Altered.");
+    EXPECT_EQ(scalar("SELECT increment_by::text FROM pg_sequences"
+                     " WHERE sequencename='lw_altseq'"), "5");
+    // The domain constraint is there AND validated -- a NOT VALID one left
+    // behind would enforce nothing for existing rows.
+    EXPECT_EQ(scalar("SELECT convalidated::text FROM pg_constraint"
+                     " WHERE conname='lw_pos_lt'"), "true");
+  }
+  // And it really enforces, which asserting the catalog alone would not show.
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/alter-enforce");
+    EXPECT_THROW(w.txn().exec("INSERT INTO lw_alt VALUES (1, 200000)"),
+                 pqxx::sql_error);
+  }
+
+  pglaswell::WriteSession w(cfg);
+  w.begin("pg_laswell/test/alter-cleanup");
+  w.txn().exec("DROP TABLE lw_alt CASCADE");
+  w.txn().exec("DROP DOMAIN lw_pos");
+  w.txn().exec("DROP SEQUENCE lw_altseq");
+  w.commit();
+}
+
 TEST_F(DatabaseTest, ObjectDependantsMatchWhatPostgresqlRefusesToDrop) {
   // The safeguard these object kinds are built on. Measured (S18): PostgreSQL
   // refuses to drop a type, function or sequence anything uses, and names the
@@ -7360,3 +7500,267 @@ TEST_F(ToolTest, APreservedBackfillIsExactlyRevertible) {
                 .as<std::string>(),
             before);
 }
+
+// --- the ALTER gaps --------------------------------------------------------
+
+static pglaswell::Observations obs_alter() {
+  auto obs = obs_objects();
+  obs.tables["shop.orders"]["columns"]["amount"] =
+      json{{"type", "integer"}, {"not_null", true}};
+  obs.tables["shop.orders"]["policies"]["tenant_iso"] = json{{"command", "ALL"}};
+  obs.objects["type:shop.pos"] =
+      json{{"exists", true}, {"kind", "type"}, {"type_kind", "domain"},
+           {"depended_on_by", json::array()}};
+  obs.objects["extension:pg_trgm"] =
+      json{{"exists", true}, {"kind", "extension"}, {"version", "1.5"},
+           {"depended_on_by", json::array()}};
+  obs.tables["shop.v"] = json{{"exists", true}, {"kind", "view"}};
+  return obs;
+}
+
+TEST(Planner, AlteringADomainConstraintSplitsBecauseItScansEveryColumnOfThatType) {
+  // Measured (S19): 37.377ms validated against 0.502ms NOT VALID, over 1.5M
+  // values in two tables. Same shape as add_check_constraint -- and worse,
+  // because the scan is not bounded by one table.
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "alter_domain"}, {"schema", "shop"},
+                                {"name", "pos"}, {"add_check", "VALUE < 100"},
+                                {"constraint_name", "lt100"}}})),
+      obs_alter(), {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto s = steps_of(plan, "alter_domain");
+  ASSERT_EQ(s.size(), 2u) << plan.render();
+  EXPECT_NE(all_sql(*s[0]).find("NOT VALID"), std::string::npos) << all_sql(*s[0]);
+  EXPECT_NE(all_sql(*s[1]).find("VALIDATE CONSTRAINT"), std::string::npos);
+  EXPECT_TRUE(s[0]->own_transaction && s[1]->own_transaction)
+      << "sharing a transaction would hold step 1's lock across the scan";
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("every column of type") != std::string::npos &&
+        w.find("pg_licht") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned)
+      << "the cost is not bounded by one table and we cannot size it: "
+      << plan.render();
+
+  // A domain SET NOT NULL has no NOT VALID form, and that must be said rather
+  // than silently emitted as one statement.
+  const auto nn = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "alter_domain"}, {"schema", "shop"},
+                                {"name", "pos"}, {"not_null", true}}})),
+      obs_alter(), {});
+  bool no_defer = false;
+  for (const auto& w : nn.warnings) {
+    if (w.find("no NOT VALID form") != std::string::npos) no_defer = true;
+  }
+  EXPECT_TRUE(no_defer) << nn.render();
+}
+
+TEST(Planner, AlterDomainOnSomethingThatIsNotADomainIsRefused) {
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "alter_domain"}, {"schema", "shop"},
+                                {"name", "mood"}, {"not_null", true}}})),
+      obs_alter(), {});
+  EXPECT_FALSE(plan.ok) << plan.render();
+  EXPECT_NE(plan.conflicts[0].find("not a domain"), std::string::npos);
+}
+
+TEST(Planner, SettingADefaultSaysItDoesNotReachExistingRows) {
+  // Measured: catalog-only, no rewrite. The trap is not the cost, it is the
+  // assumption that existing rows get the value.
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "alter_column_default"}, {"schema", "shop"},
+                                {"table", "orders"}, {"column", "amount"},
+                                {"default", "0"}}})),
+      obs_alter(), {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto* step = only_step(plan, "alter_column_default");
+  EXPECT_NE(all_sql(*step).find("SET DEFAULT 0"), std::string::npos);
+  EXPECT_NE(step->why.find("catalog-only"), std::string::npos) << step->why;
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("rows inserted AFTER") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned) << plan.render();
+
+  // Omitting the key drops the default; null is refused as ambiguous.
+  const auto dropped = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "alter_column_default"}, {"schema", "shop"},
+                                {"table", "orders"}, {"column", "amount"}}})),
+      obs_alter(), {});
+  EXPECT_NE(all_sql(*only_step(dropped, "alter_column_default")).find("DROP DEFAULT"),
+            std::string::npos);
+  json doc = minimal_spec();
+  doc["intents"] = json::array({json{{"kind", "alter_column_default"},
+                                     {"schema", "s"}, {"table", "t"},
+                                     {"column", "c"}, {"default", nullptr}}});
+  EXPECT_NE(spec_error(doc).find("reads as both"), std::string::npos);
+}
+
+TEST(Planner, DroppingNotNullIsSatisfiedWhenAlreadyNullableAndWarnsOtherwise) {
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "drop_not_null"}, {"schema", "shop"},
+                                {"table", "orders"}, {"column", "amount"}}})),
+      obs_alter(), {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("never had to handle a null") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned) << plan.render();
+
+  auto nullable = obs_alter();
+  nullable.tables["shop.orders"]["columns"]["amount"]["not_null"] = false;
+  const auto already = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "drop_not_null"}, {"schema", "shop"},
+                                {"table", "orders"}, {"column", "amount"}}})),
+      nullable, {});
+  EXPECT_EQ(only_step(already, "drop_not_null")->action,
+            pglaswell::Action::kSatisfied);
+}
+
+TEST(Planner, AnExtensionUpdateSaysItRunsScriptsWeCannotSee) {
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "alter_extension"}, {"name", "pg_trgm"},
+                                {"version", "1.6"}}})),
+      obs_alter(), {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("NOT reversible") != std::string::npos &&
+        w.find("1.5") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned) << plan.render();
+
+  // Already at the wanted version is satisfied.
+  const auto same = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "alter_extension"}, {"name", "pg_trgm"},
+                                {"version", "1.5"}}})),
+      obs_alter(), {});
+  EXPECT_EQ(only_step(same, "alter_extension")->action,
+            pglaswell::Action::kSatisfied);
+}
+
+TEST(Planner, AlteringAPolicyKeepsItsPlaceAndRepeatsTheInvisibilityWarning) {
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "alter_policy"}, {"schema", "shop"},
+                                {"table", "orders"}, {"name", "tenant_iso"},
+                                {"using", "tenant = current_user"}}})),
+      obs_alter(), {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto* step = only_step(plan, "alter_policy");
+  EXPECT_NE(all_sql(*step).find("ALTER POLICY \"tenant_iso\" ON shop.orders"),
+            std::string::npos) << all_sql(*step);
+  EXPECT_NE(step->lock.find("AccessExclusiveLock"), std::string::npos);
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("SET ROLE") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned)
+      << "an owner or superuser cannot see an RLS change take effect: "
+      << plan.render();
+
+  // A policy that is not there is a conflict, not a silent create.
+  const auto absent = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "alter_policy"}, {"schema", "shop"},
+                                {"table", "orders"}, {"name", "nope"},
+                                {"using", "true"}}})),
+      obs_alter(), {});
+  EXPECT_FALSE(absent.ok) << absent.render();
+  EXPECT_NE(absent.conflicts[0].find("create_policy"), std::string::npos);
+}
+
+TEST(Planner, ChangingVolatilityAndOwnershipAreFlaggedAsMoreThanBookkeeping) {
+  const auto vol = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "alter_function"}, {"schema", "shop"},
+                                {"name", "f"},
+                                {"arguments", json::array({json{{"type", "integer"}}})},
+                                {"volatility", "IMMUTABLE"}}})),
+      obs_alter(), {});
+  ASSERT_TRUE(vol.ok) << vol.render();
+  bool volatile_warning = false;
+  for (const auto& w : vol.warnings) {
+    if (w.find("wrong answers from indexes") != std::string::npos)
+      volatile_warning = true;
+  }
+  EXPECT_TRUE(volatile_warning) << vol.render();
+
+  const auto own = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "set_owner"}, {"object_type", "TABLE"},
+                                {"schema", "shop"}, {"name", "orders"},
+                                {"owner", "app"}}})),
+      obs_alter(), {});
+  ASSERT_TRUE(own.ok) << own.render();
+  bool owner_warning = false;
+  for (const auto& w : own.warnings) {
+    if (w.find("bypasses row-level security") != std::string::npos)
+      owner_warning = true;
+  }
+  EXPECT_TRUE(owner_warning)
+      << "an owner change is a privilege change: " << own.render();
+}
+
+TEST(Planner, SetCommentRendersEachObjectTypesOwnShape) {
+  // A schema-qualified object takes both; a SCHEMA or EXTENSION is its own
+  // name and takes only "name". Getting that backwards produces
+  // COMMENT ON SCHEMA "orders", which is valid SQL for the wrong object -- so
+  // the shapes are asserted rather than assumed.
+  struct Case { const char* type; bool qualified; const char* expect; };
+  const Case cases[] = {
+      {"TABLE", true, "COMMENT ON TABLE shop.orders IS"},
+      {"INDEX", true, "COMMENT ON INDEX shop.orders IS"},
+      {"SCHEMA", false, "COMMENT ON SCHEMA \"orders\" IS"},
+      {"EXTENSION", false, "COMMENT ON EXTENSION \"orders\" IS"},
+  };
+  for (const auto& c : cases) {
+    json body = json{{"kind", "set_comment"}, {"object_type", c.type},
+                     {"name", "orders"}, {"comment", "d"}};
+    if (c.qualified) body["schema"] = "shop";
+    const auto plan = pglaswell::plan_migration(
+        spec_of(json::array({body})), obs_alter(), {});
+    ASSERT_TRUE(plan.ok) << plan.render();
+    EXPECT_NE(all_sql(*only_step(plan, "set_comment")).find(c.expect),
+              std::string::npos) << c.type << ": "
+                                 << all_sql(*only_step(plan, "set_comment"));
+  }
+  // A column comment is named relative to its table, which is a different
+  // shape and the one most likely to be written wrongly.
+  const auto col = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "set_comment"}, {"object_type", "COLUMN"},
+                                {"schema", "shop"}, {"table", "orders"},
+                                {"name", "amount"}, {"comment", "d"}}})),
+      obs_alter(), {});
+  EXPECT_NE(all_sql(*only_step(col, "set_comment")).find(
+                "COMMENT ON COLUMN shop.orders.\"amount\" IS"),
+            std::string::npos) << all_sql(*only_step(col, "set_comment"));
+}
+
+TEST(Spec, AnObjectTypeTypoIsCaughtRatherThanSentToTheDatabase) {
+  json doc = minimal_spec();
+  doc["intents"] = json::array({json{{"kind", "set_comment"},
+                                     {"object_type", "TABEL"}, {"schema", "s"},
+                                     {"name", "t"}, {"comment", "d"}}});
+  const auto err = spec_error(doc);
+  EXPECT_NE(err.find("becomes DDL verbatim"), std::string::npos) << err;
+
+  // And a column comment without its table is caught too.
+  json doc2 = minimal_spec();
+  doc2["intents"] = json::array({json{{"kind", "set_comment"},
+                                      {"object_type", "COLUMN"}, {"schema", "s"},
+                                      {"name", "c"}, {"comment", "d"}}});
+  EXPECT_NE(spec_error(doc2).find("relative to"), std::string::npos);
+}
+
+TEST(Planner, RestartingASequenceWarnsAboutCollidingWithExistingRows) {
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "alter_sequence"}, {"schema", "shop"},
+                                {"name", "seq"}, {"restart", 1}}})),
+      obs_alter(), {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("collide") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned) << plan.render();
+}
+

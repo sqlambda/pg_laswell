@@ -603,6 +603,20 @@ inline void project(const Intent& in, const Step& step, Observations& projected)
     case IntentKind::kCreateSequence:
     case IntentKind::kDropSequence:
       return;
+    case IntentKind::kDropNotNull:
+      projected.tables[qualified]["columns"][in.body.value("column", "")]["not_null"] = false;
+      return;
+    case IntentKind::kAlterColumnDefault:
+    case IntentKind::kAlterSequence:
+    case IntentKind::kAlterSchema:
+    case IntentKind::kAlterExtension:
+    case IntentKind::kAlterDomain:
+    case IntentKind::kAlterFunction:
+    case IntentKind::kAlterView:
+    case IntentKind::kAlterPolicy:
+    case IntentKind::kSetComment:
+    case IntentKind::kSetOwner:
+      return;
     case IntentKind::kAttachPartition: {
       const auto ch = in.body.value("schema", "") + "." + in.body.value("partition", "");
       projected.tables[qualified]["partitions"].push_back(ch);
@@ -1625,6 +1639,443 @@ inline void warn_about_rebuild(
 }
 
 }  // namespace detail
+
+// --- the ALTER forms for objects we can already create ---------------------
+//
+// Measured (spike S19, 18.6). One of these is a recipe and the rest are
+// statements, and knowing which is the whole job:
+//
+//   ALTER DOMAIN ADD CONSTRAINT   37.377 ms on 1.5M values -- it SCANS
+//   ... NOT VALID                  0.502 ms
+//   ... VALIDATE afterwards       37.360 ms
+//
+// So alter_domain splits, exactly as add_check_constraint does. The blast
+// radius is wider than a table constraint's: the scan covers every column of
+// that type in every table, not one table, and grows with each new use of the
+// domain.
+//
+//   ALTER POLICY                  AccessExclusiveLock, same as CREATE POLICY
+//   ALTER COLUMN SET DEFAULT      relfilenode unchanged -- catalog-only
+namespace detail {
+// Defined below with the object planners; declared here because alter_function
+// needs the same signature rendering drop_function does, and the two must not
+// disagree about what identifies a function.
+inline std::string function_signature(const Intent& in);
+}  // namespace detail
+
+inline void plan_alter_misc(const Intent& in, const Observations& obs,
+                            Plan& plan, std::vector<Step>& out) {
+  const auto schema = in.body.value("schema", "");
+  const auto name = in.body.value("name", "");
+  const auto qualified_obj = schema + "." + name;
+  const auto qualified_tbl = in.qualified_table();
+
+  auto emit = [&](TxnClass klass, std::vector<std::string> sql,
+                  const std::string& lock, const std::string& why, bool own) {
+    Step s;
+    s.kind = in.kind_name;
+    s.txn_class = klass;
+    s.sql = std::move(sql);
+    s.lock = lock;
+    s.why = why;
+    s.own_transaction = own;
+    out.push_back(std::move(s));
+  };
+  auto verdict = [&](Action a, const std::string& why) {
+    Step s;
+    s.kind = in.kind_name;
+    s.action = a;
+    s.why = why;
+    out.push_back(std::move(s));
+  };
+  auto refuse = [&](const std::string& why, const std::string& detail) {
+    verdict(Action::kConflict, why);
+    plan.conflicts.push_back(detail);
+  };
+
+  switch (in.kind) {
+    case IntentKind::kAlterColumnDefault: {
+      const auto& t = obs.table(qualified_tbl);
+      const auto column = in.body.value("column", "");
+      if (!t.value("exists", false)) {
+        refuse(qualified_tbl + " does not exist", qualified_tbl + " does not exist");
+        return;
+      }
+      const json columns = t.value("columns", json::object());
+      if (!columns.contains(column)) {
+        refuse(qualified_tbl + "." + column + " does not exist",
+               qualified_tbl + "." + column + " does not exist");
+        return;
+      }
+      const bool setting = in.body.contains("default");
+      emit(TxnClass::kRequired,
+           {"ALTER TABLE " + qualified_tbl + " ALTER COLUMN " +
+            detail::quote_identifier(column) +
+            (setting ? " SET DEFAULT " + in.body.value("default", "")
+                     : " DROP DEFAULT") + ";"},
+           "AccessExclusiveLock on " + qualified_tbl + ", but no scan and no rewrite",
+           "measured on 18.6: relfilenode is unchanged, so this is catalog-only "
+           "whatever the table's size",
+           /*own=*/false);
+      plan.warnings.push_back(
+          "a default applies only to rows inserted AFTER this commits. Existing "
+          "rows keep whatever they have, including nulls -- if they should carry "
+          "the new value, that is a backfill intent, and it is not implied by "
+          "this one.");
+      return;
+    }
+
+    case IntentKind::kDropNotNull: {
+      const auto& t = obs.table(qualified_tbl);
+      const auto column = in.body.value("column", "");
+      const json columns = t.value("columns", json::object());
+      if (!t.value("exists", false) || !columns.contains(column)) {
+        refuse(qualified_tbl + "." + column + " does not exist",
+               qualified_tbl + "." + column + " does not exist");
+        return;
+      }
+      if (!columns[column].value("not_null", false)) {
+        verdict(Action::kSatisfied, qualified_tbl + "." + column + " is already nullable");
+        return;
+      }
+      emit(TxnClass::kRequired,
+           {"ALTER TABLE " + qualified_tbl + " ALTER COLUMN " +
+            detail::quote_identifier(column) + " DROP NOT NULL;"},
+           "AccessExclusiveLock on " + qualified_tbl + ", briefly and with no scan",
+           "removing NOT NULL needs no verification -- there is nothing to check "
+           "when the constraint is being relaxed",
+           /*own=*/false);
+      plan.warnings.push_back(
+          "this widens what " + qualified_tbl + "." + column +
+          " may contain, so it is a change to the DATA's shape and not only to "
+          "what is enforced. Anything reading the column that has never had to "
+          "handle a null now does.");
+      return;
+    }
+
+    case IntentKind::kAlterSequence: {
+      const auto& o = obs.object("sequence:" + qualified_obj);
+      if (!o.value("exists", false)) {
+        refuse("sequence " + qualified_obj + " does not exist",
+               "sequence " + qualified_obj + " does not exist");
+        return;
+      }
+      std::vector<std::string> sql;
+      if (in.body.contains("to")) {
+        sql.push_back("ALTER SEQUENCE " + qualified_obj + " RENAME TO " +
+                      detail::quote_identifier(in.body.value("to", "")) + ";");
+      }
+      std::string alter;
+      if (in.body.contains("increment")) {
+        alter += " INCREMENT BY " + std::to_string(in.body.value("increment", 1));
+      }
+      if (in.body.contains("restart")) {
+        alter += " RESTART WITH " + std::to_string(in.body.value("restart", 1));
+      }
+      if (in.body.contains("owned_by")) {
+        alter += " OWNED BY " + in.body.value("owned_by", "");
+      }
+      if (!alter.empty()) sql.push_back("ALTER SEQUENCE " + qualified_obj + alter + ";");
+      emit(TxnClass::kRequired, std::move(sql),
+           "AccessExclusiveLock on the sequence only",
+           "altering a sequence touches no table", /*own=*/false);
+      if (in.body.contains("restart")) {
+        plan.warnings.push_back(
+            "RESTART sets the sequence back without checking what is already in "
+            "the column it feeds. If rows exist at or above " +
+            std::to_string(in.body.value("restart", 1)) +
+            ", the next inserts collide with them -- and only a unique "
+            "constraint will notice.");
+      }
+      return;
+    }
+
+    case IntentKind::kAlterSchema: {
+      const auto& o = obs.object("schema:" + schema);
+      if (!o.value("exists", false)) {
+        refuse("schema " + schema + " does not exist", "schema " + schema + " does not exist");
+        return;
+      }
+      std::vector<std::string> sql;
+      if (in.body.contains("to")) {
+        sql.push_back("ALTER SCHEMA " + detail::quote_identifier(schema) +
+                      " RENAME TO " +
+                      detail::quote_identifier(in.body.value("to", "")) + ";");
+      }
+      if (in.body.contains("owner")) {
+        sql.push_back("ALTER SCHEMA " + detail::quote_identifier(schema) +
+                      " OWNER TO " +
+                      detail::quote_identifier(in.body.value("owner", "")) + ";");
+      }
+      emit(TxnClass::kRequired, std::move(sql), "AccessExclusiveLock on the schema",
+           "catalog-only", /*own=*/false);
+      if (in.body.contains("to")) {
+        plan.warnings.push_back(
+            "renaming schema " + schema +
+            " moves every object inside it. Nothing in the database breaks -- "
+            "dependencies are held by OID -- but every application search_path, "
+            "every qualified query and every grant written against the old name "
+            "stops matching, and none of that is visible from here.");
+      }
+      return;
+    }
+
+    case IntentKind::kAlterExtension: {
+      const auto ext = in.body.value("name", "");
+      const auto& o = obs.object("extension:" + ext);
+      if (!o.value("exists", false)) {
+        refuse("extension " + ext + " is not installed",
+               "extension " + ext + " is not installed, so there is nothing to "
+               "alter. create_extension is the intent for installing it.");
+        return;
+      }
+      std::vector<std::string> sql;
+      if (in.body.contains("version")) {
+        const auto want = in.body.value("version", "");
+        if (o.value("version", "") == want) {
+          verdict(Action::kSatisfied, ext + " is already at version " + want);
+          return;
+        }
+        sql.push_back("ALTER EXTENSION " + detail::quote_identifier(ext) +
+                      " UPDATE TO " + detail::quote_literal(want) + ";");
+        plan.warnings.push_back(
+            "updating extension " + ext + " from " + o.value("version", "?") +
+            " to " + want +
+            " runs the extension's own migration scripts. What they do is not "
+            "visible to pg_laswell, is not in this plan, and is generally NOT "
+            "reversible -- there is usually no downgrade script. The ledger "
+            "will record that the update ran, not what it did.");
+      }
+      if (in.body.contains("schema")) {
+        sql.push_back("ALTER EXTENSION " + detail::quote_identifier(ext) +
+                      " SET SCHEMA " +
+                      detail::quote_identifier(in.body.value("schema", "")) + ";");
+      }
+      emit(TxnClass::kRequired, std::move(sql),
+           "AccessExclusiveLock on every object the extension owns",
+           "an extension update rewrites its own objects", /*own=*/true);
+      return;
+    }
+
+    case IntentKind::kAlterDomain: {
+      const auto& o = obs.object("type:" + qualified_obj);
+      if (!o.value("exists", false)) {
+        refuse("domain " + qualified_obj + " does not exist",
+               "domain " + qualified_obj + " does not exist");
+        return;
+      }
+      if (o.value("type_kind", "") != "domain") {
+        refuse(qualified_obj + " is not a domain",
+               qualified_obj + " is a " + o.value("type_kind", "type") +
+                   ", not a domain. alter_domain applies only to domains.");
+        return;
+      }
+      if (in.body.contains("add_check")) {
+        const auto cname = in.body.value("constraint_name", "");
+        // The recipe, for the same measured reason add_check_constraint has
+        // one -- and it matters more here: the scan covers every column of this
+        // type in every table, so it grows with each use of the domain.
+        emit(TxnClass::kRequired,
+             {"ALTER DOMAIN " + qualified_obj + " ADD CONSTRAINT " +
+              detail::quote_identifier(cname) + " CHECK (" +
+              in.body.value("add_check", "") + ") NOT VALID;"},
+             "AccessExclusiveLock on the domain, briefly; NOT VALID means no scan",
+             "step 1 of 2: measured on 18.6, adding the constraint NOT VALID "
+             "took 0.5ms against 37ms for the same constraint validated -- and "
+             "that 37ms was 1.5M values across two tables, growing with every "
+             "column of this type anywhere in the database",
+             /*own=*/true);
+        emit(TxnClass::kRequired,
+             {"ALTER DOMAIN " + qualified_obj + " VALIDATE CONSTRAINT " +
+              detail::quote_identifier(cname) + ";"},
+             "AccessExclusiveLock on the domain while every column of this type "
+             "is scanned",
+             "step 2 of 2: the scan happens here, in its own transaction, so "
+             "step 1's lock is not held across it",
+             /*own=*/true);
+        plan.warnings.push_back(
+            "validating a domain constraint reads every column of type " +
+            qualified_obj +
+            " in every table that has one. Unlike a table constraint, the cost "
+            "is not bounded by one table and pg_laswell cannot size it from "
+            "here -- pg_licht listTableSizes over the tables using this domain "
+            "is the reading that would.");
+        return;
+      }
+      std::vector<std::string> sql;
+      if (in.body.contains("drop_constraint")) {
+        sql.push_back("ALTER DOMAIN " + qualified_obj + " DROP CONSTRAINT " +
+                      detail::quote_identifier(in.body.value("drop_constraint", "")) + ";");
+      }
+      if (in.body.contains("not_null")) {
+        sql.push_back("ALTER DOMAIN " + qualified_obj +
+                      (in.body.value("not_null", false) ? " SET NOT NULL" : " DROP NOT NULL") + ";");
+      }
+      if (in.body.contains("default")) {
+        sql.push_back("ALTER DOMAIN " + qualified_obj + " SET DEFAULT " +
+                      in.body.value("default", "") + ";");
+      }
+      emit(TxnClass::kRequired, std::move(sql),
+           "AccessExclusiveLock on the domain",
+           "a domain change reaches every column of that type", /*own=*/false);
+      if (in.body.value("not_null", false)) {
+        plan.warnings.push_back(
+            "SET NOT NULL on a domain scans every column of type " + qualified_obj +
+            " and fails on the first null anywhere. There is no NOT VALID form "
+            "for it, so the scan cannot be deferred the way a check can.");
+      }
+      return;
+    }
+
+    case IntentKind::kAlterFunction: {
+      const auto& o = obs.object("function:" + qualified_obj);
+      if (!o.value("exists", false)) {
+        refuse("function " + qualified_obj + " does not exist",
+               "function " + qualified_obj + " does not exist");
+        return;
+      }
+      const auto signature = detail::function_signature(in);
+      std::vector<std::string> sql;
+      if (in.body.contains("to")) {
+        sql.push_back("ALTER FUNCTION " + signature + " RENAME TO " +
+                      detail::quote_identifier(in.body.value("to", "")) + ";");
+      }
+      if (in.body.contains("owner")) {
+        sql.push_back("ALTER FUNCTION " + signature + " OWNER TO " +
+                      detail::quote_identifier(in.body.value("owner", "")) + ";");
+      }
+      if (in.body.contains("search_path")) {
+        sql.push_back("ALTER FUNCTION " + signature + " SET search_path = " +
+                      in.body.value("search_path", "") + ";");
+      }
+      if (in.body.contains("volatility")) {
+        sql.push_back("ALTER FUNCTION " + signature + " " +
+                      in.body.value("volatility", "") + ";");
+      }
+      emit(TxnClass::kRequired, std::move(sql), "no lock on any table",
+           "altering a function's properties is catalog-only", /*own=*/false);
+      if (in.body.contains("volatility")) {
+        plan.warnings.push_back(
+            "changing " + signature + "'s volatility changes how the PLANNER may "
+            "use it -- an IMMUTABLE function can be folded into an index "
+            "expression and cached, a VOLATILE one cannot. Declaring a function "
+            "more immutable than it is produces wrong answers from indexes "
+            "built over it, and nothing will report that.");
+      }
+      return;
+    }
+
+    case IntentKind::kAlterView: {
+      const auto& t = obs.table(qualified_obj);
+      if (!t.value("exists", false)) {
+        refuse(qualified_obj + " does not exist", qualified_obj + " does not exist");
+        return;
+      }
+      const bool matview = t.value("kind", "") == "materialized_view";
+      const std::string what = matview ? "MATERIALIZED VIEW " : "VIEW ";
+      std::vector<std::string> sql;
+      if (in.body.contains("to")) {
+        sql.push_back("ALTER " + what + qualified_obj + " RENAME TO " +
+                      detail::quote_identifier(in.body.value("to", "")) + ";");
+      }
+      if (in.body.contains("owner")) {
+        sql.push_back("ALTER " + what + qualified_obj + " OWNER TO " +
+                      detail::quote_identifier(in.body.value("owner", "")) + ";");
+      }
+      if (in.body.contains("options")) {
+        std::vector<std::string> opts;
+        for (const auto& o : in.body["options"]) opts.push_back(o.get<std::string>());
+        sql.push_back("ALTER " + what + qualified_obj + " SET (" +
+                      detail::join(opts, ", ") + ");");
+      }
+      emit(TxnClass::kRequired, std::move(sql),
+           "AccessExclusiveLock on " + qualified_obj,
+           "catalog-only; the view's definition is untouched", /*own=*/false);
+      return;
+    }
+
+    case IntentKind::kAlterPolicy: {
+      const auto& t = obs.table(qualified_tbl);
+      const json policies = t.value("policies", json::object());
+      if (!policies.contains(name)) {
+        refuse("no policy named " + name + " on " + qualified_tbl,
+               "no policy named " + name + " on " + qualified_tbl +
+                   ". create_policy is the intent for a new one.");
+        return;
+      }
+      std::string sql = "ALTER POLICY " + detail::quote_identifier(name) +
+                        " ON " + qualified_tbl;
+      if (in.body.contains("roles")) {
+        std::vector<std::string> roles;
+        for (const auto& r : in.body["roles"]) {
+          roles.push_back(detail::quote_identifier(r.get<std::string>()));
+        }
+        sql += " TO " + detail::join(roles, ", ");
+      }
+      if (in.body.contains("using")) sql += " USING (" + in.body.value("using", "") + ")";
+      if (in.body.contains("check")) {
+        sql += " WITH CHECK (" + in.body.value("check", "") + ")";
+      }
+      emit(TxnClass::kRequired, {sql + ";"},
+           "AccessExclusiveLock on " + qualified_tbl +
+               " -- measured, the same lock CREATE POLICY takes",
+           "changing a policy in place keeps its name and its place in the "
+           "permissive/restrictive set, which dropping and recreating would not",
+           /*own=*/false);
+      plan.warnings.push_back(
+          "this changes what rows the application sees the moment it commits, "
+          "for sessions already connected. And you will probably not see it: an "
+          "owner bypasses row-level security unless FORCE is set, and a "
+          "superuser bypasses it regardless -- check the result as the "
+          "application role, with SET ROLE.");
+      return;
+    }
+
+    case IntentKind::kSetComment: {
+      const auto ot = in.body.value("object_type", "");
+      std::string target = schema.empty() ? detail::quote_identifier(name)
+                                          : schema + "." + name;
+      std::string stmt;
+      if (ot == "COLUMN") {
+        stmt = "COMMENT ON COLUMN " + qualified_tbl + "." +
+               detail::quote_identifier(name) + " IS ";
+      } else if (ot == "TRIGGER" || ot == "POLICY" || ot == "CONSTRAINT") {
+        stmt = "COMMENT ON " + ot + " " + detail::quote_identifier(name) +
+               " ON " + qualified_tbl + " IS ";
+      } else if (ot == "SCHEMA" || ot == "EXTENSION") {
+        stmt = "COMMENT ON " + ot + " " + detail::quote_identifier(name) + " IS ";
+      } else {
+        stmt = "COMMENT ON " + ot + " " + target + " IS ";
+      }
+      emit(TxnClass::kRequired,
+           {stmt + detail::quote_literal(in.body.value("comment", "")) + ";"},
+           "AccessShareLock -- a comment blocks nothing",
+           "documentation is a change to schema state like any other, and this "
+           "is the intent that changes one without recreating the object",
+           /*own=*/false);
+      return;
+    }
+
+    case IntentKind::kSetOwner: {
+      const auto ot = in.body.value("object_type", "");
+      const std::string target = schema.empty() ? detail::quote_identifier(name)
+                                                : schema + "." + name;
+      emit(TxnClass::kRequired,
+           {"ALTER " + ot + " " + target + " OWNER TO " +
+            detail::quote_identifier(in.body.value("owner", "")) + ";"},
+           "AccessExclusiveLock on " + target,
+           "catalog-only", /*own=*/false);
+      plan.warnings.push_back(
+          "changing the owner of " + target +
+          " changes who bypasses row-level security on it, who its SECURITY "
+          "DEFINER functions run as, and which role future grants are recorded "
+          "as coming from. It is a privilege change, not bookkeeping.");
+      return;
+    }
+
+    default: break;
+  }
+}
 
 // --- schemas, extensions, types, functions, triggers, sequences ------------
 //
@@ -4139,6 +4590,18 @@ inline Plan plan_migration(const Spec& spec, const Observations& obs,
         plan_drop_table(in, projected, plan, emitted); break;
       case IntentKind::kDeleteRows:
         plan_delete_rows(in, projected, cfg, plan, emitted); break;
+      case IntentKind::kAlterColumnDefault:
+      case IntentKind::kDropNotNull:
+      case IntentKind::kAlterSequence:
+      case IntentKind::kAlterSchema:
+      case IntentKind::kAlterExtension:
+      case IntentKind::kAlterDomain:
+      case IntentKind::kAlterFunction:
+      case IntentKind::kAlterView:
+      case IntentKind::kAlterPolicy:
+      case IntentKind::kSetComment:
+      case IntentKind::kSetOwner:
+        plan_alter_misc(in, projected, plan, emitted); break;
       case IntentKind::kCreateSchema:
       case IntentKind::kDropSchema:
       case IntentKind::kCreateExtension:
