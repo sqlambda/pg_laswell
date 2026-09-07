@@ -10,12 +10,21 @@ contention rather than on a schedule. It refuses what it can prove wrong, and
 says so plainly where it can prove nothing. It converges databases that have
 drifted. And it never states a number it cannot derive.
 
-**Status: pre-0.1.0.** The whole path works — repository, signing, planning,
-dry run, paced execution, ledger — with 334 tests green on GCC and Clang, under
-AddressSanitizer/UBSan and ThreadSanitizer. Packages build for seven targets —
-deb, rpm and tarball, x86_64 and arm64, plus macOS arm64 — each installed and
-run inside the platform it targets before upload. The manual is the
-authoritative reference. Not yet published anywhere.
+**Status: pre-0.1.0, and a work in progress.** The whole path works —
+repository, signing, planning, dry run, paced execution, ledger — with 355 tests
+green on GCC and Clang, under AddressSanitizer/UBSan and ThreadSanitizer.
+Packages build for seven targets — deb, rpm and tarball, x86_64 and arm64, plus
+macOS arm64 — each installed and run inside the platform it targets before
+upload. The manual is the authoritative reference. Not yet published anywhere.
+
+**Everything here is measured against PostgreSQL 18**, and the older versions
+still need work. The known gap is `merge_rows`: its paced form emits
+`MERGE ... RETURNING`, and `when_not_matched_by_source` emits
+`WHEN NOT MATCHED BY SOURCE`, both of which are PostgreSQL 17+ — measured, they
+are a syntax error on 15 and 16. Neither is gated on the server version yet, and
+no test paces a merge against a real database, so nothing catches it. Every
+other kind, including the paced insert, update, delete and backfill, runs clean
+on 15. Treat 17+ as the supported floor for `merge_rows` until that is fixed.
 
 ## Why
 
@@ -84,6 +93,17 @@ replication lag. Those are pg_licht's readings.
   may run concurrently. It also flags a spec that was **edited after it was
   applied** — the database no longer matches the file that claims to describe
   it.
+- **Rows, not only schema.** `insert_rows`, `update_rows`, `delete_rows`,
+  `merge_rows` and `copy_rows` cover every PostgreSQL statement that writes rows
+  except `TRUNCATE`. Rows are named literally in the signed spec or by a query,
+  and *that choice decides the pacing*: a literal count is known before anything
+  runs, so a small seed is one all-or-nothing transaction and a large one is
+  paced; a query's count is not derivable by a pure planner, so those are always
+  paced rather than guessed at. The refusals are the point — a `MERGE` whose key
+  has no unique index silently updates *several* rows per source row, and an
+  explicit id leaves a sequence behind so the application's next insert dies on
+  a duplicate key. Both are visible in the catalog beforehand, so both are
+  refused or repaired beforehand.
 - **Constraints as first-class changes.** `add_foreign_key`,
   `add_check_constraint` and `set_not_null` plan as `NOT VALID` + `VALIDATE` in
   separate transactions; `drop_constraint` refuses, before anything runs, a

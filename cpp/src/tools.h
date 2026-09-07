@@ -320,13 +320,19 @@ inline json plan_migration_tool(ToolContext& ctx, const json& args) {
   // be tried before it is trusted.
   if (plan.ok && args.value("dryRun", true)) {
     std::vector<std::pair<int, std::vector<std::string>>> steps;
+    // Parallel to `steps`: the COPY payload for a copy_rows step, null
+    // otherwise. See Catalog::dry_run.
+    std::vector<json> copy_payloads;
     std::vector<bool> forbidden;
     for (const auto& step : plan.steps) {
       if (step.action != Action::kApply) continue;
       steps.emplace_back(step.ordinal, step.sql);
       forbidden.push_back(step.txn_class == TxnClass::kForbidden);
+      copy_payloads.push_back(step.detail.contains("copy_rows") ? step.detail
+                                                               : json());
     }
-    const auto dry = cat.dry_run(steps, forbidden, obs.server_version);
+    const auto dry = cat.dry_run(steps, forbidden, obs.server_version,
+                                 copy_payloads);
     json d{{"ran", dry.ran},
            {"unverifiedSteps", dry.unverified_steps},
            {"note",

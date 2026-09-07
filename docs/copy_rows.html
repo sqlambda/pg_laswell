@@ -1,0 +1,133 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>copy_rows — pg_laswell</title>
+<style>
+:root{--fg:#333;--bg:#fff;--muted:#666;--rule:#ddd;--link:#0066a4;
+      --code-bg:#f7f7f7;--code-rule:#e0e0e0;--req:#a33;--accent:#0e6ba8;
+      --dd:#444;--req-bg:#fbeaea;--req-rule:#f0cccc;--opt-bg:#eef4f8;
+      --opt-rule:#d3e3ee;--note-bg:#f6f9fb;--warn-bg:#fdf7f1;--warn-rule:#c8853a}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+     font:15px/1.6 "Helvetica Neue",Helvetica,Arial,sans-serif}
+.wrap{max-width:52rem;margin:0 auto;padding:1.5rem 1.25rem 5rem}
+a{color:var(--link);text-decoration:none}
+a:hover{text-decoration:underline}
+a:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:2px}
+nav.crumb{display:flex;justify-content:space-between;gap:1rem;
+          border-bottom:1px solid var(--rule);padding-bottom:.6rem;
+          margin-bottom:1.5rem;font-size:.85rem;color:var(--muted)}
+nav.crumb .l,nav.crumb .r{display:flex;gap:1rem;flex-wrap:wrap}
+h1{font-size:1.9rem;margin:.2rem 0 .1rem;font-weight:600;letter-spacing:-.01em}
+h1 code{font-size:inherit;background:none;padding:0;border:0}
+.purpose{color:var(--muted);margin:0 0 1.8rem;font-size:1.02rem}
+h2{font-size:1.15rem;margin:2.2rem 0 .7rem;padding-bottom:.3rem;
+   border-bottom:1px solid var(--rule);font-weight:600}
+pre{background:var(--code-bg);border:1px solid var(--code-rule);border-radius:3px;
+    padding:.85rem 1rem;overflow-x:auto;font-size:.86rem;line-height:1.5;margin:0 0 1rem}
+code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+p code,li code,dd code,dt code,td code{background:var(--code-bg);
+    border:1px solid var(--code-rule);border-radius:3px;padding:.05rem .3rem;font-size:.86em}
+dl.params{margin:0}
+dl.params>dt{margin:1.1rem 0 .35rem;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+             font-size:.92rem;font-weight:600}
+dl.params>dd{margin:0 0 0 1.6rem;color:var(--dd)}
+.tag{display:inline-block;margin-left:.5rem;padding:.02rem .4rem;border-radius:2px;
+     font:600 .68rem/1.5 "Helvetica Neue",Helvetica,Arial,sans-serif;
+     text-transform:uppercase;letter-spacing:.04em;vertical-align:.08em}
+.tag.req{background:var(--req-bg);color:var(--req);border:1px solid var(--req-rule)}
+.tag.opt{background:var(--opt-bg);color:var(--accent);border:1px solid var(--opt-rule)}
+.note{background:var(--note-bg);border-left:3px solid var(--accent);padding:.7rem .9rem;
+      margin:0 0 1rem;font-size:.92rem}
+.note.warn{background:var(--warn-bg);border-left-color:var(--warn-rule)}
+table{border-collapse:collapse;width:100%;font-size:.9rem;margin:0 0 1rem}
+th,td{text-align:left;padding:.45rem .6rem;border-bottom:1px solid var(--rule);
+      vertical-align:top;font-variant-numeric:tabular-nums}
+th{font-weight:600;color:var(--muted);font-size:.78rem;text-transform:uppercase;letter-spacing:.04em}
+td.k{white-space:nowrap;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.86rem}
+.idx{columns:2;column-gap:2.5rem}
+@media(max-width:640px){.idx{columns:1}}
+.idx section{break-inside:avoid;margin:0 0 1.4rem}
+.idx h3{font-size:.78rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);
+        margin:0 0 .4rem;font-weight:600}
+.idx ul{list-style:none;margin:0;padding:0}
+.idx li{margin:.16rem 0;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.86rem}
+footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
+       color:var(--muted);font-size:.82rem}
+/* Three states, not two: an explicit choice stamps data-theme on the root, and
+   the default "system" setting stamps nothing at all -- so the media query has
+   to carry the un-stamped case while losing to an explicit light choice, and
+   the [data-theme="dark"] block has to win in the other direction. */
+@media(prefers-color-scheme:dark){
+ :root:not([data-theme="light"]){
+  --fg:#d6d6d6;--bg:#161719;--muted:#9a9a9a;--rule:#333;--link:#63b3e8;
+  --code-bg:#1e2023;--code-rule:#2e3136;--req:#e8918f;--accent:#63b3e8;
+  --dd:#c2c2c2;--req-bg:#3a2526;--req-rule:#573537;--opt-bg:#1d2a33;
+  --opt-rule:#2b3f4d;--note-bg:#1a2126;--warn-bg:#2a2119}
+}
+:root[data-theme="dark"]{
+ --fg:#d6d6d6;--bg:#161719;--muted:#9a9a9a;--rule:#333;--link:#63b3e8;
+ --code-bg:#1e2023;--code-rule:#2e3136;--req:#e8918f;--accent:#63b3e8;
+ --dd:#c2c2c2;--req-bg:#3a2526;--req-rule:#573537;--opt-bg:#1d2a33;
+ --opt-rule:#2b3f4d;--note-bg:#1a2126;--warn-bg:#2a2119}
+</style></head><body><div class="wrap">
+<nav class="crumb"><div class="l"><a href="index.html">Intent kinds</a><span>Rows</span></div><div class="r"><a href="merge_rows.html">← merge_rows</a></div></nav>
+<h1><code>copy_rows</code></h1>
+<p class="purpose">—- copy_rows ———————————————————————————————</p>
+<h2>Synopsis</h2><pre>{
+  &quot;kind&quot;: &quot;copy_rows&quot;,
+  &quot;schema&quot;: &lt;required&gt;,
+  &quot;table&quot;: &lt;required&gt;,
+  &quot;columns&quot;: &lt;optional&gt;,
+  &quot;values&quot;: &lt;optional&gt;,
+  &quot;verify_remaining&quot;: &lt;optional&gt;,
+  &quot;assert_invariants&quot;: &lt;optional&gt;
+}</pre>
+<h2>Description</h2>
+<p>—- copy_rows ———————————————————————————————</p>
+<p>COPY is the fifth way PostgreSQL writes rows and the only one in this family the paced executor cannot drive. Measured on 18.6 (S21): a COPY whose second of three rows violated the primary key rolled back ALL THREE. It is one transaction&#x27;s worth of work whatever its size, so there is no batch boundary to place and nothing for a lock waiter to interrupt.</p>
+<p>That is stated in the plan rather than worked around, because the honest answer for a large load is that COPY is the wrong shape for a paced migration and insert_rows with &quot;select&quot; is the right one.</p>
+<p>Two more measurements worth carrying into the plan, both of which contradict what COPY is usually assumed to do:</p>
+<p>* it is NOT a fast path around constraints. A COPY into a child table whose parent row was missing failed on the foreign key exactly as an INSERT would. Row triggers fire too. * ON_ERROR ignore does not make COPY safe, it makes it QUIET: it skipped the malformed row, wrote the other two, and reported success. A step that can succeed having written less than the spec listed has to say so.</p>
+<h2>Parameters</h2><dl class="params">
+<dt>schema<span class="tag req">required</span></dt>
+<dd>&nbsp;</dd>
+<dt>table<span class="tag req">required</span></dt>
+<dd>&nbsp;</dd>
+<dt>columns<span class="tag opt">optional</span></dt>
+<dd>COPY with no column list binds by position, so a table that gains a column would silently shift every value.</dd>
+<dt>values<span class="tag opt">optional</span></dt>
+<dd>copy_rows sends literal rows over the protocol as COPY ... FROM STDIN. Reading a server-side file would need superuser and would put the real change somewhere the signature does not cover.</dd>
+<dt>verify_remaining<span class="tag opt">optional</span></dt>
+<dd>&nbsp;</dd>
+<dt>assert_invariants<span class="tag opt">optional</span></dt>
+<dd>&nbsp;</dd>
+</dl>
+<div class="note">Any key not listed here is <strong>refused</strong>, not ignored: a key this binary skips and a newer one honours would be a silent difference between what was reviewed and what ran.</div>
+<h2>Examples</h2>
+<p>From the conformance suite, which plans this intent and <em>applies</em> it to a real PostgreSQL on every test run:</p>
+<pre>{
+ &quot;kind&quot;: &quot;copy_rows&quot;,
+ &quot;schema&quot;: &quot;cf&quot;,
+ &quot;table&quot;: &quot;t&quot;,
+ &quot;columns&quot;: [
+  &quot;id&quot;,
+  &quot;amount&quot;,
+  &quot;code&quot;
+ ],
+ &quot;values&quot;: [
+  [
+   204,
+   10,
+   &quot;z4&quot;
+  ],
+  [
+   205,
+   11,
+   &quot;z5&quot;
+  ]
+ ]
+}</pre>
+<p>Afterwards, <code>SELECT string_agg(code,&#x27;,&#x27; ORDER BY id) FROM cf.t WHERE id IN (204,205)</code> returns <code>z4,z5</code>.</p>
+<h2>See also</h2><p><a href="backfill.html"><code>backfill</code></a>, <a href="delete_rows.html"><code>delete_rows</code></a>, <a href="insert_rows.html"><code>insert_rows</code></a>, <a href="update_rows.html"><code>update_rows</code></a>, <a href="merge_rows.html"><code>merge_rows</code></a></p>
+<footer>Generated from <code>cpp/src/spec.h</code> and <code>cpp/src/conformance.inc</code> by <code>tools/gen-manual.py</code>. The manual page <code>pg_laswell_mcp(1)</code> remains the authoritative reference for everything that is not a per-kind option.</footer>
+</div></body></html>

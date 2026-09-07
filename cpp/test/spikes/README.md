@@ -6,8 +6,9 @@ kept rather than discarded: the next PostgreSQL major is the moment someone
 will need to re-run them, and reconstructing them from prose is worse than
 re-running a script.
 
-Results, with raw output and the decisions they forced, are in
-`docs/ROADMAP.md` §2. That file is the record; these are the instruments.
+Each script's header states the question it settled and the answer, and running
+it reproduces the raw output that decided it. The decisions themselves -- what
+changed in the design, and why -- are in `CHANGES.md`.
 
 ## Running them
 

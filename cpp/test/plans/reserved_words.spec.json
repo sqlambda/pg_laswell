@@ -1,0 +1,9 @@
+{"laswell_spec_version":1,"id":"0009-reserved-words",
+ "description":"A schema whose every identifier is a reserved word.",
+ "rationale":"user, order, end, desc and limit are all reserved words that nonetheless match the [a-z0-9_] shape require_identifier permits, so they reach the planner. Measured on 18.6: a schema or table named this way is a syntax error in EVERY position -- CREATE TABLE user.order, and even SELECT ... FROM user.order -- and a column named this way breaks in every DDL position. Only a fully qualified schema.table.column reference survives unquoted, which is why the bug hid. This transcript is the record that every identifier the planner emits is quoted.",
+ "intents":[{"kind":"add_column","schema":"user","table":"order","column":"table",
+             "type":"text","nullable":true,"comment":"Reserved."},
+            {"kind":"create_index","schema":"user","table":"order","name":"limit",
+             "columns":["desc"],"comment":"Reserved."},
+            {"kind":"backfill","schema":"user","table":"order","key":"end",
+             "set":{"desc":"'x'"},"where":"\"desc\" IS NULL"}]}

@@ -13,319 +13,11 @@
 // cannot be checked is a recipe, and recipes are what this tool exists to
 // replace.
 
-#include <algorithm>
-#include <cctype>
-#include <map>
-#include <string>
-#include <vector>
-
-#include <nlohmann/json.hpp>
-
-#include "config.h"
-#include "observations.h"
-#include "spec.h"
+#include "planner_base.h"
+#include "planner_dml.h"
 
 namespace pglaswell {
 
-// How a step relates to a transaction. This is the direct answer to "DDL is
-// transactional, so wrap it" versus "CREATE INDEX CONCURRENTLY cannot run
-// inside a transaction block": both are true, and a step has to say which it
-// is before the executor can group anything.
-enum class TxnClass {
-  kRequired,      // must be atomic with its neighbours
-  kOptional,      // works either way; joins the current group
-  kForbidden,     // must run outside any transaction block
-  kOwnTxnPerBatch // the executor owns the boundaries
-};
-
-inline const char* to_string(TxnClass c) {
-  switch (c) {
-    case TxnClass::kRequired: return "txn_required";
-    case TxnClass::kOptional: return "txn_optional";
-    case TxnClass::kForbidden: return "txn_forbidden";
-    case TxnClass::kOwnTxnPerBatch: return "own_txn_per_batch";
-  }
-  return "unknown";
-}
-
-// What the planner concluded about an intent. `satisfied` is a SUCCESS, not a
-// shrug: the ledger records it with the observation that justified it, so a
-// later reader can tell "we didn't need to" from "we forgot to".
-enum class Action { kApply, kSatisfied, kConflict };
-
-inline const char* to_string(Action a) {
-  switch (a) {
-    case Action::kApply: return "apply";
-    case Action::kSatisfied: return "satisfied";
-    case Action::kConflict: return "conflict";
-  }
-  return "unknown";
-}
-
-struct Step {
-  int ordinal = 0;
-  int txn_group = 0;
-  std::string kind;
-  TxnClass txn_class = TxnClass::kOptional;
-  Action action = Action::kApply;
-  std::vector<std::string> sql;  // verbatim, as it will be executed
-  std::string why;               // the rule that fired, and the reading behind it
-  std::string lock;              // the lock this takes, named
-  // Forces a transaction boundary before this step even when its class would
-  // otherwise let it join the previous group. NOT VALID must commit before
-  // VALIDATE runs, or the strong lock is held across the scan regardless.
-  bool own_transaction = false;
-  json detail = json::object();
-
-  json to_json() const {
-    return json{{"ordinal", ordinal},
-                {"txnGroup", txn_group},
-                {"kind", kind},
-                {"txnClass", to_string(txn_class)},
-                {"action", to_string(action)},
-                {"sql", sql},
-                {"why", why},
-                {"lock", lock},
-                {"detail", detail}};
-  }
-};
-
-struct Plan {
-  bool ok = true;
-  std::string spec_id;
-  std::string spec_digest;
-  std::vector<Step> steps;
-  std::vector<std::string> warnings;
-  std::vector<std::string> conflicts;
-  // Out-of-band actions this migration needs, structured so something can ACT
-  // on them rather than read them.
-  //
-  // A warning tells a person something. A prerequisite tells an agent -- or a
-  // skill, or a provisioning script -- what must be true, WHERE, and how to
-  // check it. The difference matters because several of these are on a machine
-  // pg_laswell is not connected to: a replication slot on the publisher, a
-  // package on the host, free space in a tablespace. Prose cannot be acted on
-  // reliably; a shape can.
-  //
-  // Each entry: {kind, target, where, requirement, verify, blocking}.
-  // `blocking` says whether the migration fails without it or merely does
-  // less than it appears to.
-  std::vector<json> prerequisites;
-  json budget = json::object();
-
-  json to_json() const {
-    json steps_json = json::array();
-    for (const auto& s : steps) steps_json.push_back(s.to_json());
-    return json{{"ok", ok},
-                {"specId", spec_id},
-                {"specDigest", spec_digest},
-                {"steps", std::move(steps_json)},
-                {"warnings", warnings},
-                {"conflicts", conflicts},
-                {"prerequisites", prerequisites},
-                {"budget", budget}};
-  }
-
-  // The digest of the plan itself: the determinism receipt. planMigration and
-  // startMigration must produce the same one, which is how "what ran is what
-  // you were shown" becomes checkable rather than promised.
-  std::string digest() const { return digest_hex(to_json()); }
-
-  std::string render() const;
-};
-
-namespace detail {
-
-// Records an out-of-band prerequisite. Every field is required because a
-// half-filled one is worse than none: a skill that cannot tell WHERE to act, or
-// how to check whether it already did, will act on the wrong machine or twice.
-inline void require_out_of_band(Plan& plan, const std::string& kind,
-                                const std::string& target,
-                                const std::string& where,
-                                const std::string& requirement,
-                                const std::string& verify, bool blocking) {
-  plan.prerequisites.push_back(json{{"kind", kind},
-                                    {"target", target},
-                                    {"where", where},
-                                    {"requirement", requirement},
-                                    {"verify", verify},
-                                    {"blocking", blocking}});
-}
-
-inline std::string human_bytes(long long b) {
-  const char* units[] = {"B", "KiB", "MiB", "GiB", "TiB"};
-  double v = static_cast<double>(b);
-  int u = 0;
-  while (v >= 1024.0 && u < 4) {
-    v /= 1024.0;
-    ++u;
-  }
-  char buf[64];
-  std::snprintf(buf, sizeof(buf), (u == 0 ? "%.0f %s" : "%.1f %s"), v, units[u]);
-  return buf;
-}
-
-inline std::string quote_literal(const std::string& s) {
-  std::string out = "'";
-  for (const char c : s) {
-    if (c == '\'') out += '\'';
-    out += c;
-  }
-  out += "'";
-  return out;
-}
-
-// Always quotes, rather than quoting only when it looks necessary.
-//
-// A role or column named "user", "order" or "Select" is a reserved word or is
-// case-folded, and deciding case by case needs PostgreSQL's own keyword list.
-// Unconditional quoting is correct for every identifier PostgreSQL will hand
-// back to us, because what comes out of the catalog is the real name.
-inline std::string quote_identifier(const std::string& s) {
-  std::string out = "\"";
-  for (const char c : s) {
-    if (c == '"') out += '"';
-    out += c;
-  }
-  out += "\"";
-  return out;
-}
-
-inline std::string join(const std::vector<std::string>& v, const char* sep) {
-  std::string out;
-  for (std::size_t i = 0; i < v.size(); ++i) {
-    if (i != 0) out += sep;
-    out += v[i];
-  }
-  return out;
-}
-
-// The connection budget (spike S12): one blocked query pins exactly one
-// connection, so T_exhaust = headroom / arrival_rate. The ceiling that matters
-// is the APPLICATION's pool, which is invisible from the server -- so when it
-// is not configured, say so rather than substituting max_connections and
-// pretending the number means what it does not.
-inline json compute_budget(const Observations& obs, const ExecutorConfig& cfg) {
-  const int max_conn = obs.server.value("max_connections", 0);
-  const int reserved = obs.server.value("reserved_connections", 0);
-  const int current = obs.server.value("current_backends", 0);
-  const int server_headroom = std::max(0, max_conn - reserved - current);
-
-  json b{{"serverMaxConnections", max_conn},
-         {"serverHeadroom", server_headroom},
-         {"appPoolSize", cfg.app_pool_size},
-         {"appStatementTimeoutMs", cfg.app_statement_timeout_ms},
-         {"safetyPercent", cfg.safety_percent}};
-
-  if (cfg.app_pool_size > 0) {
-    b["effectiveHeadroom"] = std::min(server_headroom, cfg.app_pool_size);
-    b["headroomSource"] = "app_pool_size";
-  } else {
-    b["effectiveHeadroom"] = server_headroom;
-    b["headroomSource"] = "max_connections";
-    b["caveat"] =
-        "app_pool_size is not configured, so this is the server's ceiling, not "
-        "the application's. An application collapses when its own pool fills, "
-        "which usually happens first and is invisible from here.";
-  }
-
-  // Worker capacity, which is what actually limits concurrent migrations --
-  // and it is a server-side limit, not a client one. The migrations run inside
-  // PostgreSQL; this process contributes three connections and a poll loop per
-  // job, so the machine pg_laswell runs on is very nearly irrelevant to how
-  // many can run at once.
-  const int max_workers = obs.server.value("max_parallel_workers", 0);
-  const int max_maint = obs.server.value("max_parallel_maintenance_workers", 0);
-  const int workers_busy = obs.server.value("parallel_workers_active", 0);
-  const int jobs = std::max(1, cfg.max_concurrent_jobs);
-  json w{{"maxParallelWorkers", max_workers},
-         {"maxParallelMaintenanceWorkers", max_maint},
-         {"maxWorkerProcesses", obs.server.value("max_worker_processes", 0)},
-         {"parallelWorkersActive", workers_busy},
-         {"parallelWorkersFree", std::max(0, max_workers - workers_busy)},
-         {"maxConcurrentJobs", jobs}};
-  if (cfg.host_vcpus > 0) {
-    w["hostVcpus"] = cfg.host_vcpus;
-    w["hostVcpusSource"] = "configuration -- declared by an operator";
-  } else {
-    w["hostVcpusSource"] =
-        "not declared. PostgreSQL exposes no CPU count in SQL -- the only "
-        "cpu-named settings are planner cost constants -- so this is "
-        "configuration or nothing, never a guess.";
-  }
-
-  // The verdict, with the number that decided it. A bare boolean would make
-  // the caller guess at the reason, and the reason is the useful half.
-  const int connections_per_job = 3;
-  const int free = b.value("effectiveHeadroom", 0);
-  if (free < connections_per_job) {
-    w["canStartAnotherJob"] = false;
-    w["verdict"] = "no: " + std::to_string(free) +
-                   " connection(s) free and a job needs " +
-                   std::to_string(connections_per_job) +
-                   " (worker, observer, coordination)";
-  } else if (max_workers > 0 && workers_busy >= max_workers) {
-    // Not a refusal: a job with no index build does not need a worker slot.
-    w["canStartAnotherJob"] = true;
-    w["verdict"] = "yes, but all " + std::to_string(max_workers) +
-                   " parallel worker slots are in use -- an index build in the "
-                   "new job will run single-threaded, and silently, so any "
-                   "duration estimated from a measured build will be wrong";
-  } else {
-    w["canStartAnotherJob"] = true;
-    w["verdict"] = "yes: " + std::to_string(free) + " connection(s) and " +
-                   std::to_string(std::max(0, max_workers - workers_busy)) +
-                   " parallel worker slot(s) free";
-  }
-  if (jobs > 1 && max_workers > 0 && jobs > max_workers) {
-    w["note"] = "max_concurrent_jobs is " + std::to_string(jobs) +
-                " and the server has " + std::to_string(max_workers) +
-                " parallel worker slots in total, so concurrent index builds "
-                "will contend for them regardless of how many jobs are "
-                "allowed. Worker slots run out long before connections do.";
-  }
-  b["workers"] = w;
-
-  // maintenance_work_mem, divided by the job count.
-  //
-  // PostgreSQL applies it as a limit per OPERATION, not as a budget across
-  // them -- and, checked in the documentation rather than assumed, NOT per
-  // parallel worker: "parallel utility commands treat the resource limit
-  // maintenance_work_mem as a limit to be applied to the entire utility
-  // command, regardless of the number of parallel worker processes". So a
-  // parallel build does not multiply it and an estimate assuming otherwise
-  // would be three times too pessimistic.
-  //
-  // What DOES multiply it is concurrency, and the documentation's own
-  // justification for setting it high is the assumption concurrent migrations
-  // void: "an installation normally doesn't have many of them running
-  // concurrently". Thirty-two jobs is precisely that, so the configured
-  // ceiling is divided by how many may run at once.
-  if (cfg.maintenance_work_mem_mb > 0) {
-    const int per_job = std::max(1, cfg.maintenance_work_mem_mb / jobs);
-    b["maintenanceWorkMem"] =
-        json{{"configuredCeilingMb", cfg.maintenance_work_mem_mb},
-             {"perStepMb", per_job},
-             {"serverDefaultKb", obs.server.value("maintenance_work_mem_kb", 0)},
-             {"why", "the ceiling divided by max_concurrent_jobs (" +
-                         std::to_string(jobs) +
-                         "), because PostgreSQL limits it per operation and "
-                         "not across concurrent ones"}};
-  } else {
-    b["maintenanceWorkMem"] =
-        json{{"perStepMb", 0},
-             {"serverDefaultKb", obs.server.value("maintenance_work_mem_kb", 0)},
-             {"why", "maintenance_work_mem_mb is not configured, so the "
-                     "server's own setting is left alone. Raising it is the "
-                     "cheapest speed-up available for an index build, a "
-                     "foreign-key validation or a table rewrite -- but the "
-                     "host's free memory is not visible from SQL, so this tool "
-                     "will not guess at it."}};
-  }
-  return b;
-}
-
-}  // namespace detail
 
 // --- per-intent rules ------------------------------------------------------
 
@@ -347,6 +39,7 @@ inline void plan_add_column(const Intent& in, const Observations& obs, Plan& pla
   step.kind = in.kind_name;
   struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
   const auto qualified = in.qualified_table();
+  const auto sql_rel = detail::quote_qualified(qualified);
   const auto& t = obs.table(qualified);
   const auto column = in.body.value("column", "");
   const auto type = in.body.value("type", "");
@@ -413,13 +106,13 @@ inline void plan_add_column(const Intent& in, const Observations& obs, Plan& pla
         "anything reading through the view.");
   }
 
-  std::string sql = "ALTER TABLE " + qualified + " ADD COLUMN " + column + " " + type;
+  std::string sql = "ALTER TABLE " + sql_rel + " ADD COLUMN " + detail::quote_identifier(column) + " " + type;
   if (has_default) {
     sql += " DEFAULT " + in.body["default"].get<std::string>();
   }
   if (!nullable) sql += " NOT NULL";
   step.sql.push_back(sql + ";");
-  step.sql.push_back("COMMENT ON COLUMN " + qualified + "." + column + " IS " +
+  step.sql.push_back("COMMENT ON COLUMN " + sql_rel + "." + detail::quote_identifier(column) + " IS " +
                      detail::quote_literal(in.body.value("comment", "")) + ";");
 
   // Measured 2026-09-05 on 18.6 (spike S8): a non-volatile default is
@@ -572,6 +265,10 @@ inline void project(const Intent& in, const Step& step, Observations& projected)
       projected.tables[qualified] = json{{"exists", false}};
       return;
     case IntentKind::kDeleteRows:
+    case IntentKind::kInsertRows:
+    case IntentKind::kUpdateRows:
+    case IntentKind::kMergeRows:
+    case IntentKind::kCopyRows:
       return;  // rows change, the schema does not
     case IntentKind::kSetRowSecurity:
       projected.tables[qualified]["row_security"] =
@@ -745,6 +442,7 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
     ~Emit() { if (!skip) o.push_back(s); }
   } emit{out, step, handed_off};
   const auto qualified = in.qualified_table();
+  const auto sql_rel = detail::quote_qualified(qualified);
   const auto& t = obs.table(qualified);
   const auto name = in.body.value("name", "");
   const bool unique = in.body.value("unique", false);
@@ -755,6 +453,13 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
   for (const auto& c : in.body.value("columns", json::array())) {
     columns.push_back(c.get<std::string>());
   }
+  // Two lists, deliberately. `columns` is compared against the catalog's own
+  // column names -- which arrive unquoted -- so quoting it in place would make
+  // every equivalence check compare unequal things, which is the very failure
+  // require_identifier's comment warns about. `quoted_columns` is the one that
+  // reaches SQL.
+  std::vector<std::string> quoted_columns;
+  for (const auto& c : columns) quoted_columns.push_back(detail::quote_identifier(c));
 
   if (!t.value("exists", false)) {
     step.action = Action::kConflict;
@@ -945,9 +650,10 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
         step.txn_class = TxnClass::kOptional;
         step.lock = "ShareUpdateExclusiveLock on the index; the table is not "
                     "locked at all";
-        step.sql.push_back("ALTER INDEX " + in.schema() + "." + it.key() +
-                           " RENAME TO " + name + ";");
-        step.sql.push_back("COMMENT ON INDEX " + in.schema() + "." + name +
+        step.sql.push_back("ALTER INDEX " + detail::quote_identifier(in.schema()) + "." +
+                           detail::quote_identifier(it.key()) +
+                           " RENAME TO " + detail::quote_identifier(name) + ";");
+        step.sql.push_back("COMMENT ON INDEX " + detail::quote_identifier(in.schema()) + "." + detail::quote_identifier(name) +
                            " IS " +
                            detail::quote_literal(in.body.value("comment", "")) + ";");
         step.why = "an equivalent index already exists as \"" + it.key() +
@@ -1009,8 +715,8 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
     return;
   }
 
-  std::string columns_sql = detail::join(columns, ", ");
-  const std::string tail = " ON " + qualified + " USING " + method + " (" +
+  std::string columns_sql = detail::join(quoted_columns, ", ");
+  const std::string tail = " ON " + sql_rel + " USING " + method + " (" +
                            columns_sql + ")" +
                            (where.empty() ? "" : " WHERE " + where) + ";";
 
@@ -1026,14 +732,14 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
   const bool plain = small_enough && quiet && !unique;
 
   if (rebuild_after_drop) {
-    step.sql.push_back("DROP INDEX CONCURRENTLY " + in.schema() + "." + name + ";");
+    step.sql.push_back("DROP INDEX CONCURRENTLY " + detail::quote_identifier(in.schema()) + "." + detail::quote_identifier(name) + ";");
     step.detail["recovering_invalid_index"] = true;
   }
 
   if (plain) {
     step.txn_class = TxnClass::kOptional;
     step.lock = "ShareLock (blocks writes for the whole build)";
-    step.sql.push_back("CREATE INDEX " + name + tail);
+    step.sql.push_back("CREATE INDEX " + detail::quote_identifier(name) + tail);
     step.why = "size " + detail::human_bytes(size) + " < 64 MiB ceiling, " +
                std::to_string(waiters) + " lock waiters -> plain build " +
                "(transactional, cannot leave an invalid index)";
@@ -1044,7 +750,7 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
     step.txn_class = TxnClass::kForbidden;
     step.lock = "ShareUpdateExclusiveLock (two table scans)";
     step.sql.push_back("CREATE " + std::string(unique ? "UNIQUE " : "") +
-                       "INDEX CONCURRENTLY " + name + tail);
+                       "INDEX CONCURRENTLY " + detail::quote_identifier(name) + tail);
     std::string reason;
     if (!small_enough) reason = "size " + detail::human_bytes(size) + " >= 64 MiB ceiling";
     else if (!quiet) reason = std::to_string(waiters) + " lock waiters already on the table";
@@ -1057,7 +763,7 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
         "will DROP INDEX CONCURRENTLY before rebuilding";
   }
 
-  step.sql.push_back("COMMENT ON INDEX " + in.schema() + "." + name + " IS " +
+  step.sql.push_back("COMMENT ON INDEX " + detail::quote_identifier(in.schema()) + "." + detail::quote_identifier(name) + " IS " +
                      detail::quote_literal(in.body.value("comment", "")) + ";");
   step.detail["schema"] = in.schema();
   step.detail["index"] = name;
@@ -1069,248 +775,6 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
   (void)cfg;
 }
 
-inline void plan_backfill(const Intent& in, const Observations& obs,
-                          const ExecutorConfig& cfg, Plan& plan,
-                          std::vector<Step>& out) {
-  Step step;
-  step.kind = in.kind_name;
-  struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
-  const auto qualified = in.qualified_table();
-  const auto& t = obs.table(qualified);
-  const auto key = in.body.value("key", "");
-
-  step.txn_class = TxnClass::kOwnTxnPerBatch;
-  step.lock = "RowExclusiveLock plus row locks, released at every commit";
-
-  if (!t.value("exists", false)) {
-    step.action = Action::kConflict;
-    step.why = qualified + " does not exist";
-    plan.conflicts.push_back(step.why);
-    return;
-  }
-
-  const json columns = t.value("columns", json::object());
-  for (auto it = in.body["set"].begin(); it != in.body["set"].end(); ++it) {
-    if (!columns.contains(it.key())) {
-      step.action = Action::kConflict;
-      step.why = qualified + "." + it.key() + " does not exist";
-      plan.conflicts.push_back(
-          step.why +
-          "; if an earlier intent in this spec adds it, the backfill must come "
-          "after that intent, and the planner does not reorder intents.");
-      return;
-    }
-  }
-
-  // A keyset walk needs a unique key, or the cursor can skip or repeat rows.
-  // Refused loudly rather than falling back to OFFSET, which degrades to a
-  // full scan per batch and is quadratic in the table size.
-  bool key_is_unique = false;
-  std::string supporting_index;
-  // Bound to a local: json::value() returns BY VALUE, so calling it in both
-  // begin() and end() yields iterators into two different temporaries. Same
-  // defect class as std::ostringstream::str() -- it compiles, and nlohmann
-  // catches it at runtime with "cannot compare iterators of different
-  // containers", which is a much better outcome than the silent corruption
-  // the equivalent std:: idiom would give.
-  const json indexes = t.value("indexes", json::object());
-  for (auto it = indexes.begin(); it != indexes.end(); ++it) {
-    if (it.value().value("leading_column", "") != key) continue;
-    supporting_index = it.key();
-    if (it.value().value("is_unique", false) && it.value().value("is_valid", false)) {
-      key_is_unique = true;
-      break;
-    }
-  }
-  if (!key_is_unique) {
-    step.action = Action::kConflict;
-    step.why = "no unique index leads with " + key;
-    plan.conflicts.push_back(
-        qualified + " has no valid unique index whose leading column is \"" + key +
-        "\", so a keyset walk could skip or repeat rows. Create one first: "
-        "CREATE UNIQUE INDEX CONCURRENTLY ... ON " + qualified + " (" + key + ");");
-    return;
-  }
-
-  const long long rows = t.value("reltuples", 0LL);
-  const auto where = in.body.value("where", "");
-  const auto from = in.body.value("from", "");
-
-  std::vector<std::string> assignments;
-  for (auto it = in.body["set"].begin(); it != in.body["set"].end(); ++it) {
-    assignments.push_back(it.key() + " = " + it.value().get<std::string>());
-  }
-
-  // FOR UPDATE without SKIP LOCKED, deliberately. SKIP LOCKED would silently
-  // skip contended rows while the cursor advanced past them, leaving a
-  // backfill that reports complete and is not. It looks like the obviously
-  // right pacing idiom and is wrong here.
-  // The `from` items appear in BOTH the CTE and the outer UPDATE, because the
-  // filter may reference them -- a backfill whose predicate joins to another
-  // table is the ordinary case, not the exotic one. An earlier version put
-  // them only in the outer UPDATE, which produced a CTE referencing an alias
-  // that was not in scope: SQL that renders convincingly and does not parse.
-  //
-  // FOR UPDATE OF t, not a bare FOR UPDATE: with a join, a bare FOR UPDATE
-  // locks rows in every table named, so the backfill would take row locks on
-  // the lookup table it merely reads. That is contention this tool exists to
-  // avoid, inflicted by its own batch statement.
-  // The target table is referenced by its OWN NAME, not by an alias.
-  //
-  // A spec's `where` and `set` expressions have to name the target somehow, and
-  // that choice is an interface contract: `orders.warehouse_id = w.id` and
-  // `t.warehouse_id = w.id` are both plausible, and a spec written for one
-  // fails against the other. Using the table's own name is what someone
-  // writing this SQL by hand would do, and it needs no explanation -- an alias
-  // would be a convention every author had to learn from a footnote.
-  //
-  // The `from` items appear in BOTH the CTE and the outer UPDATE, because the
-  // filter may reference them: a backfill whose predicate joins to another
-  // table is the ordinary case. An earlier version put them only in the outer
-  // UPDATE, producing a CTE that referenced an alias not in scope -- SQL that
-  // renders convincingly and does not parse.
-  //
-  // FOR UPDATE OF <target>, not a bare FOR UPDATE: with a join, a bare FOR
-  // UPDATE locks rows in every table named, so the backfill would take row
-  // locks on the lookup table it merely reads. That is contention this tool
-  // exists to avoid, inflicted by its own batch statement.
-  const std::string rel = in.table();
-
-  // The pre-image, captured in the SAME STATEMENT as the update.
-  //
-  // Data-modifying CTEs all see one snapshot, so an INSERT ... SELECT reading
-  // the target inside this statement sees the rows as they were BEFORE the
-  // UPDATE in the same statement. That is what makes the capture atomic with
-  // the change: there is no window in which one committed and the other did
-  // not, and a crash leaves the backup and the data agreeing.
-  //
-  // This is what replaced the pinned-snapshot idea. A snapshot lets you LOOK at
-  // the old values while holding back the xmin horizon for the whole backfill;
-  // this KEEPS them, durably, and doubles as the revert path -- which a
-  // snapshot can never be.
-  std::string preserve_cte;
-  if (in.body.contains("preserve")) {
-    const auto pschema = in.body["preserve"].value("schema", "");
-    const auto ptable = in.body["preserve"].value("table", "");
-    const auto preserved = pschema + "." + ptable;
-
-    std::vector<std::string> saved_cols{key};
-    for (auto it = in.body["set"].begin(); it != in.body["set"].end(); ++it) {
-      saved_cols.push_back(it.key());
-    }
-
-    // The side table is created by its own step, from the target's real column
-    // types -- LIKE would carry constraints and defaults that have no business
-    // on a backup.
-    std::string cols_ddl;
-    for (const auto& c : saved_cols) {
-      const auto type = columns.contains(c)
-                            ? columns[c].value("type", "text")
-                            : std::string("text");
-      if (!cols_ddl.empty()) cols_ddl += ", ";
-      cols_ddl += c + " " + type;
-    }
-    Step create;
-    create.kind = in.kind_name;
-    create.txn_class = TxnClass::kRequired;
-    create.own_transaction = true;
-    create.lock = "AccessExclusiveLock on the new table only";
-    create.sql.push_back("CREATE TABLE IF NOT EXISTS " + preserved + " (" +
-                         cols_ddl + ", laswell_saved_at timestamptz NOT NULL DEFAULT now());");
-    create.sql.push_back("COMMENT ON TABLE " + preserved + " IS " +
-                         detail::quote_literal(
-                             "Pre-image captured by pg_laswell before backfilling " +
-                             qualified + ". Each row is what the target looked "
-                             "like before the change, written in the same "
-                             "transaction as the change itself.") + ";");
-    create.why = "preserve: the pre-image needs somewhere to live, and it must "
-                 "exist before the first batch writes to it";
-    out.push_back(std::move(create));
-
-    std::string select_cols;
-    for (const auto& c : saved_cols) {
-      if (!select_cols.empty()) select_cols += ", ";
-      select_cols += rel + "." + c;
-    }
-    preserve_cte = ", preserved AS (\n"
-                   "  INSERT INTO " + preserved + " (" +
-                   detail::join(saved_cols, ", ") + ")\n"
-                   "  SELECT " + select_cols + "\n"
-                   "    FROM " + qualified + ", batch AS pb\n"
-                   "   WHERE " + rel + "." + key + " = pb." + key + "\n"
-                   ")";
-    step.detail["preserve"] = preserved;
-  }
-
-  const std::string batch_sql =
-      "WITH batch AS (\n"
-      "  SELECT " + rel + "." + key + "\n"
-      "    FROM " + qualified + (from.empty() ? "" : ", " + from) + "\n"
-      "   WHERE " + rel + "." + key + " > $1 AND (" + where + ")\n"
-      "   ORDER BY " + rel + "." + key + "\n"
-      "   LIMIT $2\n"
-      "   FOR UPDATE OF " + rel + "\n"
-      ")" + preserve_cte + "\n"
-      "UPDATE " + qualified + "\n"
-      "   SET " + detail::join(assignments, ", ") + "\n"
-      "  FROM batch AS b" + (from.empty() ? "" : ", " + from) + "\n"
-      " WHERE " + rel + "." + key + " = b." + key + "\n"
-      "RETURNING " + rel + "." + key + ";";
-
-  step.sql.push_back(batch_sql);
-  step.detail["qualified"] = qualified;
-  // Carried so the executor can check a resume cursor against the predicate
-  // rather than trusting it.
-  step.detail["where"] = where;
-  step.detail["batch_rows"] = cfg.batch_rows;
-  step.detail["commit_interval_ms"] = cfg.commit_interval_ms;
-  step.detail["batch_cap_rows"] = cfg.batch_cap_rows;
-  step.detail["rows_estimated"] = rows;
-  step.detail["key"] = key;
-  step.detail["supporting_index"] = supporting_index;
-  step.detail["commits_on"] =
-      json::array({"lock_waiter", "interval", "batch_cap"});
-
-  if (in.body.contains("verify_remaining")) {
-    step.detail["verify_remaining"] = in.body["verify_remaining"];
-    // Runs on the WORKER connection, after the last batch. Verification that
-    // must see in-flight rows cannot run anywhere else: an imported snapshot
-    // does not see the exporter's uncommitted changes (spike S1).
-    step.detail["verify_runs_on"] = "worker connection, after the final batch";
-  }
-  if (in.body.contains("assert_invariants")) {
-    step.detail["assert_invariants"] = in.body["assert_invariants"];
-    step.detail["invariants_run_on"] =
-        "the worker connection, before the first batch and after the last. "
-        "They ask whether the work broke something, which verify_remaining "
-        "does not: a backfill can complete every row and still halve a total.";
-  }
-
-  step.why = std::to_string(rows) + " rows estimated; keyset walk on " + key +
-             " via " + supporting_index + ", " + std::to_string(cfg.batch_rows) +
-             " rows per batch, committing on a lock waiter or " +
-             std::to_string(cfg.commit_interval_ms) + "ms";
-
-  // Without an index that supports (key) under the filter, each batch may
-  // rescan from the start -- quadratic in the table size. A warning rather
-  // than a refusal, because on a small table it does not matter and the
-  // operator may know that.
-  bool filtered_index = false;
-  for (auto it = indexes.begin(); it != indexes.end(); ++it) {
-    const auto def = it.value().value("definition", "");
-    if (def.find(" WHERE ") != std::string::npos &&
-        it.value().value("leading_column", "") == key) {
-      filtered_index = true;
-    }
-  }
-  if (!filtered_index && rows > 1000000) {
-    plan.warnings.push_back(
-        "no partial index supports (" + key + ") under the backfill's filter on " +
-        qualified + "; at " + std::to_string(rows) +
-        " estimated rows each batch may rescan already-updated rows. Consider "
-        "a partial index before running this against a live system.");
-  }
-}
 
 // The partitioned-index recipe. Emitted as separate steps because each
 // concurrent build must run outside a transaction block, and they run one at a
@@ -1320,6 +784,7 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
 inline void plan_partitioned_index(const Intent& in, const json& t, Plan& plan,
                                    std::vector<Step>& out, Step& parent_step) {
   const auto qualified = in.qualified_table();
+  const auto sql_rel = detail::quote_qualified(qualified);
   const auto name = in.body.value("name", "");
   const auto method = in.body.value("method", "btree");
   const auto where = in.body.value("where", "");
@@ -1329,7 +794,14 @@ inline void plan_partitioned_index(const Intent& in, const json& t, Plan& plan,
   for (const auto& c : in.body.value("columns", json::array())) {
     columns.push_back(c.get<std::string>());
   }
-  const std::string cols = detail::join(columns, ", ");
+  // Two lists, deliberately. `columns` is compared against the catalog's own
+  // column names -- which arrive unquoted -- so quoting it in place would make
+  // every equivalence check compare unequal things, which is the very failure
+  // require_identifier's comment warns about. `quoted_columns` is the one that
+  // reaches SQL.
+  std::vector<std::string> quoted_columns;
+  for (const auto& c : columns) quoted_columns.push_back(detail::quote_identifier(c));
+  const std::string cols = detail::join(quoted_columns, ", ");
   const std::string tail = " USING " + method + " (" + cols + ")" +
                            (where.empty() ? "" : " WHERE " + where);
 
@@ -1385,7 +857,8 @@ inline void plan_partitioned_index(const Intent& in, const json& t, Plan& plan,
     s.txn_class = TxnClass::kForbidden;
     s.own_transaction = true;
     s.lock = "ShareUpdateExclusiveLock on " + part;
-    s.sql.push_back("CREATE INDEX CONCURRENTLY " + child + " ON " + part + tail + ";");
+    s.sql.push_back("CREATE INDEX CONCURRENTLY " + detail::quote_identifier(child) + " ON " +
+                    detail::quote_qualified(part) + tail + ";");
     s.why = "partition " + std::to_string(child_indexes.size()) + " of " +
             std::to_string(partitions.size()) +
             ": CREATE INDEX CONCURRENTLY is refused on the parent, so each "
@@ -1401,8 +874,8 @@ inline void plan_partitioned_index(const Intent& in, const json& t, Plan& plan,
   parent.txn_class = TxnClass::kOptional;
   parent.own_transaction = true;
   parent.lock = "ShareLock on " + qualified + ", which holds no data itself";
-  parent.sql.push_back("CREATE INDEX " + name + " ON ONLY " + qualified + tail + ";");
-  parent.sql.push_back("COMMENT ON INDEX " + in.schema() + "." + name + " IS " +
+  parent.sql.push_back("CREATE INDEX " + detail::quote_identifier(name) + " ON ONLY " + sql_rel + tail + ";");
+  parent.sql.push_back("COMMENT ON INDEX " + detail::quote_identifier(in.schema()) + "." + detail::quote_identifier(name) + " IS " +
                        detail::quote_literal(in.body.value("comment", "")) + ";");
   parent.why =
       "ON ONLY means the parent index is a catalog entry with no data, so this "
@@ -1416,8 +889,8 @@ inline void plan_partitioned_index(const Intent& in, const json& t, Plan& plan,
     s.kind = in.kind_name;
     s.txn_class = TxnClass::kOptional;
     s.lock = "AccessExclusiveLock on the two indexes, briefly";
-    s.sql.push_back("ALTER INDEX " + in.schema() + "." + name +
-                    " ATTACH PARTITION " + in.schema() + "." + child_indexes[i] + ";");
+    s.sql.push_back("ALTER INDEX " + detail::quote_identifier(in.schema()) + "." + detail::quote_identifier(name) +
+                    " ATTACH PARTITION " + detail::quote_identifier(in.schema()) + "." + detail::quote_identifier(child_indexes[i]) + ";");
     s.why = "attach " + std::to_string(i + 1) + " of " +
             std::to_string(child_indexes.size()) +
             "; the parent index becomes valid only when the last one lands";
@@ -1444,6 +917,7 @@ inline void plan_partitioned_index(const Intent& in, const json& t, Plan& plan,
 inline void plan_add_check_constraint(const Intent& in, const Observations& obs,
                                       Plan& plan, std::vector<Step>& out) {
   const auto qualified = in.qualified_table();
+  const auto sql_rel = detail::quote_qualified(qualified);
   const auto& t = obs.table(qualified);
   const auto name = in.body.value("name", "");
   const auto expression = in.body.value("expression", "");
@@ -1463,7 +937,7 @@ inline void plan_add_check_constraint(const Intent& in, const Observations& obs,
   add.txn_class = TxnClass::kRequired;
   add.own_transaction = true;
   add.lock = "ShareRowExclusiveLock, briefly; NOT VALID means no scan";
-  add.sql.push_back("ALTER TABLE " + qualified + " ADD CONSTRAINT " + name +
+  add.sql.push_back("ALTER TABLE " + sql_rel + " ADD CONSTRAINT " + detail::quote_identifier(name) +
                     " CHECK (" + expression + ") NOT VALID;");
   add.why = "step 1 of 2: NOT VALID costs no scan, so the strong lock is held "
             "for the catalog change only";
@@ -1475,8 +949,7 @@ inline void plan_add_check_constraint(const Intent& in, const Observations& obs,
   validate.txn_class = TxnClass::kRequired;
   validate.own_transaction = true;
   validate.lock = "ShareUpdateExclusiveLock -- does NOT block reads or writes";
-  validate.sql.push_back("ALTER TABLE " + qualified + " VALIDATE CONSTRAINT " +
-                         name + ";");
+  validate.sql.push_back("ALTER TABLE " + sql_rel + " VALIDATE CONSTRAINT " + detail::quote_identifier(name) + ";");
   validate.why = "step 2 of 2: the scan, under a lock the application can work "
                  "through. Its own transaction, or step 1's lock would span it";
   validate.detail["constraint"] = name;
@@ -1742,7 +1215,9 @@ inline void plan_replication(const Intent& in, const Observations& obs,
   auto tables_clause = [&](const char* key) {
     std::vector<std::string> ts;
     for (const auto& t : in.body.value(key, json::array())) {
-      ts.push_back(t.get<std::string>());
+      // Each entry is "schema.table" in a publication's table list, so it needs
+      // the same two-part quoting a relation gets anywhere else.
+      ts.push_back(detail::quote_qualified(t.get<std::string>()));
     }
     return detail::join(ts, ", ");
   };
@@ -1995,6 +1470,7 @@ inline void plan_final_kinds(const Intent& in, const Observations& obs,
 
     case IntentKind::kCreateTableAs: {
       const auto qualified = in.qualified_table();
+      const auto sql_rel = detail::quote_qualified(qualified);
       const auto& t = obs.table(qualified);
       if (t.value("exists", false)) {
         step.action = Action::kSatisfied;
@@ -2004,10 +1480,10 @@ inline void plan_final_kinds(const Intent& in, const Observations& obs,
       const bool with_data = in.body.value("with_data", true);
       step.sql.push_back(std::string("CREATE ") +
                          (in.body.value("unlogged", false) ? "UNLOGGED " : "") +
-                         "TABLE " + qualified + " AS " +
+                         "TABLE " + sql_rel + " AS " +
                          in.body.value("definition", "") +
                          (with_data ? " WITH DATA;" : " WITH NO DATA;"));
-      step.sql.push_back("COMMENT ON TABLE " + qualified + " IS " +
+      step.sql.push_back("COMMENT ON TABLE " + sql_rel + " IS " +
                          detail::quote_literal(in.body.value("comment", "")) + ";");
       step.own_transaction = with_data;
       step.lock = with_data
@@ -2180,6 +1656,7 @@ inline void plan_relation_extras(const Intent& in, const Observations& obs,
   const auto name = in.body.value("name", "");
   const auto qualified_obj = schema + "." + name;
   const auto qualified_tbl = in.qualified_table();
+  const auto sql_rel_tbl = detail::quote_qualified(qualified_tbl);
 
   switch (in.kind) {
     case IntentKind::kCreateMaterializedView: {
@@ -2252,8 +1729,8 @@ inline void plan_relation_extras(const Intent& in, const Observations& obs,
         for (const auto& k : in.body["kinds"]) ks.push_back(k.get<std::string>());
         kinds = " (" + detail::join(ks, ", ") + ")";
       }
-      step.sql.push_back("CREATE STATISTICS " + qualified_obj + kinds + " ON " +
-                         detail::join(cols, ", ") + " FROM " + qualified_tbl + ";");
+      step.sql.push_back("CREATE STATISTICS " + detail::quote_qualified(qualified_obj) + kinds + " ON " +
+                         detail::join(cols, ", ") + " FROM " + sql_rel_tbl + ";");
       if (in.body.contains("comment")) {
         step.sql.push_back("COMMENT ON STATISTICS " + qualified_obj + " IS " +
                            detail::quote_literal(in.body.value("comment", "")) + ";");
@@ -2281,7 +1758,7 @@ inline void plan_relation_extras(const Intent& in, const Observations& obs,
       }
       const auto event = in.body.value("event", "");
       std::string sql = "CREATE RULE " + detail::quote_identifier(name) +
-                        " AS ON " + event + " TO " + qualified_tbl;
+                        " AS ON " + event + " TO " + sql_rel_tbl;
       if (in.body.contains("where")) sql += " WHERE " + in.body.value("where", "");
       // NOTHING is not a command and must not be parenthesised: the
       // parentheses in DO [INSTEAD] (...) are for a command LIST, so
@@ -2318,7 +1795,7 @@ inline void plan_relation_extras(const Intent& in, const Observations& obs,
 
     case IntentKind::kDropRule: {
       step.sql.push_back("DROP RULE " + detail::quote_identifier(name) + " ON " +
-                         qualified_tbl + ";");
+                         sql_rel_tbl + ";");
       step.lock = "AccessExclusiveLock on " + qualified_tbl;
       step.why = "dropping a rule restores what the statements it matched "
                  "actually mean";
@@ -2351,6 +1828,7 @@ inline void plan_relation_extras(const Intent& in, const Observations& obs,
 inline void plan_physical(const Intent& in, const Observations& obs, Plan& plan,
                           std::vector<Step>& out) {
   const auto qualified = in.qualified_table();
+  const auto sql_rel = detail::quote_qualified(qualified);
   const auto& t = obs.table(qualified);
   const auto column = in.body.value("column", "");
   const long long size = t.value("size_estimate", 0LL);
@@ -2411,7 +1889,7 @@ inline void plan_physical(const Intent& in, const Observations& obs, Plan& plan,
               "recipe first, which does that scan under "
               "ShareUpdateExclusiveLock instead of blocking the table.");
         }
-        emit({"ALTER TABLE " + qualified + " ALTER COLUMN " +
+        emit({"ALTER TABLE " + sql_rel + " ALTER COLUMN " +
               detail::quote_identifier(column) + " ADD GENERATED " +
               in.body.value("identity", "") + " AS IDENTITY;"},
              "AccessExclusiveLock on " + qualified + ", but no rewrite",
@@ -2432,7 +1910,7 @@ inline void plan_physical(const Intent& in, const Observations& obs, Plan& plan,
             ". If the column holds data, follow this with an alter_sequence "
             "restart above the maximum, or the first insert collides.");
       } else {
-        emit({"ALTER TABLE " + qualified + " ALTER COLUMN " +
+        emit({"ALTER TABLE " + sql_rel + " ALTER COLUMN " +
               detail::quote_identifier(column) + " DROP IDENTITY;"},
              "AccessExclusiveLock on " + qualified + ", no rewrite",
              "measured: catalog-only. The backing sequence goes with it");
@@ -2441,7 +1919,7 @@ inline void plan_physical(const Intent& in, const Observations& obs, Plan& plan,
     }
 
     case IntentKind::kDropExpression:
-      emit({"ALTER TABLE " + qualified + " ALTER COLUMN " +
+      emit({"ALTER TABLE " + sql_rel + " ALTER COLUMN " +
             detail::quote_identifier(column) + " DROP EXPRESSION;"},
            "AccessExclusiveLock on " + qualified + ", no rewrite",
            "measured: catalog-only. The values already computed stay in the "
@@ -2455,7 +1933,7 @@ inline void plan_physical(const Intent& in, const Observations& obs, Plan& plan,
 
     case IntentKind::kSetColumnOptions: {
       std::vector<std::string> sql;
-      const std::string head = "ALTER TABLE " + qualified + " ALTER COLUMN " +
+      const std::string head = "ALTER TABLE " + sql_rel + " ALTER COLUMN " +
                                detail::quote_identifier(column) + " SET ";
       if (in.body.contains("statistics")) {
         sql.push_back(head + "STATISTICS " +
@@ -2494,13 +1972,13 @@ inline void plan_physical(const Intent& in, const Observations& obs, Plan& plan,
         for (const auto& [k, v] : options.items()) {
           pairs.push_back(k + " = " + (v.is_string() ? v.get<std::string>() : v.dump()));
         }
-        sql.push_back("ALTER TABLE " + qualified + " SET (" +
+        sql.push_back("ALTER TABLE " + sql_rel + " SET (" +
                       detail::join(pairs, ", ") + ");");
       }
       if (in.body.contains("reset")) {
         std::vector<std::string> names;
         for (const auto& r : in.body["reset"]) names.push_back(r.get<std::string>());
-        sql.push_back("ALTER TABLE " + qualified + " RESET (" +
+        sql.push_back("ALTER TABLE " + sql_rel + " RESET (" +
                       detail::join(names, ", ") + ");");
       }
       emit(std::move(sql), "AccessExclusiveLock on " + qualified + ", no rewrite",
@@ -2512,7 +1990,7 @@ inline void plan_physical(const Intent& in, const Observations& obs, Plan& plan,
 
     case IntentKind::kSetLogged: {
       const bool logged = in.body.value("logged", true);
-      emit({"ALTER TABLE " + qualified + (logged ? " SET LOGGED;" : " SET UNLOGGED;")},
+      emit({"ALTER TABLE " + sql_rel + (logged ? " SET LOGGED;" : " SET UNLOGGED;")},
            "AccessExclusiveLock on " + qualified + " for the whole rewrite",
            std::string("measured: this REWRITES the table -- relfilenode "
                        "changes in both directions -- so ") +
@@ -2540,7 +2018,7 @@ inline void plan_physical(const Intent& in, const Observations& obs, Plan& plan,
     }
 
     case IntentKind::kSetTablespace:
-      emit({"ALTER TABLE " + qualified + " SET TABLESPACE " +
+      emit({"ALTER TABLE " + sql_rel + " SET TABLESPACE " +
             detail::quote_identifier(in.body.value("tablespace", "")) + ";"},
            "AccessExclusiveLock on " + qualified + " for the whole move",
            "moving a table copies every page to the new location under an "
@@ -2564,7 +2042,7 @@ inline void plan_physical(const Intent& in, const Observations& obs, Plan& plan,
       return;
 
     case IntentKind::kSetAccessMethod:
-      emit({"ALTER TABLE " + qualified + " SET ACCESS METHOD " +
+      emit({"ALTER TABLE " + sql_rel + " SET ACCESS METHOD " +
             detail::quote_identifier(in.body.value("method", "")) + ";"},
            "AccessExclusiveLock on " + qualified + " for the whole rewrite",
            "changing access method rewrites the table in the new method's "
@@ -2578,7 +2056,7 @@ inline void plan_physical(const Intent& in, const Observations& obs, Plan& plan,
 
     case IntentKind::kSetReplicaIdentity: {
       const auto form = in.body.value("identity", "DEFAULT");
-      std::string sql = "ALTER TABLE " + qualified + " REPLICA IDENTITY " + form;
+      std::string sql = "ALTER TABLE " + sql_rel + " REPLICA IDENTITY " + form;
       if (form == "USING INDEX") {
         sql += " " + detail::quote_identifier(in.body.value("index", ""));
       }
@@ -2611,7 +2089,7 @@ inline void plan_physical(const Intent& in, const Observations& obs, Plan& plan,
 
     case IntentKind::kClusterOn: {
       const bool setting = in.body.contains("index");
-      emit({"ALTER TABLE " + qualified +
+      emit({"ALTER TABLE " + sql_rel +
             (setting ? " CLUSTER ON " +
                            detail::quote_identifier(in.body.value("index", "")) + ";"
                      : " SET WITHOUT CLUSTER;")},
@@ -2661,6 +2139,7 @@ inline void plan_alter_misc(const Intent& in, const Observations& obs,
   const auto name = in.body.value("name", "");
   const auto qualified_obj = schema + "." + name;
   const auto qualified_tbl = in.qualified_table();
+  const auto sql_rel_tbl = detail::quote_qualified(qualified_tbl);
 
   auto emit = [&](TxnClass klass, std::vector<std::string> sql,
                   const std::string& lock, const std::string& why, bool own) {
@@ -2701,7 +2180,7 @@ inline void plan_alter_misc(const Intent& in, const Observations& obs,
       }
       const bool setting = in.body.contains("default");
       emit(TxnClass::kRequired,
-           {"ALTER TABLE " + qualified_tbl + " ALTER COLUMN " +
+           {"ALTER TABLE " + sql_rel_tbl + " ALTER COLUMN " +
             detail::quote_identifier(column) +
             (setting ? " SET DEFAULT " + in.body.value("default", "")
                      : " DROP DEFAULT") + ";"},
@@ -2731,7 +2210,7 @@ inline void plan_alter_misc(const Intent& in, const Observations& obs,
         return;
       }
       emit(TxnClass::kRequired,
-           {"ALTER TABLE " + qualified_tbl + " ALTER COLUMN " +
+           {"ALTER TABLE " + sql_rel_tbl + " ALTER COLUMN " +
             detail::quote_identifier(column) + " DROP NOT NULL;"},
            "AccessExclusiveLock on " + qualified_tbl + ", briefly and with no scan",
            "removing NOT NULL needs no verification -- there is nothing to check "
@@ -2996,7 +2475,7 @@ inline void plan_alter_misc(const Intent& in, const Observations& obs,
         return;
       }
       std::string sql = "ALTER POLICY " + detail::quote_identifier(name) +
-                        " ON " + qualified_tbl;
+                        " ON " + sql_rel_tbl;
       if (in.body.contains("roles")) {
         std::vector<std::string> roles;
         for (const auto& r : in.body["roles"]) {
@@ -3029,11 +2508,11 @@ inline void plan_alter_misc(const Intent& in, const Observations& obs,
                                           : schema + "." + name;
       std::string stmt;
       if (ot == "COLUMN") {
-        stmt = "COMMENT ON COLUMN " + qualified_tbl + "." +
+        stmt = "COMMENT ON COLUMN " + sql_rel_tbl + "." +
                detail::quote_identifier(name) + " IS ";
       } else if (ot == "TRIGGER" || ot == "POLICY" || ot == "CONSTRAINT") {
         stmt = "COMMENT ON " + ot + " " + detail::quote_identifier(name) +
-               " ON " + qualified_tbl + " IS ";
+               " ON " + sql_rel_tbl + " IS ";
       } else if (ot == "SCHEMA" || ot == "EXTENSION") {
         stmt = "COMMENT ON " + ot + " " + detail::quote_identifier(name) + " IS ";
       } else {
@@ -3094,7 +2573,11 @@ inline std::string function_signature(const Intent& in) {
   for (const auto& a : in.body.value("arguments", json::array())) {
     types.push_back(a.value("type", ""));
   }
-  return in.body.value("schema", "") + "." + in.body.value("name", "") + "(" +
+  // The argument TYPES stay as written -- they are type names, not identifiers,
+  // and may legitimately be "timestamp with time zone" or "int[]". The schema
+  // and routine name are identifiers and are quoted.
+  return quote_identifier(in.body.value("schema", "")) + "." +
+         quote_identifier(in.body.value("name", "")) + "(" +
          join(types, ", ") + ")";
 }
 
@@ -3110,6 +2593,7 @@ inline void plan_object(const Intent& in, const Observations& obs, Plan& plan,
   const auto schema = in.body.value("schema", "");
   const auto name = in.body.value("name", "");
   const auto qualified = schema + "." + name;
+  const auto sql_rel = detail::quote_qualified(qualified);
 
   // Every drop in this family shares one refusal, because PostgreSQL shares one
   // behaviour: it names the dependants and stops. Doing the same beforehand
@@ -3287,7 +2771,7 @@ inline void plan_object(const Intent& in, const Observations& obs, Plan& plan,
         for (const auto& l : in.body["labels"]) {
           labels.push_back(detail::quote_literal(l.get<std::string>()));
         }
-        step.sql.push_back("CREATE TYPE " + qualified + " AS ENUM (" +
+        step.sql.push_back("CREATE TYPE " + sql_rel + " AS ENUM (" +
                            detail::join(labels, ", ") + ");");
         plan.warnings.push_back(
             "an enum's labels can be ADDED later but never removed -- measured: "
@@ -3297,7 +2781,7 @@ inline void plan_object(const Intent& in, const Observations& obs, Plan& plan,
             "column that uses it. A CHECK constraint over text is the "
             "reversible alternative.");
       } else if (tk == "domain") {
-        std::string sql = "CREATE DOMAIN " + qualified + " AS " +
+        std::string sql = "CREATE DOMAIN " + sql_rel + " AS " +
                           in.body.value("base", "");
         if (in.body.value("not_null", false)) sql += " NOT NULL";
         if (in.body.contains("check")) {
@@ -3310,12 +2794,12 @@ inline void plan_object(const Intent& in, const Observations& obs, Plan& plan,
           attrs.push_back(detail::quote_identifier(a.value("name", "")) + " " +
                           a.value("type", ""));
         }
-        step.sql.push_back("CREATE TYPE " + qualified + " AS (" +
+        step.sql.push_back("CREATE TYPE " + sql_rel + " AS (" +
                            detail::join(attrs, ", ") + ");");
       }
       step.sql.push_back("COMMENT ON " +
                          std::string(tk == "domain" ? "DOMAIN " : "TYPE ") +
-                         qualified + " IS " +
+                         sql_rel + " IS " +
                          detail::quote_literal(in.body.value("comment", "")) + ";");
       step.lock = "no lock on any existing object";
       step.why = "creating a type locks nothing";
@@ -3330,7 +2814,7 @@ inline void plan_object(const Intent& in, const Observations& obs, Plan& plan,
         return;
       }
       if (refuse_if_depended_on(o, "type " + qualified)) return;
-      step.sql.push_back("DROP TYPE " + qualified + ";");
+      step.sql.push_back("DROP TYPE " + sql_rel + ";");
       step.lock = "AccessExclusiveLock on the type";
       step.why = "nothing uses " + qualified;
       return;
@@ -3352,7 +2836,7 @@ inline void plan_object(const Intent& in, const Observations& obs, Plan& plan,
           return;
         }
       }
-      std::string sql = "ALTER TYPE " + qualified + " ADD VALUE " +
+      std::string sql = "ALTER TYPE " + sql_rel + " ADD VALUE " +
                         detail::quote_literal(value);
       if (in.body.contains("before")) {
         sql += " BEFORE " + detail::quote_literal(in.body.value("before", ""));
@@ -3412,7 +2896,7 @@ inline void plan_object(const Intent& in, const Observations& obs, Plan& plan,
         return;
       }
       const auto routine = in.body.value("routine_kind", "FUNCTION");
-      std::string sql = "CREATE OR REPLACE " + routine + " " + qualified + "(" +
+      std::string sql = "CREATE OR REPLACE " + routine + " " + sql_rel + "(" +
                         detail::join(args, ", ") +
                         (routine == "PROCEDURE" ? ")" : ")\n  RETURNS " + returns) +
                         "\n  LANGUAGE " + in.body.value("language", "");
@@ -3463,7 +2947,7 @@ inline void plan_object(const Intent& in, const Observations& obs, Plan& plan,
         step.why = "sequence " + qualified + " already exists";
         return;
       }
-      std::string sql = "CREATE SEQUENCE " + qualified;
+      std::string sql = "CREATE SEQUENCE " + sql_rel;
       if (in.body.contains("increment")) {
         sql += " INCREMENT BY " + std::to_string(in.body.value("increment", 1));
       }
@@ -3474,7 +2958,7 @@ inline void plan_object(const Intent& in, const Observations& obs, Plan& plan,
         sql += " OWNED BY " + in.body.value("owned_by", "");
       }
       step.sql.push_back(sql + ";");
-      step.sql.push_back("COMMENT ON SEQUENCE " + qualified + " IS " +
+      step.sql.push_back("COMMENT ON SEQUENCE " + sql_rel + " IS " +
                          detail::quote_literal(in.body.value("comment", "")) + ";");
       step.lock = "no lock on any existing object";
       step.why = "creating a sequence locks nothing";
@@ -3496,7 +2980,7 @@ inline void plan_object(const Intent& in, const Observations& obs, Plan& plan,
         return;
       }
       if (refuse_if_depended_on(o, "sequence " + qualified)) return;
-      step.sql.push_back("DROP SEQUENCE " + qualified + ";");
+      step.sql.push_back("DROP SEQUENCE " + sql_rel + ";");
       step.lock = "AccessExclusiveLock on the sequence";
       step.why = "nothing depends on " + qualified;
       return;
@@ -3534,7 +3018,7 @@ inline void plan_object(const Intent& in, const Observations& obs, Plan& plan,
       step.sql.push_back(std::string("DROP ") +
                          (kind == "materialized_view" ? "MATERIALIZED VIEW "
                                                       : "VIEW ") +
-                         qualified + ";");
+                         sql_rel + ";");
       step.lock = "AccessExclusiveLock on " + qualified;
       step.why = "nothing reads " + qualified;
       if (kind == "materialized_view") {
@@ -3570,6 +3054,7 @@ inline void plan_security(const Intent& in, const Observations& obs, Plan& plan,
   struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
 
   const auto qualified = in.qualified_table();
+  const auto sql_rel = detail::quote_qualified(qualified);
   const auto& t = obs.table(qualified);
   // A grant or revoke may name something that is not a relation at all, so the
   // table guard applies to the kinds that really are table-scoped.
@@ -3596,11 +3081,11 @@ inline void plan_security(const Intent& in, const Observations& obs, Plan& plan,
                    (force ? " and forced" : "");
         return;
       }
-      step.sql.push_back("ALTER TABLE " + qualified +
+      step.sql.push_back("ALTER TABLE " + sql_rel +
                          (want ? " ENABLE" : " DISABLE") +
                          " ROW LEVEL SECURITY;");
       if (want) {
-        step.sql.push_back("ALTER TABLE " + qualified +
+        step.sql.push_back("ALTER TABLE " + sql_rel +
                            (force ? " FORCE" : " NO FORCE") +
                            " ROW LEVEL SECURITY;");
       }
@@ -3644,7 +3129,7 @@ inline void plan_security(const Intent& in, const Observations& obs, Plan& plan,
         return;
       }
       std::string sql = "CREATE POLICY " + detail::quote_identifier(name) +
-                        " ON " + qualified;
+                        " ON " + sql_rel;
       if (in.body.contains("command")) sql += " FOR " + in.body.value("command", "");
       if (in.body.contains("roles")) {
         std::vector<std::string> roles;
@@ -3690,7 +3175,7 @@ inline void plan_security(const Intent& in, const Observations& obs, Plan& plan,
         return;
       }
       step.sql.push_back("DROP POLICY " + detail::quote_identifier(name) +
-                         " ON " + qualified + ";");
+                         " ON " + sql_rel + ";");
       step.lock = "AccessExclusiveLock on " + qualified;
       step.why = "dropping a policy is a catalog change";
       step.detail["policy"] = name;
@@ -3722,7 +3207,7 @@ inline void plan_security(const Intent& in, const Observations& obs, Plan& plan,
                    (want ? "enabled" : "disabled");
         return;
       }
-      step.sql.push_back("ALTER TABLE " + qualified +
+      step.sql.push_back("ALTER TABLE " + sql_rel +
                          (want ? " ENABLE TRIGGER " : " DISABLE TRIGGER ") +
                          detail::quote_identifier(name) + ";");
       step.lock = "ShareRowExclusiveLock on " + qualified +
@@ -3757,7 +3242,7 @@ inline void plan_security(const Intent& in, const Observations& obs, Plan& plan,
       }
       std::string sql = "CREATE TRIGGER " + detail::quote_identifier(name) +
                         " " + in.body.value("timing", "") + " " +
-                        detail::join(events, " OR ") + " ON " + qualified +
+                        detail::join(events, " OR ") + " ON " + sql_rel +
                         " FOR EACH " + in.body.value("for_each", "ROW");
       if (in.body.contains("when")) sql += " WHEN (" + in.body.value("when", "") + ")";
       sql += " EXECUTE FUNCTION " + in.body.value("function", "") + ";";
@@ -3787,7 +3272,7 @@ inline void plan_security(const Intent& in, const Observations& obs, Plan& plan,
         return;
       }
       step.sql.push_back("DROP TRIGGER " + detail::quote_identifier(name) +
-                         " ON " + qualified + ";");
+                         " ON " + sql_rel + ";");
       step.lock = "AccessExclusiveLock on " + qualified;
       step.why = "dropping a trigger is a catalog change";
       step.detail["trigger"] = name;
@@ -3831,7 +3316,7 @@ inline void plan_security(const Intent& in, const Observations& obs, Plan& plan,
     target = in.body.value("all_in_schema", false)
                  ? "ALL TABLES IN SCHEMA " +
                        detail::quote_identifier(in.body.value("schema", ""))
-                 : "TABLE " + qualified;
+                 : "TABLE " + detail::quote_qualified(qualified);
   } else if (object_type == "FUNCTION") {
     target = "FUNCTION " + detail::function_signature(in);
   } else if (object_type == "SCHEMA" || object_type == "DATABASE") {
@@ -3866,103 +3351,6 @@ inline void plan_security(const Intent& in, const Observations& obs, Plan& plan,
   }
 }
 
-// --- delete_rows -----------------------------------------------------------
-//
-// A retention purge, paced exactly as a backfill is and for the same reason: a
-// single DELETE over a retention window holds locks for as long as it takes and
-// is the same outage a single UPDATE would be. The executor's paced runner is
-// generic over the statement -- $1 is the cursor, $2 the batch size, and the
-// key comes back in RETURNING -- so this is a planner change and nothing else.
-//
-// It is a migration by both tests: it changes state, and it is applied once.
-inline void plan_delete_rows(const Intent& in, const Observations& obs,
-                             const ExecutorConfig& cfg, Plan& plan,
-                             std::vector<Step>& out) {
-  Step step;
-  step.kind = in.kind_name;
-  struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
-
-  const auto qualified = in.qualified_table();
-  const auto& t = obs.table(qualified);
-  const auto key = in.body.value("key", "");
-  const auto where = in.body.value("where", "");
-
-  if (!t.value("exists", false)) {
-    step.action = Action::kConflict;
-    step.why = qualified + " does not exist";
-    plan.conflicts.push_back(step.why);
-    return;
-  }
-  const json columns = t.value("columns", json::object());
-  if (!columns.contains(key)) {
-    step.action = Action::kConflict;
-    step.why = qualified + "." + key + " does not exist";
-    plan.conflicts.push_back(
-        step.why + ", so there is nothing to walk the table by.");
-    return;
-  }
-
-  // A delete that removes a parent row a foreign key points at fails per row,
-  // mid-batch, after some batches have already committed. Saying so first is
-  // the difference between a migration that stops understandably and one that
-  // stops half-done.
-  const auto referenced = t.value("referenced_by", json::array());
-  if (!referenced.empty()) {
-    std::vector<std::string> names;
-    for (const auto& r : referenced) names.push_back(r.get<std::string>());
-    plan.warnings.push_back(
-        qualified + " is referenced by " + detail::join(names, ", ") +
-        ". Any row still referenced will fail its batch, and because this is "
-        "paced, earlier batches have already COMMITTED by then -- the purge "
-        "stops part-done rather than rolling back. Delete the children first, "
-        "in an earlier intent, or confirm the constraint cascades.");
-  }
-
-  const auto rows = t.value("reltuples", 0LL);
-  step.txn_class = TxnClass::kOwnTxnPerBatch;
-  step.sql.push_back(
-      "WITH batch AS (\n"
-      "  SELECT " + qualified + "." + key + "\n"
-      "    FROM " + qualified + "\n"
-      "   WHERE " + qualified + "." + key + " > $1 AND (" + where + ")\n"
-      "   ORDER BY " + qualified + "." + key + "\n"
-      "   LIMIT $2\n"
-      "   FOR UPDATE\n"
-      ")\n"
-      "DELETE FROM " + qualified + "\n"
-      " USING batch AS b\n"
-      " WHERE " + qualified + "." + key + " = b." + key + "\n"
-      "RETURNING " + qualified + "." + key + ";");
-
-  step.lock = "RowExclusiveLock on " + qualified +
-              " -- no table-level exclusive lock at any point";
-  step.why =
-      "deleting " + std::to_string(rows) +
-      " estimated rows in batches of " + std::to_string(cfg.batch_rows) +
-      ", committing on a lock waiter, on " + std::to_string(cfg.commit_interval_ms) +
-      "ms elapsed, or on " + std::to_string(cfg.batch_cap_rows) +
-      " rows -- whichever comes first. A single DELETE over the same predicate "
-      "would hold its locks for the whole of it";
-  step.detail["qualified"] = qualified;
-  step.detail["key"] = key;
-  step.detail["where"] = where;
-  step.detail["batch_rows"] = cfg.batch_rows;
-  step.detail["commit_interval_ms"] = cfg.commit_interval_ms;
-  step.detail["batch_cap_rows"] = cfg.batch_cap_rows;
-  step.detail["rows_estimated"] = rows;
-  if (in.body.contains("verify_remaining")) {
-    step.detail["verify_remaining"] = in.body["verify_remaining"];
-  }
-
-  // The space is not returned to the operating system, and an operator who
-  // expects it to be will go looking for a bug that is not there.
-  plan.warnings.push_back(
-      "a delete does not shrink " + qualified +
-      " on disk: the rows become dead tuples and the space is reused by future "
-      "inserts, not returned to the filesystem. Autovacuum will reclaim it for "
-      "reuse; only VACUUM FULL or pg_repack returns it, and neither is a "
-      "migration. pg_licht tableBloat shows what is actually there afterwards.");
-}
 
 // --- create_table / drop_table ---------------------------------------------
 //
@@ -3979,6 +3367,7 @@ inline void plan_create_table(const Intent& in, const Observations& obs,
   struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
 
   const auto qualified = in.qualified_table();
+  const auto sql_rel = detail::quote_qualified(qualified);
   const auto& t = obs.table(qualified);
 
   if (t.value("exists", false)) {
@@ -4006,7 +3395,7 @@ inline void plan_create_table(const Intent& in, const Observations& obs,
     if (col.contains("default")) d += " DEFAULT " + col.value("default", "");
     if (!col.value("nullable", true)) d += " NOT NULL";
     defs.push_back(d);
-    comments.push_back("COMMENT ON COLUMN " + qualified + "." +
+    comments.push_back("COMMENT ON COLUMN " + sql_rel + "." +
                        detail::quote_identifier(name) + " IS " +
                        detail::quote_literal(col.value("comment", "")) + ";");
   }
@@ -4023,13 +3412,13 @@ inline void plan_create_table(const Intent& in, const Observations& obs,
 
   std::string sql = std::string("CREATE ") +
                     (in.body.value("unlogged", false) ? "UNLOGGED " : "") +
-                    "TABLE " + qualified + " (\n  " + detail::join(defs, ",\n  ") +
+                    "TABLE " + sql_rel + " (\n  " + detail::join(defs, ",\n  ") +
                     "\n)";
   if (in.body.contains("partition_by")) {
     sql += " PARTITION BY " + in.body.value("partition_by", "");
   }
   step.sql.push_back(sql + ";");
-  step.sql.push_back("COMMENT ON TABLE " + qualified + " IS " +
+  step.sql.push_back("COMMENT ON TABLE " + sql_rel + " IS " +
                      detail::quote_literal(in.body.value("comment", "")) + ";");
   for (auto& c : comments) step.sql.push_back(std::move(c));
 
@@ -4055,6 +3444,7 @@ inline void plan_drop_table(const Intent& in, const Observations& obs,
   struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
 
   const auto qualified = in.qualified_table();
+  const auto sql_rel = detail::quote_qualified(qualified);
   const auto& t = obs.table(qualified);
 
   if (!t.value("exists", false)) {
@@ -4088,7 +3478,7 @@ inline void plan_drop_table(const Intent& in, const Observations& obs,
   }
 
   step.txn_class = TxnClass::kRequired;
-  step.sql.push_back("DROP TABLE " + qualified + ";");
+  step.sql.push_back("DROP TABLE " + sql_rel + ";");
   step.lock = "AccessExclusiveLock on " + qualified;
   step.why =
       "nothing depends on " + qualified +
@@ -4123,6 +3513,7 @@ inline void plan_rename(const Intent& in, const Observations& obs, Plan& plan,
   struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
 
   const auto qualified = in.qualified_table();
+  const auto sql_rel = detail::quote_qualified(qualified);
   const auto& t = obs.table(qualified);
   const auto to = in.body.value("to", "");
 
@@ -4146,7 +3537,7 @@ inline void plan_rename(const Intent& in, const Observations& obs, Plan& plan,
       step.why = qualified + " is already named " + to;
       return;
     }
-    step.sql.push_back("ALTER TABLE " + qualified + " RENAME TO " +
+    step.sql.push_back("ALTER TABLE " + sql_rel + " RENAME TO " +
                        detail::quote_identifier(to) + ";");
     step.why =
         "renaming a table is catalog-only, and every index, constraint and "
@@ -4187,7 +3578,7 @@ inline void plan_rename(const Intent& in, const Observations& obs, Plan& plan,
           "in an earlier intent.");
       return;
     }
-    step.sql.push_back("ALTER TABLE " + qualified + " RENAME COLUMN " +
+    step.sql.push_back("ALTER TABLE " + sql_rel + " RENAME COLUMN " +
                        detail::quote_identifier(column) + " TO " +
                        detail::quote_identifier(to) + ";");
     step.why =
@@ -4238,7 +3629,7 @@ inline void plan_rename(const Intent& in, const Observations& obs, Plan& plan,
                              qualified + ": that name is taken.");
     return;
   }
-  step.sql.push_back("ALTER TABLE " + qualified + " RENAME CONSTRAINT " +
+  step.sql.push_back("ALTER TABLE " + sql_rel + " RENAME CONSTRAINT " +
                      detail::quote_identifier(name) + " TO " +
                      detail::quote_identifier(to) + ";");
   step.why = "renaming a constraint is catalog-only";
@@ -4327,6 +3718,9 @@ inline void plan_attach_partition(const Intent& in, const Observations& obs,
   const auto child =
       in.body.value("schema", "") + "." + in.body.value("partition", "");
   const auto& c = obs.table(child);
+  // Raw above for the observation lookups and the prose; quoted here for SQL.
+  const auto sql_parent = detail::quote_qualified(parent);
+  const auto sql_child = detail::quote_qualified(child);
 
   auto fail = [&](const std::string& why, const std::string& detail) {
     Step s;
@@ -4435,14 +3829,14 @@ inline void plan_attach_partition(const Intent& in, const Observations& obs,
         "needs, and the scan would happen anyway without anyone being told.");
   } else if (!check_expr.empty()) {
     emit(TxnClass::kRequired,
-         "ALTER TABLE " + child + " ADD CONSTRAINT " + check_name + " CHECK (" +
+         "ALTER TABLE " + child + " ADD CONSTRAINT " + detail::quote_identifier(check_name) + " CHECK (" +
              check_expr + ") NOT VALID;",
          "ShareRowExclusiveLock on " + child + ", briefly; NOT VALID means no scan",
          "step 1 of 4: the CHECK is what lets ATTACH skip its scan, and adding "
          "it NOT VALID costs nothing",
          /*own=*/true);
     emit(TxnClass::kRequired,
-         "ALTER TABLE " + child + " VALIDATE CONSTRAINT " + check_name + ";",
+         "ALTER TABLE " + child + " VALIDATE CONSTRAINT " + detail::quote_identifier(check_name) + ";",
          "ShareUpdateExclusiveLock on " + child + " -- does NOT block reads or writes",
          "step 2 of 4: the scan happens here instead, under a lock the "
          "application survives. Measured: ATTACH without this took 98ms on 2M "
@@ -4451,7 +3845,7 @@ inline void plan_attach_partition(const Intent& in, const Observations& obs,
   }
 
   emit(TxnClass::kRequired,
-       "ALTER TABLE " + parent + " ATTACH PARTITION " + child + " " +
+       "ALTER TABLE " + sql_parent + " ATTACH PARTITION " + sql_child + " " +
            detail::bounds_as_for_values(in) + ";",
        "ShareUpdateExclusiveLock on " + parent +
            " -- other partitions keep serving -- and AccessExclusiveLock on " +
@@ -4466,7 +3860,7 @@ inline void plan_attach_partition(const Intent& in, const Observations& obs,
   // thing, and a redundant constraint costs time on every insert forever.
   if (!check_expr.empty()) {
     emit(TxnClass::kRequired,
-         "ALTER TABLE " + child + " DROP CONSTRAINT " + check_name + ";",
+         "ALTER TABLE " + child + " DROP CONSTRAINT " + detail::quote_identifier(check_name) + ";",
          "AccessExclusiveLock on " + child + ", briefly",
          "step 4 of 4: the partition bound now enforces what the CHECK did, "
          "and PostgreSQL evaluates both on every insert if it is left behind",
@@ -4495,6 +3889,9 @@ inline void plan_detach_partition(const Intent& in, const Observations& obs,
   const auto& p = obs.table(parent);
   const auto child =
       in.body.value("schema", "") + "." + in.body.value("partition", "");
+  // Raw above for the observation lookups and the prose; quoted here for SQL.
+  const auto sql_parent = detail::quote_qualified(parent);
+  const auto sql_child = detail::quote_qualified(child);
 
   if (!p.value("exists", false)) {
     step.action = Action::kConflict;
@@ -4511,7 +3908,7 @@ inline void plan_detach_partition(const Intent& in, const Observations& obs,
     if (pending.get<std::string>() != child) continue;
     step.txn_class = TxnClass::kForbidden;
     step.own_transaction = true;
-    step.sql.push_back("ALTER TABLE " + parent + " DETACH PARTITION " + child +
+    step.sql.push_back("ALTER TABLE " + sql_parent + " DETACH PARTITION " + sql_child +
                        " FINALIZE;");
     step.lock = "ShareUpdateExclusiveLock on " + parent;
     step.why =
@@ -4541,7 +3938,7 @@ inline void plan_detach_partition(const Intent& in, const Observations& obs,
   if (concurrent_available && !small_and_quiet) {
     step.txn_class = TxnClass::kForbidden;
     step.own_transaction = true;
-    step.sql.push_back("ALTER TABLE " + parent + " DETACH PARTITION " + child +
+    step.sql.push_back("ALTER TABLE " + sql_parent + " DETACH PARTITION " + sql_child +
                        " CONCURRENTLY;");
     step.lock = "ShareUpdateExclusiveLock on " + parent +
                 ", so the rest of the table keeps serving";
@@ -4565,7 +3962,7 @@ inline void plan_detach_partition(const Intent& in, const Observations& obs,
 
   step.txn_class = TxnClass::kRequired;
   step.own_transaction = true;
-  step.sql.push_back("ALTER TABLE " + parent + " DETACH PARTITION " + child + ";");
+  step.sql.push_back("ALTER TABLE " + sql_parent + " DETACH PARTITION " + sql_child + ";");
   step.lock = "AccessExclusiveLock on " + parent + " AND on " + child;
   step.why =
       concurrent_available
@@ -4609,12 +4006,20 @@ inline void plan_unique_like(const Intent& in, const Observations& obs,
                              Plan& plan, std::vector<Step>& out) {
   const bool primary = in.kind == IntentKind::kAddPrimaryKey;
   const auto qualified = in.qualified_table();
+  const auto sql_rel = detail::quote_qualified(qualified);
   const auto& t = obs.table(qualified);
   const auto name = in.body.value("name", "");
   std::vector<std::string> columns;
   for (const auto& c : in.body.value("columns", json::array())) {
     columns.push_back(c.get<std::string>());
   }
+  // Two lists, deliberately. `columns` is compared against the catalog's own
+  // column names -- which arrive unquoted -- so quoting it in place would make
+  // every equivalence check compare unequal things, which is the very failure
+  // require_identifier's comment warns about. `quoted_columns` is the one that
+  // reaches SQL.
+  std::vector<std::string> quoted_columns;
+  for (const auto& c : columns) quoted_columns.push_back(detail::quote_identifier(c));
 
   auto fail = [&](const std::string& why, const std::string& detail) {
     Step s;
@@ -4725,7 +4130,7 @@ inline void plan_unique_like(const Intent& in, const Observations& obs,
   };
 
   const std::string kind_sql = primary ? "PRIMARY KEY" : "UNIQUE";
-  const std::string quoted_cols = detail::join(columns, ", ");
+  const std::string quoted_cols = detail::join(quoted_columns, ", ");
 
   if (!backing.empty()) {
     if (backing != name) {
@@ -4737,8 +4142,8 @@ inline void plan_unique_like(const Intent& in, const Observations& obs,
           "a NOTICE.");
     }
     emit(TxnClass::kRequired,
-         {"ALTER TABLE " + qualified + " ADD CONSTRAINT " + name + " " +
-          kind_sql + " USING INDEX " + backing + ";"},
+         {"ALTER TABLE " + sql_rel + " ADD CONSTRAINT " + detail::quote_identifier(name) + " " +
+          kind_sql + " USING INDEX " + detail::quote_identifier(backing) + ";"},
          "AccessExclusiveLock on " + qualified + ", but with no index build "
          "and no scan under it",
          "index \"" + backing + "\" already covers (" + quoted_cols +
@@ -4750,7 +4155,7 @@ inline void plan_unique_like(const Intent& in, const Observations& obs,
 
   if (small_and_quiet) {
     emit(TxnClass::kOptional,
-         {"ALTER TABLE " + qualified + " ADD CONSTRAINT " + name + " " +
+         {"ALTER TABLE " + sql_rel + " ADD CONSTRAINT " + detail::quote_identifier(name) + " " +
           kind_sql + " (" + quoted_cols + ");"},
          "AccessExclusiveLock and ShareLock on " + qualified +
              " while the index builds",
@@ -4765,7 +4170,7 @@ inline void plan_unique_like(const Intent& in, const Observations& obs,
   // it to that name anyway, so naming it so from the start turns a surprise
   // into a no-op.
   emit(TxnClass::kForbidden,
-       {"CREATE UNIQUE INDEX CONCURRENTLY " + name + " ON " + qualified +
+       {"CREATE UNIQUE INDEX CONCURRENTLY " + detail::quote_identifier(name) + " ON " + sql_rel +
         " (" + quoted_cols + ");"},
        "ShareUpdateExclusiveLock -- does NOT block reads or writes",
        "size " + detail::human_bytes(size) +
@@ -4776,8 +4181,8 @@ inline void plan_unique_like(const Intent& in, const Observations& obs,
            "it to that anyway",
        /*own=*/true);
   emit(TxnClass::kRequired,
-       {"ALTER TABLE " + qualified + " ADD CONSTRAINT " + name + " " +
-        kind_sql + " USING INDEX " + name + ";"},
+       {"ALTER TABLE " + sql_rel + " ADD CONSTRAINT " + detail::quote_identifier(name) + " " +
+        kind_sql + " USING INDEX " + detail::quote_identifier(name) + ";"},
        "AccessExclusiveLock on " + qualified + ", briefly and with no scan",
        "step 2 of 2: the lock is the same LEVEL a plain ADD CONSTRAINT takes, "
        "and that is the point -- what the concurrent build removed is the "
@@ -4824,6 +4229,7 @@ inline void plan_replace_view(const Intent& in, const Observations& obs,
   const auto schema = in.body.value("schema", "");
   const auto name = in.body.value("name", "");
   const auto qualified = schema + "." + name;
+  const auto sql_rel = detail::quote_qualified(qualified);
   const auto& v = obs.table(qualified);
   const auto definition = in.body.value("definition", "");
   const auto kind = v.value("kind", "");
@@ -4832,9 +4238,9 @@ inline void plan_replace_view(const Intent& in, const Observations& obs,
   step.detail["view"] = qualified;
 
   if (!v.value("exists", false)) {
-    step.sql.push_back("CREATE VIEW " + qualified + " AS " + definition + ";");
+    step.sql.push_back("CREATE VIEW " + sql_rel + " AS " + definition + ";");
     if (in.body.contains("comment")) {
-      step.sql.push_back("COMMENT ON VIEW " + qualified + " IS " +
+      step.sql.push_back("COMMENT ON VIEW " + sql_rel + " IS " +
                          detail::quote_literal(in.body.value("comment", "")) + ";");
     }
     step.lock = "no lock on any existing object";
@@ -4853,7 +4259,7 @@ inline void plan_replace_view(const Intent& in, const Observations& obs,
   }
 
   if (kind == "view") {
-    step.sql.push_back("CREATE OR REPLACE VIEW " + qualified + " AS " +
+    step.sql.push_back("CREATE OR REPLACE VIEW " + sql_rel + " AS " +
                        definition + ";");
     // The one thing CREATE OR REPLACE resets. Re-applied unconditionally when
     // the view had any, because the failure is silent: no error, and a view
@@ -4862,7 +4268,7 @@ inline void plan_replace_view(const Intent& in, const Observations& obs,
     if (!reloptions.empty()) {
       std::vector<std::string> o;
       for (const auto& r : reloptions) o.push_back(r.get<std::string>());
-      step.sql.push_back("ALTER VIEW " + qualified + " SET (" +
+      step.sql.push_back("ALTER VIEW " + sql_rel + " SET (" +
                          detail::join(o, ", ") + ");");
       plan.warnings.push_back(
           "CREATE OR REPLACE VIEW resets a view's options, so " + qualified +
@@ -4889,12 +4295,12 @@ inline void plan_replace_view(const Intent& in, const Observations& obs,
   // A materialized view has no replace form -- measured, it is a syntax error
   // -- so it falls back to the destructive path and pays the S13 restore.
   step.own_transaction = true;
-  step.sql.push_back("DROP MATERIALIZED VIEW " + qualified + ";");
-  step.sql.push_back("CREATE MATERIALIZED VIEW " + qualified + " AS " +
+  step.sql.push_back("DROP MATERIALIZED VIEW " + sql_rel + ";");
+  step.sql.push_back("CREATE MATERIALIZED VIEW " + sql_rel + " AS " +
                      definition + ";");
   const auto owner = v.value("owner", "");
   if (!owner.empty()) {
-    step.sql.push_back("ALTER MATERIALIZED VIEW " + qualified + " OWNER TO " +
+    step.sql.push_back("ALTER MATERIALIZED VIEW " + sql_rel + " OWNER TO " +
                        detail::quote_identifier(owner) + ";");
   }
   step.lock = "AccessExclusiveLock on " + qualified;
@@ -4984,6 +4390,7 @@ inline void plan_alter_column_type(const Intent& in, const Observations& obs,
   struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
 
   const auto qualified = in.qualified_table();
+  const auto sql_rel = detail::quote_qualified(qualified);
   const auto& t = obs.table(qualified);
   const auto column = in.body.value("column", "");
   const auto target = in.body.value("type", "");
@@ -5022,7 +4429,7 @@ inline void plan_alter_column_type(const Intent& in, const Observations& obs,
   step.own_transaction = true;
 
   detail::emit_view_drops(views, rebuild, step);
-  step.sql.push_back("ALTER TABLE " + qualified + " ALTER COLUMN " +
+  step.sql.push_back("ALTER TABLE " + sql_rel + " ALTER COLUMN " +
                      detail::quote_identifier(column) + " TYPE " + target +
                      (in.body.contains("using")
                           ? " USING " + in.body.value("using", "")
@@ -5076,6 +4483,7 @@ inline void plan_drop_column(const Intent& in, const Observations& obs,
   struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
 
   const auto qualified = in.qualified_table();
+  const auto sql_rel = detail::quote_qualified(qualified);
   const auto& t = obs.table(qualified);
   const auto column = in.body.value("column", "");
 
@@ -5098,7 +4506,7 @@ inline void plan_drop_column(const Intent& in, const Observations& obs,
   step.txn_class = TxnClass::kRequired;
   step.own_transaction = true;
   detail::emit_view_drops(views, rebuild, step);
-  step.sql.push_back("ALTER TABLE " + qualified + " DROP COLUMN " +
+  step.sql.push_back("ALTER TABLE " + sql_rel + " DROP COLUMN " +
                      detail::quote_identifier(column) + ";");
   detail::emit_view_recreates(views, rebuild, step);
 
@@ -5155,6 +4563,7 @@ inline void plan_drop_constraint(const Intent& in, const Observations& obs,
   struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
 
   const auto qualified = in.qualified_table();
+  const auto sql_rel = detail::quote_qualified(qualified);
   const auto& t = obs.table(qualified);
   const auto name = in.body.value("name", "");
 
@@ -5195,7 +4604,7 @@ inline void plan_drop_constraint(const Intent& in, const Observations& obs,
   }
 
   step.txn_class = TxnClass::kRequired;
-  step.sql.push_back("ALTER TABLE " + qualified + " DROP CONSTRAINT " + name + ";");
+  step.sql.push_back("ALTER TABLE " + sql_rel + " DROP CONSTRAINT " + detail::quote_identifier(name) + ";");
 
   // The lock reaches further than the statement reads. Measured on 18.6:
   // dropping a foreign key takes AccessExclusiveLock on the REFERENCED table
@@ -5298,13 +4707,13 @@ inline void plan_drop_index(const Intent& in, const Observations& obs, Plan& pla
   if (waiters == 0) {
     step.txn_class = TxnClass::kOptional;
     step.lock = "AccessExclusiveLock, briefly";
-    step.sql.push_back("DROP INDEX " + in.schema() + "." + name + ";");
+    step.sql.push_back("DROP INDEX " + detail::quote_identifier(in.schema()) + "." + detail::quote_identifier(name) + ";");
     step.why = "0 lock waiters -> plain DROP (transactional, so a failure "
                "leaves nothing behind)";
   } else {
     step.txn_class = TxnClass::kForbidden;
     step.lock = "ShareUpdateExclusiveLock";
-    step.sql.push_back("DROP INDEX CONCURRENTLY " + in.schema() + "." + name + ";");
+    step.sql.push_back("DROP INDEX CONCURRENTLY " + detail::quote_identifier(in.schema()) + "." + detail::quote_identifier(name) + ";");
     step.why = std::to_string(waiters) +
                " lock waiters already on " + qualified +
                " -> concurrent drop; a plain DROP would queue behind them and "
@@ -5337,6 +4746,7 @@ inline void plan_drop_index(const Intent& in, const Observations& obs, Plan& pla
 inline void plan_set_not_null(const Intent& in, const Observations& obs, Plan& plan,
                               std::vector<Step>& out) {
   const auto qualified = in.qualified_table();
+  const auto sql_rel = detail::quote_qualified(qualified);
   const auto& t = obs.table(qualified);
   const auto column = in.body.value("column", "");
   // Deliberately NOT <table>_<column>_not_null.
@@ -5393,15 +4803,16 @@ inline void plan_set_not_null(const Intent& in, const Observations& obs, Plan& p
   };
 
   make(TxnClass::kRequired,
-       "ALTER TABLE " + qualified + " ADD CONSTRAINT " + check + " CHECK (" +
-           column + " IS NOT NULL) NOT VALID;",
+       "ALTER TABLE " + sql_rel + " ADD CONSTRAINT " +
+           detail::quote_identifier(check) + " CHECK (" +
+           detail::quote_identifier(column) + " IS NOT NULL) NOT VALID;",
        "ShareRowExclusiveLock, briefly; NOT VALID means no scan",
        "step 1 of 4: a NOT VALID check costs no scan, so the strong lock is "
        "held only for the catalog change",
        /*own=*/true);
 
   make(TxnClass::kRequired,
-       "ALTER TABLE " + qualified + " VALIDATE CONSTRAINT " + check + ";",
+       "ALTER TABLE " + sql_rel + " VALIDATE CONSTRAINT " + detail::quote_identifier(check) + ";",
        "ShareUpdateExclusiveLock -- does NOT block reads or writes",
        "step 2 of 4: this is where the scan happens, and it happens under a "
        "lock that lets the application keep working. It must be its own "
@@ -5409,7 +4820,7 @@ inline void plan_set_not_null(const Intent& in, const Observations& obs, Plan& p
        /*own=*/true);
 
   make(TxnClass::kRequired,
-       "ALTER TABLE " + qualified + " ALTER COLUMN " + column + " SET NOT NULL;",
+       "ALTER TABLE " + sql_rel + " ALTER COLUMN " + detail::quote_identifier(column) + " SET NOT NULL;",
        "AccessExclusiveLock, but no scan",
        "step 3 of 4: still an exclusive lock, but PostgreSQL skips the scan "
        "because the validated CHECK already proves the column has no nulls "
@@ -5418,7 +4829,7 @@ inline void plan_set_not_null(const Intent& in, const Observations& obs, Plan& p
 
   if (!in.body.value("keep_check", false)) {
     make(TxnClass::kRequired,
-         "ALTER TABLE " + qualified + " DROP CONSTRAINT " + check + ";",
+         "ALTER TABLE " + sql_rel + " DROP CONSTRAINT " + detail::quote_identifier(check) + ";",
          "AccessExclusiveLock, briefly",
          "step 4 of 4: the CHECK is redundant once the column is NOT NULL, and "
          "a redundant constraint costs time on every insert. Set keep_check to "
@@ -5441,6 +4852,7 @@ inline void plan_set_not_null(const Intent& in, const Observations& obs, Plan& p
 inline void plan_add_foreign_key(const Intent& in, const Observations& obs,
                                  Plan& plan, std::vector<Step>& out) {
   const auto qualified = in.qualified_table();
+  const auto sql_rel = detail::quote_qualified(qualified);
   const auto& t = obs.table(qualified);
   const auto name = in.body.value("name", "");
   const auto parent = in.body.value("references_schema", "") + "." +
@@ -5496,7 +4908,7 @@ inline void plan_add_foreign_key(const Intent& in, const Observations& obs,
   add.own_transaction = true;
   add.lock = "ShareRowExclusiveLock on " + qualified + " and RowShareLock on " +
              parent + "; NOT VALID means no scan";
-  add.sql.push_back("ALTER TABLE " + qualified + " ADD CONSTRAINT " + name + " " +
+  add.sql.push_back("ALTER TABLE " + sql_rel + " ADD CONSTRAINT " + detail::quote_identifier(name) + " " +
                     clause + " NOT VALID;");
   add.why =
       "step 1 of 2: NOT VALID takes the same strong locks as a validating add "
@@ -5514,8 +4926,7 @@ inline void plan_add_foreign_key(const Intent& in, const Observations& obs,
   validate.own_transaction = true;
   validate.lock = "ShareUpdateExclusiveLock on " + qualified +
                   " -- does NOT block reads or writes";
-  validate.sql.push_back("ALTER TABLE " + qualified + " VALIDATE CONSTRAINT " +
-                         name + ";");
+  validate.sql.push_back("ALTER TABLE " + sql_rel + " VALIDATE CONSTRAINT " + detail::quote_identifier(name) + ";");
   validate.why =
       "step 2 of 2: the scan, under a lock that lets the application keep "
       "working. It must be its own transaction, or step 1's "
@@ -5617,6 +5028,14 @@ inline Plan plan_migration(const Spec& spec, const Observations& obs,
         plan_drop_table(in, projected, plan, emitted); break;
       case IntentKind::kDeleteRows:
         plan_delete_rows(in, projected, cfg, plan, emitted); break;
+      case IntentKind::kInsertRows:
+        plan_insert_rows(in, projected, cfg, plan, emitted); break;
+      case IntentKind::kUpdateRows:
+        plan_update_rows(in, projected, cfg, plan, emitted); break;
+      case IntentKind::kMergeRows:
+        plan_merge_rows(in, projected, cfg, plan, emitted); break;
+      case IntentKind::kCopyRows:
+        plan_copy_rows(in, projected, cfg, plan, emitted); break;
       case IntentKind::kCreatePublication:
       case IntentKind::kAlterPublication:
       case IntentKind::kDropPublication:

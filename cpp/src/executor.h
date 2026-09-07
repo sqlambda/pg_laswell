@@ -19,6 +19,7 @@
 // for exactly this table.
 
 #include <chrono>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -153,6 +154,18 @@ class Executor {
         verify_index_valid(worker, ordinal, step);
         continue;
       }
+      // COPY carries a payload after its statement, so it cannot go through
+      // exec() with the rest. It still belongs to the current transaction
+      // group -- COPY is transactional, and rolls back with everything else.
+      if (kind == "copy_rows" && step.value("detail", json::object())
+                                     .contains("copy_rows")) {
+        if (!group_open) {
+          worker.begin(app_name(ordinal));
+          group_open = true;
+        }
+        run_copy(worker, ordinal, step);
+        continue;
+      }
 
       if (!group_open) {
         worker.begin(app_name(ordinal));
@@ -200,6 +213,77 @@ class Executor {
     }
     record_step(ordinal, step, "succeeded", rows,
                 json{{"elapsedMs", detail::steady_ms() - started}});
+  }
+
+  // COPY ... FROM STDIN.
+  //
+  // The one step whose work is not entirely in its SQL: the statement opens the
+  // stream and the rows follow it over the protocol. Both halves are recorded
+  // -- the statement in laswell.step.sql, the row count in the step's result --
+  // because "what ran" for a COPY is genuinely two things.
+  //
+  // pqxx::stream_to is the only sanctioned way to send COPY data through
+  // libpqxx 7.10; connection::raw_connection() and write_copy_line() are
+  // private, reachable only through internal gate classes. It builds the
+  // statement itself, which is why the planner emits exactly the form probed
+  // out of it -- COPY t(cols) FROM STDIN, no WITH clause -- and why spec.h
+  // refuses ON_ERROR and friends rather than accepting keys that cannot travel.
+  void run_copy(WriteSession& w, int ordinal, const json& step) {
+    const auto started = detail::steady_ms();
+    const auto detail_json = step.value("detail", json::object());
+    const auto qualified =
+        detail_json.value("copy_relation", detail_json.value("qualified", ""));
+    const auto rows = detail_json.value("copy_rows", json::array());
+
+    std::vector<std::string> columns;
+    for (const auto& c : detail_json.value("copy_columns", json::array())) {
+      columns.push_back("\"" + c.get<std::string>() + "\"");
+    }
+
+    long long written = 0;
+    try {
+      {
+        auto stream = pqxx::stream_to::raw_table(
+            w.txn(), qualified, detail::join(columns, ", "));
+        for (const auto& row : rows) {
+          // Each cell as its own optional<string>: a JSON null becomes a real
+          // SQL NULL rather than the four characters "null", which is the
+          // difference between an absent value and a literal that happens to
+          // spell one. Numbers and booleans go as their canonical text, which
+          // is what COPY's text format expects and what the cast on the
+          // column's own type then parses.
+          std::vector<std::optional<std::string>> cells;
+          cells.reserve(row.size());
+          for (const auto& cell : row) {
+            if (cell.is_null()) {
+              cells.emplace_back(std::nullopt);
+            } else if (cell.is_string()) {
+              cells.emplace_back(cell.get<std::string>());
+            } else if (cell.is_boolean()) {
+              cells.emplace_back(cell.get<bool>() ? "true" : "false");
+            } else {
+              cells.emplace_back(cell.dump());
+            }
+          }
+          stream.write_row(cells);
+          ++written;
+        }
+        stream.complete();
+      }
+    } catch (const pqxx::sql_error& e) {
+      record_step(ordinal, step, "failed", 0,
+                  json{{"sqlstate", e.sqlstate()},
+                       {"error", e.what()},
+                       {"rowsSent", written},
+                       {"note",
+                        "a COPY is all-or-nothing within its transaction: none "
+                        "of the rows above were kept, whatever the row number "
+                        "in the error says"}});
+      throw;
+    }
+    record_step(ordinal, step, "succeeded", written,
+                json{{"elapsedMs", detail::steady_ms() - started},
+                     {"rowsCopied", written}});
   }
 
   // CREATE INDEX CONCURRENTLY and DROP INDEX CONCURRENTLY.

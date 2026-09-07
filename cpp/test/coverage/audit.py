@@ -114,6 +114,18 @@ covers = {
  'CREATE FOREIGN TABLE': ('create_object', 'generic'), 'DROP FOREIGN TABLE': ('drop_object', 'generic'),
  'DROP RULE': ('drop_rule', ''),
  'ALTER RULE': (None, 'rename only'),
+ # Row-level DML. These moved OUT of not_ddl when the row-level kinds shipped:
+ # they were excluded as "not DDL", which was true and had stopped being the
+ # relevant question. A migration that seeds a reference table or corrects
+ # specific rows is a change to state applied exactly once, which is the test
+ # this tool actually uses.
+ 'INSERT': ('insert_rows', 'no RETURNING into the ledger, no CTE sources'),
+ 'UPDATE': ('update_rows', 'per-row values and expressions; backfill covers '
+                           'one-expression-many-rows'),
+ 'DELETE': ('delete_rows', 'predicate, key list or select'),
+ 'MERGE': ('merge_rows', 'no per-branch AND conditions, no DO NOTHING branch'),
+ 'COPY': ('copy_rows', 'FROM STDIN only; no WITH options -- libpqxx sends no '
+                       'WITH clause and offers no way to add one'),
 }
 # Everything else on the page, classified.
 maintenance = {'REINDEX','VACUUM','ANALYZE','CLUSTER','CHECKPOINT','DISCARD','LOAD'}
@@ -122,12 +134,16 @@ cluster_wide = {'CREATE DATABASE','DROP DATABASE','ALTER DATABASE','CREATE TABLE
   'CREATE USER','DROP USER','ALTER USER','CREATE GROUP','DROP GROUP','ALTER GROUP',
   'ALTER SYSTEM','DROP OWNED','REASSIGN OWNED','CREATE EVENT TRIGGER',
   'DROP EVENT TRIGGER','ALTER EVENT TRIGGER'}
-not_ddl = {'ABORT','BEGIN','CALL','CLOSE','COMMIT','COMMIT PREPARED','COPY','DEALLOCATE',
-  'DECLARE','DELETE','DO','END','EXECUTE','EXPLAIN','FETCH','INSERT','LISTEN','LOCK',
-  'MERGE','MOVE','NOTIFY','PREPARE','PREPARE TRANSACTION','RELEASE SAVEPOINT','RESET',
+# Statements that change no state a migration can own. INSERT, UPDATE, DELETE,
+# MERGE and COPY used to live here and are now in `covers` above; TRUNCATE is
+# not here and never was -- it is in `covers` as a deliberate absence, because
+# it IS a migration by both tests and is left out on its own merits.
+not_ddl = {'ABORT','BEGIN','CALL','CLOSE','COMMIT','COMMIT PREPARED','DEALLOCATE',
+  'DECLARE','DO','END','EXECUTE','EXPLAIN','FETCH','LISTEN','LOCK',
+  'MOVE','NOTIFY','PREPARE','PREPARE TRANSACTION','RELEASE SAVEPOINT','RESET',
   'ROLLBACK','ROLLBACK PREPARED','ROLLBACK TO SAVEPOINT','SAVEPOINT','SELECT',
   'SELECT INTO','SET','SET CONSTRAINTS','SET ROLE','SET SESSION AUTHORIZATION',
-  'SET TRANSACTION','SHOW','START TRANSACTION','UNLISTEN','UPDATE','VALUES'}
+  'SET TRANSACTION','SHOW','START TRANSACTION','UNLISTEN','VALUES'}
 
 page = [l.strip() for l in open(__import__('os').path.join(__import__('os').path.dirname(__import__('os').path.abspath(__file__)), 'pg18-sql-commands.txt')) if l.strip()]
 full, partial, missing = [], [], []

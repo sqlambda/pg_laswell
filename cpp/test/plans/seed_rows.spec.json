@@ -1,0 +1,9 @@
+{"laswell_spec_version":1,"id":"0007-seed-regions",
+ "description":"Seed the region reference table.",
+ "rationale":"Three rows the application needs before it can accept an order. Written literally rather than as a select, so the data itself is covered by the signature and readable in the ledger.",
+ "intents":[{"kind":"insert_rows","schema":"shop","table":"region","key":"id",
+             "columns":["id","code","name"],
+             "values":[[1,"NA","North America"],
+                       [2,"EU","Europe"],
+                       [3,"APAC","Asia Pacific"]],
+             "on_conflict":"skip","conflict_target":["id"]}]}

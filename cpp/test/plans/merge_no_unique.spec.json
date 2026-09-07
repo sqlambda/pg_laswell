@@ -1,0 +1,6 @@
+{"laswell_spec_version":1,"id":"0008-merge-status",
+ "description":"Upsert order status from a staging table.",
+ "rationale":"Demonstrates the refusal that matters most in this family: MERGE's ON clause is not a key constraint, and without a unique index one source row silently updates several target rows.",
+ "intents":[{"kind":"merge_rows","schema":"shop","table":"orders","key":"status",
+             "columns":["status","amount"],
+             "values":[["open",1],["closed",2]]}]}

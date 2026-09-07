@@ -980,7 +980,15 @@ TEST(Spec, KnownKindsAreExactlyTheImplementedKinds) {
                        "label":"system_u:object_r:sepgsql_table_t:s0"},
     "alter_default_privileges": {"kind":"alter_default_privileges","schema":"s",
                                  "object_type":"TABLES",
-                                 "privileges":["SELECT"],"to":["app"]}
+                                 "privileges":["SELECT"],"to":["app"]},
+    "insert_rows": {"kind":"insert_rows","schema":"s","table":"t","key":"id",
+                    "columns":["id","a"],"values":[[1,"x"],[2,"y"]]},
+    "update_rows": {"kind":"update_rows","schema":"s","table":"t","key":"id",
+                    "columns":["id","a"],"values":[[1,"x"]]},
+    "merge_rows": {"kind":"merge_rows","schema":"s","table":"t","key":"id",
+                   "columns":["id","a"],"values":[[1,"x"]]},
+    "copy_rows": {"kind":"copy_rows","schema":"s","table":"t",
+                  "columns":["id","a"],"values":[[1,"x"]]}
   })JSON");
   for (const auto& [name, kind] : pglaswell::intent_kinds()) {
     (void)kind;
@@ -1620,7 +1628,7 @@ TEST(Planner, ASmallQuietTableChoosesAPlainIndexBuild) {
   const auto* s = find_step(plan, "create_index");
   ASSERT_NE(s, nullptr);
   EXPECT_EQ(s->txn_class, pglaswell::TxnClass::kOptional);
-  EXPECT_NE(all_sql(*s).find("CREATE INDEX orders_open_by_region_idx"),
+  EXPECT_NE(all_sql(*s).find("CREATE INDEX \"orders_open_by_region_idx\""),
             std::string::npos);
   EXPECT_EQ(all_sql(*s).find("CONCURRENTLY"), std::string::npos);
   EXPECT_NE(s->lock.find("ShareLock"), std::string::npos);
@@ -1700,11 +1708,11 @@ TEST(Planner, APartitionedTableGetsThePerPartitionRecipe) {
 
   const auto s = steps_of(plan, "create_index");
   ASSERT_EQ(s.size(), 5u) << plan.render();  // 2 builds + parent + 2 attaches
-  EXPECT_NE(all_sql(*s[0]).find("CREATE INDEX CONCURRENTLY orders_2024_orders_open_by_region_idx"
-                                " ON shop.orders_2024"),
+  EXPECT_NE(all_sql(*s[0]).find("CREATE INDEX CONCURRENTLY \"orders_2024_orders_open_by_region_idx\""
+                                " ON \"shop\".\"orders_2024\""),
             std::string::npos) << all_sql(*s[0]);
   EXPECT_EQ(s[0]->txn_class, pglaswell::TxnClass::kForbidden);
-  EXPECT_NE(all_sql(*s[2]).find("ON ONLY shop.orders"), std::string::npos);
+  EXPECT_NE(all_sql(*s[2]).find("ON ONLY \"shop\".\"orders\""), std::string::npos);
   EXPECT_NE(all_sql(*s[3]).find("ATTACH PARTITION"), std::string::npos);
   EXPECT_NE(all_sql(*s[4]).find("ATTACH PARTITION"), std::string::npos);
 
@@ -1752,7 +1760,7 @@ TEST(Planner, AddCheckConstraintSplitsIntoNotValidThenValidate) {
   const auto s = steps_of(plan, "add_check_constraint");
   ASSERT_EQ(s.size(), 2u);
   EXPECT_NE(all_sql(*s[0]).find("NOT VALID"), std::string::npos);
-  EXPECT_NE(all_sql(*s[1]).find("VALIDATE CONSTRAINT orders_status_ck"),
+  EXPECT_NE(all_sql(*s[1]).find("VALIDATE CONSTRAINT \"orders_status_ck\""),
             std::string::npos);
   EXPECT_GT(s[1]->txn_group, s[0]->txn_group);
   EXPECT_NE(s[1]->lock.find("does NOT block reads or writes"), std::string::npos);
@@ -1784,7 +1792,7 @@ TEST(Planner, AddColumnIsPlannedWhenTheColumnIsAbsent) {
   const auto* s = find_step(plan, "add_column");
   ASSERT_NE(s, nullptr);
   EXPECT_EQ(s->action, pglaswell::Action::kApply);
-  EXPECT_NE(all_sql(*s).find("ALTER TABLE shop.orders ADD COLUMN fulfilment_region text"),
+  EXPECT_NE(all_sql(*s).find("ALTER TABLE \"shop\".\"orders\" ADD COLUMN \"fulfilment_region\" text"),
             std::string::npos);
   // The COMMENT rides in the same transaction group as the ALTER.
   EXPECT_NE(all_sql(*s).find("COMMENT ON COLUMN"), std::string::npos);
@@ -1830,9 +1838,9 @@ TEST(Planner, TheBackfillBatchUsesForUpdateWithoutSkipLocked) {
       << "SKIP LOCKED would make the cursor lie: " << sql;
   // The target is referenced by its own name, not an alias -- the naming
   // contract a spec's where/set expressions have to match.
-  EXPECT_NE(sql.find("ORDER BY orders.id"), std::string::npos) << sql;
-  EXPECT_NE(sql.find("orders.id > $1"), std::string::npos) << sql;
-  EXPECT_NE(sql.find("FOR UPDATE OF orders"), std::string::npos)
+  EXPECT_NE(sql.find("ORDER BY \"orders\".\"id\""), std::string::npos) << sql;
+  EXPECT_NE(sql.find("\"orders\".\"id\" > $1"), std::string::npos) << sql;
+  EXPECT_NE(sql.find("FOR UPDATE OF \"orders\""), std::string::npos)
       << "a bare FOR UPDATE would lock rows in the joined lookup table too: "
       << sql;
   EXPECT_EQ(s->txn_class, pglaswell::TxnClass::kOwnTxnPerBatch);
@@ -2315,9 +2323,11 @@ class BootstrappedTest : public DatabaseTest {
   }
 
   // A spec signed by the suite key, ready for gate 2.
-  json signed_spec() const {
-    const auto parsed = pglaswell::parse_spec(minimal_spec());
-    json doc = minimal_spec();
+  json signed_spec() const { return signed_doc(minimal_spec()); }
+
+  // The same, for a spec that is not minimal_spec().
+  json signed_doc(json doc) const {
+    const auto parsed = pglaswell::parse_spec(doc);
     doc["signatures"] = json::array({{{"key_id", test_key().key_id},
                                       {"algorithm", "ed25519"},
                                       {"signature", base64(sign(parsed.canonical_bytes))}}});
@@ -2973,6 +2983,69 @@ TEST_F(ToolTest, StartMigrationReturnsAJobIdBeforeDoingTheWork) {
   })) << "the job never finished";
   const auto final_status = status_of(p["jobId"]);
   EXPECT_EQ(final_status.value("state", ""), "succeeded") << final_status.dump(2);
+}
+
+TEST_F(ToolTest, CopyRowsTravelsThroughTheRealExecutorAndLandsInTheLedger) {
+  // The one step in the row-level family whose work is not entirely in its SQL:
+  // the statement opens the stream and the rows follow it over the protocol.
+  // That means Executor::run_copy is a code path the conformance suite cannot
+  // reach -- it drives statements, not streams -- so it is exercised here,
+  // through startMigration, exactly as an operator would reach it.
+  make_shop(cfg());
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/copy");
+    w.txn().exec("CREATE TABLE shop.region(id bigint GENERATED BY DEFAULT AS IDENTITY"
+                 " PRIMARY KEY, code text NOT NULL, note text)");
+    w.commit();
+  }
+
+  json doc = minimal_spec();
+  doc["id"] = "0009-copy-regions";
+  doc["description"] = "Load the region reference table.";
+  doc["intents"] = json::array({json{
+      {"kind", "copy_rows"}, {"schema", "shop"}, {"table", "region"},
+      {"columns", json::array({"id", "code", "note"})},
+      // A NULL in the payload, deliberately: COPY's text format spells it \\N,
+      // and a JSON null that arrived as the four characters "null" would be an
+      // ordinary string nobody noticed until someone read the column.
+      {"values", json::array({json::array({1, "NA", "North America"}),
+                              json::array({2, "EU", nullptr})})}}});
+
+  const auto p = payload(call("startMigration", json{{"spec", signed_doc(doc)}}));
+  ASSERT_TRUE(p.value("accepted", false)) << p.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, p["jobId"], [](const json& s) {
+    return s.value("state", "") == "succeeded";
+  })) << status_of(p["jobId"]).dump(2);
+
+  pglaswell::ReadSession r(cfg());
+  EXPECT_EQ(r.txn().exec("SELECT count(*)::text FROM shop.region")[0][0].as<std::string>(), "2");
+  EXPECT_EQ(r.txn().exec("SELECT code FROM shop.region WHERE id = 1")[0][0].as<std::string>(), "NA");
+  EXPECT_TRUE(r.txn().exec("SELECT note FROM shop.region WHERE id = 2")[0][0].is_null())
+      << "a JSON null must become a SQL NULL, not the string \"null\"";
+
+  // The sequence catch-up ran too, so the application's next insert does not
+  // collide -- which is the whole reason that second step exists. Without it
+  // this insert fails with a duplicate key, measured on 18.6.
+  {
+    pglaswell::WriteSession app(cfg());
+    app.begin("pg_laswell/test/app-insert");
+    EXPECT_EQ(app.txn()
+                  .exec("INSERT INTO shop.region(code) VALUES ('APAC') RETURNING id::text")[0][0]
+                  .as<std::string>(),
+              "3");
+    app.commit();
+  }
+
+  // And the ledger records the statement that ran, verbatim.
+  const auto sql = r.txn().exec(
+      "SELECT s.sql FROM laswell.step s JOIN laswell.job j ON j.job_id = s.job_id"
+      " WHERE j.job_id = $1::uuid AND s.kind = 'copy_rows' ORDER BY s.ordinal LIMIT 1",
+      pqxx::params{p["jobId"].get<std::string>()});
+  ASSERT_FALSE(sql.empty()) << "the COPY left no step row";
+  EXPECT_NE(sql[0][0].as<std::string>().find("COPY \"shop\".\"region\""),
+            std::string::npos)
+      << sql[0][0].as<std::string>();
 }
 
 TEST_F(ToolTest, TheExecutedPlanIsTheOneThatWasShown) {
@@ -3672,8 +3745,8 @@ TEST(Planner, AnEquivalentIndexUnderAnotherNameIsRenamedNotRebuilt) {
   const auto* s = find_step(plan, "create_index");
   ASSERT_NE(s, nullptr);
   EXPECT_EQ(s->action, pglaswell::Action::kApply);
-  EXPECT_NE(all_sql(*s).find("ALTER INDEX shop.some_other_name RENAME TO "
-                             "orders_open_by_region_idx"),
+  EXPECT_NE(all_sql(*s).find("ALTER INDEX \"shop\".\"some_other_name\" RENAME TO "
+                             "\"orders_open_by_region_idx\""),
             std::string::npos)
       << all_sql(*s);
   EXPECT_EQ(all_sql(*s).find("CREATE INDEX"), std::string::npos)
@@ -3856,7 +3929,7 @@ TEST(Planner, DroppingAnIndexOnAQuietTableUsesAPlainDrop) {
   ASSERT_TRUE(plan.ok) << plan.render();
   const auto s = steps_of(plan, "drop_index");
   ASSERT_EQ(s.size(), 1u);
-  EXPECT_NE(all_sql(*s[0]).find("DROP INDEX shop.stale_idx"), std::string::npos);
+  EXPECT_NE(all_sql(*s[0]).find("DROP INDEX \"shop\".\"stale_idx\""), std::string::npos);
   EXPECT_EQ(all_sql(*s[0]).find("CONCURRENTLY"), std::string::npos);
   EXPECT_EQ(s[0]->txn_class, pglaswell::TxnClass::kOptional);
 }
@@ -3962,7 +4035,7 @@ TEST(Planner, AttachProvesTheBoundsFirstSoTheAttachItselfIsCatalogOnly) {
             std::string::npos) << all_sql(*s[0]);
   EXPECT_NE(all_sql(*s[1]).find("VALIDATE CONSTRAINT"), std::string::npos);
   EXPECT_NE(all_sql(*s[2]).find(
-                "ATTACH PARTITION shop.events_2026 FOR VALUES FROM "
+                "ATTACH PARTITION \"shop\".\"events_2026\" FOR VALUES FROM "
                 "('2026-01-01') TO ('2027-01-01')"),
             std::string::npos) << all_sql(*s[2]);
   // The CHECK is dropped afterwards: the partition bound now enforces it, and
@@ -4069,7 +4142,7 @@ TEST(Planner, DetachingALargePartitionUsesConcurrentlyOutsideATransaction) {
   const auto plan = pglaswell::plan_migration(detach_spec(), obs, {});
   ASSERT_TRUE(plan.ok) << plan.render();
   const auto* step = steps_of(plan, "detach_partition")[0];
-  EXPECT_NE(all_sql(*step).find("DETACH PARTITION shop.events_2025 CONCURRENTLY"),
+  EXPECT_NE(all_sql(*step).find("DETACH PARTITION \"shop\".\"events_2025\" CONCURRENTLY"),
             std::string::npos) << all_sql(*step);
   // Measured: it cannot run inside a transaction block.
   EXPECT_EQ(step->txn_class, pglaswell::TxnClass::kForbidden);
@@ -4134,7 +4207,7 @@ TEST(Planner, APartitionStuckMidDetachIsFinalizedNotDetachedAgain) {
   const auto plan = pglaswell::plan_migration(detach_spec(), obs, {});
   ASSERT_TRUE(plan.ok) << plan.render();
   const auto* step = steps_of(plan, "detach_partition")[0];
-  EXPECT_NE(all_sql(*step).find("DETACH PARTITION shop.events_2025 FINALIZE"),
+  EXPECT_NE(all_sql(*step).find("DETACH PARTITION \"shop\".\"events_2025\" FINALIZE"),
             std::string::npos) << all_sql(*step);
   EXPECT_EQ(step->detail.value("method", ""), "finalize");
 }
@@ -4177,10 +4250,10 @@ TEST(Planner, AddingAUniqueConstraintOnALargeTableBuildsTheIndexConcurrently) {
   const auto s = steps_of(plan, "add_unique_constraint");
   ASSERT_EQ(s.size(), 2u) << plan.render();
   EXPECT_NE(all_sql(*s[0]).find(
-                "CREATE UNIQUE INDEX CONCURRENTLY orders_code_uq ON shop.orders (code)"),
+                "CREATE UNIQUE INDEX CONCURRENTLY \"orders_code_uq\" ON \"shop\".\"orders\" (\"code\")"),
             std::string::npos) << all_sql(*s[0]);
   EXPECT_EQ(s[0]->txn_class, pglaswell::TxnClass::kForbidden);
-  EXPECT_NE(all_sql(*s[1]).find("ADD CONSTRAINT orders_code_uq UNIQUE USING INDEX"),
+  EXPECT_NE(all_sql(*s[1]).find("ADD CONSTRAINT \"orders_code_uq\" UNIQUE USING INDEX"),
             std::string::npos) << all_sql(*s[1]);
 
   // The index is named after the constraint, so USING INDEX's rename is a
@@ -4207,7 +4280,7 @@ TEST(Planner, ASmallQuietTableGetsOneStatementInstead) {
   ASSERT_TRUE(plan.ok) << plan.render();
   const auto s = steps_of(plan, "add_unique_constraint");
   ASSERT_EQ(s.size(), 1u) << plan.render();
-  EXPECT_NE(all_sql(*s[0]).find("ADD CONSTRAINT orders_code_uq UNIQUE (code)"),
+  EXPECT_NE(all_sql(*s[0]).find("ADD CONSTRAINT \"orders_code_uq\" UNIQUE (\"code\")"),
             std::string::npos);
   EXPECT_EQ(all_sql(*s[0]).find("CONCURRENTLY"), std::string::npos);
 
@@ -4233,7 +4306,7 @@ TEST(Planner, AnExistingUniqueIndexIsAdoptedRatherThanRebuilt) {
   ASSERT_EQ(s.size(), 1u) << plan.render();
   EXPECT_EQ(all_sql(*s[0]).find("CREATE UNIQUE INDEX"), std::string::npos)
       << "the build is already paid for:\n" << all_sql(*s[0]);
-  EXPECT_NE(all_sql(*s[0]).find("USING INDEX orders_code_key"), std::string::npos);
+  EXPECT_NE(all_sql(*s[0]).find("USING INDEX \"orders_code_key\""), std::string::npos);
 
   // Here the rename IS real, and must be said: an index named in a dashboard
   // silently becomes something else, and PostgreSQL reports it as a NOTICE.
@@ -4380,7 +4453,7 @@ TEST(Planner, ReplacingAPlainViewUsesCreateOrReplaceRatherThanARebuild) {
   const auto s = steps_of(plan, "replace_view");
   ASSERT_EQ(s.size(), 1u);
   const auto sql = all_sql(*s[0]);
-  EXPECT_NE(sql.find("CREATE OR REPLACE VIEW public.v1"), std::string::npos) << sql;
+  EXPECT_NE(sql.find("CREATE OR REPLACE VIEW \"public\".\"v1\""), std::string::npos) << sql;
   EXPECT_EQ(sql.find("DROP VIEW"), std::string::npos)
       << "a plain view must not be dropped when replace is legal:\n" << sql;
   EXPECT_EQ(s[0]->detail.value("method", ""), "replace");
@@ -4395,7 +4468,7 @@ TEST(Planner, ReplacingAViewReappliesTheOptionsThatReplaceSilentlyResets) {
       obs_with_view_object("view", true), {});
   ASSERT_TRUE(plan.ok) << plan.render();
   const auto sql = all_sql(*steps_of(plan, "replace_view")[0]);
-  EXPECT_NE(sql.find("ALTER VIEW public.v1 SET (security_barrier=true)"),
+  EXPECT_NE(sql.find("ALTER VIEW \"public\".\"v1\" SET (security_barrier=true)"),
             std::string::npos)
       << "the reset option was not re-applied:\n" << sql;
   bool warned = false;
@@ -4422,8 +4495,8 @@ TEST(Planner, AMaterializedViewHasNoReplaceFormSoItIsRebuilt) {
   ASSERT_TRUE(plan.ok) << plan.render();
   const auto* step = steps_of(plan, "replace_view")[0];
   const auto sql = all_sql(*step);
-  EXPECT_NE(sql.find("DROP MATERIALIZED VIEW public.v1"), std::string::npos) << sql;
-  EXPECT_NE(sql.find("CREATE MATERIALIZED VIEW public.v1"), std::string::npos) << sql;
+  EXPECT_NE(sql.find("DROP MATERIALIZED VIEW \"public\".\"v1\""), std::string::npos) << sql;
+  EXPECT_NE(sql.find("CREATE MATERIALIZED VIEW \"public\".\"v1\""), std::string::npos) << sql;
   EXPECT_EQ(sql.find("CREATE OR REPLACE MATERIALIZED"), std::string::npos)
       << "that syntax does not exist:\n" << sql;
   EXPECT_EQ(step->detail.value("method", ""), "drop_and_recreate");
@@ -4544,7 +4617,7 @@ TEST(Planner, AlterColumnTypeRebuildsOnlyTheViewsThatBlockIt) {
   const auto drop_v2 = sql.find("DROP VIEW public.v2");
   const auto drop_mv = sql.find("DROP MATERIALIZED VIEW public.mv1");
   const auto drop_v1 = sql.find("DROP VIEW public.v1");
-  const auto alter   = sql.find("ALTER TABLE shop.orders ALTER COLUMN");
+  const auto alter   = sql.find("ALTER TABLE \"shop\".\"orders\" ALTER COLUMN");
   const auto make_v1 = sql.find("CREATE VIEW public.v1");
   const auto make_v2 = sql.find("CREATE VIEW public.v2");
   for (auto pos : {drop_v2, drop_mv, drop_v1, alter, make_v1, make_v2}) {
@@ -4638,7 +4711,7 @@ TEST(Planner, AlterColumnTypeWithNoViewsEmitsJustTheAlter) {
   ASSERT_TRUE(plan.ok) << plan.render();
   const auto sql = all_sql(*steps_of(plan, "alter_column_type")[0]);
   EXPECT_EQ(sql.find("DROP VIEW"), std::string::npos) << sql;
-  EXPECT_NE(sql.find("ALTER TABLE shop.orders ALTER COLUMN \"amount\" TYPE bigint"),
+  EXPECT_NE(sql.find("ALTER TABLE \"shop\".\"orders\" ALTER COLUMN \"amount\" TYPE bigint"),
             std::string::npos) << sql;
 }
 
@@ -4723,7 +4796,7 @@ TEST(Planner, AddColumnIsNotBlockedByViewsButWarnsTheColumnIsInvisible) {
   // that starts emitting view DDL here fails loudly.
   const auto* step = steps_of(plan, "add_column")[0];
   ASSERT_EQ(step->sql.size(), 2u) << all_sql(*step);
-  EXPECT_NE(step->sql[0].find("ALTER TABLE shop.orders ADD COLUMN region"),
+  EXPECT_NE(step->sql[0].find("ALTER TABLE \"shop\".\"orders\" ADD COLUMN \"region\""),
             std::string::npos) << step->sql[0];
   EXPECT_NE(step->sql[1].find("COMMENT ON COLUMN"), std::string::npos)
       << step->sql[1];
@@ -4863,13 +4936,13 @@ TEST(Planner, CreateTableEmitsCommentsAndDoesNotCompareAnExistingOne) {
   const auto plan = pglaswell::plan_migration(spec, observations(1024, 10), {});
   ASSERT_TRUE(plan.ok) << plan.render();
   const auto sql = all_sql(*only_step(plan, "create_table"));
-  EXPECT_NE(sql.find("CREATE TABLE shop.regions"), std::string::npos) << sql;
+  EXPECT_NE(sql.find("CREATE TABLE \"shop\".\"regions\""), std::string::npos) << sql;
   EXPECT_NE(sql.find("\"id\" bigint NOT NULL"), std::string::npos) << sql;
   EXPECT_NE(sql.find("PRIMARY KEY (\"id\")"), std::string::npos)
       << "on an empty table the inline key is free; the two-step recipe would "
          "be machinery for nothing:\n" << sql;
-  EXPECT_NE(sql.find("COMMENT ON TABLE shop.regions"), std::string::npos);
-  EXPECT_NE(sql.find("COMMENT ON COLUMN shop.regions.\"name\""), std::string::npos);
+  EXPECT_NE(sql.find("COMMENT ON TABLE \"shop\".\"regions\""), std::string::npos);
+  EXPECT_NE(sql.find("COMMENT ON COLUMN \"shop\".\"regions\".\"name\""), std::string::npos);
 
   // An existing table is satisfied WITHOUT a shape comparison, and the plan
   // must say so -- silently reporting satisfied over a table that differs is
@@ -4936,7 +5009,7 @@ TEST(Planner, DeleteRowsIsPacedLikeABackfillAndWarnsAboutChildren) {
   // batch, and the key returned.
   EXPECT_NE(sql.find("> $1"), std::string::npos) << sql;
   EXPECT_NE(sql.find("LIMIT $2"), std::string::npos) << sql;
-  EXPECT_NE(sql.find("RETURNING shop.orders.id"), std::string::npos) << sql;
+  EXPECT_NE(sql.find("RETURNING \"shop\".\"orders\".\"id\""), std::string::npos) << sql;
   EXPECT_NE(sql.find("FOR UPDATE"), std::string::npos) << sql;
   EXPECT_EQ(step->lock.find("AccessExclusive"), std::string::npos) << step->lock;
 
@@ -4949,6 +5022,508 @@ TEST(Planner, DeleteRowsIsPacedLikeABackfillAndWarnsAboutChildren) {
       << "a paced delete that hits a foreign key stops part-done: "
       << plan.render();
   EXPECT_TRUE(space_warning) << plan.render();
+}
+
+
+// --- the row-level DML family ----------------------------------------------
+//
+// Each of these asserts a MEASUREMENT, not a preference. The spike that
+// produced them is cpp/test/spikes/s21_dml.sh and every one of them is a bug
+// this planner would otherwise ship: a statement PostgreSQL refuses, a
+// statement it accepts and silently gets wrong, or a walk that stops early and
+// calls itself finished.
+
+static pglaswell::Observations obs_dml() {
+  auto obs = obs_rich();
+  auto& t = obs.tables["shop.orders"];
+  // The pkey needs its column list for the ON CONFLICT arbiter match, and the
+  // three column flags row-level DML reads. '' is the ordinary case; the
+  // planner tests for the letter rather than for presence.
+  t["indexes"]["orders_pkey"]["columns"] = json::array({"id"});
+  t["indexes"]["orders_pkey"]["predicate"] = "";
+  t["indexes"]["orders_pkey"]["has_expressions"] = false;
+  for (const char* c : {"id", "warehouse_id", "created_at", "fulfilment_region"}) {
+    t["columns"][c]["identity"] = "";
+    t["columns"][c]["generated"] = "";
+    t["columns"][c]["sequence"] = nullptr;
+  }
+  return obs;
+}
+
+TEST(Planner, InsertRowsBelowTheThresholdIsOneTransactionAndSaysWhichNumberDecided) {
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "insert_rows"}, {"schema", "shop"},
+                                {"table", "orders"}, {"key", "id"},
+                                {"columns", json::array({"id", "fulfilment_region"})},
+                                {"values", json::array({json::array({1, "NA"}),
+                                                        json::array({2, "EU"})})}}})),
+      obs_dml(), {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto* step = only_step(plan, "insert_rows");
+  ASSERT_NE(step, nullptr);
+  // Atomicity is the point: a half-applied reference table is worse than one
+  // that failed and can be retried.
+  EXPECT_EQ(step->txn_class, pglaswell::TxnClass::kRequired);
+  const auto sql = all_sql(*step);
+  EXPECT_NE(sql.find("INSERT INTO \"shop\".\"orders\""), std::string::npos) << sql;
+  EXPECT_NE(sql.find("VALUES (1, 'NA')"), std::string::npos) << sql;
+  EXPECT_EQ(sql.find("$1"), std::string::npos) << "not paced, so no cursor: " << sql;
+  // The plan must name the reading, not merely assert the choice.
+  EXPECT_NE(step->why.find("2 literal rows"), std::string::npos) << step->why;
+  EXPECT_NE(step->why.find("dml_single_txn_rows"), std::string::npos) << step->why;
+}
+
+TEST(Planner, InsertRowsAboveTheThresholdIsPacedInTheShapeTheExecutorRequires) {
+  pglaswell::ExecutorConfig cfg;
+  cfg.dml_single_txn_rows = 1;
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "insert_rows"}, {"schema", "shop"},
+                                {"table", "orders"}, {"key", "id"},
+                                {"columns", json::array({"id", "fulfilment_region"})},
+                                {"values", json::array({json::array({1, "NA"}),
+                                                        json::array({2, "EU"})})}}})),
+      obs_dml(), cfg);
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto* step = only_step(plan, "insert_rows");
+  ASSERT_NE(step, nullptr);
+  EXPECT_EQ(step->txn_class, pglaswell::TxnClass::kOwnTxnPerBatch);
+  const auto sql = all_sql(*step);
+  // Exactly the contract executor.h::run_backfill drives: $1 cursor, $2 limit,
+  // column 0 of the result is the key.
+  EXPECT_NE(sql.find("> $1"), std::string::npos) << sql;
+  EXPECT_NE(sql.find("LIMIT $2"), std::string::npos) << sql;
+  EXPECT_NE(sql.find("SELECT batch.\"id\" FROM batch ORDER BY batch.\"id\""),
+            std::string::npos) << sql;
+  // And the cast that (VALUES ...) needs to join to a bigint key at all.
+  EXPECT_NE(sql.find("1::bigint"), std::string::npos) << sql;
+}
+
+TEST(Planner, InsertRowsRefusesOnConflictWithNoMatchingUniqueIndex) {
+  // Measured on 18.6: PostgreSQL does not fall back to the primary key, it
+  // refuses -- "there is no unique or exclusion constraint matching the ON
+  // CONFLICT specification". Refusing here means it never reaches execution.
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "insert_rows"}, {"schema", "shop"},
+                                {"table", "orders"}, {"key", "id"},
+                                {"columns", json::array({"id", "fulfilment_region"})},
+                                {"values", json::array({json::array({1, "NA"})})},
+                                {"on_conflict", "skip"},
+                                {"conflict_target", json::array({"fulfilment_region"})}}})),
+      obs_dml(), {});
+  EXPECT_FALSE(plan.ok) << plan.render();
+  bool named = false;
+  for (const auto& c : plan.conflicts) {
+    if (c.find("no valid unique index on (fulfilment_region)") != std::string::npos &&
+        c.find("rather than falling back to the primary key") != std::string::npos) {
+      named = true;
+    }
+  }
+  EXPECT_TRUE(named) << plan.render();
+}
+
+TEST(Planner, InsertRowsRefusesAPartialArbiterAndNamesThePredicateToAdd) {
+  // Measured on 18.6: against a PARTIAL unique index, ON CONFLICT (id) is
+  // refused and ON CONFLICT (id) WHERE <predicate> is accepted. The refusal
+  // must hand back the exact predicate, or the author has to go and find it.
+  auto obs = obs_dml();
+  obs.tables["shop.orders"]["indexes"]["orders_live_uq"] =
+      json{{"is_valid", true}, {"is_unique", true}, {"is_primary", false},
+           {"leading_column", "fulfilment_region"},
+           {"columns", json::array({"fulfilment_region"})},
+           {"predicate", "(created_at IS NOT NULL)"},
+           {"has_expressions", false}};
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "insert_rows"}, {"schema", "shop"},
+                                {"table", "orders"}, {"key", "id"},
+                                {"columns", json::array({"id", "fulfilment_region"})},
+                                {"values", json::array({json::array({1, "NA"})})},
+                                {"on_conflict", "skip"},
+                                {"conflict_target", json::array({"fulfilment_region"})}}})),
+      obs, {});
+  EXPECT_FALSE(plan.ok) << plan.render();
+  bool helped = false;
+  for (const auto& c : plan.conflicts) {
+    if (c.find("it is PARTIAL") != std::string::npos &&
+        c.find("\"conflict_where\": '(created_at IS NOT NULL)'") != std::string::npos) {
+      helped = true;
+    }
+  }
+  EXPECT_TRUE(helped) << "the refusal must name the predicate to copy: "
+                      << plan.render();
+
+  // ... and supplying it is accepted, with the arbiter recorded.
+  auto body = json{{"kind", "insert_rows"}, {"schema", "shop"},
+                   {"table", "orders"}, {"key", "id"},
+                   {"columns", json::array({"id", "fulfilment_region"})},
+                   {"values", json::array({json::array({1, "NA"})})},
+                   {"on_conflict", "skip"},
+                   {"conflict_target", json::array({"fulfilment_region"})},
+                   {"conflict_where", "(created_at IS NOT NULL)"}};
+  const auto ok = pglaswell::plan_migration(spec_of(json::array({body})), obs, {});
+  ASSERT_TRUE(ok.ok) << ok.render();
+  const auto sql = all_sql(*only_step(ok, "insert_rows"));
+  EXPECT_NE(sql.find("ON CONFLICT (\"fulfilment_region\") WHERE (created_at IS NOT NULL) DO NOTHING"),
+            std::string::npos) << sql;
+}
+
+TEST(Planner, InsertRowsRefusesColumnsPostgreSQLWouldNotLetItWrite) {
+  // Two refusals, both measured on 18.6, both errors that would otherwise
+  // arrive mid-walk after earlier batches had committed.
+  auto obs = obs_dml();
+  obs.tables["shop.orders"]["columns"]["id"]["identity"] = "a";
+  obs.tables["shop.orders"]["columns"]["fulfilment_region"]["generated"] = "s";
+
+  const auto identity = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "insert_rows"}, {"schema", "shop"},
+                                {"table", "orders"},
+                                {"columns", json::array({"id"})},
+                                {"values", json::array({json::array({1})})}}})),
+      obs, {});
+  EXPECT_FALSE(identity.ok) << identity.render();
+  bool hinted = false;
+  for (const auto& c : identity.conflicts) {
+    if (c.find("OVERRIDING SYSTEM VALUE") != std::string::npos) hinted = true;
+  }
+  EXPECT_TRUE(hinted) << "PostgreSQL's own hint is the useful one: "
+                      << identity.render();
+
+  // Saying so explicitly is accepted, and the clause appears.
+  const auto overridden = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "insert_rows"}, {"schema", "shop"},
+                                {"table", "orders"},
+                                {"columns", json::array({"id"})},
+                                {"values", json::array({json::array({1})})},
+                                {"overriding", "system"}}})),
+      obs, {});
+  ASSERT_TRUE(overridden.ok) << overridden.render();
+  EXPECT_NE(all_sql(*only_step(overridden, "insert_rows")).find("OVERRIDING SYSTEM VALUE"),
+            std::string::npos);
+
+  const auto generated = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "insert_rows"}, {"schema", "shop"},
+                                {"table", "orders"},
+                                {"columns", json::array({"fulfilment_region"})},
+                                {"values", json::array({json::array({"NA"})})}}})),
+      obs, {});
+  EXPECT_FALSE(generated.ok) << generated.render();
+  bool said = false;
+  for (const auto& c : generated.conflicts) {
+    if (c.find("GENERATED ALWAYS AS ... STORED") != std::string::npos) said = true;
+  }
+  EXPECT_TRUE(said) << generated.render();
+}
+
+TEST(Planner, InsertRowsEmitsTheSetvalThatStopsTheApplicationsNextInsertFailing) {
+  // The measurement this whole step exists for. On 18.6, five rows inserted
+  // with explicit ids into a GENERATED BY DEFAULT identity left the sequence
+  // unset, and the application's very next insert died on a duplicate key --
+  // after the migration reported success.
+  auto obs = obs_dml();
+  obs.tables["shop.orders"]["columns"]["id"]["identity"] = "d";
+  obs.tables["shop.orders"]["columns"]["id"]["sequence"] = "shop.orders_id_seq";
+
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "insert_rows"}, {"schema", "shop"},
+                                {"table", "orders"}, {"key", "id"},
+                                {"columns", json::array({"id", "fulfilment_region"})},
+                                {"values", json::array({json::array({1, "NA"}),
+                                                        json::array({2, "EU"})})}}})),
+      obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto steps = steps_of(plan, "insert_rows");
+  ASSERT_EQ(steps.size(), 2u) << "the insert, then the sequence catch-up: "
+                              << plan.render();
+  const auto insert_sql = all_sql(*steps[0]);
+  const auto setval_sql = all_sql(*steps[1]);
+  EXPECT_NE(insert_sql.find("INSERT INTO"), std::string::npos) << insert_sql;
+  EXPECT_NE(setval_sql.find("setval('shop.orders_id_seq'"), std::string::npos)
+      << "the catch-up must come AFTER the insert it depends on: " << setval_sql;
+  // The number is read from the table, never taken from the spec, so it stays
+  // correct when the seed was already partly applied -- and writes nothing when
+  // the table is empty, because setval(seq, NULL) is an error.
+  EXPECT_NE(setval_sql.find("max(\"id\")"), std::string::npos) << setval_sql;
+  EXPECT_NE(setval_sql.find("WHERE s.v IS NOT NULL"), std::string::npos) << setval_sql;
+  EXPECT_NE(steps[1]->why.find("duplicate key"), std::string::npos) << steps[1]->why;
+}
+
+TEST(Planner, UpdateRowsRefusesWithoutAUniqueIndexOnItsKey) {
+  auto obs = obs_dml();
+  obs.tables["shop.orders"]["indexes"]["orders_pkey"]["is_unique"] = false;
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "update_rows"}, {"schema", "shop"},
+                                {"table", "orders"}, {"key", "id"},
+                                {"columns", json::array({"id", "fulfilment_region"})},
+                                {"values", json::array({json::array({1, "NA"})})}}})),
+      obs, {});
+  EXPECT_FALSE(plan.ok) << plan.render();
+  bool named = false;
+  for (const auto& c : plan.conflicts) {
+    if (c.find("with no error anywhere") != std::string::npos) named = true;
+  }
+  EXPECT_TRUE(named) << plan.render();
+}
+
+TEST(Planner, UpdateRowsGivesEachRowItsOwnValuesAndCastsTheFirstOne) {
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "update_rows"}, {"schema", "shop"},
+                                {"table", "orders"}, {"key", "id"},
+                                {"columns", json::array({"id", "fulfilment_region"})},
+                                {"values", json::array({json::array({41, "NA"}),
+                                                        json::array({42, "EU"})})}}})),
+      obs_dml(), {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto sql = all_sql(*only_step(plan, "update_rows"));
+  // The casts are not decoration. Measured on 18.6: without them, a uuid key
+  // gives "operator does not exist: uuid = text", while int and text happen to
+  // work -- which is what makes it easy to ship broken.
+  EXPECT_NE(sql.find("(41::bigint, 'NA'::text)"), std::string::npos) << sql;
+  // Row two inherits the resolved type, so the cast appears once.
+  EXPECT_NE(sql.find("(42, 'EU')"), std::string::npos) << sql;
+  EXPECT_NE(sql.find("SET \"fulfilment_region\" = v.\"fulfilment_region\""),
+            std::string::npos) << sql;
+  EXPECT_NE(sql.find("WHERE \"shop\".\"orders\".\"id\" = v.\"id\""), std::string::npos) << sql;
+  // And the warning that this kind, unlike backfill, leaves no record behind.
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("no record of what they were") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned) << plan.render();
+}
+
+TEST(Planner, MergeRowsRefusesWhenOneSourceRowCouldMatchSeveralTargetRows) {
+  // The sharpest measurement in the family. On 18.6, with duplicate target
+  // rows and no unique index, ONE source row updated TWO target rows -- no
+  // error, nothing in the row count to notice. MERGE's ON is not a key
+  // constraint and PostgreSQL does not pretend it is.
+  auto obs = obs_dml();
+  obs.tables["shop.orders"]["indexes"]["orders_pkey"]["is_unique"] = false;
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "merge_rows"}, {"schema", "shop"},
+                                {"table", "orders"}, {"key", "id"},
+                                {"columns", json::array({"id", "fulfilment_region"})},
+                                {"values", json::array({json::array({1, "NA"})})}}})),
+      obs, {});
+  EXPECT_FALSE(plan.ok) << plan.render();
+  bool named = false;
+  for (const auto& c : plan.conflicts) {
+    if (c.find("is not a key constraint") != std::string::npos &&
+        c.find("updated BOTH of them") != std::string::npos) named = true;
+  }
+  EXPECT_TRUE(named) << plan.render();
+}
+
+TEST(Planner, MergeRowsNamesItsCursorFromTheBatchAndNotFromItsOwnReturning) {
+  // Measured on 18.6: a paced MERGE whose batch matched nothing returned ZERO
+  // rows from RETURNING, and executor.h reads a zero-row result as "the walk is
+  // finished". The step would report success having merged nothing at all.
+  pglaswell::ExecutorConfig cfg;
+  cfg.dml_single_txn_rows = 1;
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "merge_rows"}, {"schema", "shop"},
+                                {"table", "orders"}, {"key", "id"},
+                                {"columns", json::array({"id", "fulfilment_region"})},
+                                {"values", json::array({json::array({1, "NA"}),
+                                                        json::array({2, "EU"})})}}})),
+      obs_dml(), cfg);
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto* step = only_step(plan, "merge_rows");
+  ASSERT_NE(step, nullptr);
+  EXPECT_EQ(step->txn_class, pglaswell::TxnClass::kOwnTxnPerBatch);
+  const auto sql = all_sql(*step);
+  EXPECT_NE(sql.find("MERGE INTO shop.orders USING batch"), std::string::npos) << sql;
+  EXPECT_NE(sql.find("WHEN MATCHED THEN UPDATE SET"), std::string::npos) << sql;
+  EXPECT_NE(sql.find("WHEN NOT MATCHED THEN INSERT"), std::string::npos) << sql;
+  // The cursor comes from the batch, ordered, and NOT from the MERGE.
+  EXPECT_NE(sql.find("SELECT batch.\"id\" FROM batch ORDER BY batch.\"id\""),
+            std::string::npos) << sql;
+  EXPECT_EQ(sql.find("RETURNING s."), std::string::npos)
+      << "a paced MERGE must never advance its cursor from its own RETURNING: "
+      << sql;
+}
+
+TEST(Planner, MergeRowsRefusesNotMatchedBySourceDeleteWhenItWouldBePaced) {
+  // "Delete every target row the source does not mention" is only meaningful
+  // over the WHOLE source. Paced, the first batch would delete everything
+  // outside it -- including the rows later batches were going to match.
+  pglaswell::ExecutorConfig cfg;
+  cfg.dml_single_txn_rows = 1;
+  auto body = json{{"kind", "merge_rows"}, {"schema", "shop"}, {"table", "orders"},
+                   {"key", "id"},
+                   {"columns", json::array({"id", "fulfilment_region"})},
+                   {"values", json::array({json::array({1, "NA"}), json::array({2, "EU"})})},
+                   {"when_not_matched_by_source", "delete"}};
+  const auto paced = pglaswell::plan_migration(spec_of(json::array({body})), obs_dml(), cfg);
+  EXPECT_FALSE(paced.ok) << paced.render();
+  bool explained = false;
+  for (const auto& c : paced.conflicts) {
+    if (c.find("would delete everything outside it") != std::string::npos) explained = true;
+  }
+  EXPECT_TRUE(explained) << paced.render();
+
+  // Unpaced it is allowed, and warns that it is a full replacement.
+  body["paced"] = false;
+  const auto whole = pglaswell::plan_migration(spec_of(json::array({body})), obs_dml(), cfg);
+  ASSERT_TRUE(whole.ok) << whole.render();
+  EXPECT_NE(all_sql(*only_step(whole, "merge_rows")).find("WHEN NOT MATCHED BY SOURCE THEN DELETE"),
+            std::string::npos);
+  bool warned = false;
+  for (const auto& w : whole.warnings) {
+    if (w.find("full replacement of the table's contents") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned) << whole.render();
+}
+
+TEST(Planner, DeleteRowsAcceptsAnExplicitKeyListBesideItsPredicate) {
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "delete_rows"}, {"schema", "shop"},
+                                {"table", "orders"}, {"key", "id"},
+                                {"columns", json::array({"id"})},
+                                {"values", json::array({json::array({7}),
+                                                        json::array({9})})}}})),
+      obs_dml(), {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto* step = only_step(plan, "delete_rows");
+  ASSERT_NE(step, nullptr);
+  EXPECT_EQ(step->txn_class, pglaswell::TxnClass::kRequired);
+  const auto sql = all_sql(*step);
+  EXPECT_NE(sql.find("DELETE FROM \"shop\".\"orders\""), std::string::npos) << sql;
+  EXPECT_NE(sql.find("(7::bigint)"), std::string::npos) << sql;
+  EXPECT_NE(sql.find("WHERE \"shop\".\"orders\".\"id\" = v.\"id\""), std::string::npos) << sql;
+}
+
+TEST(Planner, ASelectRowSourceIsAlwaysPacedBecauseItsSizeIsNotDerivable) {
+  // planner.h is a pure function with no database in it, so the row count of a
+  // select cannot be measured. Pacing unconditionally is the honest answer;
+  // guessing a number would break the rule the whole tool rests on.
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "insert_rows"}, {"schema", "shop"},
+                                {"table", "orders"}, {"key", "id"},
+                                {"columns", json::array({"id", "fulfilment_region"})},
+                                {"select", "SELECT id, region FROM staging.regions"}}})),
+      obs_dml(), {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto* step = only_step(plan, "insert_rows");
+  ASSERT_NE(step, nullptr);
+  EXPECT_EQ(step->txn_class, pglaswell::TxnClass::kOwnTxnPerBatch);
+  EXPECT_NE(step->why.find("cannot be measured without running it"),
+            std::string::npos) << step->why;
+  EXPECT_NE(all_sql(*step).find("SELECT id, region FROM staging.regions"),
+            std::string::npos);
+}
+
+TEST(Planner, DuplicateKeysInsideValuesAreRefusedOnce) {
+  // The same spec breaks three different ways depending on the statement, so
+  // it is refused in one place rather than failing three.
+  for (const char* kind : {"insert_rows", "update_rows", "merge_rows"}) {
+    const auto plan = pglaswell::plan_migration(
+        spec_of(json::array({json{{"kind", kind}, {"schema", "shop"},
+                                  {"table", "orders"}, {"key", "id"},
+                                  {"columns", json::array({"id", "fulfilment_region"})},
+                                  {"values", json::array({json::array({1, "NA"}),
+                                                          json::array({1, "EU"})})}}})),
+        obs_dml(), {});
+    EXPECT_FALSE(plan.ok) << kind << ": " << plan.render();
+    bool named = false;
+    for (const auto& c : plan.conflicts) {
+      if (c.find("more than once") != std::string::npos) named = true;
+    }
+    EXPECT_TRUE(named) << kind << ": " << plan.render();
+  }
+}
+
+TEST(Planner, CopyRowsEmitsExactlyTheStatementLibpqxxWillSendAndSaysItCannotPace) {
+  pglaswell::ExecutorConfig cfg;
+  cfg.dml_single_txn_rows = 1;
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "copy_rows"}, {"schema", "shop"},
+                                {"table", "orders"},
+                                {"columns", json::array({"id", "fulfilment_region"})},
+                                {"values", json::array({json::array({1, "NA"}),
+                                                        json::array({2, "EU"})})}}})),
+      obs_dml(), cfg);
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto* step = only_step(plan, "copy_rows");
+  ASSERT_NE(step, nullptr);
+  // Probed out of pqxx::stream_to against 18.6: COPY t(cols) FROM STDIN, no
+  // space before the paren, no WITH clause. The ledger records statements
+  // verbatim, so this has to BE the statement rather than resemble it.
+  ASSERT_EQ(step->sql.size(), 1u);
+  EXPECT_EQ(step->sql.at(0),
+            "COPY \"shop\".\"orders\"(\"id\", \"fulfilment_region\") FROM STDIN;");
+  // COPY is one transaction whatever its size -- measured: a failing second row
+  // of three rolled back all three -- so it is never paced, even above the
+  // threshold that would pace an insert.
+  EXPECT_EQ(step->txn_class, pglaswell::TxnClass::kRequired);
+  EXPECT_NE(step->why.find("rolled back all three"), std::string::npos) << step->why;
+  ASSERT_TRUE(step->detail.contains("copy_rows"));
+  EXPECT_EQ(step->detail["copy_rows"].size(), 2u);
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("COPY has no paced form") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned) << plan.render();
+}
+
+TEST(Spec, CopyRowsRefusesOptionsItCannotActuallySend) {
+  // Accepting ON_ERROR and quietly sending a COPY that stops on the first bad
+  // row would be worse than not offering it: the spec would say one thing and
+  // the database would do another.
+  json doc = minimal_spec();
+  doc["intents"] = json::array({json{{"kind", "copy_rows"}, {"schema", "s"},
+                                     {"table", "t"},
+                                     {"columns", json::array({"id"})},
+                                     {"values", json::array({json::array({1})})},
+                                     {"on_error", "ignore"}}});
+  const auto err = spec_error(doc);
+  EXPECT_NE(err.find("cannot send"), std::string::npos) << err;
+}
+
+TEST(Spec, ARowSourceMustBeGivenExactlyOnce) {
+  json doc = minimal_spec();
+  // None.
+  doc["intents"] = json::array({json{{"kind", "insert_rows"}, {"schema", "s"},
+                                     {"table", "t"},
+                                     {"columns", json::array({"id"})}}});
+  EXPECT_NE(spec_error(doc).find("names no rows"), std::string::npos);
+  // Both.
+  doc["intents"][0]["values"] = json::array({json::array({1})});
+  doc["intents"][0]["select"] = "SELECT 1";
+  doc["intents"][0]["key"] = "id";
+  EXPECT_NE(spec_error(doc).find("more than one way"), std::string::npos);
+}
+
+TEST(Spec, ValuesRowsMustLineUpWithTheColumnList) {
+  json doc = minimal_spec();
+  doc["intents"] = json::array({json{{"kind", "insert_rows"}, {"schema", "s"},
+                                     {"table", "t"},
+                                     {"columns", json::array({"id", "code"})},
+                                     {"values", json::array({json::array({1})})}}});
+  const auto err = spec_error(doc);
+  EXPECT_NE(err.find("has 1 values but"), std::string::npos) << err;
+}
+
+TEST(Planner, RowLevelDmlWarnsAboutWhatRowSecurityHidesFromIt) {
+  // Measured on 18.6: a WITH CHECK policy refuses an INSERT loudly, but a USING
+  // policy silently narrowed a DELETE naming two ids down to one, reported
+  // "DELETE 1", and said nothing about the other.
+  auto obs = obs_dml();
+  obs.tables["shop.orders"]["row_security"] = json{{"enabled", true}, {"forced", false}};
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "delete_rows"}, {"schema", "shop"},
+                                {"table", "orders"}, {"key", "id"},
+                                {"columns", json::array({"id"})},
+                                {"values", json::array({json::array({7})})}}})),
+      obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  bool warned = false, owner_note = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("silently narrows") != std::string::npos) warned = true;
+    if (w.find("BYPASSES the policies") != std::string::npos) owner_note = true;
+  }
+  EXPECT_TRUE(warned) << plan.render();
+  EXPECT_TRUE(owner_note)
+      << "force_row_level_security is off, so running as the owner behaves "
+         "differently from the application: " << plan.render();
 }
 
 TEST(Spec, AnUnfilteredDeleteIsRefused) {
@@ -5008,7 +5583,7 @@ TEST(Planner, APolicyOnATableWithoutRlsIsStoredAndDoesNothing) {
       obs_rich(), {});
   ASSERT_TRUE(plan.ok) << plan.render();
   const auto sql = all_sql(*only_step(plan, "create_policy"));
-  EXPECT_NE(sql.find("CREATE POLICY \"tenant_iso\" ON shop.orders FOR UPDATE "
+  EXPECT_NE(sql.find("CREATE POLICY \"tenant_iso\" ON \"shop\".\"orders\" FOR UPDATE "
                      "TO \"app\" USING (tenant = current_user)"),
             std::string::npos) << sql;
   bool inert = false, check = false;
@@ -5089,7 +5664,7 @@ TEST(Planner, GrantIsCheapAndRevokeHitsLiveConnections) {
   // "ON TABLE ..." rather than "ON ...": the keyword is optional in
   // PostgreSQL and stating it keeps the table form indistinguishable from the
   // schema, sequence and function forms only by the word that says which.
-  EXPECT_NE(sql.find("GRANT SELECT, UPDATE (\"amount\") ON TABLE shop.orders "
+  EXPECT_NE(sql.find("GRANT SELECT, UPDATE (\"amount\") ON TABLE \"shop\".\"orders\" "
                      "TO \"app\", PUBLIC;"),
             std::string::npos) << sql;
   EXPECT_NE(only_step(g, "grant")->lock.find("AccessShareLock"), std::string::npos);
@@ -5102,7 +5677,7 @@ TEST(Planner, GrantIsCheapAndRevokeHitsLiveConnections) {
       obs_rich(), {});
   ASSERT_TRUE(r.ok) << r.render();
   EXPECT_NE(all_sql(*only_step(r, "revoke")).find(
-                "REVOKE SELECT ON TABLE shop.orders FROM \"app\";"),
+                "REVOKE SELECT ON TABLE \"shop\".\"orders\" FROM \"app\";"),
             std::string::npos) << all_sql(*only_step(r, "revoke"));
   bool warned = false;
   for (const auto& w : r.warnings) {
@@ -5477,7 +6052,7 @@ TEST(Planner, ChangingAFunctionsReturnTypeIsRefusedWithWhatItWouldCost) {
       obs, {});
   ASSERT_TRUE(ok.ok) << ok.render();
   const auto sql = all_sql(*only_step(ok, "create_function"));
-  EXPECT_NE(sql.find("CREATE OR REPLACE FUNCTION shop.f"), std::string::npos) << sql;
+  EXPECT_NE(sql.find("CREATE OR REPLACE FUNCTION \"shop\".\"f\""), std::string::npos) << sql;
   EXPECT_NE(only_step(ok, "create_function")->why.find("OID"), std::string::npos)
       << only_step(ok, "create_function")->why;
 }
@@ -5573,7 +6148,7 @@ TEST(Planner, CreatingATriggerTakesTheWeakerLockAndWarnsAboutExistingRows) {
   ASSERT_TRUE(plan.ok) << plan.render();
   const auto* step = only_step(plan, "create_trigger");
   ASSERT_NE(step, nullptr);
-  EXPECT_NE(all_sql(*step).find("BEFORE INSERT OR UPDATE ON shop.orders"),
+  EXPECT_NE(all_sql(*step).find("BEFORE INSERT OR UPDATE ON \"shop\".\"orders\""),
             std::string::npos) << all_sql(*step);
   EXPECT_NE(step->lock.find("ShareRowExclusiveLock"), std::string::npos)
       << "measured: creating a trigger blocks writes, not reads: " << step->lock;
@@ -5675,7 +6250,7 @@ TEST(Planner, DroppingAForeignKeyNamesTheLockOnTheParentTable) {
   const auto s = steps_of(plan, "drop_constraint");
   ASSERT_EQ(s.size(), 1u);
   EXPECT_NE(all_sql(*s[0]).find(
-                "ALTER TABLE shop.orders DROP CONSTRAINT orders_warehouse_fk"),
+                "ALTER TABLE \"shop\".\"orders\" DROP CONSTRAINT \"orders_warehouse_fk\""),
             std::string::npos);
   EXPECT_NE(s[0]->lock.find("shop.warehouse"), std::string::npos)
       << "the parent's lock was not named: " << s[0]->lock;
@@ -5818,7 +6393,7 @@ TEST(Planner, SetNotNullUsesTheFourStepRecipeInSeparateTransactions) {
   const auto s = steps_of(plan, "set_not_null");
   ASSERT_EQ(s.size(), 4u) << plan.render();
 
-  EXPECT_NE(all_sql(*s[0]).find("CHECK (fulfilment_region IS NOT NULL) NOT VALID"),
+  EXPECT_NE(all_sql(*s[0]).find("CHECK (\"fulfilment_region\" IS NOT NULL) NOT VALID"),
             std::string::npos);
   EXPECT_NE(all_sql(*s[1]).find("VALIDATE CONSTRAINT"), std::string::npos);
   EXPECT_NE(all_sql(*s[2]).find("SET NOT NULL"), std::string::npos);
@@ -5876,7 +6451,7 @@ TEST(Planner, AddForeignKeySplitsIntoNotValidThenValidate) {
   ASSERT_EQ(s.size(), 2u);
   EXPECT_NE(all_sql(*s[0]).find("NOT VALID"), std::string::npos);
   EXPECT_NE(all_sql(*s[0]).find("ON DELETE RESTRICT"), std::string::npos);
-  EXPECT_NE(all_sql(*s[1]).find("VALIDATE CONSTRAINT orders_wh_fk"), std::string::npos);
+  EXPECT_NE(all_sql(*s[1]).find("VALIDATE CONSTRAINT \"orders_wh_fk\""), std::string::npos);
   EXPECT_GT(s[1]->txn_group, s[0]->txn_group)
       << "VALIDATE must commit separately or step 1's lock spans the scan";
 
@@ -7446,7 +8021,7 @@ TEST_F(ToolTest, AnInvariantThatHoldsLetsTheMigrationSucceed) {
   {
     pglaswell::WriteSession w(cfg());
     w.begin("pg_laswell/test/col");
-    w.txn().exec("ALTER TABLE shop.orders ADD COLUMN fulfilment_region text");
+    w.txn().exec("ALTER TABLE \"shop\".\"orders\" ADD COLUMN \"fulfilment_region\" text");
     w.commit();
   }
   auto doc = backfill_spec_with_invariants(
@@ -7482,7 +8057,7 @@ TEST_F(ToolTest, AnInvariantThatBreaksFailsTheMigrationAndSaysHow) {
   {
     pglaswell::WriteSession w(cfg());
     w.begin("pg_laswell/test/col");
-    w.txn().exec("ALTER TABLE shop.orders ADD COLUMN fulfilment_region text");
+    w.txn().exec("ALTER TABLE \"shop\".\"orders\" ADD COLUMN \"fulfilment_region\" text");
     // A trigger that deletes a row on every update: the backfill completes and
     // the row count silently drops.
     w.txn().exec("CREATE FUNCTION shop.eat() RETURNS trigger LANGUAGE plpgsql AS "
@@ -7562,7 +8137,7 @@ TEST(Planner, PreserveCapturesInTheSameStatementAsTheUpdate) {
 
   // The side table is created from the target's real column types, not LIKE:
   // LIKE would carry constraints and defaults a backup has no business having.
-  EXPECT_NE(all_sql(*s[0]).find("CREATE TABLE IF NOT EXISTS archive.orders_before"),
+  EXPECT_NE(all_sql(*s[0]).find("CREATE TABLE IF NOT EXISTS \"archive\".\"orders_before\""),
             std::string::npos) << all_sql(*s[0]);
   EXPECT_NE(all_sql(*s[0]).find("laswell_saved_at"), std::string::npos);
   EXPECT_NE(all_sql(*s[0]).find("COMMENT ON TABLE"), std::string::npos);
@@ -7570,7 +8145,7 @@ TEST(Planner, PreserveCapturesInTheSameStatementAsTheUpdate) {
   // One statement, not two: the INSERT is a CTE of the UPDATE.
   const auto sql = all_sql(*s[1]);
   EXPECT_NE(sql.find(", preserved AS ("), std::string::npos) << sql;
-  EXPECT_NE(sql.find("INSERT INTO archive.orders_before (id, fulfilment_region)"),
+  EXPECT_NE(sql.find("INSERT INTO \"archive\".\"orders_before\" (\"id\", \"fulfilment_region\")"),
             std::string::npos) << sql;
   EXPECT_LT(sql.find("preserved AS ("), sql.find("UPDATE shop.orders"))
       << "the capture must be part of the same statement as the update";
@@ -7792,7 +8367,7 @@ TEST(Planner, AlteringAPolicyKeepsItsPlaceAndRepeatsTheInvisibilityWarning) {
       obs_alter(), {});
   ASSERT_TRUE(plan.ok) << plan.render();
   const auto* step = only_step(plan, "alter_policy");
-  EXPECT_NE(all_sql(*step).find("ALTER POLICY \"tenant_iso\" ON shop.orders"),
+  EXPECT_NE(all_sql(*step).find("ALTER POLICY \"tenant_iso\" ON \"shop\".\"orders\""),
             std::string::npos) << all_sql(*step);
   EXPECT_NE(step->lock.find("AccessExclusiveLock"), std::string::npos);
   bool warned = false;
@@ -7874,7 +8449,7 @@ TEST(Planner, SetCommentRendersEachObjectTypesOwnShape) {
                                 {"name", "amount"}, {"comment", "d"}}})),
       obs_alter(), {});
   EXPECT_NE(all_sql(*only_step(col, "set_comment")).find(
-                "COMMENT ON COLUMN shop.orders.\"amount\" IS"),
+                "COMMENT ON COLUMN \"shop\".\"orders\".\"amount\" IS"),
             std::string::npos) << all_sql(*only_step(col, "set_comment"));
 }
 
@@ -8131,9 +8706,9 @@ TEST(Planner, ExtendedStatisticsDoNothingUntilAnalyzeAndSaySo) {
       obs, {});
   ASSERT_TRUE(plan.ok) << plan.render();
   const auto* step = only_step(plan, "create_statistics");
-  EXPECT_NE(all_sql(*step).find("CREATE STATISTICS shop.orders_corr "
+  EXPECT_NE(all_sql(*step).find("CREATE STATISTICS \"shop\".\"orders_corr\" "
                                 "(ndistinct, mcv) ON \"amount\", \"status\" "
-                                "FROM shop.orders"),
+                                "FROM \"shop\".\"orders\""),
             std::string::npos) << all_sql(*step);
   EXPECT_NE(step->lock.find("does NOT block"), std::string::npos) << step->lock;
   bool warned = false;
@@ -8198,7 +8773,7 @@ TEST(Planner, GrantsReachBeyondTablesAndCheckThePrivilegeAgainstTheObject) {
       {json{{"kind", "grant"}, {"object_type", "FUNCTION"}, {"schema", "shop"},
             {"name", "f"}, {"arguments", json::array({json{{"type", "integer"}}})},
             {"privileges", json::array({"EXECUTE"})}, {"to", json::array({"app"})}},
-       "GRANT EXECUTE ON FUNCTION shop.f(integer) TO \"app\";"},
+       "GRANT EXECUTE ON FUNCTION \"shop\".\"f\"(integer) TO \"app\";"},
       {json{{"kind", "grant"}, {"object_type", "TABLE"}, {"schema", "shop"},
             {"all_in_schema", true}, {"privileges", json::array({"SELECT"})},
             {"to", json::array({"app"})}},
@@ -8444,7 +9019,7 @@ TEST(Planner, AProcedureIsTheFunctionKindsWithARoutineKind) {
       obs_alter(), {});
   ASSERT_TRUE(plan.ok) << plan.render();
   const auto sql = all_sql(*only_step(plan, "create_function"));
-  EXPECT_NE(sql.find("CREATE OR REPLACE PROCEDURE shop.reconcile()"), std::string::npos)
+  EXPECT_NE(sql.find("CREATE OR REPLACE PROCEDURE \"shop\".\"reconcile\"()"), std::string::npos)
       << sql;
   EXPECT_EQ(sql.find("RETURNS"), std::string::npos)
       << "a procedure has no return type: " << sql;
@@ -8652,6 +9227,36 @@ TEST_F(DatabaseTest, EveryIntentKindPlansAndRunsAgainstARealDatabase) {
     ASSERT_TRUE(plan.ok) << c.kind << " was refused:\n" << plan.render();
 
     for (const auto& step : plan.steps) {
+      // COPY's rows follow its statement over the protocol rather than being
+      // part of it, so driving it here means doing what the executor does --
+      // which is the point: a step that only works inside the executor is a
+      // step nobody can check.
+      if (step.kind == "copy_rows" && step.detail.contains("copy_rows")) {
+        pglaswell::WriteSession w(cfg);
+        w.begin("pg_laswell/conformance/copy");
+        std::vector<std::string> cols;
+        for (const auto& col : step.detail["copy_columns"]) {
+          cols.push_back("\"" + col.get<std::string>() + "\"");
+        }
+        {
+          auto stream = pqxx::stream_to::raw_table(
+              w.txn(), step.detail["qualified"].get<std::string>(),
+              pglaswell::detail::join(cols, ", "));
+          for (const auto& row : step.detail["copy_rows"]) {
+            std::vector<std::optional<std::string>> cells;
+            for (const auto& cell : row) {
+              if (cell.is_null()) cells.emplace_back(std::nullopt);
+              else if (cell.is_string()) cells.emplace_back(cell.get<std::string>());
+              else if (cell.is_boolean()) cells.emplace_back(cell.get<bool>() ? "true" : "false");
+              else cells.emplace_back(cell.dump());
+            }
+            stream.write_row(cells);
+          }
+          stream.complete();
+        }
+        w.commit();
+        continue;
+      }
       for (const auto& q : step.sql) {
         const std::string stmt = q;
         const auto trimmed = stmt.substr(0, stmt.size() - 1);
@@ -8710,6 +9315,224 @@ TEST_F(DatabaseTest, EveryIntentKindPlansAndRunsAgainstARealDatabase) {
                " THEN EXECUTE 'DROP OWNED BY cf_app'; EXECUTE 'DROP ROLE cf_app';"
                " END IF; END$$");
   w.commit();
+}
+
+// Every identifier below is a PostgreSQL RESERVED WORD that nonetheless matches
+// the [a-z0-9_] shape require_identifier() permits, so all of them reach the
+// planner. Measured on 18.6 (scratch spike, summarised in quote_qualified's
+// comment): a schema or table named this way is a syntax error in EVERY
+// position -- "CREATE TABLE user.order", and even "SELECT ... FROM user.order"
+// -- and a column named this way breaks in every DDL position: ADD COLUMN,
+// ALTER COLUMN, DROP COLUMN, RENAME COLUMN, an index column list, an INSERT
+// column list, a SET clause and a VALUES alias list. Only a fully qualified
+// schema.table.column reference survives unquoted, which is why the bug hid.
+//
+// This is the acceptance test for identifier handling: it plans each kind and
+// APPLIES it, so anything the planner renders unquoted fails here rather than
+// on somebody's legacy database.
+TEST_F(DatabaseTest, ReservedWordIdentifiersAreQuotedEverywhereTheyAreEmitted) {
+  pglaswell::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = url_;
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/reserved");
+    w.txn().exec("DROP SCHEMA IF EXISTS \"user\" CASCADE");
+    w.txn().exec("CREATE SCHEMA \"user\"");
+    w.txn().exec(
+        "CREATE TABLE \"user\".\"order\"("
+        "  \"end\" bigint PRIMARY KEY,"
+        "  \"desc\" text,"
+        "  \"limit\" integer,"
+        "  \"select\" text)");
+    w.txn().exec("INSERT INTO \"user\".\"order\" SELECT g, 'd'||g, g, NULL"
+                 " FROM generate_series(1,20) g");
+    w.txn().exec("CREATE TABLE \"user\".\"group\"(\"end\" bigint PRIMARY KEY,"
+                 " \"default\" text)");
+    w.txn().exec("INSERT INTO \"user\".\"group\" SELECT g, 'g'||g FROM generate_series(1,20) g");
+    w.commit();
+  }
+
+  struct Case { const char* what; json body; const char* verify; const char* expect; };
+  const std::vector<Case> cases = {
+    {"add_column",
+     json{{"kind","add_column"},{"schema","user"},{"table","order"},
+          {"column","table"},{"type","text"},{"nullable",true},{"comment","Reserved."}},
+     "SELECT count(*)::text FROM pg_attribute"
+     " WHERE attrelid='\"user\".\"order\"'::regclass AND attname='table'", "1"},
+
+    {"alter_column_default",
+     json{{"kind","alter_column_default"},{"schema","user"},{"table","order"},
+          {"column","table"},{"default","'x'"}},
+     "SELECT count(*)::text FROM pg_attrdef"
+     " WHERE adrelid='\"user\".\"order\"'::regclass", "1"},
+
+    {"create_index",
+     json{{"kind","create_index"},{"schema","user"},{"table","order"},
+          {"name","limit"},{"columns",json::array({"desc"})},{"comment","Reserved."}},
+     "SELECT indisvalid::text FROM pg_index"
+     " WHERE indexrelid='\"user\".\"limit\"'::regclass", "true"},
+
+    {"add_check_constraint",
+     json{{"kind","add_check_constraint"},{"schema","user"},{"table","order"},
+          {"name","check"},{"expression","\"limit\" IS NULL OR \"limit\" >= 0"}},
+     "SELECT convalidated::text FROM pg_constraint WHERE conname='check'", "true"},
+
+    {"backfill",
+     json{{"kind","backfill"},{"schema","user"},{"table","order"},{"key","end"},
+          {"set",json{{"select","'filled'"}}},{"where","\"select\" IS NULL"}},
+     "SELECT count(*)::text FROM \"user\".\"order\" WHERE \"select\"='filled'", "20"},
+
+    {"insert_rows",
+     json{{"kind","insert_rows"},{"schema","user"},{"table","order"},{"key","end"},
+          {"columns",json::array({"end","desc","limit"})},
+          {"values",json::array({json::array({101,"i1",1}),
+                                 json::array({102,"i2",2})})}},
+     "SELECT count(*)::text FROM \"user\".\"order\" WHERE \"end\" > 100", "2"},
+
+    {"update_rows",
+     json{{"kind","update_rows"},{"schema","user"},{"table","order"},{"key","end"},
+          {"columns",json::array({"end","desc"})},
+          {"values",json::array({json::array({101,"u1"}),
+                                 json::array({102,"u2"})})}},
+     "SELECT string_agg(\"desc\",',' ORDER BY \"end\") FROM \"user\".\"order\""
+     " WHERE \"end\" > 100", "u1,u2"},
+
+    {"merge_rows",
+     json{{"kind","merge_rows"},{"schema","user"},{"table","order"},{"key","end"},
+          {"columns",json::array({"end","desc"})},
+          {"values",json::array({json::array({102,"m2"}),
+                                 json::array({103,"m3"})})}},
+     "SELECT string_agg(\"desc\",',' ORDER BY \"end\") FROM \"user\".\"order\""
+     " WHERE \"end\" IN (102,103)", "m2,m3"},
+
+    {"delete_rows by key",
+     json{{"kind","delete_rows"},{"schema","user"},{"table","order"},{"key","end"},
+          {"columns",json::array({"end"})},
+          {"values",json::array({json::array({103})})}},
+     "SELECT count(*)::text FROM \"user\".\"order\" WHERE \"end\"=103", "0"},
+
+    {"delete_rows by predicate",
+     json{{"kind","delete_rows"},{"schema","user"},{"table","order"},{"key","end"},
+          {"where","\"end\" > 100"}},
+     "SELECT count(*)::text FROM \"user\".\"order\" WHERE \"end\" > 100", "0"},
+
+    {"rename_column",
+     json{{"kind","rename_column"},{"schema","user"},{"table","order"},
+          {"column","table"},{"to","from"}},
+     "SELECT count(*)::text FROM pg_attribute"
+     " WHERE attrelid='\"user\".\"order\"'::regclass AND attname='from'", "1"},
+
+    {"set_not_null",
+     json{{"kind","set_not_null"},{"schema","user"},{"table","order"},{"column","desc"}},
+     "SELECT attnotnull::text FROM pg_attribute"
+     " WHERE attrelid='\"user\".\"order\"'::regclass AND attname='desc'", "true"},
+
+    {"alter_column_type",
+     json{{"kind","alter_column_type"},{"schema","user"},{"table","order"},
+          {"column","limit"},{"type","bigint"}},
+     "SELECT format_type(atttypid,atttypmod) FROM pg_attribute"
+     " WHERE attrelid='\"user\".\"order\"'::regclass AND attname='limit'", "bigint"},
+
+    {"drop_column",
+     json{{"kind","drop_column"},{"schema","user"},{"table","order"},{"column","from"}},
+     "SELECT count(*)::text FROM pg_attribute"
+     " WHERE attrelid='\"user\".\"order\"'::regclass AND attname='from'"
+     " AND NOT attisdropped", "0"},
+
+    {"drop_index",
+     json{{"kind","drop_index"},{"schema","user"},{"table","order"},{"name","limit"}},
+     "SELECT count(*)::text FROM pg_class WHERE relname='limit' AND relkind='i'", "0"},
+
+    {"create_table",
+     json{{"kind","create_table"},{"schema","user"},{"table","union"},
+          {"comment","Reserved."},{"primary_key",json::array({"end"})},
+          {"columns",json::array({
+             json{{"name","end"},{"type","bigint"},{"nullable",false},{"comment","K."}},
+             json{{"name","case"},{"type","text"},{"nullable",true},{"comment","C."}}})}},
+     "SELECT count(*)::text FROM pg_class WHERE oid='\"user\".\"union\"'::regclass", "1"},
+
+    {"copy_rows",
+     json{{"kind","copy_rows"},{"schema","user"},{"table","union"},
+          {"columns",json::array({"end","case"})},
+          {"values",json::array({json::array({1,"c1"}), json::array({2,"c2"})})}},
+     "SELECT string_agg(\"case\",',' ORDER BY \"end\") FROM \"user\".\"union\"", "c1,c2"},
+
+    {"drop_table",
+     json{{"kind","drop_table"},{"schema","user"},{"table","union"}},
+     "SELECT count(*)::text FROM pg_class c JOIN pg_namespace n"
+     " ON n.oid=c.relnamespace WHERE n.nspname='user' AND c.relname='union'", "0"},
+  };
+
+  pglaswell::Catalog cat(cfg);
+  for (const auto& c : cases) {
+    SCOPED_TRACE(std::string("reserved-word case: ") + c.what);
+    json doc = minimal_spec();
+    doc["intents"] = json::array({c.body});
+    const auto spec = pglaswell::parse_spec(doc);
+    std::vector<std::string> schemas, tables, keys;
+    for (const auto& in : spec.intents) {
+      for (const auto& key : pglaswell::conflict_keys(in)) {
+        const auto colon = key.find(':');
+        if (colon != std::string::npos) { keys.push_back(key); continue; }
+        const auto dot = key.find('.');
+        if (dot == std::string::npos) continue;
+        schemas.push_back(key.substr(0, dot));
+        tables.push_back(key.substr(dot + 1));
+      }
+    }
+    const auto obs = cat.observe(schemas, tables, keys);
+    const auto plan = pglaswell::plan_migration(spec, obs, {});
+    ASSERT_TRUE(plan.ok) << c.what << " was refused:\n" << plan.render();
+
+    for (const auto& step : plan.steps) {
+      if (step.action != pglaswell::Action::kApply) continue;
+      if (step.kind == "copy_rows" && step.detail.contains("copy_rows")) {
+        pglaswell::WriteSession w(cfg);
+        w.begin("pg_laswell/test/reserved-copy");
+        pglaswell::Catalog::stream_copy(w, step.detail);
+        w.commit();
+        continue;
+      }
+      for (const auto& q : step.sql) {
+        const auto trimmed = q.substr(0, q.size() - 1);
+        if (step.txn_class == pglaswell::TxnClass::kOwnTxnPerBatch) {
+          std::string cursor = "0";
+          for (int pass = 0; pass < 100; ++pass) {
+            pglaswell::WriteSession b(cfg);
+            b.begin("pg_laswell/test/reserved-batch");
+            const auto rows = b.txn().exec(trimmed, pqxx::params{cursor, 1000});
+            for (const auto& row : rows) cursor = row[0].as<std::string>();
+            b.commit();
+            if (rows.empty()) break;
+          }
+          continue;
+        }
+        pglaswell::WriteSession w(cfg);
+        try {
+          if (step.txn_class == pglaswell::TxnClass::kForbidden) {
+            w.exec_nontransactional(trimmed);
+          } else {
+            w.begin("pg_laswell/test/reserved-apply");
+            w.txn().exec(trimmed);
+            w.commit();
+          }
+        } catch (const std::exception& e) {
+          // Named, with the statement, because "syntax error near user" on its
+          // own says nothing about WHICH renderer left an identifier bare.
+          FAIL() << c.what << " emitted SQL PostgreSQL will not parse:\n"
+                 << trimmed << "\n\n" << e.what();
+        }
+      }
+    }
+
+    pglaswell::ReadSession r(cfg);
+    const auto got = r.txn().exec(c.verify);
+    ASSERT_FALSE(got.empty()) << c.what << ": verify returned no row";
+    EXPECT_EQ(got[0][0].is_null() ? std::string("") : got[0][0].as<std::string>(),
+              std::string(c.expect))
+        << c.what << ":\n" << plan.render();
+  }
 }
 
 TEST(Conformance, CoversEveryIntentKind) {

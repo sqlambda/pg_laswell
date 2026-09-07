@@ -41,6 +41,21 @@ struct ExecutorConfig {
   int commit_interval_ms = 1000;
   int batch_cap_rows = 10000;  // backstop against pathological row widths
 
+  // Where a row-level DML intent stops being a seed and starts being a
+  // migration that has to be paced.
+  //
+  // Below this, a `values` form runs in ONE transaction, because atomicity is
+  // what a caller wants from "insert these forty rows": a half-applied
+  // reference table is worse than one that failed outright and can be retried.
+  // Above it, the same intent is paced like a backfill, because a single
+  // transaction over a large list holds its locks for the whole of it -- which
+  // is the harm this tool exists to bound.
+  //
+  // It only ever decides the `values` form. A `select` count is not derivable
+  // without running the query, and planner.h is a pure function with no
+  // database in it, so those are always paced rather than guessed at.
+  int dml_single_txn_rows = 1000;
+
   int lock_timeout_ms = 3000;
   // A dry run applies the whole plan in ONE transaction, so a step that scans
   // -- VALIDATE CONSTRAINT, say -- runs its scan while holding whatever lock
@@ -242,6 +257,7 @@ inline bool apply_executor_key(ExecutorConfig& e, const std::string& key,
   if (key == "batch_rows") { e.batch_rows = detail::positive_int(value, key, w); return true; }
   if (key == "commit_interval_ms") { e.commit_interval_ms = detail::positive_int(value, key, w); return true; }
   if (key == "batch_cap_rows") { e.batch_cap_rows = detail::positive_int(value, key, w); return true; }
+  if (key == "dml_single_txn_rows") { e.dml_single_txn_rows = detail::positive_int(value, key, w); return true; }
   if (key == "lock_timeout_ms") { e.lock_timeout_ms = detail::positive_int(value, key, w); return true; }
   if (key == "dry_run_statement_timeout_ms") { e.dry_run_statement_timeout_ms = detail::positive_int(value, key, w); return true; }
   if (key == "observer_tick_ms") { e.observer_tick_ms = detail::positive_int(value, key, w); return true; }

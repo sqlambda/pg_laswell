@@ -59,7 +59,8 @@ enum class IntentKind { kAddColumn, kBackfill, kCreateIndex, kDropIndex,
                         kAlterSubscription, kDropSubscription,
                         kCreateObject, kDropObject, kAlterObject,
                         kCreateTableAs, kImportForeignSchema, kSecurityLabel,
-                        kAlterDefaultPrivileges };
+                        kAlterDefaultPrivileges,
+                        kInsertRows, kUpdateRows, kMergeRows, kCopyRows };
 
 inline const std::map<std::string, IntentKind>& intent_kinds() {
   static const std::map<std::string, IntentKind> kKinds = {
@@ -142,6 +143,10 @@ inline const std::map<std::string, IntentKind>& intent_kinds() {
       {"import_foreign_schema", IntentKind::kImportForeignSchema},
       {"security_label", IntentKind::kSecurityLabel},
       {"alter_default_privileges", IntentKind::kAlterDefaultPrivileges},
+      {"insert_rows", IntentKind::kInsertRows},
+      {"update_rows", IntentKind::kUpdateRows},
+      {"merge_rows", IntentKind::kMergeRows},
+      {"copy_rows", IntentKind::kCopyRows},
   };
   return kKinds;
 }
@@ -316,11 +321,33 @@ namespace detail {
   throw SpecError(what, hint);
 }
 
-// Identifiers are validated rather than quoted-and-hoped. A spec is signed, so
-// this is not an injection defence -- whoever controls the identifier controls
-// the change. It is a determinism defence: an identifier needing quoting has a
-// different rendering in the plan than in the catalog, and the idempotence
-// check would compare unequal things.
+// Identifiers are validated here AND quoted when they are rendered into SQL.
+// Both, and the division between them is the point.
+//
+// A spec is signed, so neither is an injection defence -- whoever controls the
+// identifier controls the change. Validation is a DETERMINISM defence: an
+// identifier PostgreSQL would case-fold has a different rendering in the plan
+// than in the catalog, and the idempotence check would compare unequal things.
+// So [a-z0-9_] is required, which rules out case-folding and every character
+// that would need escaping.
+//
+// That was once thought to be sufficient, and it is not. It leaves reserved
+// words: `order`, `user`, `end`, `desc`, `limit`, `table` are all legal
+// PostgreSQL identifiers that match this shape, and all of them are legal
+// column names in a real legacy schema -- which is the kind of database this
+// tool exists for. Measured on 18.6, unquoted they are a syntax error in almost
+// every position a planner emits, and the exceptions are worse than the rule:
+// "SELECT ... FROM user.order" fails while "shop.orders.desc" parses, so the
+// breakage is by position rather than by name and does not show up in testing
+// against ordinary schemas.
+//
+// So the rule is: raw here, quoted there. The RAW name is the observation key,
+// the repository's concurrency key and the executor's advisory-lock key -- all
+// three must agree with the catalog, which returns names unquoted. The QUOTED
+// name is what reaches SQL, via detail::quote_identifier and
+// detail::quote_qualified in planner_base.h. Quoting is unconditional rather
+// than "when it looks necessary": deciding case by case needs PostgreSQL's own
+// keyword list, and quoting a name that did not need it changes nothing.
 inline void require_identifier(const std::string& v, const std::string& field,
                                std::size_t ordinal) {
   const std::string at = "intents[" + std::to_string(ordinal) + "]." + field;
@@ -1564,30 +1591,535 @@ inline void parse_grant_like(Intent& in) {
   }
 }
 
-inline void parse_delete_rows(Intent& in) {
-  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
-  detail::reject_unknown_keys(
-      in.body, {"kind", "schema", "table", "key", "where", "verify_remaining",
-                "preserve"}, at);
-  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
-  detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
-  detail::require_identifier(detail::require_string(in.body, "key", at), "key", in.ordinal);
-  // Read with value() rather than require_string(), so the refusal below is the
-  // one the author sees. require_string rejects an empty string first, with a
-  // generic message -- which made this hint dead code until a test noticed.
-  // Worded to match backfill's, because it is the same mistake.
-  const auto where = in.body.value("where", "");
-  if (!in.body.contains("where") || !in.body["where"].is_string() || where.empty()) {
-    detail::fail(at + " has no \"where\" clause",
-                 "An unfiltered delete empties the table. If that is really "
-                 "intended, write \"where\": \"true\" and say so in the "
-                 "rationale -- and consider whether drop_table is what you "
-                 "meant instead.");
+// --- the row source shared by every row-level DML kind ----------------------
+//
+// insert_rows, update_rows, merge_rows, copy_rows and delete_rows all have to
+// answer the same question -- WHICH ROWS -- and there are exactly three honest
+// answers. Parsing them in one place is what keeps the five kinds from drifting
+// into five dialects:
+//
+//   "values"  literal rows, in the spec, covered by its signature. This is what
+//             "specific rows" means: the change and the data are one reviewable
+//             artefact, and the ledger records the exact rows that were written.
+//   "select"  a query that produces the rows, for volume that cannot sensibly
+//             be written out.
+//   "where"   a predicate over the target, which only delete_rows can use --
+//             an INSERT has no existing row to filter.
+//
+// The pacing rule falls out of this split rather than being bolted on, and it
+// is the usual "measure, then say what decided it":
+//
+//   a `values` row count is known EXACTLY at plan time, so the planner runs it
+//   in one transaction when it is small -- a half-applied seed is worse than a
+//   failed one -- and paces it when it is not;
+//
+//   a `select` row count is NOT derivable, because planner.h is a pure function
+//   with no database in it (planner_purity_check.cpp enforces that), so those
+//   are always paced. The alternative is to state a number this tool cannot
+//   derive, which is the one thing it does not do. Pacing a small result costs
+//   one extra round trip.
+namespace detail {
+
+// Cells are JSON SCALARS ONLY -- string, number, boolean, null.
+//
+// A jsonb or array column takes its value as a STRING in PostgreSQL's own input
+// syntax ("{\"k\": 1}", "{x,y}"), which the column-typed cast then parses.
+// Measured on 18.6 (S21): with the cast, both round-trip exactly. Accepting a
+// nested JSON object here instead would be ambiguous the moment a column is
+// text[] rather than jsonb, and would make one spec mean two things.
+inline void require_scalar_cell(const json& cell, const std::string& at) {
+  if (cell.is_object() || cell.is_array()) {
+    fail(at + " must be a string, number, boolean or null",
+         "A jsonb or array value is written as a STRING in PostgreSQL's own "
+         "input syntax -- \"{\\\"k\\\": 1}\" for jsonb, \"{x,y}\" for text[] -- "
+         "and the cast to the column's real type parses it. A bare JSON object "
+         "would be ambiguous for a text[] column.");
+  }
+}
+
+// key_role is what the key means for this kind, used only in messages:
+// "identifies the rows to update", and so on. Empty means the key is optional.
+inline void parse_row_source(Intent& in, const std::string& at,
+                             const std::string& key_role,
+                             bool allow_where) {
+  const bool has_values = in.body.contains("values");
+  const bool has_select = in.body.contains("select");
+  const bool has_where = allow_where && in.body.contains("where") &&
+                         in.body["where"].is_string() &&
+                         !in.body["where"].get<std::string>().empty();
+
+  const int sources = (has_values ? 1 : 0) + (has_select ? 1 : 0) + (has_where ? 1 : 0);
+  if (sources == 0) {
+    fail(at + " names no rows",
+         std::string("Give exactly one of \"values\" (literal rows, signed with "
+                     "the spec), \"select\" (a query producing them)") +
+             (allow_where ? " or \"where\" (a predicate over the target)." : ".") +
+             " Which one you choose also decides pacing: a values count is "
+             "known at plan time, a select's is not.");
+  }
+  if (sources > 1) {
+    fail(at + " names rows more than one way",
+         "\"values\", \"select\"" +
+             std::string(allow_where ? " and \"where\"" : " and nothing else") +
+             " are alternatives, not layers. Two of them in one intent have no "
+             "single meaning, and guessing an order of precedence would make "
+             "the plan depend on something the spec never said.");
+  }
+
+  if (has_select) {
+    (void)require_string(in.body, "select", at);
+    if (!key_role.empty() || true) {
+      // A select is ALWAYS paced (its size is not derivable), and a keyset walk
+      // needs a key to walk. Refused here rather than in the planner so the
+      // author is told at authoring time.
+      if (!in.body.contains("key")) {
+        fail(at + " uses \"select\" but names no \"key\"",
+             "A select's row count cannot be measured without running it, so "
+             "these are always paced, and a paced walk needs a key column that "
+             "the select returns. Add \"key\", and make sure the select "
+             "produces it.");
+      }
+    }
+  }
+
+  if (has_values) {
+    if (!in.body.contains("columns") || !in.body["columns"].is_array() ||
+        in.body["columns"].empty()) {
+      fail(at + " has \"values\" but no non-empty \"columns\"",
+           "\"columns\" names what each row's entries are, in order. Positional "
+           "rows with no column list would make a spec that reads correctly and "
+           "writes the wrong column the moment the table gains one.");
+    }
+    std::set<std::string> seen;
+    for (const auto& c : in.body["columns"]) {
+      if (!c.is_string()) fail(at + ".columns entries must be strings", "");
+      const auto name = c.get<std::string>();
+      require_identifier(name, "columns", in.ordinal);
+      if (!seen.insert(name).second) {
+        fail(at + ".columns names \"" + name + "\" twice",
+             "Each column may appear once. Two entries for one column have no "
+             "meaning and PostgreSQL would refuse the statement anyway.");
+      }
+    }
+
+    if (!in.body["values"].is_array() || in.body["values"].empty()) {
+      fail(at + ".values must be a non-empty array of rows", "");
+    }
+    const auto arity = in.body["columns"].size();
+    std::size_t r = 0;
+    for (const auto& row : in.body["values"]) {
+      const std::string row_at = at + ".values[" + std::to_string(r) + "]";
+      if (!row.is_array()) {
+        fail(row_at + " must be an array",
+             "Each row is an array of values positionally matching \"columns\".");
+      }
+      if (row.size() != arity) {
+        fail(row_at + " has " + std::to_string(row.size()) + " values but " +
+                 "\"columns\" names " + std::to_string(arity),
+             "Every row must line up with the column list. A short row would "
+             "otherwise be padded with something the spec never said.");
+      }
+      for (std::size_t c = 0; c < row.size(); ++c) {
+        require_scalar_cell(row[c], row_at + "[" + std::to_string(c) + "]");
+      }
+      ++r;
+    }
+
+    // The key must be a column the rows actually carry, or neither the keyset
+    // walk nor the per-row match has anything to join on.
+    if (in.body.contains("key")) {
+      const auto key = in.body.value("key", "");
+      bool found = false;
+      for (const auto& c : in.body["columns"]) {
+        if (c.get<std::string>() == key) found = true;
+      }
+      if (!found) {
+        fail(at + ".key \"" + key + "\" is not in \"columns\"",
+             "The key " +
+                 (key_role.empty() ? std::string("has to be one of the values "
+                                                 "each row supplies")
+                                   : key_role) +
+                 ", so every row must carry it.");
+      }
+    }
+  }
+
+  // Pacing may be forced either way. Left out, the planner decides and says
+  // which reading decided it.
+  if (in.body.contains("paced") && !in.body["paced"].is_boolean()) {
+    fail(at + ".paced must be a boolean",
+         "true paces the change into short transactions; false runs it in one, "
+         "which is what a small seed usually wants. Omit it and the planner "
+         "chooses on the measured row count and says so.");
   }
   if (in.body.contains("verify_remaining") &&
       !in.body["verify_remaining"].is_string()) {
-    detail::fail(at + ".verify_remaining must be a string", "");
+    fail(at + ".verify_remaining must be a string", "");
   }
+}
+
+// preserve and assert_invariants, shared with backfill, which had them first.
+inline void parse_preserve_and_invariants(Intent& in, const std::string& at) {
+  if (in.body.contains("preserve")) {
+    const auto& p = in.body["preserve"];
+    if (!p.is_object()) fail(at + ".preserve must be an object", "");
+    reject_unknown_keys(p, {"schema", "table"}, at + ".preserve");
+    require_identifier(require_string(p, "schema", at + ".preserve"),
+                       "preserve.schema", in.ordinal);
+    require_identifier(require_string(p, "table", at + ".preserve"),
+                       "preserve.table", in.ordinal);
+    if (p.value("schema", "") == in.body.value("schema", "") &&
+        p.value("table", "") == in.body.value("table", "")) {
+      fail(at + ".preserve names the table being changed",
+           "The pre-image has to go somewhere else, or the change would "
+           "overwrite the record of what it changed.");
+    }
+  }
+  if (in.body.contains("assert_invariants")) {
+    if (!in.body["assert_invariants"].is_array()) {
+      fail(at + ".assert_invariants must be an array", "");
+    }
+    for (const auto& inv : in.body["assert_invariants"]) {
+      if (!inv.is_object()) fail(at + ".assert_invariants entries must be objects", "");
+      reject_unknown_keys(inv, {"name", "query"}, at + ".assert_invariants[]");
+      (void)require_string(inv, "name", at + ".assert_invariants[]");
+      (void)require_string(inv, "query", at + ".assert_invariants[]");
+    }
+  }
+}
+
+}  // namespace detail
+
+inline void parse_delete_rows(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(
+      in.body, {"kind", "schema", "table", "key", "where", "columns", "values",
+                "select", "paced", "verify_remaining", "preserve",
+                "assert_invariants"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "key", at), "key", in.ordinal);
+
+  // The three forms are alternatives. `where` is the one this kind had first,
+  // and its refusal is kept verbatim because it is the mistake people actually
+  // make -- but it now only fires when `where` is the form being used, so
+  // deleting an explicit list of keys no longer has to invent a predicate.
+  const bool has_values = in.body.contains("values");
+  const bool has_select = in.body.contains("select");
+  if (!has_values && !has_select) {
+    const auto where = in.body.value("where", "");
+    if (!in.body.contains("where") || !in.body["where"].is_string() || where.empty()) {
+      detail::fail(at + " names no rows to delete",
+                   "Give \"where\" (a predicate), \"values\" (the exact keys, "
+                   "which is what \"delete these rows\" usually means) or "
+                   "\"select\" (a query producing them). An unfiltered delete "
+                   "empties the table: if that is really intended, write "
+                   "\"where\": \"true\" and say so in the rationale -- and "
+                   "consider whether drop_table is what you meant instead.");
+    }
+  }
+  detail::parse_row_source(in, at, "identifies the rows to delete", true);
+  detail::parse_preserve_and_invariants(in, at);
+}
+
+// --- insert_rows ------------------------------------------------------------
+inline void parse_insert_rows(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(
+      in.body, {"kind", "schema", "table", "key", "columns", "values", "select",
+                "on_conflict", "conflict_target", "conflict_where",
+                "update_columns", "overriding", "paced", "verify_remaining",
+                "assert_invariants"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
+  if (in.body.contains("key")) {
+    detail::require_identifier(in.body.value("key", ""), "key", in.ordinal);
+  }
+  detail::parse_row_source(in, at, "", false);
+
+  // The select form has to say which columns it is filling, because
+  // INSERT ... SELECT with no column list binds by POSITION -- and a table that
+  // gains a column silently shifts every value one place to the left.
+  if (in.body.contains("select") &&
+      (!in.body.contains("columns") || !in.body["columns"].is_array() ||
+       in.body["columns"].empty())) {
+    detail::fail(at + " uses \"select\" but names no \"columns\"",
+                 "INSERT ... SELECT with no column list binds by position, so "
+                 "adding a column to the table would silently shift every "
+                 "value. Name the target columns, in the order the select "
+                 "returns them.");
+  }
+
+  const auto on_conflict = in.body.value("on_conflict", "refuse");
+  if (in.body.contains("on_conflict")) {
+    if (!in.body["on_conflict"].is_string() ||
+        (on_conflict != "refuse" && on_conflict != "skip" && on_conflict != "update")) {
+      detail::fail(at + ".on_conflict must be \"refuse\", \"skip\" or \"update\"",
+                   "refuse (the default) emits no ON CONFLICT clause, so a "
+                   "duplicate is an error and the migration stops; skip emits "
+                   "DO NOTHING, which makes re-running the spec harmless; "
+                   "update emits DO UPDATE, which is an upsert -- and if that "
+                   "is what you want against an existing table, merge_rows says "
+                   "it more directly.");
+    }
+  }
+  if (on_conflict != "refuse") {
+    if (!in.body.contains("conflict_target") ||
+        !in.body["conflict_target"].is_array() ||
+        in.body["conflict_target"].empty()) {
+      detail::fail(at + ".on_conflict \"" + on_conflict +
+                       "\" needs a \"conflict_target\"",
+                   "Name the columns of the unique index that decides what a "
+                   "conflict IS. PostgreSQL has no default arbiter: measured on "
+                   "18.6, ON CONFLICT with no matching unique index is refused "
+                   "outright rather than falling back to the primary key.");
+    }
+    for (const auto& c : in.body["conflict_target"]) {
+      if (!c.is_string()) detail::fail(at + ".conflict_target entries must be strings", "");
+      detail::require_identifier(c.get<std::string>(), "conflict_target", in.ordinal);
+    }
+  } else if (in.body.contains("conflict_target")) {
+    detail::fail(at + " has a \"conflict_target\" but on_conflict is \"refuse\"",
+                 "An arbiter with nothing to arbitrate is a spec whose author "
+                 "meant one thing and wrote another. Set on_conflict to \"skip\" "
+                 "or \"update\", or drop the target.");
+  }
+  if (in.body.contains("conflict_where") &&
+      (!in.body["conflict_where"].is_string() ||
+       in.body["conflict_where"].get<std::string>().empty())) {
+    detail::fail(at + ".conflict_where must be a non-empty string",
+                 "This is the predicate of a PARTIAL unique index, repeated so "
+                 "the arbiter matches it. Measured on 18.6: against a partial "
+                 "unique index, ON CONFLICT (col) is refused and "
+                 "ON CONFLICT (col) WHERE <predicate> is accepted.");
+  }
+  if (in.body.contains("update_columns")) {
+    if (on_conflict != "update") {
+      detail::fail(at + " has \"update_columns\" but on_conflict is not \"update\"",
+                   "Nothing would be updated, so the list has no effect.");
+    }
+    if (!in.body["update_columns"].is_array() || in.body["update_columns"].empty()) {
+      detail::fail(at + ".update_columns must be a non-empty array", "");
+    }
+    for (const auto& c : in.body["update_columns"]) {
+      if (!c.is_string()) detail::fail(at + ".update_columns entries must be strings", "");
+      detail::require_identifier(c.get<std::string>(), "update_columns", in.ordinal);
+    }
+  }
+  if (in.body.contains("overriding")) {
+    const auto o = in.body.value("overriding", "");
+    if (!in.body["overriding"].is_string() || (o != "system" && o != "user")) {
+      detail::fail(at + ".overriding must be \"system\" or \"user\"",
+                   "\"system\" emits OVERRIDING SYSTEM VALUE, which is the only "
+                   "way to write an explicit value into a GENERATED ALWAYS "
+                   "identity column; \"user\" emits OVERRIDING USER VALUE, "
+                   "which discards the value supplied and lets the sequence "
+                   "decide.");
+    }
+  }
+  detail::parse_preserve_and_invariants(in, at);
+}
+
+// --- update_rows ------------------------------------------------------------
+//
+// Not a duplicate of backfill, and the difference is the whole reason it
+// exists. backfill applies ONE EXPRESSION to MANY rows -- "region_id =
+// w.region_id where region_id is null". update_rows applies A DIFFERENT VALUE
+// TO EACH ROW, which no expression can say: row 41 becomes 'NA' and row 42
+// becomes 'EU' because someone decided so, not because a rule derives it.
+inline void parse_update_rows(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(
+      in.body, {"kind", "schema", "table", "key", "columns", "values", "select",
+                "paced", "verify_remaining", "preserve", "assert_invariants"},
+      at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "key", at), "key", in.ordinal);
+  detail::parse_row_source(in, at, "identifies the row each set of values "
+                                   "belongs to", false);
+
+  if (!in.body.contains("columns") || !in.body["columns"].is_array() ||
+      in.body["columns"].empty()) {
+    detail::fail(at + " needs a non-empty \"columns\"",
+                 "Name the key and the columns being set, in the order each "
+                 "row supplies them -- the select form needs it for the same "
+                 "reason as the values form: to know which returned column is "
+                 "which.");
+  }
+  const auto key = in.body.value("key", "");
+  bool key_in_columns = false;
+  for (const auto& c : in.body["columns"]) {
+    if (c.is_string() && c.get<std::string>() == key) key_in_columns = true;
+  }
+  if (!key_in_columns) {
+    detail::fail(at + ".columns does not include the key \"" + key + "\"",
+                 "The key identifies which row each set of values belongs to, "
+                 "so it has to be one of the columns supplied.");
+  }
+  if (in.body["columns"].size() < 2) {
+    detail::fail(at + " sets no columns",
+                 "\"columns\" holds the key plus at least one column to change. "
+                 "With only the key there is nothing to update, and if the "
+                 "intent was to prove those rows exist, an assert_invariants "
+                 "entry says that without writing to them.");
+  }
+  detail::parse_preserve_and_invariants(in, at);
+}
+
+// --- merge_rows -------------------------------------------------------------
+inline void parse_merge_rows(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(
+      in.body, {"kind", "schema", "table", "key", "columns", "values", "select",
+                "when_matched", "update_columns", "when_not_matched",
+                "when_not_matched_by_source", "paced", "verify_remaining",
+                "preserve", "assert_invariants"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "key", at), "key", in.ordinal);
+  detail::parse_row_source(in, at, "matches a source row to a target row", false);
+
+  if (!in.body.contains("columns") || !in.body["columns"].is_array() ||
+      in.body["columns"].empty()) {
+    detail::fail(at + " needs a non-empty \"columns\"",
+                 "Name the key and the columns the source carries, in order. "
+                 "MERGE needs them to build both the INSERT and the UPDATE.");
+  }
+  const auto key = in.body.value("key", "");
+  bool key_in_columns = false;
+  for (const auto& c : in.body["columns"]) {
+    if (!c.is_string()) detail::fail(at + ".columns entries must be strings", "");
+    if (c.get<std::string>() == key) key_in_columns = true;
+  }
+  if (!key_in_columns) {
+    detail::fail(at + ".columns does not include the key \"" + key + "\"",
+                 "The key is what ON matches source rows to target rows by, so "
+                 "the source has to carry it.");
+  }
+
+  const auto matched = in.body.value("when_matched", "update");
+  if (in.body.contains("when_matched") &&
+      (!in.body["when_matched"].is_string() ||
+       (matched != "update" && matched != "delete" && matched != "nothing"))) {
+    detail::fail(at + ".when_matched must be \"update\", \"delete\" or \"nothing\"",
+                 "What to do with a source row that already has a match in the "
+                 "target. \"update\" is the default.");
+  }
+  const auto not_matched = in.body.value("when_not_matched", "insert");
+  if (in.body.contains("when_not_matched") &&
+      (!in.body["when_not_matched"].is_string() ||
+       (not_matched != "insert" && not_matched != "nothing"))) {
+    detail::fail(at + ".when_not_matched must be \"insert\" or \"nothing\"", "");
+  }
+  const auto by_source = in.body.value("when_not_matched_by_source", "nothing");
+  if (in.body.contains("when_not_matched_by_source") &&
+      (!in.body["when_not_matched_by_source"].is_string() ||
+       (by_source != "nothing" && by_source != "delete"))) {
+    detail::fail(at + ".when_not_matched_by_source must be \"nothing\" or \"delete\"",
+                 "\"delete\" removes every target row the source does not "
+                 "mention, which turns this from an upsert into a full "
+                 "replacement of the table's contents.");
+  }
+  if (matched == "nothing" && not_matched == "nothing" && by_source == "nothing") {
+    detail::fail(at + " would do nothing",
+                 "All three WHEN branches are \"nothing\", so the statement has "
+                 "no effect. At least one branch has to act.");
+  }
+  if (in.body.contains("update_columns")) {
+    if (matched != "update") {
+      detail::fail(at + " has \"update_columns\" but when_matched is \"" +
+                       matched + "\"",
+                   "Nothing would be updated, so the list has no effect.");
+    }
+    if (!in.body["update_columns"].is_array() || in.body["update_columns"].empty()) {
+      detail::fail(at + ".update_columns must be a non-empty array", "");
+    }
+    for (const auto& c : in.body["update_columns"]) {
+      if (!c.is_string()) detail::fail(at + ".update_columns entries must be strings", "");
+      detail::require_identifier(c.get<std::string>(), "update_columns", in.ordinal);
+    }
+  }
+  detail::parse_preserve_and_invariants(in, at);
+}
+
+// --- copy_rows --------------------------------------------------------------
+//
+// COPY is here because it is one of PostgreSQL's ways to write rows and leaving
+// it out would be a gap rather than a decision. What the planner has to say
+// about it is mostly what it CANNOT do: measured on 18.6 (S21), a COPY whose
+// second of three rows violates a constraint rolls back all three, so it is one
+// transaction's worth of work whatever its size and the paced executor has
+// nothing to pace. It is not a fast path around constraints either -- foreign
+// keys and row triggers fire exactly as they do for INSERT.
+//
+// NO `WITH` OPTIONS, AND THE REASON IS THE CLIENT LIBRARY RATHER THAN A
+// JUDGEMENT. PostgreSQL 17 and 18 added ON_ERROR ignore, LOG_VERBOSITY and
+// REJECT_LIMIT, and they were in an earlier draft of this kind. libpqxx 7.10
+// offers exactly one sanctioned way to send COPY data -- pqxx::stream_to --
+// which builds its own statement and accepts no options; the two entry points
+// that would allow one, connection::raw_connection() and write_copy_line(), are
+// private and reachable only through internal gate classes. Probed against
+// 18.6, stream_to sends:
+//
+//     COPY cf_probe(id, code) FROM STDIN
+//
+// This tool records the statement that ran, verbatim, and it will not accept a
+// spec key it cannot honour -- a spec asking for ON_ERROR ignore and getting a
+// COPY that stops on the first bad row would be worse than no COPY at all. So
+// those keys are refused here, by name, rather than silently dropped.
+//
+// The gap is narrow in practice: ON_ERROR ignore is a data-loading convenience,
+// and a migration that is willing to skip rows it cannot parse is not really
+// making a reviewed change. Reaching it would mean linking libpq directly,
+// which this binary deliberately does not (libpq arrives through libpqxx, and
+// the packaging derives its dependencies from what is actually linked).
+inline void parse_copy_rows(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  for (const char* unsupported : {"on_error", "reject_limit", "freeze"}) {
+    if (in.body.contains(unsupported)) {
+      detail::fail(at + " uses \"" + unsupported +
+                       "\", which this build cannot send",
+                   "COPY's WITH options -- ON_ERROR, REJECT_LIMIT, "
+                   "LOG_VERBOSITY, FREEZE -- cannot be expressed through "
+                   "libpqxx's COPY interface, which builds its own "
+                   "\"COPY t(cols) FROM STDIN\" and takes no options. Rather "
+                   "than accept the key and quietly send a statement that does "
+                   "something else, it is refused. For rows that may not parse, "
+                   "insert_rows with \"on_conflict\": \"skip\" handles the "
+                   "duplicate case and reports honestly on the rest.");
+    }
+  }
+  detail::reject_unknown_keys(
+      in.body, {"kind", "schema", "table", "columns", "values",
+                "verify_remaining", "assert_invariants"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
+
+  // No `select` form: COPY ... FROM takes a stream, not a query. Someone
+  // reaching for that wants insert_rows, and saying so beats a generic
+  // unknown-key refusal.
+  if (in.body.contains("select")) {
+    detail::fail(at + " has \"select\", which COPY cannot take",
+                 "COPY ... FROM reads a stream of rows, not a query. To insert "
+                 "the result of a query, use insert_rows with \"select\" -- "
+                 "which also paces, where a COPY cannot.");
+  }
+  detail::parse_row_source(in, at, "", false);
+  if (!in.body.contains("values")) {
+    detail::fail(at + " needs \"values\"",
+                 "copy_rows sends literal rows over the protocol as "
+                 "COPY ... FROM STDIN. Reading a server-side file would need "
+                 "superuser and would put the real change somewhere the "
+                 "signature does not cover.");
+  }
+  if (!in.body.contains("columns") || !in.body["columns"].is_array() ||
+      in.body["columns"].empty()) {
+    detail::fail(at + " needs a non-empty \"columns\"",
+                 "COPY with no column list binds by position, so a table that "
+                 "gains a column would silently shift every value.");
+  }
+
 }
 
 inline void parse_create_table(Intent& in) {
@@ -1918,6 +2450,10 @@ inline Spec parse_spec(const json& doc) {
     case IntentKind::kCreateTable: parse_create_table(in); break;
     case IntentKind::kDropTable: parse_drop_table(in); break;
     case IntentKind::kDeleteRows: parse_delete_rows(in); break;
+    case IntentKind::kInsertRows: parse_insert_rows(in); break;
+    case IntentKind::kUpdateRows: parse_update_rows(in); break;
+    case IntentKind::kMergeRows:  parse_merge_rows(in);  break;
+    case IntentKind::kCopyRows:   parse_copy_rows(in);   break;
     case IntentKind::kSetRowSecurity: parse_set_row_security(in); break;
     case IntentKind::kCreatePolicy: parse_create_policy(in); break;
     case IntentKind::kDropPolicy: parse_drop_policy(in); break;

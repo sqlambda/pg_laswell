@@ -155,6 +155,74 @@ inline std::vector<Case> cases() {
           {"where","id > 40"}},
      "SELECT count(*)::text FROM cf.t", "40"},
 
+    // --- the row-level DML family -------------------------------------------
+    //
+    // Every one of these supplies `amount` as well as `code`, because
+    // set_not_null on amount runs a few cases below and a row left NULL here
+    // would fail it -- a nice demonstration that the conformance suite is one
+    // database evolving, not a set of independent cases.
+
+    {"insert_rows", {},
+     json{{"kind","insert_rows"},{"schema","cf"},{"table","t"},{"key","id"},
+          {"columns",json::array({"id","amount","code"})},
+          {"values",json::array({json::array({201,7,"i1"}),
+                                 json::array({202,8,"i2"})})},
+          {"on_conflict","skip"},{"conflict_target",json::array({"id"})}},
+     "SELECT string_agg(code,',' ORDER BY id) FROM cf.t WHERE id IN (201,202)",
+     "i1,i2"},
+
+    // The same intent again, proving ON CONFLICT DO NOTHING really is
+    // idempotent: re-running it must change nothing and must not fail.
+    {"insert_rows_is_idempotent", {},
+     json{{"kind","insert_rows"},{"schema","cf"},{"table","t"},{"key","id"},
+          {"columns",json::array({"id","amount","code"})},
+          {"values",json::array({json::array({201,999,"CHANGED"}),
+                                 json::array({202,999,"CHANGED"})})},
+          {"on_conflict","skip"},{"conflict_target",json::array({"id"})}},
+     "SELECT string_agg(code,',' ORDER BY id) FROM cf.t WHERE id IN (201,202)",
+     "i1,i2"},
+
+    // Per-row values: 201 and 202 take DIFFERENT codes from one statement,
+    // which is the whole reason this kind exists beside backfill.
+    {"update_rows", {},
+     json{{"kind","update_rows"},{"schema","cf"},{"table","t"},{"key","id"},
+          {"columns",json::array({"id","code"})},
+          {"values",json::array({json::array({201,"u1"}),
+                                 json::array({202,"u2"})})}},
+     "SELECT string_agg(code,',' ORDER BY id) FROM cf.t WHERE id IN (201,202)",
+     "u1,u2"},
+
+    // MERGE doing both halves at once: 202 exists and is updated, 203 does not
+    // and is inserted.
+    {"merge_rows", {},
+     json{{"kind","merge_rows"},{"schema","cf"},{"table","t"},{"key","id"},
+          {"columns",json::array({"id","amount","code"})},
+          {"values",json::array({json::array({202,8,"m2"}),
+                                 json::array({203,9,"m3"})})}},
+     "SELECT string_agg(code,',' ORDER BY id) FROM cf.t WHERE id IN (202,203)",
+     "m2,m3"},
+
+    {"copy_rows", {},
+     json{{"kind","copy_rows"},{"schema","cf"},{"table","t"},
+          {"columns",json::array({"id","amount","code"})},
+          // Codes deliberately not "c4"/"c5": the backfill case above seeds
+          // code = 'c'||g for 1..50 and add_unique_constraint made code
+          // unique, so those would collide with rows 4 and 5.
+          {"values",json::array({json::array({204,10,"z4"}),
+                                 json::array({205,11,"z5"})})}},
+     "SELECT string_agg(code,',' ORDER BY id) FROM cf.t WHERE id IN (204,205)",
+     "z4,z5"},
+
+    // Clear the rows this family added, so the cases below it -- which count
+    // and constrain cf.t -- see the table they were written against.
+    {"delete_rows_by_key", {},
+     json{{"kind","delete_rows"},{"schema","cf"},{"table","t"},{"key","id"},
+          {"columns",json::array({"id"})},
+          {"values",json::array({json::array({201}), json::array({202}),
+                                 json::array({203}), json::array({204}),
+                                 json::array({205})})}},
+     "SELECT count(*)::text FROM cf.t", "40"},
+
     {"set_not_null", {},
      json{{"kind","set_not_null"},{"schema","cf"},{"table","t"},{"column","amount"}},
      "SELECT attnotnull::text FROM pg_attribute WHERE attrelid='cf.t'::regclass"

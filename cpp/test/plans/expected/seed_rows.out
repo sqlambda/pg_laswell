@@ -1,0 +1,17 @@
+Plan for 0007-seed-regions  (digest 5e35abd4f3b0…)
+
+-- transaction group 1 ---------------- atomic --
+ 0. insert_rows
+    INSERT INTO "shop"."region" ("id", "code", "name")
+VALUES (1, 'NA', 'North America'),
+       (2, 'EU', 'Europe'),
+       (3, 'APAC', 'Asia Pacific')
+ON CONFLICT ("id") DO NOTHING;
+    lock: RowExclusiveLock on shop.region for one transaction; no table-level exclusive lock
+    why:  3 literal rows, at or below dml_single_txn_rows (1000), so this runs in ONE transaction and is all-or-nothing -- a half-applied set of literal rows is worse than one that failed; ON CONFLICT DO NOTHING, so re-running this spec against a database that already has these rows changes nothing
+ 1. insert_rows
+    SELECT setval('shop.region_id_seq', s.v)
+  FROM (SELECT max("id") AS v FROM "shop"."region") s
+ WHERE s.v IS NOT NULL;
+    lock: no table lock; a row lock on the sequence for the duration of the setval
+    why:  explicit values were supplied for shop.region.id, which draws from shop.region_id_seq. Inserting an explicit value does NOT advance a sequence, so without this the application's next insert collides on a duplicate key -- after the migration has reported success. Measured on 18.6

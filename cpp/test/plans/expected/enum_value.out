@@ -2,7 +2,7 @@ Plan for 0003-enum-value  (digest 409ec6e338f7…)
 
 -- transaction group 1 ---------------- atomic --
  0. add_enum_value
-    ALTER TYPE shop.status ADD VALUE 'cancelled';
+    ALTER TYPE "shop"."status" ADD VALUE 'cancelled';
     lock: no table lock; the type's row is updated
     why:  added in its own transaction because PostgreSQL refuses to USE a new enum label until the transaction that added it has committed ("unsafe use of new value") -- so anything backfilling with cancelled must come after this commits, which this boundary guarantees
 

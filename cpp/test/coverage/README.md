@@ -16,9 +16,14 @@ code -- only from PostgreSQL, which is what the version-stamped files are for.
 Three exclusions are deliberate and are counted separately rather than hidden:
 
 * **maintenance** -- REINDEX, VACUUM, ANALYZE, CLUSTER and friends. Excluded by
-  the second test in ROADMAP.md: a migration is a change to schema state,
-  applied exactly once, and these are none of those things.
+  the second test this project applies to every intent kind: a migration is a
+  change to state, applied exactly once, and these are neither. They change
+  nothing a catalog can show afterwards, and the ledger keys on a spec digest,
+  so a repeatable operation would run once and never again.
 * **cluster- and instance-wide** -- roles, databases, tablespaces, ALTER
   SYSTEM, event triggers. These live outside the database a migration connects
   to, and outside what a per-database ledger can record.
-* **not DDL** -- SELECT, INSERT, transaction control, session settings.
+* **not DDL** -- SELECT, transaction control, session settings. INSERT, UPDATE,
+  DELETE, MERGE and COPY used to be counted here and are not any more: they are
+  covered by the row-level intent kinds, and are scored above like everything
+  else.

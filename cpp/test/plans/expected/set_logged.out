@@ -2,7 +2,7 @@ Plan for 0006-set-logged  (digest 6f7042762561…)
 
 -- transaction group 1 ---------------- atomic --
  0. set_logged
-    ALTER TABLE shop.orders SET LOGGED;
+    ALTER TABLE "shop"."orders" SET LOGGED;
     lock: AccessExclusiveLock on shop.orders for the whole rewrite
     why:  measured: this REWRITES the table -- relfilenode changes in both directions -- so 2.0 GiB is copied under an exclusive lock, and every byte of it is written to WAL as it goes
 

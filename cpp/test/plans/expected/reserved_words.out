@@ -1,0 +1,31 @@
+Plan for 0009-reserved-words  (digest 02af752a535f…)
+
+-- transaction group 1 ---------------- atomic --
+ 0. add_column
+    ALTER TABLE "user"."order" ADD COLUMN "table" text;
+    COMMENT ON COLUMN "user"."order"."table" IS 'Reserved.';
+    lock: AccessExclusiveLock
+    why:  column absent; nullable with no default is catalog-only
+ 1. create_index
+    CREATE INDEX "limit" ON "user"."order" USING btree ("desc");
+    COMMENT ON INDEX "user"."limit" IS 'Reserved.';
+    lock: ShareLock (blocks writes for the whole build)
+    why:  size 8.0 KiB < 64 MiB ceiling, 0 lock waiters -> plain build (transactional, cannot leave an invalid index)
+
+-- transaction group 2 ---------------- NOT atomic: paced, many commits --
+ 2. backfill
+    WITH batch AS (
+  SELECT "order"."end"
+    FROM "user"."order"
+   WHERE "order"."end" > $1 AND ("desc" IS NULL)
+   ORDER BY "order"."end"
+   LIMIT $2
+   FOR UPDATE OF "order"
+)
+UPDATE "user"."order"
+   SET "desc" = 'x'
+  FROM batch AS b
+ WHERE "order"."end" = b."end"
+RETURNING "order"."end";
+    lock: RowExclusiveLock plus row locks, released at every commit
+    why:  20 rows estimated; keyset walk on end via order_pkey, 1000 rows per batch, committing on a lock waiter or 1000ms

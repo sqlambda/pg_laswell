@@ -3,9 +3,107 @@
 ## 0.1.0 (unreleased)
 
 The whole path works: repository, signing, planning, dry run, paced execution,
-ledger. 334 tests green on GCC 14.2 and Clang 22, under AddressSanitizer/UBSan
+ledger. 354 tests green on GCC 14.2 and Clang 22, under AddressSanitizer/UBSan
 and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
 `--call` contract test.
+
+- **Row-level DML: `insert_rows`, `update_rows`, `merge_rows`, `copy_rows`, and
+  two new forms for `delete_rows`.** 84 kinds. Every PostgreSQL statement that
+  writes rows except `TRUNCATE`, which stays deliberately absent. Each names its
+  rows exactly one way, and the choice decides the pacing: a `values` count is
+  known at planning time, so it runs in one transaction below
+  `dml_single_txn_rows` and is paced above it; a `select` count is not derivable
+  by a pure planner, so those are always paced rather than sized by a guess.
+  Five of the six need no executor change at all — the paced runner was already
+  generic over the statement.
+
+  What the planner now refuses before anything runs, each from a reading and
+  each measured on 18.6 (`cpp/test/spikes/s21_dml.sh`):
+
+  - **A `merge_rows` whose key has no unique index.** `MERGE`'s `ON` is not a
+    key constraint: against a table with two rows sharing a key, *one* source
+    row updated *both* target rows — no error, nothing in the row count to
+    notice. An `INSERT` would have hit the unique index; a `MERGE` has none.
+  - **`ON CONFLICT` with no matching arbiter.** PostgreSQL does not fall back to
+    the primary key, it refuses; and against a *partial* unique index the
+    arbiter must repeat the index predicate. The refusal names the predicate to
+    copy.
+  - **A `GENERATED ALWAYS` identity column without `overriding`, and a `STORED`
+    generated column at all.**
+  - **Duplicate keys inside `values`**, which break three different ways
+    depending on the statement.
+  - **`when_not_matched_by_source: delete` when the statement would be paced** —
+    it means "delete every target row the source does not mention", and a paced
+    merge sees one batch at a time, so the first batch would delete everything
+    outside it.
+
+  Two findings changed the design rather than confirming it:
+
+  - **A paced statement takes its cursor from the batch, never from the
+    mutation's own `RETURNING`.** A paced `MERGE` whose batch matched nothing
+    returned zero rows, which the executor reads as "the walk is finished" — the
+    step would have reported success having merged nothing. The same trap waits
+    for an update whose rows have gone and an insert whose every row hits
+    `DO NOTHING`.
+  - **A sequence is not advanced by explicit values**, so a seed that succeeds
+    leaves the application's next insert failing on a duplicate key. Where
+    explicit values are supplied for a column that owns a sequence, a second
+    step emits the `setval` that closes the gap — deriving the number from the
+    table at execution time, never from the spec, and writing nothing when the
+    table is empty.
+
+  **Known gap, and it is not gated yet.** All of this is measured against
+  PostgreSQL 18. `merge_rows` is the one kind that does not reach as far back as
+  the rest: its paced form emits `MERGE ... RETURNING` and
+  `when_not_matched_by_source` emits `WHEN NOT MATCHED BY SOURCE`, both
+  PostgreSQL 17+, and measured, both are a syntax error on 15 and 16. Nothing
+  refuses them on an older server, and no test paces a merge against a real
+  database -- the conformance and reserved-word cases are each two rows, below
+  `dml_single_txn_rows`, so both take the unpaced path -- so CI on 15 and 16
+  would pass while the kind is broken there. The unpaced merge works from 15,
+  and the paced insert, update, delete and backfill all run clean on 15.
+
+  `copy_rows` is the one kind that is never paced and cannot be: a `COPY` whose
+  second of three rows violates a constraint rolls back all three. It accepts no
+  `WITH` options and **refuses `on_error`, `reject_limit` and `freeze` by name**
+  rather than ignoring them — libpqxx offers one sanctioned way to send `COPY`
+  data and it builds its own statement with no `WITH` clause. A spec asking for
+  `ON_ERROR ignore` and silently getting a copy that stops on the first bad row
+  would be worse than no copy at all.
+
+- **Every identifier the planner emits is now quoted.** A column named `order`,
+  `user`, `end`, `desc` or `limit` is legal PostgreSQL and matches the
+  `[a-z0-9_]` shape `require_identifier` permits, so it reached the planner and
+  came out as broken SQL. Measured on 18.6, the breakage is **by position, not
+  by name**, which is why it survived: a schema or table named this way fails
+  everywhere -- `CREATE TABLE user.order`, and even `SELECT ... FROM user.order`
+  -- a column fails in every DDL position (`ADD COLUMN`, `ALTER COLUMN`,
+  `DROP COLUMN`, `RENAME COLUMN`, an index column list, an `INSERT` column list,
+  a `SET` clause, a `VALUES` alias list), and yet a fully qualified
+  `schema.table.column` reference parses unquoted. Testing against ordinary
+  schemas could never find it.
+
+  The rule is now stated once, in `require_identifier`: **raw here, quoted
+  there.** The raw name stays the observation key, the repository's concurrency
+  key and the executor's advisory-lock key -- all three must agree with the
+  catalog, which returns names unquoted. The quoted name is what reaches SQL,
+  through `quote_identifier` and the new `quote_qualified`, which splits a
+  `schema.table` key and quotes both halves.
+
+  Verified by applying 18 intent kinds to a schema in which *every* identifier
+  is a reserved word (`DatabaseTest.ReservedWordIdentifiersAreQuotedEverywhere\
+  TheyAreEmitted`), and by a plan transcript. Every plan digest moves; the
+  transcripts are the diff, and nothing but the quoting changed in them.
+
+- **`planner.h` split.** `planner_base.h` holds `Step`, `Plan` and the rendering
+  helpers; `planner_dml.h` holds the six row-level planners. `planner.h` keeps
+  the single `plan_migration` entry point, and the purity check still covers the
+  whole include graph. The six committed plan transcripts are byte-identical
+  across the split.
+
+- **New observations:** `attidentity`, `attgenerated` and the owning sequence
+  per column, which is what makes the four insert refusals derivable rather than
+  discovered at execution.
 
 - **`--call <tool>`** runs one tool and **exits non-zero when it reports a
   problem**, which is what CI wants and the pipe alone did not give. Not a CLI:
