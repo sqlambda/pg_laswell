@@ -14,6 +14,12 @@ concurrency:
 
 env:
   DEBIAN_FRONTEND: noninteractive
+  # Pinned, and built from source by .github/actions/libpqxx rather than taken
+  # from apt. This project targets the current libpqxx and uses its current
+  # spelling -- exec(sql, pqxx::params), which 7.9 introduced -- so whatever
+  # version a runner happens to package is not a supported input. release.yml
+  # pins the same version for the same reason; keep the two in step.
+  PQXX_VERSION: 8.0.2
 
 jobs:
   # Both compilers, because they disagree about -Wconversion around the OpenSSL
@@ -50,8 +56,12 @@ jobs:
         run: |
           sudo apt-get update -o DPkg::Lock::Timeout=300
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build libpqxx-dev libpq-dev nlohmann-json3-dev \
+            cmake ninja-build libpq-dev nlohmann-json3-dev \
             libgtest-dev libssl-dev mandoc postgresql-client
+      - name: Build libpqxx from source, not from apt
+        uses: ./.github/actions/libpqxx
+        with:
+          version: ${{ env.PQXX_VERSION }}
       - name: Configure
         run: cmake -S cpp -B build -G Ninja -DCMAKE_CXX_COMPILER=${{ matrix.compiler }}
       - name: Build
@@ -89,8 +99,12 @@ jobs:
         run: |
           sudo apt-get update -o DPkg::Lock::Timeout=300
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build libpqxx-dev libpq-dev nlohmann-json3-dev \
+            cmake ninja-build libpq-dev nlohmann-json3-dev \
             libgtest-dev libssl-dev mandoc postgresql-client
+      - name: Build libpqxx from source, not from apt
+        uses: ./.github/actions/libpqxx
+        with:
+          version: ${{ env.PQXX_VERSION }}
       - name: Configure
         run: cmake -S cpp -B build -G Ninja -DPGLASWELL_SANITIZER=${{ matrix.sanitizer }}
       - name: Build
@@ -125,8 +139,12 @@ jobs:
         run: |
           sudo apt-get update -o DPkg::Lock::Timeout=300
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build libpqxx-dev libpq-dev nlohmann-json3-dev \
+            cmake ninja-build libpq-dev nlohmann-json3-dev \
             libgtest-dev libssl-dev mandoc valgrind postgresql-client
+      - name: Build libpqxx from source, not from apt
+        uses: ./.github/actions/libpqxx
+        with:
+          version: ${{ env.PQXX_VERSION }}
       - name: Configure and build
         run: cmake -S cpp -B build -G Ninja && cmake --build build
       - name: Valgrind
@@ -155,8 +173,12 @@ jobs:
         run: |
           sudo apt-get update -o DPkg::Lock::Timeout=300
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build libpqxx-dev libpq-dev nlohmann-json3-dev \
+            cmake ninja-build libpq-dev nlohmann-json3-dev \
             libgtest-dev libssl-dev mandoc pgbouncer postgresql-client
+      - name: Build libpqxx from source, not from apt
+        uses: ./.github/actions/libpqxx
+        with:
+          version: ${{ env.PQXX_VERSION }}
       - name: Configure and build
         run: cmake -S cpp -B build -G Ninja && cmake --build build
       - name: Read-only tools work through a pooler
@@ -171,8 +193,12 @@ jobs:
         run: |
           sudo apt-get update -o DPkg::Lock::Timeout=300
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build libpqxx-dev libpq-dev nlohmann-json3-dev \
+            cmake ninja-build libpq-dev nlohmann-json3-dev \
             libssl-dev rpm file
+      - name: Build libpqxx from source, not from apt
+        uses: ./.github/actions/libpqxx
+        with:
+          version: ${{ env.PQXX_VERSION }}
       - name: Build packages
         run: |
           cmake -S cpp -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF

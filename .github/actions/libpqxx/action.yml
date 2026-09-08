@@ -1,0 +1,58 @@
+name: Build libpqxx
+description: >
+  Build a pinned libpqxx from source, statically, and point pkg-config at it.
+
+  Deliberately NOT the distribution's libpqxx-dev. This project targets the
+  current libpqxx and uses its current spelling -- exec(sql, pqxx::params),
+  which 7.9 introduced -- so a runner carrying an older package fails the build
+  outright. That is what happened on the very first CI run: every one of the
+  twelve jobs died in Build with "no matching function for call to
+  pqxx::transaction<>::exec(..., pqxx::params)", because release.yml had been
+  moved to a pinned source build and tests.yml had been left on apt.
+
+  Same method release.yml already uses, and the same pg_licht uses, kept in one
+  place so the two workflows cannot drift apart again.
+
+inputs:
+  version:
+    description: libpqxx release tag to build.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # libpqxx compiles against libpq's headers, so a libpq upgrade must not
+    # reuse an object built before it. Part of the cache key for that reason.
+    - name: Record the libpq version for the cache key
+      shell: bash
+      run: echo "LIBPQ_VERSION=$(dpkg-query -W -f='${Version}' libpq-dev)" >> "$GITHUB_ENV"
+
+    # Installed under $HOME rather than /usr/local so it can be cached: the
+    # generated libpqxx.pc bakes in its prefix, so the restore path has to match
+    # the install path exactly.
+    - name: Cache libpqxx
+      id: pqxx
+      uses: actions/cache@v4
+      with:
+        path: ~/pqxx
+        key: pqxx-${{ inputs.version }}-${{ runner.os }}-${{ runner.arch }}-libpq-${{ env.LIBPQ_VERSION }}
+
+    - name: Build libpqxx ${{ inputs.version }}
+      if: steps.pqxx.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        curl -fsSL "https://github.com/jtv/libpqxx/archive/refs/tags/${{ inputs.version }}.tar.gz" \
+          | tar -xz -C /tmp
+        cmake -S "/tmp/libpqxx-${{ inputs.version }}" -B /tmp/libpqxx-build \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DBUILD_SHARED_LIBS=OFF \
+          -DSKIP_BUILD_TEST=ON \
+          -DCMAKE_INSTALL_PREFIX="$HOME/pqxx"
+        cmake --build /tmp/libpqxx-build -j"$(nproc)"
+        cmake --install /tmp/libpqxx-build
+
+    # lib64 as well as lib: CMake picks the directory, not this action.
+    - name: Point pkg-config at it
+      shell: bash
+      run: |
+        echo "PKG_CONFIG_PATH=$HOME/pqxx/lib/pkgconfig:$HOME/pqxx/lib64/pkgconfig" >> "$GITHUB_ENV"

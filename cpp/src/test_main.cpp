@@ -3038,7 +3038,8 @@ TEST_F(ToolTest, CopyRowsTravelsThroughTheRealExecutorAndLandsInTheLedger) {
   }
 
   // And the ledger records the statement that ran, verbatim.
-  const auto sql = r.txn().exec(
+  const auto sql = pglaswell::pqxx_exec(
+      r.txn(),
       "SELECT s.sql FROM laswell.step s JOIN laswell.job j ON j.job_id = s.job_id"
       " WHERE j.job_id = $1::uuid AND s.kind = 'copy_rows' ORDER BY s.ordinal LIMIT 1",
       pqxx::params{p["jobId"].get<std::string>()});
@@ -7342,8 +7343,8 @@ TEST_F(DatabaseTest, TheRemainingKindsRunAndRowSecurityReallyHidesEverything) {
     pglaswell::WriteSession w(cfg);
     w.begin("pg_laswell/test/rest-delete");
     const std::string stmt = steps[0]->sql[0];
-    const auto rows = w.txn().exec(stmt.substr(0, stmt.size() - 1),
-                                   pqxx::params{"0", 1000});
+    const auto rows = pglaswell::pqxx_exec(
+        w.txn(), stmt.substr(0, stmt.size() - 1), pqxx::params{"0", 1000});
     w.commit();
     EXPECT_EQ(rows.size(), 40u) << "the paced delete statement is malformed";
   }
@@ -9272,7 +9273,8 @@ TEST_F(DatabaseTest, EveryIntentKindPlansAndRunsAgainstARealDatabase) {
             pglaswell::WriteSession b(cfg);
             b.begin("pg_laswell/conformance/batch");
             const auto rows =
-                b.txn().exec(trimmed, pqxx::params{cursor, 1000});
+                pglaswell::pqxx_exec(b.txn(), trimmed,
+                                     pqxx::params{cursor, 1000});
             for (const auto& row : rows) cursor = row[0].as<std::string>();
             b.commit();
             if (rows.empty()) break;
@@ -9501,7 +9503,8 @@ TEST_F(DatabaseTest, ReservedWordIdentifiersAreQuotedEverywhereTheyAreEmitted) {
           for (int pass = 0; pass < 100; ++pass) {
             pglaswell::WriteSession b(cfg);
             b.begin("pg_laswell/test/reserved-batch");
-            const auto rows = b.txn().exec(trimmed, pqxx::params{cursor, 1000});
+            const auto rows = pglaswell::pqxx_exec(
+                b.txn(), trimmed, pqxx::params{cursor, 1000});
             for (const auto& row : rows) cursor = row[0].as<std::string>();
             b.commit();
             if (rows.empty()) break;
