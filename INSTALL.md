@@ -7,13 +7,13 @@ see [BUILD.md](BUILD.md).
 
 | target | artifact |
 |---|---|
-| Linux x86_64 (portable) | `pg_laswell_mcp-linux-x86_64.tar.gz` |
-| Linux arm64 (portable) | `pg_laswell_mcp-linux-arm64.tar.gz` |
-| Debian 13 x86_64 | `pg_laswell_mcp-linux-x86_64-debian13.deb` |
-| Debian 13 arm64 | `pg_laswell_mcp-linux-arm64-debian13.deb` |
-| Rocky/RHEL 9 x86_64 | `pg_laswell_mcp-linux-x86_64-rocky9.rpm` |
-| Rocky/RHEL 9 arm64 | `pg_laswell_mcp-linux-arm64-rocky9.rpm` |
-| macOS arm64 | `pg_laswell_mcp-macos-arm64.tar.gz` |
+| Linux x86_64 (portable) | `pg_laswell-linux-x86_64.tar.gz` |
+| Linux arm64 (portable) | `pg_laswell-linux-arm64.tar.gz` |
+| Debian 13 x86_64 | `pg_laswell-linux-x86_64-debian13.deb` |
+| Debian 13 arm64 | `pg_laswell-linux-arm64-debian13.deb` |
+| Rocky/RHEL 9 x86_64 | `pg_laswell-linux-x86_64-rocky9.rpm` |
+| Rocky/RHEL 9 arm64 | `pg_laswell-linux-arm64-rocky9.rpm` |
+| macOS arm64 | `pg_laswell-macos-arm64.tar.gz` |
 
 ```bash
 cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release

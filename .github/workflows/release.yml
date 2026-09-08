@@ -48,38 +48,38 @@ jobs:
           # rpm below exist because a tarball can declare no dependency at all;
           # anyone on an older glibc should build from source.
           - os: ubuntu-latest
-            artifact: pg_laswell_mcp-linux-x86_64
+            artifact: pg_laswell-linux-x86_64
             distro: ubuntu
             extension: tar.gz
           - os: ubuntu-24.04-arm
-            artifact: pg_laswell_mcp-linux-arm64
+            artifact: pg_laswell-linux-arm64
             distro: ubuntu
             extension: tar.gz
           - os: ubuntu-latest
             container: debian:trixie
-            artifact: pg_laswell_mcp-linux-x86_64-debian13
+            artifact: pg_laswell-linux-x86_64-debian13
             distro: debian
             extension: deb
           - os: ubuntu-24.04-arm
             container: debian:trixie
-            artifact: pg_laswell_mcp-linux-arm64-debian13
+            artifact: pg_laswell-linux-arm64-debian13
             distro: debian
             extension: deb
           - os: ubuntu-latest
             container: rockylinux:9
-            artifact: pg_laswell_mcp-linux-x86_64-rocky9
+            artifact: pg_laswell-linux-x86_64-rocky9
             distro: rocky
             extension: rpm
           - os: ubuntu-24.04-arm
             container: rockylinux:9
-            artifact: pg_laswell_mcp-linux-arm64-rocky9
+            artifact: pg_laswell-linux-arm64-rocky9
             distro: rocky
             extension: rpm
           # GitHub's macos-latest is Apple silicon. There is no x86_64 macOS
           # target: the runners for it are being retired, and Rosetta runs the
           # arm64 binary anyway.
           - os: macos-latest
-            artifact: pg_laswell_mcp-macos-arm64
+            artifact: pg_laswell-macos-arm64
             distro: macos
             extension: tar.gz
 
@@ -364,13 +364,13 @@ jobs:
       - name: All seven artifacts must be present
         run: |
           missing=0
-          for f in pg_laswell_mcp-linux-x86_64.tar.gz \
-                   pg_laswell_mcp-linux-arm64.tar.gz \
-                   pg_laswell_mcp-linux-x86_64-debian13.deb \
-                   pg_laswell_mcp-linux-arm64-debian13.deb \
-                   pg_laswell_mcp-linux-x86_64-rocky9.rpm \
-                   pg_laswell_mcp-linux-arm64-rocky9.rpm \
-                   pg_laswell_mcp-macos-arm64.tar.gz; do
+          for f in pg_laswell-linux-x86_64.tar.gz \
+                   pg_laswell-linux-arm64.tar.gz \
+                   pg_laswell-linux-x86_64-debian13.deb \
+                   pg_laswell-linux-arm64-debian13.deb \
+                   pg_laswell-linux-x86_64-rocky9.rpm \
+                   pg_laswell-linux-arm64-rocky9.rpm \
+                   pg_laswell-macos-arm64.tar.gz; do
             [ -f "dist/$f" ] || { echo "::error::missing artifact $f"; missing=1; }
           done
           ls -l dist
