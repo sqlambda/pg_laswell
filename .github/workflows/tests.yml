@@ -214,6 +214,18 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    # Sharded because it ran serially for 12 minutes while every other job had
+    # been finished for ten of them, and it is embarrassingly parallel: four
+    # tests were 43% of it, one of them 149s on its own. gtest's own
+    # --gtest_shard_index splits by test, so coverage is identical to one
+    # process -- the union of the shards is the same filtered set -- and the
+    # total compute is unchanged. Only the wall clock moves, down to roughly
+    # the slowest single test.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    name: valgrind (${{ matrix.shard }})
     services:
       postgres:
         image: postgres:18
@@ -252,6 +264,14 @@ jobs:
           test -n "$NAMES" || { echo "::error::$EXCL listed no tests"; exit 1; }
           FILTER="-$NAMES"
           echo "gtest filter: $FILTER"
+          # strategy.job-total is the matrix length, so adding or removing a
+          # shard above needs no edit here. Hardcoding 4 would silently drop
+          # tests the day the matrix changed: a shard count larger than
+          # GTEST_TOTAL_SHARDS means the extra shards run nothing, and a
+          # smaller one means the tail is never run at all -- in both cases
+          # every job still passes.
+          GTEST_TOTAL_SHARDS=${{ strategy.job-total }} \
+          GTEST_SHARD_INDEX=${{ matrix.shard }} \
           valgrind --error-exitcode=99 --leak-check=full --track-origins=yes \
             ./pg_laswell_mcp_test "--gtest_filter=$FILTER"
 
