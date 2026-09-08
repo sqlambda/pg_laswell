@@ -18,7 +18,18 @@ set -euo pipefail
 
 BIN="${1:?usage: run-pooled-tests.sh <path to pg_laswell_mcp>}"
 PG_PORT="${PG_PORT:-5432}"
-PG_HOST="${PG_HOST:-localhost}"
+# 127.0.0.1, not localhost, and this is not pedantry.
+#
+# On a GitHub runner `localhost` resolves to both 127.0.0.1 and ::1, and a
+# service container publishes on IPv4 only. psql walks every resolved address
+# and finds the server; PgBouncer resolves through c-ares and may settle on ::1,
+# where nothing is listening -- so the pooler comes up, accepts clients, and
+# cannot reach the backend. That produces exactly the shape seen on CI:
+# everything through the pooler fails while the direct control passes.
+#
+# Naming the address costs nothing if that was not the cause, and removes it as
+# a candidate if it was.
+PG_HOST="${PG_HOST:-127.0.0.1}"
 PG_USER="${PG_USER:-postgres}"
 PG_PASS="${PG_PASS:-postgres}"
 PG_DB="${PG_DB:-postgres}"
@@ -70,27 +81,48 @@ EOF
 # the wrong thing entirely, and it is exactly the mistake this project refuses
 # to make elsewhere, where a reading that cannot be taken is reported as
 # unavailable rather than guessed at.
+# connect_timeout is load-bearing. Without it a pooler that is up but cannot
+# reach its backend leaves psql waiting on PgBouncer's client_login_timeout --
+# 60 seconds by default -- and thirty attempts of that is half an hour of a job
+# hanging rather than failing. Measured here: the run had to be killed.
+# connect_timeout bounds the TCP connect and NOTHING ELSE, which is the half
+# that was never the problem: PgBouncer accepts the socket immediately and then
+# holds the client through its own login wait while it fails to reach the
+# backend. Measured here, an unreachable backend took 2m50s to report through
+# connect_timeout alone. `timeout` around the whole probe is what actually
+# bounds it, so a broken pooler costs half a minute and a message instead of a
+# hung job the runner eventually kills.
+PROBE="host=$PG_HOST port=$BOUNCER_PORT dbname=$PG_DB user=$PG_USER connect_timeout=3"
 reachable=no
-for _ in $(seq 30); do
-  if psql -X -q -c 'SELECT 1' \
-       "host=127.0.0.1 port=$BOUNCER_PORT dbname=$PG_DB user=$PG_USER" >/dev/null 2>&1; then
+for _ in $(seq 10); do
+  if timeout 3 psql -X -q -c 'SELECT 1' "$PROBE" >/dev/null 2>&1; then
     reachable=yes; break
   fi
   sleep 0.5
 done
 if [ "$reachable" != yes ]; then
   echo "  FAIL the pooler never accepted a connection, so nothing below was measured"
+  # Every line here ends in `|| true`, and that is not defensive habit: the
+  # script runs under `set -euo pipefail`, so the FIRST diagnostic pipeline --
+  # a psql that is expected to fail, feeding sed -- aborts the script before it
+  # can print the pgbouncer log. The diagnostics that explain the failure were
+  # being suppressed by the failure they were there to explain.
   echo "       psql said:"
-  psql -X -q -c 'SELECT 1' \
-    "host=127.0.0.1 port=$BOUNCER_PORT dbname=$PG_DB user=$PG_USER" 2>&1 | sed 's/^/         /'
+  timeout 5 psql -X -q -c 'SELECT 1' "$PROBE" 2>&1 | sed 's/^/         /' || true
   echo "       pgbouncer log:"
-  sed 's/^/         /' "$WORK/pgbouncer.log" 2>/dev/null || echo "         (no log at $WORK/pgbouncer.log)"
+  if [ -s "$WORK/pgbouncer.log" ]; then
+    sed 's/^/         /' "$WORK/pgbouncer.log" || true
+  else
+    echo "         (empty or absent: $WORK/pgbouncer.log)"
+  fi
+  echo "       resolved $PG_HOST:"
+  getent ahosts "$PG_HOST" 2>/dev/null | awk '{print "         " $1}' | sort -u || true
   echo "       config:"
-  sed 's/^/         /' "$WORK/pgbouncer.ini"
+  sed 's/^/         /' "$WORK/pgbouncer.ini" || true
   exit 1
 fi
 
-POOLED="host=127.0.0.1 port=$BOUNCER_PORT dbname=$PG_DB user=$PG_USER password=$PG_PASS"
+POOLED="host=$PG_HOST port=$BOUNCER_PORT dbname=$PG_DB user=$PG_USER password=$PG_PASS"
 DIRECT="host=$PG_HOST port=$PG_PORT dbname=$PG_DB user=$PG_USER password=$PG_PASS"
 
 echo "--- the assumption the refusal rests on ---"
