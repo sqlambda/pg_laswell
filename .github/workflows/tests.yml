@@ -22,25 +22,121 @@ env:
   PQXX_VERSION: 8.0.2
 
 jobs:
-  # Both compilers, because they disagree about -Wconversion around the OpenSSL
-  # C boundary and about dangling references. -Werror is on everywhere, so a
-  # disagreement is a build failure rather than a warning nobody reads.
-  build-and-test:
-    name: ${{ matrix.compiler }} / PostgreSQL ${{ matrix.pg }}
+  # Compile each distinct configuration ONCE and hand the binary to the jobs
+  # that run it.
+  #
+  # There are four configurations and eleven test jobs, and compiling per job
+  # spent most of the runner time re-deriving the same four binaries: the seven
+  # database jobs differ only in the server they talk to and the compiler that
+  # produced them, not in anything that has to be built again per PostgreSQL
+  # major. This is pg_licht's arrangement, adopted here for the same reason.
+  #
+  # libpqxx is linked statically, so an artifact needs nothing at run time
+  # beyond libpq.
+  build:
+    name: build-${{ matrix.config }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
-        compiler: [g++, clang++]
-        pg: [16, 17, 18]
         include:
+          # Both compilers, because they disagree about -Wconversion around the
+          # OpenSSL C boundary and about dangling references. -Werror is on
+          # everywhere, so a disagreement is a build failure rather than a
+          # warning nobody reads. pg_laswell links OpenSSL directly, which is
+          # the boundary they disagree at.
+          - config: plain-gcc
+            compiler: g++
+            sanitizer: NONE
+            tools: true
+          - config: plain-clang
+            compiler: clang++
+            sanitizer: NONE
+            tools: false
+          - config: address-undefined
+            compiler: g++
+            sanitizer: ADDRESS_UNDEFINED
+            tools: false
+          # THREAD is a gate for this project rather than belt-and-braces: a
+          # worker thread per job plus one process-wide observer against a
+          # shared registry is real concurrency, not a theoretical possibility.
+          - config: thread
+            compiler: g++
+            sanitizer: THREAD
+            tools: false
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -o DPkg::Lock::Timeout=300
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build libpq-dev nlohmann-json3-dev \
+            libgtest-dev libssl-dev mandoc postgresql-client
+      - name: Build libpqxx from source, not from apt
+        uses: ./.github/actions/libpqxx
+        with:
+          version: ${{ env.PQXX_VERSION }}
+
+      - name: Configure
+        run: |
+          cmake -S cpp -B build -G Ninja \
+            -DCMAKE_CXX_COMPILER=${{ matrix.compiler }} \
+            -DPGLASWELL_SANITIZER=${{ matrix.sanitizer }}
+      - name: Build the test binary
+        run: cmake --build build --target pg_laswell_mcp_test
+      - name: Build the shipped binaries and the plan renderer
+        if: matrix.tools
+        run: cmake --build build --target pg_laswell pg_laswell_mcp render_plan
+
+      # Neither needs a database nor varies by PostgreSQL version, so they run
+      # ONCE here rather than seven times downstream. They also need the build
+      # tree rather than a bare binary, which is the other reason they belong
+      # here: mandoc lints the two man pages, no_dangling_items reads the
+      # source, and plans drives render_plan against committed transcripts.
+      - name: Lint the manuals, and check the source and plan transcripts
+        if: matrix.tools
+        run: ctest --test-dir build -R 'manpage_lint|no_dangling_items|plans' --output-on-failure
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: test-binary-${{ matrix.config }}
+          path: build/pg_laswell_mcp_test
+          retention-days: 1
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: matrix.tools
+        with:
+          name: tools-plain
+          path: |
+            build/pg_laswell
+            build/pg_laswell_mcp
+          retention-days: 1
+          if-no-files-found: error
+
+  # The suite against each supported server. One binary per compiler, five
+  # servers, no rebuilding.
+  test:
+    name: ${{ matrix.config }} / PostgreSQL ${{ matrix.pg }}
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {config: plain-gcc,   pg: 16}
+          - {config: plain-gcc,   pg: 17}
+          - {config: plain-gcc,   pg: 18}
           # PostgreSQL 15 has no EXPLAIN (GENERIC_PLAN), so listMigrations
           # cannot derive relations hidden in expressions and says so. One job
           # covers that degraded path; running the whole matrix on it would
           # test the same fallback five times.
-          - compiler: g++
-            pg: 15
+          - {config: plain-gcc,   pg: 15}
+          - {config: plain-clang, pg: 16}
+          - {config: plain-clang, pg: 17}
+          - {config: plain-clang, pg: 18}
     services:
       postgres:
         image: postgres:${{ matrix.pg }}
@@ -51,39 +147,37 @@ jobs:
           --health-timeout 5s --health-retries 10
         ports: ['5432:5432']
     steps:
+      # The suite shells out to psql to install the ledger, and reads
+      # sql/bootstrap.sql through a path baked in at compile time, so the source
+      # tree has to be present even though nothing here is compiled.
       - uses: actions/checkout@v4
-      - name: Install dependencies
+      - name: Install runtime dependencies
         run: |
           sudo apt-get update -o DPkg::Lock::Timeout=300
-          sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build libpq-dev nlohmann-json3-dev \
-            libgtest-dev libssl-dev mandoc postgresql-client
-      - name: Build libpqxx from source, not from apt
-        uses: ./.github/actions/libpqxx
+          sudo apt-get install -y --no-install-recommends libpq5 postgresql-client
+      - uses: actions/download-artifact@v4
         with:
-          version: ${{ env.PQXX_VERSION }}
-      - name: Configure
-        run: cmake -S cpp -B build -G Ninja -DCMAKE_CXX_COMPILER=${{ matrix.compiler }}
-      - name: Build
-        run: cmake --build build
-      - name: Test
+          name: test-binary-${{ matrix.config }}
+          path: build
+      - name: Run the suite
+        working-directory: build
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
           # A skip nobody notices is a test that silently stopped running.
           PGLASWELL_REQUIRE_DATABASE: '1'
-        run: ctest --test-dir build --output-on-failure
+        run: |
+          chmod +x pg_laswell_mcp_test   # artifacts do not preserve the mode bit
+          ./pg_laswell_mcp_test
 
-  # THREAD is a gate for this project rather than belt-and-braces: a worker
-  # thread per job plus one process-wide observer against a shared registry is
-  # real concurrency, not a theoretical possibility.
   sanitizers:
-    name: ${{ matrix.sanitizer }}
+    name: ${{ matrix.config }}
+    needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        sanitizer: [ADDRESS_UNDEFINED, THREAD]
+        config: [address-undefined, thread]
     services:
       postgres:
         image: postgres:18
@@ -95,35 +189,31 @@ jobs:
         ports: ['5432:5432']
     steps:
       - uses: actions/checkout@v4
-      - name: Install dependencies
+      - name: Install runtime dependencies
         run: |
           sudo apt-get update -o DPkg::Lock::Timeout=300
-          sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build libpq-dev nlohmann-json3-dev \
-            libgtest-dev libssl-dev mandoc postgresql-client
-      - name: Build libpqxx from source, not from apt
-        uses: ./.github/actions/libpqxx
+          sudo apt-get install -y --no-install-recommends libpq5 postgresql-client
+      - uses: actions/download-artifact@v4
         with:
-          version: ${{ env.PQXX_VERSION }}
-      - name: Configure
-        run: cmake -S cpp -B build -G Ninja -DPGLASWELL_SANITIZER=${{ matrix.sanitizer }}
-      - name: Build
-        run: cmake --build build
-      - name: Test
+          name: test-binary-${{ matrix.config }}
+          path: build
+      - name: Run the suite
+        working-directory: build
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
           PGLASWELL_REQUIRE_DATABASE: '1'
-          # Fail on a finding rather than printing it and passing.
-          TSAN_OPTIONS: halt_on_error=1
-          ASAN_OPTIONS: abort_on_error=1
+          ASAN_OPTIONS: abort_on_error=1:detect_leaks=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
-        run: ctest --test-dir build --output-on-failure
+        run: |
+          chmod +x pg_laswell_mcp_test
+          ./pg_laswell_mcp_test
 
   # Valgrind covers what a sanitizer build cannot run under, and the OpenSSL
   # EVP handle lifetimes are the one place with manual C resource management.
   valgrind:
+    needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     services:
       postgres:
         image: postgres:18
@@ -135,27 +225,79 @@ jobs:
         ports: ['5432:5432']
     steps:
       - uses: actions/checkout@v4
-      - name: Install dependencies
+      - name: Install runtime dependencies
         run: |
           sudo apt-get update -o DPkg::Lock::Timeout=300
-          sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build libpq-dev nlohmann-json3-dev \
-            libgtest-dev libssl-dev mandoc valgrind postgresql-client
-      - name: Build libpqxx from source, not from apt
-        uses: ./.github/actions/libpqxx
+          sudo apt-get install -y --no-install-recommends libpq5 valgrind postgresql-client
+      - uses: actions/download-artifact@v4
         with:
-          version: ${{ env.PQXX_VERSION }}
-      - name: Configure and build
-        run: cmake -S cpp -B build -G Ninja && cmake --build build
-      - name: Valgrind
+          name: test-binary-plain-gcc
+          path: build
+      - name: Run the suite under Valgrind
+        working-directory: build
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
           PGLASWELL_REQUIRE_DATABASE: '1'
-        run: ctest --test-dir build -R valgrind --output-on-failure
+        run: |
+          chmod +x pg_laswell_mcp_test
+          valgrind --error-exitcode=99 --leak-check=full --track-origins=yes \
+            ./pg_laswell_mcp_test
+
+  # --call is the one caller that is neither an agent nor a person, and the exit
+  # code is the whole point of it. Runs once: it does not vary by server major.
+  call_mode:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 10
+        ports: ['5432:5432']
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update -o DPkg::Lock::Timeout=300
+          sudo apt-get install -y --no-install-recommends libpq5 postgresql-client
+      - uses: actions/download-artifact@v4
+        with:
+          name: tools-plain
+          path: build
+      - name: The --call contract, at the process level
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+        run: |
+          chmod +x build/pg_laswell_mcp build/pg_laswell
+          bash cpp/test/call-mode.sh ./build/pg_laswell_mcp
+
+  # Logical replication needs a publisher and a subscriber, so the script builds
+  # two clusters with initdb and throws them away. Server binaries, not a
+  # service container.
+  replication:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update -o DPkg::Lock::Timeout=300
+          sudo apt-get install -y --no-install-recommends libpq5 postgresql postgresql-client
+      # No artifact: this script drives psql against two clusters it builds
+      # itself, asserting that the SQL pg_laswell EMITS is accepted by a real
+      # publisher and subscriber. It never runs the binary.
+      - name: Two clusters, a publication and a subscription
+        run: bash cpp/test/replication-tests.sh
 
   # The executor refuses to run behind a transaction-mode pooler. This asserts
   # that the refusal HAPPENS -- not that the incompatibility is absent.
   pooled:
+    needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 20
     services:
@@ -169,21 +311,21 @@ jobs:
         ports: ['5432:5432']
     steps:
       - uses: actions/checkout@v4
-      - name: Install dependencies
+      - name: Install runtime dependencies
         run: |
           sudo apt-get update -o DPkg::Lock::Timeout=300
-          sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build libpq-dev nlohmann-json3-dev \
-            libgtest-dev libssl-dev mandoc pgbouncer postgresql-client
-      - name: Build libpqxx from source, not from apt
-        uses: ./.github/actions/libpqxx
+          sudo apt-get install -y --no-install-recommends libpq5 pgbouncer postgresql-client
+      - uses: actions/download-artifact@v4
         with:
-          version: ${{ env.PQXX_VERSION }}
-      - name: Configure and build
-        run: cmake -S cpp -B build -G Ninja && cmake --build build
+          name: tools-plain
+          path: build
       - name: Read-only tools work through a pooler
-        run: bash cpp/test/run-pooled-tests.sh ./build/pg_laswell_mcp
+        run: |
+          chmod +x build/pg_laswell_mcp build/pg_laswell
+          bash cpp/test/run-pooled-tests.sh ./build/pg_laswell_mcp
 
+  # Independent of the fan-out: a package is built from a Release tree with
+  # testing off, which is a different configuration from any of the four above.
   packages:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -202,7 +344,10 @@ jobs:
       - name: Build packages
         run: |
           cmake -S cpp -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
-          cmake --build build --target pg_laswell_mcp
+          # BOTH binaries: the install rules name both, so cpack fails on a tree
+          # where only one was built -- and a package missing the deployment
+          # binary would not be noticed until somebody tried to deploy with it.
+          cmake --build build --target pg_laswell pg_laswell_mcp
           cd build && cpack -G DEB && cpack -G RPM && cpack -G TGZ
       - name: The package must carry both binaries, both manuals and bootstrap.sql
         run: |
@@ -222,4 +367,8 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: packages
-          path: build/pg-laswell-*
+          path: |
+            build/*.deb
+            build/*.rpm
+            build/*.tar.gz
+          retention-days: 7

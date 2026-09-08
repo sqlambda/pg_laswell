@@ -14,8 +14,19 @@
 set -uo pipefail
 
 BIN="${1:-}"
+# Discovered rather than hardcoded, because the hardcoded path was
+# /usr/lib/postgresql/18/bin and a runner that installs 16 would take the SKIP
+# below and report success -- which is exactly the failure this project warns
+# about elsewhere: a skip nobody notices is a test that silently stopped
+# running. Newest first; PGBIN still overrides.
+if [ -z "${PGBIN:-}" ]; then
+  for d in $(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -Vr); do
+    [ -x "$d/initdb" ] && { PGBIN="$d"; break; }
+  done
+fi
 PGBIN="${PGBIN:-/usr/lib/postgresql/18/bin}"
-[ -x "$PGBIN/initdb" ] || { echo "SKIP: no initdb at $PGBIN"; exit 0; }
+[ -x "$PGBIN/initdb" ] || { echo "SKIP: no initdb found under /usr/lib/postgresql"; exit 0; }
+echo "using $PGBIN"
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/laswell-repl-XXXXXX")
 PUB_PORT=$((5600 + RANDOM % 100))
