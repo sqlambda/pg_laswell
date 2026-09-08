@@ -52,16 +52,16 @@ and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
     table at execution time, never from the spec, and writing nothing when the
     table is empty.
 
-  **Known gap, and it is not gated yet.** All of this is measured against
-  PostgreSQL 18. `merge_rows` is the one kind that does not reach as far back as
-  the rest: its paced form emits `MERGE ... RETURNING` and
+  **Version floor, gated.** `merge_rows` is the one kind that does not reach as
+  far back as the rest: its paced form emits `MERGE ... RETURNING` and
   `when_not_matched_by_source` emits `WHEN NOT MATCHED BY SOURCE`, both
-  PostgreSQL 17+, and measured, both are a syntax error on 15 and 16. Nothing
-  refuses them on an older server, and no test paces a merge against a real
-  database -- the conformance and reserved-word cases are each two rows, below
-  `dml_single_txn_rows`, so both take the unpaced path -- so CI on 15 and 16
-  would pass while the kind is broken there. The unpaced merge works from 15,
-  and the paced insert, update, delete and backfill all run clean on 15.
+  PostgreSQL 17+, and measured against real 15, 16 and 17 clusters, both are a
+  syntax error before 17. The planner refuses each below 17 and names the
+  observed version — and refuses rather than quietly dropping to the unpaced
+  form, because that would turn a bounded change into one long transaction
+  holding its locks throughout, which is the harm this tool exists to prevent.
+  The unpaced merge works from 15, as do the paced insert, update, delete and
+  backfill.
 
   `copy_rows` is the one kind that is never paced and cannot be: a `COPY` whose
   second of three rows violates a constraint rolls back all three. It accepts no

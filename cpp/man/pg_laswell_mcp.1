@@ -796,7 +796,7 @@ A specification asking for
 and silently getting a copy that stops on the first bad row would be worse than
 no copy at all.
 .Pp
-.Sy Version floor, and it is not yet enforced .
+.Sy Version floor .
 Everything in this family is measured against PostgreSQL 18, and
 .Cm merge_rows
 is the one kind that does not reach back as far as the rest.
@@ -808,13 +808,17 @@ emits
 .Ic WHEN NOT MATCHED BY SOURCE ,
 both of which arrived in PostgreSQL 17: measured, each is a syntax error on 15
 and 16.
-Neither is gated on the observed server version yet, and no test paces a merge
-against a real database, so the planner will emit SQL an older server refuses
-rather than refusing it beforehand.
-Treat 17 as the floor for
-.Cm merge_rows
-until that is fixed; the unpaced form works from 15, and every other kind in
-this family
+The planner refuses both below 17, naming the observed server version, rather
+than emitting SQL the server cannot parse.
+It refuses rather than quietly dropping to the unpaced form: that would turn a
+bounded change into one long transaction holding its locks throughout, which is
+the harm this tool exists to prevent, arrived at by a decision nobody made.
+Set
+.Va paced
+to
+.Ql false
+and accept the transaction, or run against 17 or later.
+The unpaced form works from 15, and every other kind in this family
 .Pq including the paced insert, update, delete and backfill
 runs clean on 15.
 .Pp

@@ -17,14 +17,14 @@ Packages build for seven targets — deb, rpm and tarball, x86_64 and arm64, plu
 macOS arm64 — each installed and run inside the platform it targets before
 upload. The manual is the authoritative reference. Not yet published anywhere.
 
-**Everything here is measured against PostgreSQL 18**, and the older versions
-still need work. The known gap is `merge_rows`: its paced form emits
-`MERGE ... RETURNING`, and `when_not_matched_by_source` emits
-`WHEN NOT MATCHED BY SOURCE`, both of which are PostgreSQL 17+ — measured, they
-are a syntax error on 15 and 16. Neither is gated on the server version yet, and
-no test paces a merge against a real database, so nothing catches it. Every
-other kind, including the paced insert, update, delete and backfill, runs clean
-on 15. Treat 17+ as the supported floor for `merge_rows` until that is fixed.
+**Everything here is measured against PostgreSQL 18, and the suite runs against
+15 through 18.** One kind does not reach as far back as the rest: `merge_rows`
+in its paced form emits `MERGE ... RETURNING`, and `when_not_matched_by_source`
+emits `WHEN NOT MATCHED BY SOURCE`, both PostgreSQL 17+. The planner refuses
+them below 17 and names the reading, rather than emitting SQL the server cannot
+parse — and refuses rather than silently running unpaced, because that would
+turn a bounded change into one long transaction. The unpaced merge, and every
+other kind, runs from 15.
 
 ## Why
 

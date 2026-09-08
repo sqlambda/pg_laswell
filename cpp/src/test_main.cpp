@@ -5422,6 +5422,59 @@ TEST(Planner, MergeRowsNamesItsCursorFromTheBatchAndNotFromItsOwnReturning) {
       << sql;
 }
 
+TEST(Planner, MergeRowsRefusesWhatTheServerInFrontOfItCannotParse) {
+  // Measured against real 15, 16 and 17 clusters: MERGE ... RETURNING and
+  // WHEN NOT MATCHED BY SOURCE both arrived in 17, and both are a syntax error
+  // before it. The planner had no gate at all, so it emitted them happily and
+  // the failure landed at execution -- and CI would not have caught it, because
+  // every merge case was two rows and took the unpaced path.
+  pglaswell::ExecutorConfig cfg;
+  cfg.dml_single_txn_rows = 1;              // force the paced form
+  auto obs = obs_dml();
+  obs.server_version = 160004;
+
+  const auto paced = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "merge_rows"}, {"schema", "shop"},
+                                {"table", "orders"}, {"key", "id"},
+                                {"columns", json::array({"id", "fulfilment_region"})},
+                                {"values", json::array({json::array({1, "NA"}),
+                                                        json::array({2, "EU"})})}}})),
+      obs, cfg);
+  EXPECT_FALSE(paced.ok) << paced.render();
+  bool named = false;
+  for (const auto& c : paced.conflicts) {
+    if (c.find("arrived in PostgreSQL 17") != std::string::npos &&
+        c.find("160004") != std::string::npos) named = true;
+  }
+  EXPECT_TRUE(named) << "the refusal must name the feature and the reading that "
+                        "decided it: " << paced.render();
+
+  // Refused, NOT silently unpaced. A fallback would turn a bounded change into
+  // one long transaction holding its locks throughout, which is the harm this
+  // tool exists to prevent -- arrived at by a decision nobody made.
+  EXPECT_TRUE(paced.steps.empty() ||
+              paced.steps[0].action == pglaswell::Action::kConflict)
+      << paced.render();
+
+  // The same spec unpaced is fine on 16: only the paced form needs 17.
+  auto body = json{{"kind", "merge_rows"}, {"schema", "shop"}, {"table", "orders"},
+                   {"key", "id"},
+                   {"columns", json::array({"id", "fulfilment_region"})},
+                   {"values", json::array({json::array({1, "NA"})})},
+                   {"paced", false}};
+  const auto unpaced = pglaswell::plan_migration(spec_of(json::array({body})), obs, cfg);
+  EXPECT_TRUE(unpaced.ok) << "an unpaced merge runs from 15: " << unpaced.render();
+
+  // when_not_matched_by_source is 17+ whether or not it is paced.
+  body["when_not_matched_by_source"] = "delete";
+  const auto by_source = pglaswell::plan_migration(spec_of(json::array({body})), obs, cfg);
+  EXPECT_FALSE(by_source.ok) << by_source.render();
+
+  // ...and all three are accepted on 18.
+  obs.server_version = 180006;
+  EXPECT_TRUE(pglaswell::plan_migration(spec_of(json::array({body})), obs, cfg).ok);
+}
+
 TEST(Planner, MergeRowsRefusesNotMatchedBySourceDeleteWhenItWouldBePaced) {
   // "Delete every target row the source does not mention" is only meaningful
   // over the WHOLE source. Paced, the first batch would delete everything
@@ -9344,7 +9397,17 @@ TEST_F(DatabaseTest, EveryIntentKindPlansAndRunsAgainstARealDatabase) {
       }
     }
     const auto obs = cat.observe(schemas, tables, keys);
-    const auto plan = pglaswell::plan_migration(spec, obs, {});
+    if (c.min_server_version > 0 && obs.server_version < c.min_server_version) {
+      // Named, not silent. A case that needs a newer server says which one, so
+      // a reader can tell "not applicable here" from "quietly stopped running".
+      std::cout << "  skipping " << c.kind << ": needs server "
+                << c.min_server_version << ", this is " << obs.server_version
+                << "\n";
+      continue;
+    }
+    pglaswell::ExecutorConfig exec;
+    if (c.single_txn_rows > 0) exec.dml_single_txn_rows = c.single_txn_rows;
+    const auto plan = pglaswell::plan_migration(spec, obs, exec);
     ASSERT_TRUE(plan.ok) << c.kind << " was refused:\n" << plan.render();
 
     for (const auto& step : plan.steps) {

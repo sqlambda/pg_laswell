@@ -17,6 +17,18 @@ struct Case {
   json body;                            // the intent itself
   const char* verify;                   // one scalar query
   const char* expect;                   // and what it must return
+
+  // Forces the paced path for a case small enough to write out. Without it a
+  // two-row `values` form is below dml_single_txn_rows and takes the ONE
+  // TRANSACTION branch, so the paced statement -- the one the executor drives,
+  // and the one with the cursor in it -- was never executed against a database
+  // by anything. Zero leaves the default.
+  int single_txn_rows = 0;
+
+  // Skip below this server version, for a case whose SQL genuinely needs a
+  // newer PostgreSQL. Named per case rather than assumed, so the skip says
+  // which feature and which version rather than disappearing.
+  int min_server_version = 0;
 };
 
 // Kinds that cannot be proved against a single database, with the reason.
@@ -202,6 +214,23 @@ inline std::vector<Case> cases() {
      "SELECT string_agg(code,',' ORDER BY id) FROM cf.t WHERE id IN (202,203)",
      "m2,m3"},
 
+    // The paced MERGE, which nothing executed until now. The unpaced case above
+    // proves the statement; this proves the one the executor actually drives --
+    // a batch CTE, a cursor, and the outer SELECT that advances it. Measured on
+    // 18.6, naming the cursor from the MERGE's own RETURNING instead returns
+    // nothing for a source row that matched no WHEN clause, and the walk stops
+    // early reporting success. That is the bug this case exists to catch.
+    {"merge_rows_paced",
+     {"INSERT INTO cf.t(id, amount, code) VALUES (301,1,'p1'),(302,2,'p2')"},
+     json{{"kind","merge_rows"},{"schema","cf"},{"table","t"},{"key","id"},
+          {"columns",json::array({"id","amount","code"})},
+          {"values",json::array({json::array({301,9,"pm1"}),
+                                 json::array({303,9,"pm3"})})}},
+     "SELECT string_agg(code,',' ORDER BY id) FROM cf.t WHERE id IN (301,302,303)",
+     "pm1,p2,pm3",
+     /*single_txn_rows=*/1,
+     /*min_server_version=*/170000},
+
     {"copy_rows", {},
      json{{"kind","copy_rows"},{"schema","cf"},{"table","t"},
           {"columns",json::array({"id","amount","code"})},
@@ -220,7 +249,14 @@ inline std::vector<Case> cases() {
           {"columns",json::array({"id"})},
           {"values",json::array({json::array({201}), json::array({202}),
                                  json::array({203}), json::array({204}),
-                                 json::array({205})})}},
+                                 json::array({205}),
+                                 // ...and the three the paced merge case above
+                                 // left behind. The cases below this one COUNT
+                                 // cf.t, so anything this family adds has to be
+                                 // removed here or it fails a later case with a
+                                 // message about the wrong thing entirely.
+                                 json::array({301}), json::array({302}),
+                                 json::array({303})})}},
      "SELECT count(*)::text FROM cf.t", "40"},
 
     {"set_not_null", {},

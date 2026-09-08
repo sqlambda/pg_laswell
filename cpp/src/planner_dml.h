@@ -1329,6 +1329,56 @@ inline void plan_merge_rows(const Intent& in, const Observations& obs,
 
   const auto src = detail::decide_pacing(in, cfg, true);
 
+  // The version floor, measured against real 15, 16 and 17 clusters rather than
+  // read off a release note:
+  //
+  //   paced merge (MERGE ... RETURNING)   syntax error on 15 and 16, ok on 17+
+  //   when_not_matched_by_source          syntax error on 15 and 16, ok on 17+
+  //   unpaced merge                       ok from 15
+  //
+  // REFUSED rather than degraded, and the choice is deliberate. Silently
+  // dropping to the unpaced form on an older server would turn a bounded change
+  // into one long transaction holding its locks for the whole of it -- which is
+  // the harm this tool exists to prevent, arrived at by a fallback nobody asked
+  // for. A refusal that names the reading is what the rest of the planner does,
+  // and it leaves the choice with the author: pace it on 17, or say `paced:
+  // false` and accept the transaction.
+  //
+  // Gated on the OBSERVED server version, the way detach_partition gates
+  // CONCURRENTLY on >= 140000. Nothing here is inferred from the spec.
+  const bool merge_returning_available = obs.server_version >= 170000;
+  if (!merge_returning_available && obs.server_version > 0) {
+    const auto server = std::to_string(obs.server_version);
+    if (src.paced) {
+      step.action = Action::kConflict;
+      step.why = "a paced merge needs MERGE ... RETURNING, which is PostgreSQL 17+";
+      plan.conflicts.push_back(
+          "merge_rows on " + qualified + " would be paced, and a paced merge "
+          "emits MERGE ... RETURNING, which arrived in PostgreSQL 17. This "
+          "server is " + server +
+          ", where it is a syntax error -- measured, not assumed. Either set "
+          "\"paced\": false, accepting that the statement holds its locks for "
+          "the whole source rather than committing as it goes, or run this "
+          "against 17 or later. It is NOT silently unpaced here: that would "
+          "turn a bounded change into one long transaction, which is the harm "
+          "this tool exists to prevent.");
+      return;
+    }
+    if (by_source == "delete") {
+      step.action = Action::kConflict;
+      step.why = "when_not_matched_by_source needs PostgreSQL 17+";
+      plan.conflicts.push_back(
+          "when_not_matched_by_source on " + qualified +
+          " emits WHEN NOT MATCHED BY SOURCE, which arrived in PostgreSQL 17. "
+          "This server is " + server +
+          ", where it is a syntax error -- measured, not assumed. Express the "
+          "removal as its own delete_rows intent with a predicate that says "
+          "which rows are obsolete; that runs on every version this tool "
+          "supports.");
+      return;
+    }
+  }
+
   // WHEN NOT MATCHED BY SOURCE means "every target row this MERGE did not see".
   // Under pacing the MERGE only ever sees ONE BATCH, so the first batch would
   // delete every row not in that batch -- including all the rows later batches
