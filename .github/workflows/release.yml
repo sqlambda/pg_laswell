@@ -187,8 +187,12 @@ jobs:
       - name: Build
         run: |
           cmake -S cpp -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
-          cmake --build build --target pg_laswell_mcp
-          strip build/pg_laswell_mcp
+          # BOTH binaries. The install rules name both, so a tree with only one
+          # built either fails packaging or -- worse -- produces a package that
+          # installs and has nothing to deploy with, which nobody would discover
+          # until a release night.
+          cmake --build build --target pg_laswell pg_laswell_mcp
+          strip build/pg_laswell build/pg_laswell_mcp
 
       # Static libpqxx is the entire point of the source build above, and a
       # silent fall back to the platform's shared copy would produce a package
@@ -196,17 +200,22 @@ jobs:
       # visible: the linker's own record.
       - name: libpqxx must be linked statically
         run: |
-          if [ "${{ matrix.distro }}" = "macos" ]; then
-            otool -L build/pg_laswell_mcp
-            LINKED=$(otool -L build/pg_laswell_mcp)
-          else
-            objdump -p build/pg_laswell_mcp | grep NEEDED
-            LINKED=$(objdump -p build/pg_laswell_mcp)
-          fi
-          if grep -q 'pqxx' <<<"$LINKED"; then
-            echo "::error::libpqxx was linked dynamically; the source build did not take effect"
-            exit 1
-          fi
+          # Both binaries link it, so both are checked: they are separate link
+          # lines and only one of them being static would ship a package that
+          # installs and then cannot start.
+          for b in pg_laswell pg_laswell_mcp; do
+            if [ "${{ matrix.distro }}" = "macos" ]; then
+              otool -L "build/$b"
+              LINKED=$(otool -L "build/$b")
+            else
+              objdump -p "build/$b" | grep NEEDED
+              LINKED=$(objdump -p "build/$b")
+            fi
+            if grep -q 'pqxx' <<<"$LINKED"; then
+              echo "::error::libpqxx was linked dynamically into $b; the source build did not take effect"
+              exit 1
+            fi
+          done
 
       - name: Package (tar.gz)
         if: matrix.extension == 'tar.gz'
@@ -248,7 +257,7 @@ jobs:
       # set pipefail. Capturing first makes the check quiet, and makes pipefail
       # safe to turn on, which is what catches a listing command that fails
       # outright rather than merely matching nothing.
-      - name: The package must carry all three things
+      - name: The package must carry both binaries, both manuals and bootstrap.sql
         shell: bash
         run: |
           set -euo pipefail
@@ -265,7 +274,8 @@ jobs:
               LIST=$(tar tzf ${{ matrix.artifact }}.tar.gz)
               DEPS="" ;;
           esac
-          for want in bin/pg_laswell_mcp man1/pg_laswell_mcp.1 \
+          for want in bin/pg_laswell bin/pg_laswell_mcp \
+                      man1/pg_laswell.1 man1/pg_laswell_mcp.1 \
                       share/pg_laswell/bootstrap.sql; do
             grep -q "$want" <<<"$LIST" || {
               echo "::error::$want is missing from the package"; exit 1; }
@@ -292,19 +302,30 @@ jobs:
           SPEC='{"spec":{"laswell_spec_version":1,"id":"x","description":"d","intents":[{"kind":"add_column","schema":"s","table":"t","column":"c","type":"text","nullable":true,"comment":"c"}]}}'
           case "${{ matrix.extension }}" in
             deb) apt-get install -y --no-install-recommends ./${{ matrix.artifact }}.deb
-                 BIN=pg_laswell_mcp ;;
+                 BIN=pg_laswell_mcp; DEPLOY=pg_laswell ;;
             rpm) dnf install -y ./${{ matrix.artifact }}.rpm
-                 BIN=pg_laswell_mcp ;;
+                 BIN=pg_laswell_mcp; DEPLOY=pg_laswell ;;
             tar.gz)
                  rm -rf verify && mkdir verify
                  tar xzf ${{ matrix.artifact }}.tar.gz -C verify
-                 BIN="$PWD/verify/bin/pg_laswell_mcp" ;;
+                 BIN="$PWD/verify/bin/pg_laswell_mcp"
+                 DEPLOY="$PWD/verify/bin/pg_laswell" ;;
           esac
           "$BIN" --version
           OUT=$("$BIN" --call getSpecDigest --args "$SPEC")
           grep -q '"digest"' <<<"$OUT" || {
             echo "::error::the installed binary did not answer: $OUT"; exit 1; }
-          echo "unpacked from the release artifact, and answered"
+          # The deployment binary too. --version is the right probe for it for
+          # the same reason getSpecDigest is for the server: it needs no
+          # database, and it still proves the thing loads and its dynamic
+          # dependencies resolve.
+          "$DEPLOY" --version
+          # And that it refuses correctly rather than merely starting: no
+          # --repo is a configuration problem, which is exit 3.
+          set +e; "$DEPLOY" >/dev/null 2>&1; rc=$?; set -e
+          [ "$rc" = "3" ] || {
+            echo "::error::pg_laswell with no --repo exited $rc, expected 3"; exit 1; }
+          echo "both binaries unpacked from the release artifact, and answered"
 
       - uses: actions/upload-artifact@v4
         with:
