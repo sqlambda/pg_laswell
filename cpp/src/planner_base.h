@@ -129,7 +129,25 @@ struct Plan {
   // The digest of the plan itself: the determinism receipt. planMigration and
   // startMigration must produce the same one, which is how "what ran is what
   // you were shown" becomes checkable rather than promised.
-  std::string digest() const { return digest_hex(to_json()); }
+  //
+  // Everything that decides WHAT RUNS is covered: the SQL, each step's why and
+  // detail (maintenance_work_mem_mb among them, which is where the executor
+  // reads it from), the warnings, the conflicts and the prerequisites.
+  //
+  // The budget is deliberately NOT covered, and leaving it in was a bug. Half
+  // of it is a reading of the server this instant -- current_backends, the free
+  // parallel worker slots, and the verdict sentences built from them -- so two
+  // identical calls a second apart legitimately disagree, and the receipt
+  // failed for a reason that had nothing to do with the migration. Worse, it
+  // is disagreement the design EXPECTS: startMigration re-reads capacity
+  // precisely because the answer goes stale, so hashing it asserted the one
+  // thing the tool is built not to assume. The parts of the budget that do
+  // reach execution reach it through a step, and steps are hashed.
+  std::string digest() const {
+    json d = to_json();
+    d.erase("budget");
+    return digest_hex(d);
+  }
 
   std::string render() const;
 };

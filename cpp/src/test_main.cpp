@@ -2749,8 +2749,36 @@ TEST_F(ToolTest, PlanMigrationIsDeterministicAcrossCalls) {
   w.commit();
 
   const auto a = payload(call("planMigration", json{{"spec", signed_spec()}}));
+
+  // Occupy backends BETWEEN the two calls, so the second one observes a server
+  // under measurably different load. This used to change the digest -- the
+  // budget carried current_backends and the free worker slots, and hashing it
+  // made the determinism receipt fail for a reason that had nothing to do with
+  // the migration. It surfaced as a rare CI failure because it needed a
+  // connection to arrive in the gap; here the gap is made on purpose, so the
+  // test fails every run rather than one in fifty.
+  std::vector<std::unique_ptr<pglaswell::ReadSession>> load;
+  for (int i = 0; i < 5; ++i) {
+    load.push_back(std::make_unique<pglaswell::ReadSession>(cfg()));
+    load.back()->txn().exec("SELECT 1");
+  }
+  const int backends_now =
+      pglaswell::ReadSession(cfg())
+          .txn()
+          .exec("SELECT count(*) FROM pg_stat_activity")[0][0]
+          .as<int>();
+
   const auto b = payload(call("planMigration", json{{"spec", signed_spec()}}));
-  EXPECT_EQ(a.value("planDigest", "a"), b.value("planDigest", "b"));
+  EXPECT_EQ(a.value("planDigest", "a"), b.value("planDigest", "b"))
+      << "the digest moved when only the server's load did";
+
+  // The reading really did differ; otherwise the assertion above proves
+  // nothing and would keep passing if the volatile fields came back.
+  EXPECT_NE(a["budget"].value("serverHeadroom", -1),
+            b["budget"].value("serverHeadroom", -2))
+      << "headroom did not move (" << backends_now
+      << " backends), so this test did not exercise what it claims";
+  load.clear();
 
   pglaswell::WriteSession c(cfg());
   c.begin("pg_laswell/test/cleanup");
