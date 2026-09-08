@@ -52,6 +52,11 @@ function(pglaswell_apply_sanitizers target)
         message(FATAL_ERROR "Unknown PGLASWELL_SANITIZER: ${PGLASWELL_SANITIZER}")
     endif()
 
+    # Tests that assert on WALL-CLOCK RATIOS need to know. An instrumented build
+    # measures the sanitizer as much as it measures PostgreSQL, so a ratio that
+    # holds on a plain build is noise here -- and a test that fails for that
+    # reason teaches people to ignore the sanitizer jobs.
+    target_compile_definitions(${target} PRIVATE PGLASWELL_SANITIZER_ACTIVE=1)
     target_compile_options(${target} PRIVATE -g -fno-omit-frame-pointer ${_flags})
     target_link_options(${target} PRIVATE ${_flags})
 endfunction()

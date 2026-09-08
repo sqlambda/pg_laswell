@@ -778,27 +778,43 @@ class Executor {
     job_->warnings.push_back(w);
   }
 
+  // THE LEDGER FIRST, THEN THE STATE, for all three terminal transitions.
+  //
+  // A caller polls jobStatus until the state is terminal and then reads the
+  // ledger -- that is the documented shape, and it is what the deployment
+  // runner and every agent does. Flipping the state first opens a window where
+  // jobStatus says "succeeded" and laswell.migration still says the job is
+  // running, so the two answers disagree and which one a caller gets depends on
+  // timing it cannot see. Found on CI, where a repository scan taken straight
+  // after a successful wait reported in_progress; it had never lost the race on
+  // a developer's machine, which is exactly why it survived.
+  //
+  // Ordered this way, a terminal state MEANS "durably recorded as terminal".
   void succeed() {
-    job_->state = JobState::kSucceeded;
     if (ledger_) ledger_->finish_job(job_->job_id, "succeeded", json());
+    job_->state = JobState::kSucceeded;
   }
 
   void cancelled() {
-    job_->state = JobState::kCancelled;
     if (ledger_) ledger_->finish_job(job_->job_id, "cancelled", json());
+    job_->state = JobState::kCancelled;
   }
 
   void fail(const json& error) {
-    if (job_->state.load() != JobState::kAbortedContention) {
-      job_->state = JobState::kFailed;
-    }
+    // The state this job is ending in, decided before it is published: an
+    // abort for contention keeps its own state rather than being overwritten
+    // with a generic failure.
+    const auto ending = job_->state.load() == JobState::kAbortedContention
+                            ? JobState::kAbortedContention
+                            : JobState::kFailed;
     {
       std::lock_guard<std::mutex> lock(job_->m);
       job_->error = error;
     }
     if (ledger_) {
-      ledger_->finish_job(job_->job_id, to_string(job_->state.load()), error);
+      ledger_->finish_job(job_->job_id, to_string(ending), error);
     }
+    job_->state = ending;
   }
 
   ConnConfig cfg_;

@@ -7311,6 +7311,18 @@ TEST_F(DatabaseTest, ThePartitionRecipesRunAndTheCheckReallyRemovesTheScan) {
                  << without_check << "ms); the machine is faster than the "
                                      "measurement needs";
   }
+#ifdef PGLASWELL_SANITIZER_ACTIVE
+  // The CORRECTNESS above still ran and still asserted -- the CHECK was
+  // accepted, the attach succeeded, the catalog agrees. Only the RATIO is
+  // skipped, because an instrumented build measures the sanitizer as much as it
+  // measures PostgreSQL: observed on CI at 31ms against 62ms, a real
+  // improvement that fails a 3x claim. Asserting it anyway would teach people
+  // to ignore the sanitizer jobs, which is a worse outcome than not measuring
+  // speed in a build that was never built to measure speed.
+  GTEST_SKIP() << "timing ratio not asserted under a sanitizer: " << with_check
+               << "ms against " << without_check
+               << "ms measures the instrumentation as much as the server";
+#endif
   EXPECT_LT(with_check * 3, without_check)
       << "attach with a validated CHECK took " << with_check
       << "ms, without took " << without_check
@@ -8161,7 +8173,13 @@ TEST_F(DatabaseTest, TheNotNullRecipeLeavesPostgresqlsOwnConstraintName) {
       << "the temporary CHECK was not dropped";
   // And on a server that catalogues NOT NULL constraints, the permanent one
   // has PostgreSQL's natural name rather than an auto-suffixed one.
-  if (r.server_version() >= 170000) {
+  //
+  // 180000, not 170000. Catalogued NOT NULL constraints -- pg_constraint rows
+  // with contype='n' -- were proposed for 17 and landed in 18. Measured, not
+  // recalled: on a real 17 that query returns no rows, on 18 it returns one. The
+  // floor being one release too low made every PostgreSQL 17 job fail on an
+  // assertion about a feature that server does not have.
+  if (r.server_version() >= 180000) {
     const auto names = r.txn().exec(
         "SELECT coalesce(string_agg(conname, ','), '') FROM pg_constraint"
         " WHERE conrelid='laswell_nn'::regclass AND contype='n'"
