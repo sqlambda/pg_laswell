@@ -53,7 +53,14 @@ enum class RepoStatus {
   kModified,    // the id was applied under a DIFFERENT digest
   kInProgress,  // a job for this digest is running
   kFailed,      // the last job for this digest failed
-  kUnreadable   // the file does not parse
+  kUnreadable,  // the file does not parse
+  // Not applicable here, and not a problem. A specification for another
+  // environment is somebody else's migration; one whose release has not been
+  // approved is this database's migration, waiting. Both are ordinary states of
+  // a healthy repository, which is why neither is a `problem`: a deployment
+  // that skips them has done its job correctly.
+  kWrongEnvironment,
+  kHeldForRelease
 };
 
 inline const char* to_string(RepoStatus s) {
@@ -64,6 +71,8 @@ inline const char* to_string(RepoStatus s) {
     case RepoStatus::kInProgress: return "in_progress";
     case RepoStatus::kFailed: return "failed";
     case RepoStatus::kUnreadable: return "unreadable";
+    case RepoStatus::kWrongEnvironment: return "wrong_environment";
+    case RepoStatus::kHeldForRelease: return "held_for_release";
   }
   return "unknown";
 }
@@ -78,6 +87,8 @@ struct RepoEntry {
   std::string error;
   std::string hint;
   std::string applied_digest;  // set when status is kModified
+  std::string environment;     // target.environment, as the spec declares it
+  std::string release;         // the release tag gating it, if any
 };
 
 // Derives what a spec actually touches.
@@ -253,6 +264,22 @@ class MigrationRepository {
     }
     std::sort(files.begin(), files.end());
 
+    // What this database says about itself, read once. Every gate below is a
+    // lookup against these two, so the answer cannot drift between entries in
+    // one listing the way a per-entry query could.
+    try {
+      Ledger ledger(cfg_, cache_);
+      const auto st = ledger.status();
+      ledger_env_ = st.environment;
+      ledger_ready_ = st.releases_ready;
+    } catch (const std::exception&) {
+      // Unreadable ledger is reported by the tools that need it; here it means
+      // "nothing is labelled and nothing is approved", which holds every gated
+      // spec rather than releasing it.
+      ledger_env_.clear();
+      ledger_ready_.clear();
+    }
+
     const auto applied = applied_index();
     std::map<std::string, Spec> parsed;
 
@@ -266,8 +293,11 @@ class MigrationRepository {
         entry.spec_id = spec.id;
         entry.digest = spec.digest;
         entry.depends_on = spec.depends_on;
+        entry.environment = spec.target_environment;
+        entry.release = spec.release;
         parsed[spec.id] = spec;
         classify(entry, applied);
+        gate(entry);
       } catch (const SpecError& e) {
         entry.status = RepoStatus::kUnreadable;
         entry.error = e.what();
@@ -370,6 +400,66 @@ class MigrationRepository {
       return;
     }
     e.status = RepoStatus::kPending;
+  }
+
+  // Applicability, asked only of something that would otherwise run.
+  //
+  // Deliberately AFTER classify and only over the runnable states: an applied
+  // migration stays applied whatever environment this is, and a spec that was
+  // edited after being applied is a problem in every environment. Re-labelling
+  // those would hide a real fault behind a routine one.
+  //
+  // Both answers come from the DATABASE, never from the specification alone or
+  // from configuration beside it -- the laswell.environment and laswell.release
+  // tables, which the migrating role can read and cannot write. That is the
+  // trusted_key argument applied to a second question: a permissive client
+  // configuration must not be able to talk a production database into running
+  // the development migration, and an environment asserted by whoever launched
+  // the tool would be exactly that.
+  void gate(RepoEntry& e) {
+    if (e.status != RepoStatus::kPending && e.status != RepoStatus::kFailed) {
+      return;
+    }
+
+    if (!e.environment.empty()) {
+      if (ledger_env_.empty()) {
+        // Cannot be checked, so it is not assumed to pass. An unlabelled
+        // database is a database that has not said what it is, and a spec that
+        // names an environment is asking a question it cannot answer.
+        e.status = RepoStatus::kWrongEnvironment;
+        e.error = "\"" + e.spec_id + "\" targets environment \"" +
+                  e.environment + "\" and this database is not labelled";
+        e.hint =
+            "Label it as the owner of the laswell schema: INSERT INTO "
+            "laswell.environment(name) VALUES ('...') ON CONFLICT (only_one) "
+            "DO UPDATE SET name = EXCLUDED.name, set_at = now(), "
+            "set_by = current_user;";
+        return;
+      }
+      if (e.environment != ledger_env_) {
+        e.status = RepoStatus::kWrongEnvironment;
+        e.error = "\"" + e.spec_id + "\" targets environment \"" +
+                  e.environment + "\" and this database is \"" + ledger_env_ +
+                  "\"";
+        e.hint = "Nothing is wrong: this specification is for another "
+                 "database. It will stay listed here and will never be applied "
+                 "to this one.";
+        return;
+      }
+    }
+
+    if (!e.release.empty() && ledger_ready_.count(e.release) == 0) {
+      e.status = RepoStatus::kHeldForRelease;
+      e.error = "\"" + e.spec_id + "\" is held: release \"" + e.release +
+                "\" is not marked ready in this database";
+      e.hint =
+          "Approve it as the owner of the laswell schema: INSERT INTO "
+          "laswell.release(tag, ready, marked_ready_at, marked_by, note) "
+          "VALUES ('" + e.release + "', true, now(), current_user, '...') "
+          "ON CONFLICT (tag) DO UPDATE SET ready = EXCLUDED.ready, "
+          "marked_ready_at = EXCLUDED.marked_ready_at, "
+          "marked_by = EXCLUDED.marked_by, note = EXCLUDED.note;";
+    }
   }
 
   void derive(std::vector<RepoEntry>& entries,
@@ -587,6 +677,10 @@ class MigrationRepository {
     return level;
   }
 
+  // Read once per scan, in scan(), so every gate in one listing answers
+  // against the same reading.
+  std::string ledger_env_;
+  std::set<std::string> ledger_ready_;
   ConnConfig cfg_;
   ConnectionCache* cache_ = nullptr;
 };

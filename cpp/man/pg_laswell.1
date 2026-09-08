@@ -1,0 +1,94 @@
+.Dd September 8, 2026
+.Dt PG_LASWELL 1
+.Os
+.Sh NAME
+.Nm pg_laswell
+.Nd apply a migration repository, unattended
+.Sh SYNOPSIS
+.Nm
+.Fl -repo Ar directory
+.Op Fl -status | Fl -dry-run
+.Op Fl c Ar file
+.Op Ar conninfo
+.Nm
+.Op Fl V | Fl -version
+.Op Fl h | Fl -help
+.Sh DESCRIPTION
+.Nm
+applies every migration a repository has pending, in dependency order, and
+exits with a code.
+It is the deployment half of a pair:
+.Xr pg_laswell_mcp 1
+is for
+.Em authoring
+a migration, where an agent plans one, reads the warnings and decides;
+.Nm
+is for
+.Em applying
+one on a release pipeline, where there is nobody to ask.
+.Pp
+.Sy Nothing about the decisions needs an agent ,
+which is the part worth stating because the opposite is the natural assumption.
+Pacing is measured rather than decided: the executor commits on a lock waiter,
+an interval or a row cap, and the observer throttles on the transitive waiter
+count and cancels a batch that starves one.
+Ordering is declared rather than decided:
+.Va depends_on
+is a field of the signed specification.
+And the concurrency grouping a repository reports is already the conservative
+one, because it denies concurrency both on a shared relation, which is
+decidable, and on incomplete evidence, which is the case that matters -- an
+opaque trigger function can write any table, so a migration whose relation list
+cannot be proven complete is never grouped with another.
+.Pp
+.Nm
+therefore honours what the repository derived and never widens it: it does not
+reorder a level, does not merge two groups, and does not run an
+.Ql undecided
+pair together.
+Advisory locks refuse an unsafe overlap whatever anybody decided.
+.Ss Options
+.Bl -tag -width Ds
+.It Fl -repo Ar directory
+The directory of signed specifications.
+Required; there is nothing to apply without one.
+.It Fl -status
+Report what is pending, held, or for another environment, and exit.
+Changes nothing.
+.It Fl -dry-run
+Plan every pending migration and apply none.
+Each plan is tried against the real schema in a transaction that is rolled
+back, so a refusal here is a refusal that would have happened.
+.It Fl c Ar file , Fl -config Ar file
+Configuration file.
+Also read from
+.Ev PGLASWELL_CONFIG .
+.It Ar conninfo
+A libpq connection string.
+Also read from
+.Ev DATABASE_URL .
+.El
+.Sh EXAMPLES
+Gate a build on whether anything is pending or has drifted:
+.Bd -literal -offset indent
+pg_laswell --repo ./migrations --status || exit 1
+.Ed
+.Pp
+Plan everything without applying it, on the real schema:
+.Bd -literal -offset indent
+pg_laswell --repo ./migrations --dry-run
+.Ed
+.Pp
+Apply, in a deployment step:
+.Bd -literal -offset indent
+pg_laswell --repo ./migrations
+.Ed
+.Sh SEE ALSO
+.Xr pg_laswell_mcp 1
+.Pp
+.Xr pg_laswell_mcp 1
+is the authoritative reference for the specification format, pacing, trust,
+bootstrap and the ledger.
+This page documents only what differs when there is no agent.
+.Sh AUTHORS
+.An sqlambda

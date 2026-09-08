@@ -115,13 +115,35 @@ class Deployment {
     }
 
     std::map<std::string, json> by_id;
-    int pending = 0;
+    int pending = 0, held = 0, elsewhere = 0;
     for (const auto& m : listing.value("migrations", json::array())) {
       by_id[m.value("specId", "")] = m;
-      if (m.value("status", "") == "pending") ++pending;
+      const auto status = m.value("status", "");
+      if (status == "pending") ++pending;
+      if (status == "held_for_release") ++held;
+      if (status == "wrong_environment") ++elsewhere;
     }
 
     report_plan(out, listing, pending);
+    // Held and not-for-here are reported and are NOT failures. A deployment
+    // that skips them has done its job: the first is waiting on an approval
+    // this database has not been given, the second belongs to another
+    // database. Exiting non-zero on either would make a correct run look like
+    // a broken one, and a pipeline would learn to ignore the code.
+    for (const auto& m : listing.value("migrations", json::array())) {
+      const auto status = m.value("status", "");
+      if (status == "held_for_release" || status == "wrong_environment") {
+        out << "  " << m.value("specId", "") << ": " << status;
+        if (m.contains("error")) {
+          out << " -- " << m["error"].get<std::string>();
+        }
+        out << "\n";
+      }
+    }
+    if (held || elsewhere) {
+      out << "  (" << held << " held, " << elsewhere
+          << " for another environment)\n";
+    }
     if (opts_.status_only || pending == 0) return DeployResult::kOk;
 
     // Levels run in order; within a level, groups run one after another,

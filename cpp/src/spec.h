@@ -297,6 +297,20 @@ struct Spec {
   std::string description;
   std::string rationale;
   std::string target_database;
+  // Which environment this specification is FOR, and which release gates it.
+  //
+  // Both sit inside the signature -- target is in signed_top_level_keys() and
+  // `release` is added to it -- and that is the whole point of putting them in
+  // the specification rather than beside it. An environment an operator can
+  // edit on the way to production is not a constraint, it is a comment; a
+  // signed one cannot be retargeted without re-signing, which is a person
+  // deciding again rather than a file being changed.
+  //
+  // Empty means unconstrained: a specification with no environment applies
+  // anywhere, and one with no release tag is not held. Both defaults are
+  // backwards compatible with every specification written before this existed.
+  std::string target_environment;
+  std::string release;
   int min_server_version = 0;
   // Business ordering, which no amount of measurement can derive. Relation
   // overlap says what MUST NOT run together; this says what must run FIRST.
@@ -410,7 +424,7 @@ inline void reject_unknown_keys(const json& obj, const std::set<std::string>& al
 inline const std::set<std::string>& signed_top_level_keys() {
   static const std::set<std::string> kKeys = {
       "laswell_spec_version", "id", "description", "rationale", "target",
-      "depends_on", "intents"};
+      "release", "depends_on", "intents"};
   return kKeys;
 }
 
@@ -2384,13 +2398,25 @@ inline Spec parse_spec(const json& doc) {
     }
   }
 
+  if (doc.contains("release")) {
+    // A tag, not a version: pg_laswell never orders releases or reasons about
+    // what one supersedes. It asks the target database one question -- has this
+    // tag been approved here -- and that is a lookup, not a comparison.
+    s.release = detail::require_string(doc, "release", "spec");
+  }
+
   if (doc.contains("target")) {
     if (!doc["target"].is_object()) {
       detail::fail("\"target\" must be an object", "");
     }
-    detail::reject_unknown_keys(doc["target"], {"database", "min_server_version"},
-                                "target");
+    detail::reject_unknown_keys(
+        doc["target"], {"database", "environment", "min_server_version"},
+        "target");
     s.target_database = doc["target"].value("database", "");
+    if (doc["target"].contains("environment")) {
+      s.target_environment = detail::require_string(doc["target"], "environment",
+                                                    "target");
+    }
     if (doc["target"].contains("min_server_version")) {
       if (!doc["target"]["min_server_version"].is_number_integer()) {
         detail::fail("target.min_server_version must be an integer",

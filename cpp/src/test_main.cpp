@@ -5527,6 +5527,46 @@ TEST(Planner, RowLevelDmlWarnsAboutWhatRowSecurityHidesFromIt) {
          "differently from the application: " << plan.render();
 }
 
+TEST(Spec, EnvironmentAndReleaseAreInsideTheSignature) {
+  // The whole value of declaring these in the specification rather than beside
+  // it. If either sat outside the signed projection, an operator could retarget
+  // a reviewed migration at production, or move it into an approved release, by
+  // editing a file -- and every signature would still verify.
+  json doc = minimal_spec();
+  const auto base = pglaswell::parse_spec(doc).digest;
+
+  doc["target"]["environment"] = "production";
+  const auto with_env = pglaswell::parse_spec(doc).digest;
+  EXPECT_NE(base, with_env) << "target.environment must change the digest";
+
+  doc["release"] = "2026.09";
+  const auto with_release = pglaswell::parse_spec(doc).digest;
+  EXPECT_NE(with_env, with_release) << "release must change the digest";
+
+  // And they are read back, not merely canonicalised.
+  const auto spec = pglaswell::parse_spec(doc);
+  EXPECT_EQ(spec.target_environment, "production");
+  EXPECT_EQ(spec.release, "2026.09");
+}
+
+TEST(Spec, AnUnconstrainedSpecIsUnchangedByTheseFields) {
+  // Every specification written before this existed must parse identically and
+  // hash identically, or the feature would silently invalidate a repository.
+  const auto spec = pglaswell::parse_spec(minimal_spec());
+  EXPECT_TRUE(spec.target_environment.empty());
+  EXPECT_TRUE(spec.release.empty());
+}
+
+TEST(Spec, EnvironmentAndReleaseMustBeNonEmptyStrings) {
+  json doc = minimal_spec();
+  doc["release"] = "";
+  EXPECT_NE(spec_error(doc).find("release"), std::string::npos);
+
+  doc = minimal_spec();
+  doc["target"]["environment"] = 42;
+  EXPECT_NE(spec_error(doc).find("environment"), std::string::npos);
+}
+
 TEST(Spec, AnUnfilteredDeleteIsRefused) {
   json doc = minimal_spec();
   doc["intents"] = json::array({json{{"kind", "delete_rows"}, {"schema", "s"},
@@ -9536,6 +9576,61 @@ TEST_F(DatabaseTest, ReservedWordIdentifiersAreQuotedEverywhereTheyAreEmitted) {
               std::string(c.expect))
         << c.what << ":\n" << plan.render();
   }
+}
+
+// The environment and release gates, end to end, because the property being
+// tested is WHERE THE ANSWER COMES FROM. A unit test against a hand-built
+// LedgerStatus would pass just as well if the gate read a config file, which is
+// exactly the design this rejects: laswell.environment and laswell.release are
+// SELECT-only for the migrating role, so what they say is the database's
+// assertion and not the caller's.
+TEST_F(BootstrappedTest, TheDatabaseDecidesItsEnvironmentAndWhichReleasesAreReady) {
+  auto exec = [&](const std::string& sql) {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/gates");
+    w.txn().exec(sql);
+    w.commit();
+  };
+  exec("DELETE FROM laswell.environment");
+  exec("DELETE FROM laswell.release");
+
+  pglaswell::Ledger ledger(cfg());
+  {
+    const auto st = ledger.status();
+    EXPECT_EQ(st.version, pglaswell::kLedgerSchemaVersion);
+    EXPECT_TRUE(st.environment.empty()) << "an unlabelled database says so";
+    EXPECT_TRUE(st.releases_ready.empty());
+  }
+
+  exec("INSERT INTO laswell.environment(name) VALUES ('staging')");
+  exec("INSERT INTO laswell.release(tag, ready, marked_ready_at, marked_by)"
+       " VALUES ('2026.09', false, NULL, NULL)");
+  {
+    const auto st = ledger.status();
+    EXPECT_EQ(st.environment, "staging");
+    // Present and not ready is still held: absence and false mean the same
+    // thing to a gate, which is what makes "held" the safe default.
+    EXPECT_EQ(st.releases_ready.count("2026.09"), 0u);
+  }
+
+  exec("UPDATE laswell.release SET ready = true, marked_ready_at = now(),"
+       " marked_by = current_user WHERE tag = '2026.09'");
+  {
+    const auto st = ledger.status();
+    EXPECT_EQ(st.releases_ready.count("2026.09"), 1u);
+  }
+
+  // The constraint that keeps an approval accountable: ready with nobody
+  // recorded as having approved it is refused by the database itself.
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/gates");
+    EXPECT_THROW(
+        w.txn().exec("INSERT INTO laswell.release(tag, ready) VALUES ('x', true)"),
+        pqxx::sql_error);
+  }
+  exec("DELETE FROM laswell.environment");
+  exec("DELETE FROM laswell.release");
 }
 
 TEST(Conformance, CoversEveryIntentKind) {

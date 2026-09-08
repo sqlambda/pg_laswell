@@ -104,6 +104,17 @@ replication lag. Those are pg_licht's readings.
   explicit id leaves a sequence behind so the application's next insert dies on
   a duplicate key. Both are visible in the catalog beforehand, so both are
   refused or repaired beforehand.
+- **Environments and releases, decided by the database.** A spec may declare
+  `target.environment`, and applies only where `laswell.environment` agrees; it
+  may carry a `release` tag, and is held until that tag is marked ready in
+  `laswell.release`. Both fields are inside the signature, so a reviewed
+  migration cannot be retargeted at production by editing a file. Both tables
+  are `SELECT`-only for the migrating role, for the same reason
+  `laswell.trusted_key` is: a role that could label its own database, or approve
+  its own release, is a gate that exists only as a comment. Neither is a
+  failure — a held migration is waiting for an approval, and one for another
+  environment belongs to another database, so a deployment reports both and
+  exits 0.
 - **Constraints as first-class changes.** `add_foreign_key`,
   `add_check_constraint` and `set_not_null` plan as `NOT VALID` + `VALIDATE` in
   separate transactions; `drop_constraint` refuses, before anything runs, a

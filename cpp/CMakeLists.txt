@@ -59,7 +59,8 @@ install(TARGETS pg_laswell pg_laswell_mcp RUNTIME DESTINATION ${CMAKE_INSTALL_BI
 # no doc toolchain, and the release build runs `--target pg_laswell_mcp` rather
 # than `all`, so a generator target would never run and CPack would then fail on
 # a missing install file.
-install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/man/pg_laswell_mcp.1
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/man/pg_laswell.1
+              ${CMAKE_CURRENT_SOURCE_DIR}/man/pg_laswell_mcp.1
         DESTINATION ${CMAKE_INSTALL_MANDIR}/man1)
 # The bootstrap script ships alongside the binary because the binary must never
 # run it: if pg_laswell created laswell.trusted_key its role would own it, and
@@ -93,6 +94,7 @@ if(BUILD_TESTING)
     if(MANDOC_EXECUTABLE)
         add_test(NAME manpage_lint
                  COMMAND ${MANDOC_EXECUTABLE} -Tlint -Wwarning
+                         ${CMAKE_CURRENT_SOURCE_DIR}/man/pg_laswell.1
                          ${CMAKE_CURRENT_SOURCE_DIR}/man/pg_laswell_mcp.1)
     else()
         message(STATUS "mandoc not found: skipping the manpage_lint test")

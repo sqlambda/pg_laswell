@@ -404,6 +404,44 @@ inline json start_migration(ToolContext& ctx, const json& args) {
     return json{{"error", "this server has no job registry"},
                 {"hint", "startMigration is unavailable in this build."}};
   }
+  // The environment and release gates, enforced HERE as well as in the
+  // repository listing. The listing is what a deployment reads; this is what
+  // stops a spec being applied by a direct call that never consulted it.
+  // Advisory locks follow the same principle: derive the answer once, enforce
+  // it at the point of action, so a caller cannot route around the analysis.
+  try {
+    const auto spec_probe = parse_spec(args["spec"]);
+    if (!spec_probe.target_environment.empty() || !spec_probe.release.empty()) {
+      Ledger ledger(ctx.connection(args), ctx.cache);
+      const auto st = ledger.status();
+      if (!spec_probe.target_environment.empty() &&
+          spec_probe.target_environment != st.environment) {
+        return json{
+            {"accepted", false},
+            {"error", "this database is \"" +
+                          (st.environment.empty() ? std::string("not labelled")
+                                                  : st.environment) +
+                          "\" and the spec targets \"" +
+                          spec_probe.target_environment + "\""},
+            {"hint", "laswell.environment says which database this is, and only "
+                     "the owner of that schema can change it."}};
+      }
+      if (!spec_probe.release.empty() &&
+          st.releases_ready.count(spec_probe.release) == 0) {
+        return json{
+            {"accepted", false},
+            {"error", "release \"" + spec_probe.release +
+                          "\" is not marked ready in this database"},
+            {"hint", "Approve it in laswell.release, as the owner of the "
+                     "laswell schema. Until then every spec carrying this tag "
+                     "is held."}};
+      }
+    }
+  } catch (const SpecError&) {
+    // A spec that does not parse is plan_migration_tool's error to report, in
+    // its own words, rather than a worse one from here.
+  }
+
   const auto planned = plan_migration_tool(ctx, args);
   if (planned.contains("error")) return planned;
   if (!planned.value("ok", false)) {

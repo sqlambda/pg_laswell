@@ -18,6 +18,7 @@
 //     ledger row at all. That is a foreign key, not a code path: there is no
 //     branch to forget.
 
+#include <set>
 #include <string>
 #include <vector>
 
@@ -30,13 +31,24 @@
 
 namespace pglaswell {
 
-inline constexpr int kLedgerSchemaVersion = 1;
+// 2 added laswell.environment and laswell.release. The bump is deliberate
+// rather than a silent CREATE TABLE IF NOT EXISTS: a binary that gates on a
+// release tag must refuse a ledger that has no table to read the tag out of,
+// because "no row" and "no table" mean opposite things -- the first holds the
+// migration and the second would silently let every gated migration through.
+inline constexpr int kLedgerSchemaVersion = 2;
 
 struct LedgerStatus {
   bool installed = false;
   int version = 0;
   bool usable = false;
   std::vector<std::string> trusted_key_ids;
+  // What this database says it IS, and which releases it has approved. Empty
+  // environment means unlabelled, which is not the same as "any": a spec that
+  // declares an environment cannot be checked against a database that declines
+  // to say what it is, and is refused rather than assumed to match.
+  std::string environment;
+  std::set<std::string> releases_ready;
   std::string error;
   std::string hint;
 
@@ -45,7 +57,9 @@ struct LedgerStatus {
            {"version", version},
            {"expectedVersion", kLedgerSchemaVersion},
            {"usable", usable},
-           {"trustedKeyIds", trusted_key_ids}};
+           {"trustedKeyIds", trusted_key_ids},
+           {"environment", environment},
+           {"releasesReady", releases_ready}};
     if (!error.empty()) j["error"] = error;
     if (!hint.empty()) j["hint"] = hint;
     return j;
@@ -89,13 +103,32 @@ class Ledger {
         'version', (SELECT MAX(version) FROM laswell.schema_version),
         'keys', COALESCE((SELECT JSONB_AGG(key_id ORDER BY key_id)
                             FROM laswell.trusted_key
-                           WHERE revoked_at IS NULL), '[]'::jsonb))
+                           WHERE revoked_at IS NULL), '[]'::jsonb),
+        -- to_regclass, not a plain SELECT: this same query has to answer for a
+        -- version 1 ledger, where neither table exists, and it answers "not
+        -- labelled, nothing approved" rather than failing. The version check
+        -- below is what refuses such a ledger; this must not fail first with a
+        -- less useful message.
+        'environment', (SELECT name FROM laswell.environment
+                         WHERE to_regclass('laswell.environment') IS NOT NULL
+                         LIMIT 1),
+        'releases', COALESCE((SELECT JSONB_AGG(tag ORDER BY tag)
+                                FROM laswell.release
+                               WHERE ready
+                                 AND to_regclass('laswell.release') IS NOT NULL),
+                             '[]'::jsonb))
     )SQL");
     if (!r.empty() && !r[0][0].is_null()) {
       const auto j = json::parse(r[0][0].as<std::string>());
       st.version = j.value("version", 0);
       for (const auto& k : j.value("keys", json::array())) {
         st.trusted_key_ids.push_back(k.get<std::string>());
+      }
+      if (j.contains("environment") && !j["environment"].is_null()) {
+        st.environment = j["environment"].get<std::string>();
+      }
+      for (const auto& t : j.value("releases", json::array())) {
+        st.releases_ready.insert(t.get<std::string>());
       }
     }
 

@@ -46,10 +46,15 @@ DECLARE
 BEGIN
   SELECT version INTO existing FROM laswell.schema_version ORDER BY version DESC LIMIT 1;
   IF existing IS NULL THEN
-    INSERT INTO laswell.schema_version(version) VALUES (1);
-  ELSIF existing <> 1 THEN
+    INSERT INTO laswell.schema_version(version) VALUES (2);
+  ELSIF existing = 1 THEN
+    -- 1 -> 2 adds laswell.environment and laswell.release. Both are created
+    -- unconditionally below, so the upgrade is the version row: a ledger at 1
+    -- has the same job, step and migration history and loses nothing.
+    INSERT INTO laswell.schema_version(version) VALUES (2);
+  ELSIF existing <> 2 THEN
     RAISE EXCEPTION
-      'laswell schema is at version %, this script installs version 1',
+      'laswell schema is at version %, this script installs version 2',
       existing
       USING HINT = 'Use the bootstrap script shipped with the pg_laswell binary '
                    'you are running, or migrate the ledger deliberately.';
@@ -88,6 +93,66 @@ COMMENT ON COLUMN laswell.trusted_key.revoked_at IS 'When trust was withdrawn. A
 -- --------------------------------------------------------------------------
 -- What was applied.
 -- --------------------------------------------------------------------------
+
+-- --------------------------------------------------------------------------
+-- WHICH DATABASE THIS IS, and WHICH RELEASES IT WILL ACCEPT.
+--
+-- Both live here, in the database, for the same reason laswell.trusted_key
+-- does: a permissive client configuration must not be able to talk a
+-- production database into accepting something meant for development. An
+-- environment read out of a config file beside the specs is an assertion by
+-- whoever is running the tool; an environment read out of the database is an
+-- assertion by the database itself, and only the second one is worth anything
+-- when the question is "am I about to run the dev migration against prod".
+--
+-- Both are therefore SELECT-only for the migrating role, and writing them is a
+-- privileged act performed by whoever owns this schema -- the same person who
+-- decides which signing keys are trusted.
+
+CREATE TABLE IF NOT EXISTS laswell.environment (
+  -- One row, enforced. Two rows would make "which environment is this" a
+  -- question with two answers, and every gate downstream would have to pick.
+  only_one    boolean     PRIMARY KEY DEFAULT true CHECK (only_one),
+  name        text        NOT NULL CHECK (name <> ''),
+  set_at      timestamptz NOT NULL DEFAULT now(),
+  set_by      text        NOT NULL DEFAULT current_user
+);
+COMMENT ON TABLE  laswell.environment      IS 'One row: which environment this database IS. A specification declaring target.environment is applied only where the two agree.';
+COMMENT ON COLUMN laswell.environment.name IS 'Environment name, e.g. production, staging, dev. Compared exactly; there is no matching rule to get wrong.';
+COMMENT ON COLUMN laswell.environment.set_at IS 'When this database was labelled.';
+COMMENT ON COLUMN laswell.environment.set_by IS 'Role that labelled it.';
+
+CREATE TABLE IF NOT EXISTS laswell.release (
+  tag             text        PRIMARY KEY CHECK (tag <> ''),
+  -- Held is the default and the safe state. A tag nobody has marked is a tag
+  -- nobody has approved, so a specification carrying it waits -- including a
+  -- tag that does not exist here at all, which is the ordinary case for a
+  -- release that has been written but not yet approved.
+  ready           boolean     NOT NULL DEFAULT false,
+  marked_ready_at timestamptz,
+  marked_by       text,
+  note            text,
+  CONSTRAINT ready_records_who_and_when
+    CHECK (NOT ready OR (marked_ready_at IS NOT NULL AND marked_by IS NOT NULL))
+);
+COMMENT ON TABLE  laswell.release       IS 'Release tags and whether each has been approved. A specification carrying a release tag is applied only once that tag is ready here.';
+COMMENT ON COLUMN laswell.release.tag   IS 'The tag, matching a specification''s top-level "release".';
+COMMENT ON COLUMN laswell.release.ready IS 'False holds every specification carrying this tag. Absent behaves as false.';
+COMMENT ON COLUMN laswell.release.marked_ready_at IS 'When the tag was approved.';
+COMMENT ON COLUMN laswell.release.marked_by IS 'Who approved it. Recorded because approval is an authorisation act, not a technical one.';
+COMMENT ON COLUMN laswell.release.note IS 'Free text: the change ticket, the approval, whatever the operator wants the next reader to see.';
+
+-- To label this database and approve a release, as the owner of this schema:
+--
+--   INSERT INTO laswell.environment(name) VALUES ('production')
+--     ON CONFLICT (only_one) DO UPDATE SET name = EXCLUDED.name,
+--       set_at = now(), set_by = current_user;
+--
+--   INSERT INTO laswell.release(tag, ready, marked_ready_at, marked_by, note)
+--     VALUES ('2026.09', true, now(), current_user, 'CHG-1234 approved')
+--     ON CONFLICT (tag) DO UPDATE SET ready = EXCLUDED.ready,
+--       marked_ready_at = EXCLUDED.marked_ready_at,
+--       marked_by = EXCLUDED.marked_by, note = EXCLUDED.note;
 
 CREATE TABLE IF NOT EXISTS laswell.migration (
   migration_id    bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -205,6 +270,11 @@ REVOKE ALL ON laswell.trusted_key FROM PUBLIC;
 GRANT USAGE ON SCHEMA laswell TO :"laswell_role";
 GRANT SELECT ON laswell.trusted_key    TO :"laswell_role";
 GRANT SELECT ON laswell.schema_version TO :"laswell_role";
+-- SELECT and no more, deliberately, and for the trusted_key reason: a role that
+-- could label its own database, or approve its own release, is a gate that
+-- exists only as a comment.
+GRANT SELECT ON laswell.environment    TO :"laswell_role";
+GRANT SELECT ON laswell.release        TO :"laswell_role";
 GRANT SELECT, INSERT, UPDATE ON laswell.migration       TO :"laswell_role";
 GRANT SELECT, INSERT, UPDATE ON laswell.job             TO :"laswell_role";
 GRANT SELECT, INSERT, UPDATE ON laswell.step            TO :"laswell_role";
@@ -216,4 +286,4 @@ GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA laswell TO :"laswell_role";
 
 COMMIT;
 
-\echo 'pg_laswell: schema laswell installed at version 1.'
+\echo 'pg_laswell: schema laswell installed at version 2.'

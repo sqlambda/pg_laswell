@@ -204,10 +204,15 @@ jobs:
           cmake -S cpp -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
           cmake --build build --target pg_laswell_mcp
           cd build && cpack -G DEB && cpack -G RPM && cpack -G TGZ
-      - name: The package must carry the binary, the manual and bootstrap.sql
+      - name: The package must carry both binaries, both manuals and bootstrap.sql
         run: |
           cd build
-          dpkg-deb -c ./*.deb | tee /dev/stderr | grep -q 'bin/pg_laswell_mcp'
+          # Both, checked by name. A package that shipped only the MCP server
+          # would leave a deployment with nothing to run, and the failure would
+          # not appear until somebody tried it on a release night.
+          dpkg-deb -c ./*.deb | tee /dev/stderr | grep -qE 'bin/pg_laswell$'
+          dpkg-deb -c ./*.deb | grep -q 'bin/pg_laswell_mcp'
+          dpkg-deb -c ./*.deb | grep -q 'man1/pg_laswell.1'
           dpkg-deb -c ./*.deb | grep -q 'man1/pg_laswell_mcp.1'
           # Shipped alongside the binary precisely because the binary must
           # never run it: an owner of laswell.trusted_key can grant itself
