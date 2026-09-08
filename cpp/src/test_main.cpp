@@ -37,6 +37,7 @@
 #include "ledger.h"
 #include "observations.h"
 #include "planner.h"
+#include "deploy.h"
 #include "repository.h"
 #include "server.h"
 #include "session.h"
@@ -9774,6 +9775,163 @@ TEST_F(BootstrappedTest, TheDatabaseDecidesItsEnvironmentAndWhichReleasesAreRead
   }
   exec("DELETE FROM laswell.environment");
   exec("DELETE FROM laswell.release");
+}
+
+// --- unattended deployment --------------------------------------------------
+//
+// The scheduler had no automated coverage at all: it was proven by hand against
+// a real repository, which is how all three of its original bugs were found and
+// none of them by reading it. What that proved, though, was one happy path on
+// one machine. These pin the parts a pipeline depends on -- what it applies,
+// what it refuses, what it merely reports, and the exit code for each -- so the
+// contract cannot drift.
+
+namespace {
+
+class DeployTest : public RepoTest {
+ public:
+  // Runs the deployment against the fixture's repository and database, and
+  // hands back both halves of what a pipeline sees: the code, and the text.
+  std::pair<pglaswell::DeployResult, std::string> deploy(
+      bool dry_run = false, bool status_only = false) {
+    std::ostringstream out;
+    pglaswell::DeployOptions opts;
+    opts.repo = dir_;
+    opts.dry_run = dry_run;
+    opts.status_only = status_only;
+    opts.poll_ms = 50;
+    opts.out = &out;
+    pglaswell::Deployment run(*ctx_, opts);
+    const auto result = run.run();
+    return {result, out.str()};
+  }
+
+  int column_count(const std::string& table, const std::string& column) {
+    pglaswell::ReadSession r(cfg());
+    return pglaswell::pqxx_exec(
+               r.txn(),
+               "SELECT count(*) FROM pg_attribute WHERE attrelid = $1::regclass"
+               " AND attname = $2 AND NOT attisdropped",
+               pqxx::params{"shop." + table, column})[0][0]
+        .as<int>();
+  }
+
+  void exec(const std::string& sql) {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/deploy");
+    w.txn().exec(sql);
+    w.commit();
+  }
+};
+
+}  // namespace
+
+TEST_F(DeployTest, AppliesEverythingPendingAndSaysNothingIsLeft) {
+  exec("DROP SCHEMA IF EXISTS shop CASCADE");
+  exec("CREATE SCHEMA shop");
+  exec("CREATE TABLE shop.orders(id bigint PRIMARY KEY)");
+  write_spec("a.json", add_column_spec("a", "orders", "ca"));
+
+  const auto [result, text] = deploy();
+  EXPECT_EQ(result, pglaswell::DeployResult::kOk) << text;
+  EXPECT_EQ(column_count("orders", "ca"), 1) << text;
+  EXPECT_NE(text.find("succeeded"), std::string::npos) << text;
+
+  // And again: an applied migration is not pending, so a second run is a no-op
+  // that still exits 0. A deployment step runs on every release whether or not
+  // anything changed, so this is the ordinary case rather than an edge one.
+  const auto [again, again_text] = deploy();
+  EXPECT_EQ(again, pglaswell::DeployResult::kOk) << again_text;
+  EXPECT_NE(again_text.find("0 pending"), std::string::npos) << again_text;
+}
+
+TEST_F(DeployTest, StatusAndDryRunChangeNothing) {
+  exec("DROP SCHEMA IF EXISTS shop CASCADE");
+  exec("CREATE SCHEMA shop");
+  exec("CREATE TABLE shop.orders(id bigint PRIMARY KEY)");
+  write_spec("a.json", add_column_spec("a", "orders", "ca"));
+
+  const auto [st, st_text] = deploy(/*dry_run=*/false, /*status_only=*/true);
+  EXPECT_EQ(st, pglaswell::DeployResult::kOk) << st_text;
+  EXPECT_EQ(column_count("orders", "ca"), 0) << "--status applied something";
+
+  const auto [dry, dry_text] = deploy(/*dry_run=*/true);
+  EXPECT_EQ(dry, pglaswell::DeployResult::kOk) << dry_text;
+  EXPECT_EQ(column_count("orders", "ca"), 0) << "--dry-run applied something";
+  // The dry run plans against the real schema, so it reports steps rather than
+  // merely echoing the specification back.
+  EXPECT_NE(dry_text.find("step(s)"), std::string::npos) << dry_text;
+}
+
+TEST_F(DeployTest, ARefusedPlanStopsTheRunAndNamesTheConflict) {
+  exec("DROP SCHEMA IF EXISTS shop CASCADE");
+  exec("CREATE SCHEMA shop");
+  exec("CREATE TABLE shop.orders(id bigint PRIMARY KEY, ca text NOT NULL)");
+  // The column already exists as NOT NULL and the spec declares it nullable:
+  // a conflict the planner can prove without running anything.
+  write_spec("a.json", add_column_spec("a", "orders", "ca"));
+
+  const auto [result, text] = deploy();
+  EXPECT_EQ(result, pglaswell::DeployResult::kRefused) << text;
+  EXPECT_NE(text.find("REFUSED"), std::string::npos) << text;
+  // The reason, not merely the verdict. Reporting "not accepted" and discarding
+  // the conflict was the original defect here, and it threw away the one thing
+  // this tool exists to say.
+  EXPECT_NE(text.find("ca"), std::string::npos) << text;
+}
+
+TEST_F(DeployTest, HeldAndNotForHereAreReportedAndAreNotFailures) {
+  exec("DROP SCHEMA IF EXISTS shop CASCADE");
+  exec("CREATE SCHEMA shop");
+  exec("CREATE TABLE shop.orders(id bigint PRIMARY KEY)");
+  exec("DELETE FROM laswell.environment");
+  exec("DELETE FROM laswell.release");
+  exec("INSERT INTO laswell.environment(name) VALUES ('staging')");
+
+  auto for_prod = add_column_spec("b", "orders", "cb");
+  for_prod["target"] = json{{"environment", "production"}};
+  write_spec("b.json", for_prod);
+
+  auto gated = add_column_spec("c", "orders", "cc");
+  gated["release"] = "2026.09";
+  write_spec("c.json", gated);
+
+  const auto [result, text] = deploy();
+  // Exit 0 is the contract. A held migration is waiting on an approval this
+  // database has not been given, and one for another environment belongs to a
+  // different database; a pipeline that learned to ignore a non-zero code
+  // would be worse than no code at all.
+  EXPECT_EQ(result, pglaswell::DeployResult::kOk) << text;
+  EXPECT_EQ(column_count("orders", "cb"), 0) << "a spec for production ran here";
+  EXPECT_EQ(column_count("orders", "cc"), 0) << "a held spec ran";
+  EXPECT_NE(text.find("wrong_environment"), std::string::npos) << text;
+  EXPECT_NE(text.find("held_for_release"), std::string::npos) << text;
+
+  // Approving the release releases exactly that one, and nothing else.
+  exec("INSERT INTO laswell.release(tag, ready, marked_ready_at, marked_by)"
+       " VALUES ('2026.09', true, now(), current_user)");
+  const auto [after, after_text] = deploy();
+  EXPECT_EQ(after, pglaswell::DeployResult::kOk) << after_text;
+  EXPECT_EQ(column_count("orders", "cc"), 1) << after_text;
+  EXPECT_EQ(column_count("orders", "cb"), 0) << "the environment gate opened too";
+
+  exec("DELETE FROM laswell.environment");
+  exec("DELETE FROM laswell.release");
+}
+
+TEST_F(DeployTest, ARepositoryProblemIsItsOwnExitCodeAndAppliesNothing) {
+  exec("DROP SCHEMA IF EXISTS shop CASCADE");
+  exec("CREATE SCHEMA shop");
+  exec("CREATE TABLE shop.orders(id bigint PRIMARY KEY)");
+  write_spec("a.json", add_column_spec("a", "orders", "ca"));
+  // Unparseable: a repository fault, not a migration failure, and a deployment
+  // must not start applying the healthy half of a repository it cannot read.
+  std::ofstream(dir_ + "/broken.json") << "{ this is not json";
+
+  const auto [result, text] = deploy();
+  EXPECT_EQ(result, pglaswell::DeployResult::kRepoProblem) << text;
+  EXPECT_EQ(column_count("orders", "ca"), 0)
+      << "a repository problem must stop before anything is applied: " << text;
 }
 
 TEST(Conformance, CoversEveryIntentKind) {

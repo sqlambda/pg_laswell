@@ -309,6 +309,21 @@ class MigrationRepository {
       entries.push_back(std::move(entry));
     }
 
+    // A file that does not parse is a fault in the REPOSITORY, not a property
+    // of one migration, so it belongs in `problems` and not only on its own
+    // entry. Two callers depend on that and both were wrong without it: the
+    // documented CI gate is "problems is non-empty", which would have passed
+    // over a spec nobody can read; and pg_laswell would apply the healthy half
+    // of a repository whose remainder is unknown -- and what is unknown
+    // includes where that file sat in the dependency order.
+    for (const auto& e : entries) {
+      if (e.status != RepoStatus::kUnreadable) continue;
+      problems.push_back(
+          e.path + " does not parse, so what it changes and where it belongs in "
+          "the order are both unknown: " +
+          (e.error.empty() ? std::string("no detail") : e.error));
+    }
+
     // Anything the ledger knows that the directory does not.
     std::set<std::string> on_disk;
     for (const auto& e : entries) {
