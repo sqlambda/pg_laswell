@@ -7282,6 +7282,8 @@ TEST_F(DatabaseTest, ThePartitionRecipesRunAndTheCheckReallyRemovesTheScan) {
     return attach_only;
   };
 
+  double with_check_best = 0, without_check_best = 0;
+
   // With the recipe: the CHECK is added NOT VALID, validated under a lock that
   // does not block, and only then is the partition attached.
   const double with_check = attach_ms(
@@ -7303,13 +7305,75 @@ TEST_F(DatabaseTest, ThePartitionRecipesRunAndTheCheckReallyRemovesTheScan) {
                         std::chrono::steady_clock::now() - t0).count();
   }
 
+  // BEST OF THREE, on both sides, because one sample each is not a measurement
+  // on shared infrastructure.
+  //
+  // The comment below has always said a loaded box can make any single timing
+  // meaningless, and the test then drew a conclusion from exactly one. On CI
+  // that produced 31ms for an attach that does no scanning at all -- a figure
+  // about the runner's neighbour, not about PostgreSQL -- against 62ms for the
+  // one that scans 400 000 rows, and a claim of 3x failed on a difference that
+  // is really nearer 60x.
+  //
+  // The minimum of several samples is the least-contended one, which is the
+  // closest thing to the truth about the server that a shared machine can
+  // offer. Both sides get the same treatment, so neither is flattered.
+  auto best_attach_ms = [&](const char* child, const char* from, const char* to,
+                            bool proven) {
+    double best = with_check;  // the sample already taken, for the proven side
+    if (!proven) best = without_check;
+    for (int i = 0; i < 2; ++i) {
+      pglaswell::WriteSession w(cfg);
+      w.begin("pg_laswell/test/part-remeasure");
+      w.txn().exec(std::string("ALTER TABLE laswell_ev DETACH PARTITION ") + child);
+      // A validated CHECK matching the bounds is exactly what lets PostgreSQL
+      // skip the scan; without one it must read every row. Set up per round so
+      // each sample measures the same thing the first one did.
+      w.txn().exec(std::string("ALTER TABLE ") + child +
+                   " DROP CONSTRAINT IF EXISTS remeasure_ck");
+      if (proven) {
+        w.txn().exec(std::string("ALTER TABLE ") + child +
+                     " ADD CONSTRAINT remeasure_ck CHECK (at >= '" + from +
+                     "' AND at < '" + to + "')");
+      }
+      w.commit();
+
+      pglaswell::WriteSession a(cfg);
+      const auto t0 = std::chrono::steady_clock::now();
+      a.begin("pg_laswell/test/part-remeasure-attach");
+      a.txn().exec(std::string("ALTER TABLE laswell_ev ATTACH PARTITION ") +
+                   child + " FOR VALUES FROM ('" + from + "') TO ('" + to + "')");
+      a.commit();
+      best = std::min(best, std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - t0).count());
+    }
+    return best;
+  };
+  with_check_best =
+      best_attach_ms("laswell_ev_a", "2026-01-01", "2027-01-01", true);
+  without_check_best =
+      best_attach_ms("laswell_ev_b", "2027-01-01", "2028-01-01", false);
+  {
+    // The measurement's own scaffolding, removed. The assertions below check
+    // that the RECIPE leaves no CHECK behind, and a constraint this test added
+    // for its own purposes would fail that for the wrong reason -- which it
+    // did, the first time this ran.
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/part-remeasure-cleanup");
+    for (const char* child : {"laswell_ev_a", "laswell_ev_b"}) {
+      w.txn().exec(std::string("ALTER TABLE ") + child +
+                   " DROP CONSTRAINT IF EXISTS remeasure_ck");
+    }
+    w.commit();
+  }
+
   // A loaded CI box can make any single timing meaningless, so this is a
   // bounded claim: the proven attach must be clearly cheaper, not merely
   // faster by a hair. If it is not, the recipe is not earning its four steps.
-  if (without_check < 5.0) {
+  if (without_check_best < 5.0) {
     GTEST_SKIP() << "the unproven attach was too fast to compare ("
-                 << without_check << "ms); the machine is faster than the "
-                                     "measurement needs";
+                 << without_check_best << "ms); the machine is faster than the "
+                                          "measurement needs";
   }
 #ifdef PGLASWELL_SANITIZER_ACTIVE
   // The CORRECTNESS above still ran and still asserted -- the CHECK was
@@ -7319,13 +7383,13 @@ TEST_F(DatabaseTest, ThePartitionRecipesRunAndTheCheckReallyRemovesTheScan) {
   // improvement that fails a 3x claim. Asserting it anyway would teach people
   // to ignore the sanitizer jobs, which is a worse outcome than not measuring
   // speed in a build that was never built to measure speed.
-  GTEST_SKIP() << "timing ratio not asserted under a sanitizer: " << with_check
-               << "ms against " << without_check
+  GTEST_SKIP() << "timing ratio not asserted under a sanitizer: "
+               << with_check_best << "ms against " << without_check_best
                << "ms measures the instrumentation as much as the server";
 #endif
-  EXPECT_LT(with_check * 3, without_check)
-      << "attach with a validated CHECK took " << with_check
-      << "ms, without took " << without_check
+  EXPECT_LT(with_check_best * 3, without_check_best)
+      << "attach with a validated CHECK took " << with_check_best
+      << "ms, without took " << without_check_best
       << "ms -- the CHECK is supposed to remove the scan entirely";
 
   {
