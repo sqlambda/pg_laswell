@@ -40,13 +40,21 @@ set(PGLASWELL_LIBS
     OpenSSL::Crypto
 )
 
+# Two binaries, one core. pg_laswell_mcp is for AUTHORING a migration -- an
+# agent plans it, reads the reasoning and decides. pg_laswell APPLIES one on a
+# release pipeline, where there is nobody to ask. deploy.h explains why there is
+# nothing to ask: pacing is measured, ordering is declared in the signed spec,
+# and the repository's concurrency grouping is already the conservative one.
+add_executable(pg_laswell src/deploy_main.cpp)
 add_executable(pg_laswell_mcp src/main.cpp)
 target_compile_definitions(pg_laswell_mcp PRIVATE PGLASWELL_VERSION="${PROJECT_VERSION}")
+target_compile_definitions(pg_laswell PRIVATE PGLASWELL_VERSION="${PROJECT_VERSION}")
 target_link_libraries(pg_laswell_mcp PRIVATE ${PGLASWELL_LIBS})
+target_link_libraries(pg_laswell PRIVATE ${PGLASWELL_LIBS})
 pglaswell_harden(pg_laswell_mcp)
 pglaswell_apply_sanitizers(pg_laswell_mcp)
 
-install(TARGETS pg_laswell_mcp RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(TARGETS pg_laswell pg_laswell_mcp RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 # The man page is checked in rather than generated: the release containers carry
 # no doc toolchain, and the release build runs `--target pg_laswell_mcp` rather
 # than `all`, so a generator target would never run and CPack would then fail on

@@ -111,9 +111,20 @@ replication lag. Those are pg_licht's readings.
 - **Convergence.** The same spec creates an index where it is missing and
   renames one that was built by hand under a different name, so a repository
   drives every database to the same state rather than only the clean ones.
-- **Agent operation.** It is an MCP server. Migrations return a job id
-  immediately; `jobStatus` reports progress, contention and per-step results
-  while they run.
+- **Two binaries, one core.** `pg_laswell` applies a repository unattended —
+  point it at a directory of signed specs and it walks the dependency levels,
+  runs each group, paces on contention and exits with a code a pipeline can
+  branch on. No agent, no MCP, nothing to poll. `pg_laswell_mcp` is the MCP
+  server, for *authoring* a migration: an agent plans one, reads the warnings,
+  argues with the reasoning and decides.
+
+  The split works because none of the decisions ever needed an agent. Pacing is
+  measured, not decided. Ordering is `depends_on`, declared in the signed spec.
+  And the repository's concurrency grouping is already the conservative one — it
+  denies concurrency on a shared relation *and* on incomplete evidence, so an
+  opaque trigger function is never assumed harmless. An agent can only widen
+  that grouping, which is an optimisation; it was never load-bearing for
+  safety.
 
 Measured on 300 000 rows with an application contending: **48 of 63 commits
 fired on a lock waiter and none on the interval**, finishing in the same wall
