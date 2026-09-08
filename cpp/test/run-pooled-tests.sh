@@ -33,7 +33,16 @@ PG_HOST="${PG_HOST:-127.0.0.1}"
 PG_USER="${PG_USER:-postgres}"
 PG_PASS="${PG_PASS:-postgres}"
 PG_DB="${PG_DB:-postgres}"
-BOUNCER_PORT="${BOUNCER_PORT:-6432}"
+# NOT 6432, which is PgBouncer's own default and therefore the one port
+# guaranteed to be taken. Installing the Debian/Ubuntu package enables and
+# starts a system pgbouncer service -- CI's log says so in as many words,
+# "Created symlink ... pgbouncer.service" -- and it listens on 6432 with a
+# configuration that knows nothing about this test. The script's own instance
+# then fails to bind, FATALs after forking (so `set -e` sees nothing, see
+# below), and every probe reaches the SYSTEM pooler instead, which rejects the
+# login. Everything through the pooler fails while the direct control passes,
+# which is exactly the shape this was reported as.
+BOUNCER_PORT="${BOUNCER_PORT:-16432}"
 PGBOUNCER="${PGBOUNCER:-pgbouncer}"
 
 export PSQLRC=/dev/null
@@ -70,6 +79,24 @@ unix_socket_dir =
 EOF
 
 "$PGBOUNCER" --version || true
+
+# The port has to be OURS. Binding is the one failure `pgbouncer -d` cannot
+# report to us -- it forks first and FATALs in the child -- so it is checked
+# beforehand, where the message can name the real problem instead of leaving a
+# stranger's pooler to answer our probes.
+if psql -X -q -c 'SELECT 1' \
+     "host=$PG_HOST port=$BOUNCER_PORT dbname=$PG_DB user=$PG_USER connect_timeout=2" \
+     >/dev/null 2>&1 ||
+   (command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | grep -q ":$BOUNCER_PORT[[:space:]]"); then
+  echo "  FAIL something is already listening on port $BOUNCER_PORT"
+  echo "       This test needs a pooler it configured itself. Installing the"
+  echo "       pgbouncer package starts a system service on 6432, which is why"
+  echo "       BOUNCER_PORT does not default to it. Set BOUNCER_PORT to a free"
+  echo "       port, or stop whatever holds this one."
+  command -v ss >/dev/null 2>&1 && ss -ltnp 2>/dev/null | grep ":$BOUNCER_PORT[[:space:]]" | sed 's/^/         /' || true
+  exit 1
+fi
+
 "$PGBOUNCER" -d "$WORK/pgbouncer.ini"
 
 # Prove the pooler is reachable BEFORE running any probe through it.
