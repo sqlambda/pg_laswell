@@ -22,6 +22,14 @@ set_property(CACHE PGLASWELL_SANITIZER PROPERTY STRINGS
 
 find_program(VALGRIND_EXECUTABLE valgrind)
 
+# Captured HERE, at include time. CMAKE_CURRENT_LIST_DIR is dynamically scoped:
+# read inside a function it is the directory of the file that CALLED the
+# function, not of this one, which resolved the exclusions file to a path that
+# does not exist -- and an unreadable list produced an EMPTY gtest filter, which
+# runs zero tests and reports success. A silent no-op is the worst outcome for
+# a safety check, so the path is fixed at include time and its absence is fatal.
+set(PGLASWELL_CMAKE_DIR "${CMAKE_CURRENT_LIST_DIR}")
+
 # Always-on static hygiene: warnings-as-errors + hardened standard library.
 function(pglaswell_harden target)
     target_compile_options(${target} PRIVATE
@@ -73,8 +81,32 @@ function(pglaswell_add_valgrind_test target)
         message(STATUS "PGLASWELL_SANITIZER=${PGLASWELL_SANITIZER} active — skipping ${target}_valgrind test")
         return()
     endif()
+    # The exclusions come from a file both this and tests.yml read, so the two
+    # cannot disagree about what Valgrind covers. See the file for why each is
+    # there.
+    set(_excl "${PGLASWELL_CMAKE_DIR}/../test/valgrind-slow-tests.txt")
+    if(NOT EXISTS "${_excl}")
+        message(FATAL_ERROR "missing ${_excl}: without it the Valgrind filter is "
+                            "empty, which runs no tests and reports success")
+    endif()
+    set(_filter "")
+    file(STRINGS "${_excl}" _lines)
+    foreach(_l IN LISTS _lines)
+        string(STRIP "${_l}" _l)
+        if(_l AND NOT _l MATCHES "^#")
+            if(_filter)
+                set(_filter "${_filter}:${_l}")
+            else()
+                set(_filter "-${_l}")
+            endif()
+        endif()
+    endforeach()
+    if(NOT _filter)
+        message(FATAL_ERROR "${_excl} lists no tests; an empty filter runs none")
+    endif()
+    message(STATUS "Valgrind excludes: ${_filter}")
     add_test(NAME ${target}_valgrind
         COMMAND ${VALGRIND_EXECUTABLE} --error-exitcode=99 --leak-check=full --track-origins=yes
-                $<TARGET_FILE:${target}>
+                $<TARGET_FILE:${target}> "--gtest_filter=${_filter}"
     )
 endfunction()

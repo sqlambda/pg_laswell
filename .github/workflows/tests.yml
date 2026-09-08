@@ -240,8 +240,20 @@ jobs:
           PGLASWELL_REQUIRE_DATABASE: '1'
         run: |
           chmod +x pg_laswell_mcp_test
+          # The exclusions come from the same file cpp/cmake/SafetyFlags.cmake
+          # reads, so a local `ctest -R valgrind` and this job cover exactly the
+          # same tests. The file says why each is excluded.
+          EXCL="$GITHUB_WORKSPACE/cpp/test/valgrind-slow-tests.txt"
+          NAMES="$(grep -vE '^\s*(#|$)' "$EXCL" | paste -sd:)"
+          # Guarded because a silently empty list is worse than a missing one:
+          # it would leave the filter meaning "exclude nothing" while still
+          # printing a plausible command line, so the exclusions would rot
+          # unnoticed. Same reasoning as the FATAL_ERROR in SafetyFlags.cmake.
+          test -n "$NAMES" || { echo "::error::$EXCL listed no tests"; exit 1; }
+          FILTER="-$NAMES"
+          echo "gtest filter: $FILTER"
           valgrind --error-exitcode=99 --leak-check=full --track-origins=yes \
-            ./pg_laswell_mcp_test
+            ./pg_laswell_mcp_test "--gtest_filter=$FILTER"
 
   # --call is the one caller that is neither an agent nor a person, and the exit
   # code is the whole point of it. Runs once: it does not vary by server major.

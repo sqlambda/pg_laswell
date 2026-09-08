@@ -1,0 +1,28 @@
+# Tests NOT run under Valgrind, and why.
+#
+# Read by cpp/cmake/SafetyFlags.cmake and by .github/workflows/tests.yml, so the
+# two cannot disagree about what is covered.
+#
+# Every one of these waits on a PACED BACKFILL to reach a terminal state, which
+# is bounded by wall clock rather than by work: the executor commits on an
+# interval, and Valgrind's slowdown multiplies the number of intervals a job
+# takes. On a GitHub runner -- roughly a hundred times slower than a developer's
+# machine under Valgrind, measured -- one of these reached two interval commits
+# in 260 seconds and had not finished. Locally the same test takes 1.6s under
+# Valgrind and passes. Nothing is wrong with the code; the measurement is of the
+# runner.
+#
+# They are NOT uncovered. ADDRESS_UNDEFINED and THREAD both run the whole suite
+# including these, and THREAD is the gate that matters for them -- a worker
+# thread per job against a shared registry is what they exercise. Valgrind is
+# here for what a sanitizer build cannot reach: the OpenSSL EVP handle
+# lifetimes, which are the only manual C resource management in the project, and
+# every test that touches signing still runs.
+#
+# One name per line. Adding a wildcard would silently exclude tests written
+# later, so each is named.
+ToolTest.ThePacedBackfillCommitsRepeatedlyRatherThanOnce
+ToolTest.CancellingAJobStopsItAndLeavesTheCursorCommitted
+ToolTest.TwoJobsForTheSameSpecCannotRunAtOnce
+ToolTest.WithNoWaiterTheIntervalIsWhatCommits
+ToolTest.ASucceededJobsCursorIsNotResumedFrom
