@@ -3665,6 +3665,18 @@ TEST_F(RepoTest, ADependencyStuckInABadStateIsNotMisreportedAsACycle) {
   EXPECT_FALSE(cycle) << "a blocked dependency was misreported as a cycle";
 }
 
+// EXPLAIN (GENERIC_PLAN) arrived in PostgreSQL 16, and relation derivation for
+// an opaque expression rests entirely on it. Below 16 the tool cannot see
+// inside such an expression and SAYS so rather than guessing -- which is the
+// behaviour worth asserting, so these tests check the degraded answer instead
+// of being skipped. A skip nobody notices is a test that silently stopped
+// running; an assertion on the degraded path keeps the promise honest on every
+// server this project claims to support.
+static int server_version_of(const pglaswell::ConnConfig& cfg) {
+  pglaswell::ReadSession r(cfg);
+  return r.txn().exec("SHOW server_version_num")[0][0].as<int>();
+}
+
 TEST_F(RepoTest, RelationsHiddenInAnOpaqueExpressionAreDerived) {
   // The spec declares shop.orders. The set-expression reads shop.region_tax,
   // which no intent names. EXPLAIN reveals it, which is the whole reason the
@@ -3699,6 +3711,21 @@ TEST_F(RepoTest, RelationsHiddenInAnOpaqueExpressionAreDerived) {
   for (const auto& r : (*e)["relations"]) {
     if (r.get<std::string>() == "shop.region_tax") found = true;
   }
+
+  if (server_version_of(cfg()) < 160000) {
+    // The degraded path, asserted rather than skipped: without GENERIC_PLAN the
+    // hidden relation cannot be derived, and the tool must mark the evidence
+    // INCOMPLETE rather than report a short list as if it were the whole one.
+    // Reporting a partial list confidently is the failure that matters here --
+    // it is what would let two migrations be grouped that share a table nobody
+    // could see.
+    EXPECT_FALSE(found) << "GENERIC_PLAN is unavailable before 16, so this "
+                           "relation cannot have been derived: "
+                        << (*e)["relations"].dump();
+    EXPECT_TRUE(e->contains("opaque"))
+        << "evidence is incomplete and the listing must say so: " << e->dump(2);
+    return;
+  }
   EXPECT_TRUE(found) << "a relation hidden in an opaque expression was not "
                         "derived: " << (*e)["relations"].dump();
 }
@@ -3718,8 +3745,17 @@ TEST_F(RepoTest, IndependentMigrationsAreGroupedAndOverlappingOnesAreNot) {
 
   const auto s = scan(true);
   ASSERT_EQ(s["order"].size(), 1u) << s.dump(2);
-  EXPECT_TRUE(s["order"][0].value("provenConcurrent", false))
-      << "two migrations on disjoint tables were not grouped: " << s.dump(2);
+  if (server_version_of(cfg()) < 160000) {
+    // Nothing proves independence, so incomplete evidence denies it. Before 16
+    // the relation lists cannot be completed, so these two are NOT grouped --
+    // and that is the correct answer, not a defect: the tool declines to
+    // parallelise what it could not prove disjoint.
+    EXPECT_FALSE(s["order"][0].value("provenConcurrent", true))
+        << "without GENERIC_PLAN nothing may be proven concurrent: " << s.dump(2);
+  } else {
+    EXPECT_TRUE(s["order"][0].value("provenConcurrent", false))
+        << "two migrations on disjoint tables were not grouped: " << s.dump(2);
+  }
 
   // Now make them overlap: both touch shop.orders.
   write_spec("b.json", add_column_spec("b", "orders", "cb"));

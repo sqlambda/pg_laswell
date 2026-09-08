@@ -58,12 +58,37 @@ pidfile = $WORK/bouncer.pid
 unix_socket_dir =
 EOF
 
+"$PGBOUNCER" --version || true
 "$PGBOUNCER" -d "$WORK/pgbouncer.ini"
+
+# Prove the pooler is reachable BEFORE running any probe through it.
+#
+# Without this the script ran its probes against a pooler nothing could connect
+# to, and reported "session state did NOT leak -- PgBouncer's default may have
+# changed" -- a conclusion about PgBouncer's behaviour drawn from a connection
+# that never happened. That is worse than failing: it points the next reader at
+# the wrong thing entirely, and it is exactly the mistake this project refuses
+# to make elsewhere, where a reading that cannot be taken is reported as
+# unavailable rather than guessed at.
+reachable=no
 for _ in $(seq 30); do
-  psql -X -q -c 'SELECT 1' \
-    "host=127.0.0.1 port=$BOUNCER_PORT dbname=$PG_DB user=$PG_USER" >/dev/null 2>&1 && break
+  if psql -X -q -c 'SELECT 1' \
+       "host=127.0.0.1 port=$BOUNCER_PORT dbname=$PG_DB user=$PG_USER" >/dev/null 2>&1; then
+    reachable=yes; break
+  fi
   sleep 0.5
 done
+if [ "$reachable" != yes ]; then
+  echo "  FAIL the pooler never accepted a connection, so nothing below was measured"
+  echo "       psql said:"
+  psql -X -q -c 'SELECT 1' \
+    "host=127.0.0.1 port=$BOUNCER_PORT dbname=$PG_DB user=$PG_USER" 2>&1 | sed 's/^/         /'
+  echo "       pgbouncer log:"
+  sed 's/^/         /' "$WORK/pgbouncer.log" 2>/dev/null || echo "         (no log at $WORK/pgbouncer.log)"
+  echo "       config:"
+  sed 's/^/         /' "$WORK/pgbouncer.ini"
+  exit 1
+fi
 
 POOLED="host=127.0.0.1 port=$BOUNCER_PORT dbname=$PG_DB user=$PG_USER password=$PG_PASS"
 DIRECT="host=$PG_HOST port=$PG_PORT dbname=$PG_DB user=$PG_USER password=$PG_PASS"
