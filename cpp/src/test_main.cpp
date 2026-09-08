@@ -1351,6 +1351,50 @@ TEST(Config, FromUrlNeedsNoFileAndConnectsToNothing) {
             std::string::npos);
 }
 
+TEST(Config, ApplicationNameIsAppendedTheWayEachConninfoSpellingTakesIt) {
+  // libpq accepts two spellings and they take a parameter differently. The
+  // keyword form appends a space-separated pair; a URI takes a query parameter.
+  // Appending the keyword form to a URI lands the pair inside the last
+  // component, and libpq refuses the whole string:
+  //
+  //   Error in connection string: unexpected spaces found in
+  //   "postgres application_name=pg-laswell/0.1.0"
+  //
+  // That is not a corner case. postgresql://user:pass@host:5432/db is how most
+  // people write DATABASE_URL, and it is what this project's own CI uses -- so
+  // the broken half was the common one, and no local run could show it because
+  // the keyword form is what a developer types by hand.
+  {
+    const auto r = pglaswell::Registry::from_url("port=5555 dbname=x", "app");
+    const auto c = r.get("default").conninfo;
+    EXPECT_NE(c.find(" application_name=app"), std::string::npos) << c;
+    EXPECT_EQ(c.find('?'), std::string::npos) << "keyword form takes no query: " << c;
+  }
+  {
+    const auto r = pglaswell::Registry::from_url(
+        "postgresql://postgres:postgres@localhost:5432/postgres", "pg-laswell/0.1.0");
+    const auto c = r.get("default").conninfo;
+    EXPECT_NE(c.find("?application_name=pg-laswell%2F0.1.0"), std::string::npos) << c;
+    // The slash MUST be escaped and there must be no space anywhere: those are
+    // the two things that made libpq refuse the string.
+    EXPECT_EQ(c.find(' '), std::string::npos) << c;
+  }
+  {
+    // postgres:// is the same scheme under its older name.
+    const auto r = pglaswell::Registry::from_url("postgres://h/db", "app");
+    EXPECT_NE(r.get("default").conninfo.find("?application_name=app"),
+              std::string::npos);
+  }
+  {
+    // A URI that already carries a parameter continues the query rather than
+    // starting a second one.
+    const auto r = pglaswell::Registry::from_url(
+        "postgresql://h/db?sslmode=require", "app");
+    const auto c = r.get("default").conninfo;
+    EXPECT_NE(c.find("?sslmode=require&application_name=app"), std::string::npos) << c;
+  }
+}
+
 TEST(Config, ConninfoValuesNeedingQuotingAreQuoted) {
   TempIni ini("[a]\nhost = x\npassword = a b\n");
   const auto r = pglaswell::Registry::from_ini(ini.path(), "t");

@@ -248,6 +248,56 @@ inline std::string quote_conninfo(const std::string& v) {
   return out;
 }
 
+// libpq accepts two spellings of a connection string and they take a parameter
+// differently. Appending " application_name=x" is right for the keyword form
+// and WRONG for a URI, where it lands inside the last component and libpq
+// refuses the whole string:
+//
+//   Error in connection string: unexpected spaces found in
+//   "postgres application_name=pg-laswell/0.1.0", use percent-encoded spaces
+//
+// Found by the first CI run this project ever had, where DATABASE_URL is
+// postgresql://postgres:postgres@localhost:5432/postgres -- which is how most
+// people write it, so the broken half was the common one.
+inline bool is_conninfo_uri(const std::string& url) {
+  return url.rfind("postgresql://", 0) == 0 || url.rfind("postgres://", 0) == 0;
+}
+
+// RFC 3986 unreserved characters pass through; everything else is escaped. The
+// application name carries a slash and a dot (pg-laswell/0.1.0), and while both
+// are legal in a query value, escaping by an explicit allowlist is the rule
+// that stays correct when the name changes.
+inline std::string percent_encode(const std::string& v) {
+  static const char* kHex = "0123456789ABCDEF";
+  std::string out;
+  for (const char raw : v) {
+    const auto c = static_cast<unsigned char>(raw);
+    const bool unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                            (c >= '0' && c <= '9') || c == '-' || c == '.' ||
+                            c == '_' || c == '~';
+    if (unreserved) {
+      out += static_cast<char>(c);
+    } else {
+      out += '%';
+      out += kHex[c >> 4];
+      out += kHex[c & 0x0F];
+    }
+  }
+  return out;
+}
+
+// One place that knows how to add a parameter to either spelling.
+inline std::string with_application_name(const std::string& url,
+                                         const std::string& app_name) {
+  if (!is_conninfo_uri(url)) {
+    return url + " application_name=" + quote_conninfo(app_name);
+  }
+  // A URI carries parameters in a query string. Anything after '#' would be a
+  // fragment, which libpq does not use, so appending is safe.
+  const auto sep = url.find('?') == std::string::npos ? '?' : '&';
+  return url + sep + "application_name=" + percent_encode(app_name);
+}
+
 }  // namespace detail
 
 // Applies one `key = value` pair to an ExecutorConfig. Returns false if the key
@@ -416,7 +466,7 @@ class Registry {
     Registry r;
     ConnConfig c;
     c.name = "default";
-    c.conninfo = url + " application_name=" + detail::quote_conninfo(app_name);
+    c.conninfo = detail::with_application_name(url, app_name);
     c.executor = r.executor_;
     r.conns_["default"] = c;
     r.order_.push_back("default");
