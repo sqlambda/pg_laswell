@@ -192,7 +192,16 @@ class Ledger {
 
       // The bytes come from the database, not from the caller's config. This
       // is what makes gate 2 stronger than gate 1 rather than a repeat of it.
-      const auto bin = r[0][0].as<std::basic_string<std::byte>>();
+      //
+      // pqxx::bytes, not std::basic_string<std::byte>. They are the same type
+      // on libstdc++ and are NOT on libc++, which deprecates char_traits<T>
+      // for any T that is not a character type -- so spelling it out built on
+      // Linux for a year and failed the first macOS build with -Werror. The
+      // alias exists for exactly this, and libpqxx substitutes its own traits
+      // where the generic ones are missing. It is also what keeps this working
+      // when libpqxx changes bytes to std::vector<std::byte>, as it says it
+      // will: size() and the range-for below are all this needs from it.
+      const auto bin = r[0][0].as<pqxx::bytes>();
       std::vector<unsigned char> pubkey;
       pubkey.reserve(bin.size());
       for (const auto b : bin) pubkey.push_back(static_cast<unsigned char>(b));

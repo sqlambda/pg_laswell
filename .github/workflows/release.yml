@@ -218,6 +218,10 @@ jobs:
           # Both binaries link it, so both are checked: they are separate link
           # lines and only one of them being static would ship a package that
           # installs and then cannot start.
+          # No here-strings (<<<) or [[ ]] anywhere in this file: the runner
+          # picks `sh -e` for the Debian container, and a bash-ism there is a
+          # syntax error that kills the step before it checks anything --
+          # which is how a check can be both present and useless.
           for b in pg_laswell pg_laswell_mcp; do
             if [ "${{ matrix.distro }}" = "macos" ]; then
               otool -L "build/$b"
@@ -226,7 +230,7 @@ jobs:
               objdump -p "build/$b" | grep NEEDED
               LINKED=$(objdump -p "build/$b")
             fi
-            if grep -q 'pqxx' <<<"$LINKED"; then
+            if printf '%s\n' "$LINKED" | grep -q 'pqxx'; then
               echo "::error::libpqxx was linked dynamically into $b; the source build did not take effect"
               exit 1
             fi
@@ -292,15 +296,15 @@ jobs:
           for want in bin/pg_laswell bin/pg_laswell_mcp \
                       man1/pg_laswell.1 man1/pg_laswell_mcp.1 \
                       share/pg_laswell/bootstrap.sql; do
-            grep -q "$want" <<<"$LIST" || {
+            printf '%s\n' "$LIST" | grep -q "$want" || {
               echo "::error::$want is missing from the package"; exit 1; }
           done
           # Dependencies are derived, so this asserts that generation RAN, not
           # what it produced: pinning the exact list here would be the same
           # mistake as pinning it in CMakeLists.
           case "${{ matrix.extension }}" in
-            deb) grep -q 'libpq5'     <<<"$DEPS" || { echo "::error::no derived Depends"; exit 1; } ;;
-            rpm) grep -q 'libpq.so.5' <<<"$DEPS" || { echo "::error::no derived Requires"; exit 1; } ;;
+            deb) printf '%s\n' "$DEPS" | grep -q 'libpq5'     || { echo "::error::no derived Depends"; exit 1; } ;;
+            rpm) printf '%s\n' "$DEPS" | grep -q 'libpq.so.5' || { echo "::error::no derived Requires"; exit 1; } ;;
           esac
           echo "$LIST"
 
@@ -328,7 +332,7 @@ jobs:
           esac
           "$BIN" --version
           OUT=$("$BIN" --call getSpecDigest --args "$SPEC")
-          grep -q '"digest"' <<<"$OUT" || {
+          printf '%s\n' "$OUT" | grep -q '"digest"' || {
             echo "::error::the installed binary did not answer: $OUT"; exit 1; }
           # The deployment binary too. --version is the right probe for it for
           # the same reason getSpecDigest is for the server: it needs no
