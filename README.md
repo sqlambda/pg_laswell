@@ -145,6 +145,53 @@ costs nothing and bounds the harm.
 Signing answers *"did this exact change come from someone we trust?"*, not
 *"should this change be allowed?"*. The second question is `GRANT`'s job.
 
+## A worked example
+
+[`examples/house`](examples/house) is a whole repository rather than a snippet:
+fifty-one signed specifications building a household inventory from an empty
+database — schema, eight enums, a supertype and seven detail tables, views, a
+materialized view, triggers, seeds, and then the awkward changes that come
+afterwards. Twenty-six of the intent kinds, applied against a real PostgreSQL
+and checked afterwards by forty-six assertions.
+
+```bash
+cd examples/house
+bin/setup.sh --port 5432    # database, roles, ledger, signing key, config
+bin/sign-specs.sh           # canonical bytes from getSpecDigest, signed with openssl
+bin/run.sh                  # status, dry run, apply, verify
+```
+
+The part worth reading is `depends_on`. Every edge is one the change actually
+has, so the fifty-one resolve to ten levels with concurrent groups of up to
+eleven — and the serialisation *inside* those levels is derived rather than
+declared. Building from empty, all fifty-six of those refusals are provable
+ones, on a shared relation or a shared type:
+
+```
+serialised: 0030-table-item and 0070-seed-room both touch house.room,
+so they must not run together
+```
+
+The second kind needs a database that is only part-way through, because the
+grouping is computed from what is still pending: interrupt an apply, or add to
+the repository later, and the remaining specifications are now planned against
+a schema where the `updated_at` triggers already exist. Then this appears — the
+refusal this tool is built around, in its own words:
+
+```
+serialised: 0062-view-borrowed-book and 0086-seed-book share no relation this
+analysis can see, but independence is NOT proven: house.item carries triggers
+(item_touch_updated_at -> touch_updated_at()); what a trigger function writes
+is not visible in the catalog or the plan, so relations it touches are not in
+this set. An opaque trigger function can write any table, including the other
+migration's. Your call.
+```
+
+Its README also records what writing it found, including two worth knowing
+before you rely on an unattended run: an interrupted `pg_laswell` leaves a job
+with no `finished_at` and wedges the repository, and a `failed` migration is
+then never retried — it is printed in the plan, skipped, and the run exits 0.
+
 ## What it deliberately does not do
 
 An intent kind must make a real decision **and** be a change to schema state
