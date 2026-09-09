@@ -1,0 +1,210 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0084-seed-cleaning-product",
+  "description": "Seed the cleaning cupboard, two items of which are hazardous.",
+  "rationale": "Volumes and masses share one unit column, so bleach in litres and dishwasher salt in kilograms sit in the same table without either being converted into a unit nobody reads off a label. Ids come from the 5000-5099 block.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0044-table-cleaning-product",
+    "0070-seed-room",
+    "0071-seed-brand"
+  ],
+  "intents": [
+    {
+      "kind": "insert_rows",
+      "schema": "house",
+      "table": "item",
+      "key": "item_id",
+      "overriding": "system",
+      "on_conflict": "skip",
+      "conflict_target": [
+        "item_id"
+      ],
+      "columns": [
+        "item_id",
+        "category",
+        "name",
+        "brand_id",
+        "room_id",
+        "purchase_date",
+        "purchase_price",
+        "current_price"
+      ],
+      "values": [
+        [
+          5001,
+          "cleaning_product",
+          "Dish soap",
+          9,
+          1,
+          "2026-08-14",
+          "4.90",
+          null
+        ],
+        [
+          5002,
+          "cleaning_product",
+          "Bleach",
+          9,
+          10,
+          "2026-08-14",
+          "6.30",
+          null
+        ],
+        [
+          5003,
+          "cleaning_product",
+          "Laundry detergent",
+          9,
+          10,
+          "2026-07-02",
+          "28.90",
+          null
+        ],
+        [
+          5004,
+          "cleaning_product",
+          "Fabric softener",
+          9,
+          10,
+          "2026-07-02",
+          "19.40",
+          null
+        ],
+        [
+          5005,
+          "cleaning_product",
+          "Glass cleaner",
+          9,
+          1,
+          "2026-06-11",
+          "8.70",
+          null
+        ],
+        [
+          5006,
+          "cleaning_product",
+          "Toilet cleaner",
+          9,
+          9,
+          "2026-08-14",
+          "9.80",
+          null
+        ],
+        [
+          5007,
+          "cleaning_product",
+          "Dishwasher salt",
+          2,
+          1,
+          "2026-05-23",
+          "12.40",
+          null
+        ],
+        [
+          5008,
+          "cleaning_product",
+          "Floor cleaner",
+          9,
+          4,
+          "2026-06-11",
+          "15.60",
+          null
+        ]
+      ]
+    },
+    {
+      "kind": "insert_rows",
+      "schema": "house",
+      "table": "cleaning_product",
+      "key": "item_id",
+      "on_conflict": "skip",
+      "conflict_target": [
+        "item_id"
+      ],
+      "columns": [
+        "item_id",
+        "net_volume",
+        "volume_unit",
+        "hazardous",
+        "expiry_date",
+        "scent"
+      ],
+      "values": [
+        [
+          5001,
+          "500.000",
+          "ml",
+          false,
+          "2028-02-28",
+          "lemon"
+        ],
+        [
+          5002,
+          "1.000",
+          "l",
+          true,
+          "2027-02-28",
+          null
+        ],
+        [
+          5003,
+          "2.000",
+          "l",
+          false,
+          "2028-06-30",
+          "lavender"
+        ],
+        [
+          5004,
+          "2.000",
+          "l",
+          false,
+          "2028-06-30",
+          "lavender"
+        ],
+        [
+          5005,
+          "500.000",
+          "ml",
+          false,
+          null,
+          "unscented"
+        ],
+        [
+          5006,
+          "750.000",
+          "ml",
+          true,
+          "2027-08-31",
+          "pine"
+        ],
+        [
+          5007,
+          "2.000",
+          "kg",
+          false,
+          null,
+          null
+        ],
+        [
+          5008,
+          "1.000",
+          "l",
+          false,
+          "2028-01-31",
+          "eucalyptus"
+        ]
+      ]
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "iDosx98ltsPsnSAhRLhyjlIfJHvtdBjxrzlk8veYOqD685tdkR/rfGW3WYoD9VjrW2ee9R58Wyubfo+UVbyvCg=="
+    }
+  ]
+}

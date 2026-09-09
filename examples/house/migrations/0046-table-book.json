@@ -1,0 +1,144 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0046-table-book",
+  "description": "Create house.book, shelved on a piece of furniture and sometimes lent to a friend.",
+  "rationale": "A book is on a shelf, and a shelf is furniture, so shelf_item_id points at house.furniture rather than at house.item -- a book cannot be shelved on a frying pan. Who borrowed it is the field this household actually needs.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0030-table-item",
+    "0040-table-furniture"
+  ],
+  "intents": [
+    {
+      "kind": "create_table",
+      "schema": "house",
+      "table": "book",
+      "comment": "Detail for an item of category book. One row per house.item row.",
+      "primary_key": [
+        "item_id"
+      ],
+      "columns": [
+        {
+          "name": "item_id",
+          "type": "bigint",
+          "nullable": false,
+          "comment": "The house.item row this extends."
+        },
+        {
+          "name": "isbn",
+          "type": "varchar(17)",
+          "nullable": true,
+          "comment": "ISBN-13 with or without hyphens. Null for anything printed before 1970 or bound at home. Unique when present."
+        },
+        {
+          "name": "title",
+          "type": "text",
+          "nullable": false,
+          "comment": "Title as printed on the spine."
+        },
+        {
+          "name": "author",
+          "type": "text",
+          "nullable": false,
+          "comment": "Author as printed. One text field on purpose: this is a household shelf, not a library catalogue."
+        },
+        {
+          "name": "shelf_item_id",
+          "type": "bigint",
+          "nullable": true,
+          "comment": "The piece of furniture it is shelved on. Null when it is in a pile, or lent out."
+        },
+        {
+          "name": "borrowed_by",
+          "type": "text",
+          "nullable": true,
+          "comment": "Name of the friend who has it. Null when the book is home. Renamed to borrowed_by_friend in 0099."
+        },
+        {
+          "name": "borrowed_on",
+          "type": "date",
+          "nullable": true,
+          "comment": "When it left the house. Null when the book is home."
+        }
+      ]
+    },
+    {
+      "kind": "create_index",
+      "schema": "house",
+      "table": "book",
+      "name": "book_shelf_item_id_idx",
+      "columns": [
+        "shelf_item_id"
+      ],
+      "comment": "Leads with the referencing column of book_shelf_fk, and answers 'what is on this shelf'."
+    },
+    {
+      "kind": "create_index",
+      "schema": "house",
+      "table": "book",
+      "name": "book_borrowed_idx",
+      "columns": [
+        "borrowed_by"
+      ],
+      "where": "borrowed_by IS NOT NULL",
+      "comment": "Partial: the lent-out shortlist. Most books are home, and only the absent ones are ever chased."
+    },
+    {
+      "kind": "add_check_constraint",
+      "schema": "house",
+      "table": "book",
+      "name": "book_borrowed_pair",
+      "expression": "(borrowed_by IS NULL) = (borrowed_on IS NULL)"
+    },
+    {
+      "kind": "add_unique_constraint",
+      "schema": "house",
+      "table": "book",
+      "name": "book_isbn_key",
+      "columns": [
+        "isbn"
+      ]
+    },
+    {
+      "kind": "add_foreign_key",
+      "schema": "house",
+      "table": "book",
+      "name": "book_item_fk",
+      "columns": [
+        "item_id"
+      ],
+      "references_schema": "house",
+      "references_table": "item",
+      "references_columns": [
+        "item_id"
+      ],
+      "on_delete": "CASCADE",
+      "on_update": "CASCADE"
+    },
+    {
+      "kind": "add_foreign_key",
+      "schema": "house",
+      "table": "book",
+      "name": "book_shelf_fk",
+      "columns": [
+        "shelf_item_id"
+      ],
+      "references_schema": "house",
+      "references_table": "furniture",
+      "references_columns": [
+        "item_id"
+      ],
+      "on_delete": "SET NULL",
+      "on_update": "CASCADE"
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "DMAB1UIGvmwyUmcxxEqKyq0dU4RWfI5HkjGtcbgHfGV0fWwQjNvRFGICHp0+Alq00HnSv6aptrKbtTWrW0NvAg=="
+    }
+  ]
+}

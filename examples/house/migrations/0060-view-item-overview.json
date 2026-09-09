@@ -1,0 +1,30 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0060-view-item-overview",
+  "description": "Create house.item_overview, the flat inventory listing with room and brand names resolved.",
+  "rationale": "Written through replace_view rather than a create_object, because CREATE OR REPLACE is what every later change to it will use and the first version should be created by the same mechanism. Columns are enumerated, never SELECT *: a star is expanded once, at creation, so a later ADD COLUMN would never reach this view and nothing would say so.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0030-table-item",
+    "0020-table-room",
+    "0021-table-brand"
+  ],
+  "intents": [
+    {
+      "kind": "replace_view",
+      "schema": "house",
+      "name": "item_overview",
+      "comment": "Every item with its room and brand resolved to names, and the loss against purchase price where a current price is known.",
+      "definition": "SELECT i.item_id, i.category, i.name, b.name AS brand_name, r.name AS room_name, r.kind AS room_kind, i.purchase_date, i.purchase_price, i.current_price, i.current_price - i.purchase_price AS value_change FROM house.item AS i LEFT JOIN house.brand AS b ON b.brand_id = i.brand_id LEFT JOIN house.room AS r ON r.room_id = i.room_id"
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "bX8yhhXPeJTDfU0VxR18kigl2/V/B7VPxPb99eR+aIG/vGeH9LDZnbhi5VM5RQSf23joKjBFTukx7mQjkjQaBQ=="
+    }
+  ]
+}

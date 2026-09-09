@@ -1,0 +1,57 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0099-rename-borrower",
+  "description": "Rename house.book.borrowed_by to borrowed_by_friend, and republish the view that reads it.",
+  "rationale": "The column holds a friend's name, and borrowed_by read like a role or a user id. The rename itself repairs the catalog by itself: dependencies are held by OID, so house.borrowed_book stays queryable and its stored definition follows the new name with nothing rebuilt. What does NOT follow is the part people expect to -- the view keeps its OWN output column name, so its definition becomes \"borrowed_by_friend AS borrowed_by\" and anything reading through it still sees borrowed_by, correct and misleading, with nothing erroring to say so. Fixing that costs more than a replace: CREATE OR REPLACE VIEW can only APPEND columns, and PostgreSQL refuses outright to rename an existing one -- pg_laswell's dry run caught exactly that before anything ran. So the view is dropped and rebuilt, which is what renaming a column a view exposes actually costs. It depends on 0096 because that specification names the old column, and a rename that landed first would leave 0096 unable to parse. The explicit set_comment on the view is not redundant: replace_view emits its COMMENT ON only when it is CREATING the view, and after a drop_view in the same specification it still measures the view as present -- so the comment the drop removed is never put back. Stating it as its own intent is the reliable form.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0046-table-book",
+    "0062-view-borrowed-book",
+    "0096-lend-books"
+  ],
+  "intents": [
+    {
+      "kind": "rename_column",
+      "schema": "house",
+      "table": "book",
+      "column": "borrowed_by",
+      "to": "borrowed_by_friend"
+    },
+    {
+      "kind": "drop_view",
+      "schema": "house",
+      "name": "borrowed_book"
+    },
+    {
+      "kind": "replace_view",
+      "schema": "house",
+      "name": "borrowed_book",
+      "comment": "Books that are out on loan, oldest loan first.",
+      "definition": "SELECT b.item_id, b.title, b.author, b.isbn, b.borrowed_by_friend, b.borrowed_on, CURRENT_DATE - b.borrowed_on AS days_out FROM house.book AS b WHERE b.borrowed_by_friend IS NOT NULL"
+    },
+    {
+      "kind": "set_comment",
+      "object_type": "VIEW",
+      "schema": "house",
+      "name": "borrowed_book",
+      "comment": "Books that are out on loan, oldest loan first."
+    },
+    {
+      "kind": "set_comment",
+      "object_type": "COLUMN",
+      "schema": "house",
+      "table": "book",
+      "name": "borrowed_by_friend",
+      "comment": "Name of the friend who has the book. Null when it is home. Renamed from borrowed_by in 0099."
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "V9mteoSf4DNZvKI1FyOOASzSNLuspv3Z9iVbw7jluj+p24OZ+DPMgquvsq2E2vHpB83Eh8tirnQFYYXJia4MCg=="
+    }
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0063-matview-room-value",
+  "description": "Create house.room_value, a materialized rollup of what each room holds.",
+  "rationale": "Stale by design: this is a household inventory, and 'what is the study worth' does not need to be true to the second. The unique index REFRESH ... CONCURRENTLY needs is a separate specification, 0064, because a plan is measured against the catalog and the matview does not exist there until this one has committed.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0030-table-item",
+    "0020-table-room"
+  ],
+  "intents": [
+    {
+      "kind": "create_materialized_view",
+      "schema": "house",
+      "name": "room_value",
+      "with_data": true,
+      "comment": "Item count and total value per room, as of the last REFRESH. Refresh it CONCURRENTLY; room_value_room_id_key exists to make that legal.",
+      "definition": "SELECT r.room_id, r.name AS room_name, r.kind AS room_kind, count(i.item_id) AS item_count, COALESCE(sum(i.purchase_price), 0) AS purchase_total, COALESCE(sum(COALESCE(i.current_price, i.purchase_price)), 0) AS current_total FROM house.room AS r LEFT JOIN house.item AS i ON i.room_id = r.room_id GROUP BY r.room_id, r.name, r.kind"
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "mlnc4yv73+GmRtkUKSMft//OyFoxB3GplMxWPznmZ/+vVuRb1dAribZr+bRo/F+z2DyRi5MySzTSiCML8Jr8Dw=="
+    }
+  ]
+}

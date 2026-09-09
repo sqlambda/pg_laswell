@@ -1,0 +1,65 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0094-brand-upsert",
+  "description": "Reconcile the brand list: correct two country codes and add three makers.",
+  "rationale": "A MERGE keyed on name, which house.brand has a unique constraint on. That constraint is not decoration: MERGE's ON clause is not a key constraint, and against a table with two rows sharing a key one source row would silently update both. pg_laswell refuses a merge whose key has no unique index behind it, which is why this is safe to write as an upsert at all. when_not_matched_by_source is deliberately absent -- this is a reconciliation of the rows named here, not a replacement of the table.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0071-seed-brand"
+  ],
+  "intents": [
+    {
+      "kind": "merge_rows",
+      "schema": "house",
+      "table": "brand",
+      "key": "name",
+      "columns": [
+        "name",
+        "country_code"
+      ],
+      "values": [
+        [
+          "Logitech",
+          "CH"
+        ],
+        [
+          "Nintendo",
+          "JP"
+        ],
+        [
+          "Philips",
+          "NL"
+        ],
+        [
+          "Dell",
+          "US"
+        ],
+        [
+          "3M",
+          "US"
+        ]
+      ],
+      "when_matched": "update",
+      "update_columns": [
+        "country_code"
+      ],
+      "when_not_matched": "insert",
+      "paced": false,
+      "assert_invariants": [
+        {
+          "name": "no_brand_loses_its_name",
+          "query": "SELECT count(*)::text FROM house.brand WHERE name IS NULL OR name = ''"
+        }
+      ]
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "T9AWWZJGGe7ymLauL6ifvweLbbbRk/1j387jGIO1KXxQm0Tbf/l8L79Fdyw3BVEzA//0LD/Arc5TnhyZE+VPBw=="
+    }
+  ]
+}

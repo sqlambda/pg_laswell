@@ -1,0 +1,114 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0043-table-food",
+  "description": "Create house.food, the only category with an expiry date.",
+  "rationale": "Food is the one thing in the house that stops being an asset on a known date. That date is required, and it is what 0097 deletes on.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0016-type-food-kind",
+    "0012-type-measure-unit",
+    "0030-table-item"
+  ],
+  "intents": [
+    {
+      "kind": "create_table",
+      "schema": "house",
+      "table": "food",
+      "comment": "Detail for an item of category food. One row per house.item row; the brand is on house.item.",
+      "primary_key": [
+        "item_id"
+      ],
+      "columns": [
+        {
+          "name": "item_id",
+          "type": "bigint",
+          "nullable": false,
+          "comment": "The house.item row this extends."
+        },
+        {
+          "name": "kind",
+          "type": "house.food_kind",
+          "nullable": false,
+          "comment": "Staple category of the food."
+        },
+        {
+          "name": "expiry_date",
+          "type": "date",
+          "nullable": false,
+          "comment": "Last day it should be eaten. Required: food with no expiry is food nobody can clear out."
+        },
+        {
+          "name": "net_weight",
+          "type": "numeric(10,3)",
+          "nullable": false,
+          "comment": "Net quantity in the package, in weight_unit."
+        },
+        {
+          "name": "weight_unit",
+          "type": "house.measure_unit",
+          "nullable": false,
+          "comment": "Unit net_weight is stated in. Stored rather than normalised to grams, because the label is what anyone checks against."
+        },
+        {
+          "name": "opened",
+          "type": "boolean",
+          "default": "false",
+          "nullable": false,
+          "comment": "Whether the package has been opened, which shortens how long it really lasts."
+        }
+      ]
+    },
+    {
+      "kind": "create_index",
+      "schema": "house",
+      "table": "food",
+      "name": "food_expiry_date_idx",
+      "columns": [
+        "expiry_date"
+      ],
+      "comment": "What expires next, which is the only question anybody asks this table."
+    },
+    {
+      "kind": "create_index",
+      "schema": "house",
+      "table": "food",
+      "name": "food_kind_idx",
+      "columns": [
+        "kind"
+      ],
+      "comment": "How much rice is in the house."
+    },
+    {
+      "kind": "add_check_constraint",
+      "schema": "house",
+      "table": "food",
+      "name": "food_net_weight_positive",
+      "expression": "net_weight > 0"
+    },
+    {
+      "kind": "add_foreign_key",
+      "schema": "house",
+      "table": "food",
+      "name": "food_item_fk",
+      "columns": [
+        "item_id"
+      ],
+      "references_schema": "house",
+      "references_table": "item",
+      "references_columns": [
+        "item_id"
+      ],
+      "on_delete": "CASCADE",
+      "on_update": "CASCADE"
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "IX5NnD053/CUGWCfPs1fR1EBnro44raTbSmA0BBFeSusBIF/QdpRkA+e/aVVNGiCigYd384RoVSEwxOWSkP4Dw=="
+    }
+  ]
+}

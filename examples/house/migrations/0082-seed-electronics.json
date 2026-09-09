@@ -1,0 +1,336 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0082-seed-electronics",
+  "description": "Seed the electronics, from the TV down to the mouse.",
+  "rationale": "The self-built desktop has a null brand_id on purpose: brand is nullable because a thing somebody assembled has no maker, and a seed that never exercises the null case does not test it. Every serial number is unique, which is the constraint 0042 added. Ids come from the 3000-3099 block.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0042-table-electronics",
+    "0070-seed-room",
+    "0071-seed-brand"
+  ],
+  "intents": [
+    {
+      "kind": "insert_rows",
+      "schema": "house",
+      "table": "item",
+      "key": "item_id",
+      "overriding": "system",
+      "on_conflict": "skip",
+      "conflict_target": [
+        "item_id"
+      ],
+      "columns": [
+        "item_id",
+        "category",
+        "name",
+        "brand_id",
+        "room_id",
+        "purchase_date",
+        "purchase_price",
+        "current_price"
+      ],
+      "values": [
+        [
+          3001,
+          "electronics",
+          "Living room TV",
+          3,
+          2,
+          "2022-11-25",
+          "3299.00",
+          "2100.00"
+        ],
+        [
+          3002,
+          "electronics",
+          "Soundbar",
+          3,
+          2,
+          "2022-11-25",
+          "899.00",
+          "600.00"
+        ],
+        [
+          3003,
+          "electronics",
+          "Study monitor",
+          3,
+          8,
+          "2023-02-09",
+          "1450.00",
+          "1000.00"
+        ],
+        [
+          3004,
+          "electronics",
+          "Main cellphone",
+          3,
+          6,
+          "2024-05-17",
+          "4199.00",
+          "2800.00"
+        ],
+        [
+          3005,
+          "electronics",
+          "Work laptop",
+          3,
+          8,
+          "2023-08-30",
+          "6890.00",
+          "4200.00"
+        ],
+        [
+          3006,
+          "electronics",
+          "Self-built desktop",
+          null,
+          8,
+          "2021-06-12",
+          "5400.00",
+          "2600.00"
+        ],
+        [
+          3007,
+          "electronics",
+          "Desk mouse",
+          10,
+          8,
+          "2023-08-30",
+          "349.00",
+          "200.00"
+        ],
+        [
+          3008,
+          "electronics",
+          "Desk keyboard",
+          10,
+          8,
+          "2023-08-30",
+          "629.00",
+          "400.00"
+        ],
+        [
+          3009,
+          "electronics",
+          "3D printer",
+          11,
+          11,
+          "2024-01-22",
+          "4750.00",
+          "3900.00"
+        ],
+        [
+          3010,
+          "electronics",
+          "Games console",
+          12,
+          2,
+          "2021-12-24",
+          "2199.00",
+          "1300.00"
+        ],
+        [
+          3011,
+          "electronics",
+          "Dishwasher",
+          2,
+          1,
+          "2020-09-08",
+          "3890.00",
+          "2000.00"
+        ],
+        [
+          3012,
+          "electronics",
+          "Microwave",
+          2,
+          1,
+          "2020-09-08",
+          "1150.00",
+          "500.00"
+        ],
+        [
+          3013,
+          "electronics",
+          "Built-in oven",
+          2,
+          1,
+          "2017-05-30",
+          "4600.00",
+          "1400.00"
+        ],
+        [
+          3014,
+          "electronics",
+          "Compact camera",
+          3,
+          8,
+          "2019-04-06",
+          "1890.00",
+          "600.00"
+        ],
+        [
+          3015,
+          "electronics",
+          "Hi-fi system",
+          3,
+          2,
+          "2016-10-11",
+          "2450.00",
+          "700.00"
+        ]
+      ]
+    },
+    {
+      "kind": "insert_rows",
+      "schema": "house",
+      "table": "electronics",
+      "key": "item_id",
+      "on_conflict": "skip",
+      "conflict_target": [
+        "item_id"
+      ],
+      "columns": [
+        "item_id",
+        "kind",
+        "model",
+        "serial_number",
+        "power_watts",
+        "warranty_until"
+      ],
+      "values": [
+        [
+          3001,
+          "tv",
+          "QE55Q60B",
+          "SN-TV-4471902",
+          120,
+          "2027-11-25"
+        ],
+        [
+          3002,
+          "soundbar",
+          "HW-Q600B",
+          "SN-SB-1180334",
+          80,
+          "2026-11-25"
+        ],
+        [
+          3003,
+          "monitor",
+          "LS27AG320NLXZD",
+          "SN-MO-9925117",
+          45,
+          "2026-02-09"
+        ],
+        [
+          3004,
+          "cellphone",
+          "Galaxy S23",
+          "SN-CP-3390218",
+          15,
+          "2026-05-17"
+        ],
+        [
+          3005,
+          "laptop",
+          "Galaxy Book3 Pro",
+          "SN-LP-7712045",
+          65,
+          "2026-08-30"
+        ],
+        [
+          3006,
+          "computer",
+          "custom-ryzen-5600",
+          "SN-PC-0000001",
+          550,
+          null
+        ],
+        [
+          3007,
+          "mouse",
+          "MX Master 3S",
+          "SN-MS-5561023",
+          2,
+          "2025-08-30"
+        ],
+        [
+          3008,
+          "keyboard",
+          "MX Mechanical",
+          "SN-KB-8834190",
+          3,
+          "2025-08-30"
+        ],
+        [
+          3009,
+          "printer_3d",
+          "MK4",
+          "SN-3D-2204471",
+          240,
+          "2026-01-22"
+        ],
+        [
+          3010,
+          "video_game",
+          "Switch OLED",
+          "SN-VG-6640813",
+          18,
+          "2023-12-24"
+        ],
+        [
+          3011,
+          "dishwasher",
+          "SMS4HVI33E",
+          "SN-DW-1029384",
+          900,
+          "2025-09-08"
+        ],
+        [
+          3012,
+          "microwave",
+          "BFL523MS0",
+          "SN-MW-4455661",
+          800,
+          "2022-09-08"
+        ],
+        [
+          3013,
+          "oven",
+          "HBA5780S0",
+          "SN-OV-7788990",
+          3300,
+          "2019-05-30"
+        ],
+        [
+          3014,
+          "camera",
+          "NX3300",
+          "SN-CA-3311002",
+          6,
+          null
+        ],
+        [
+          3015,
+          "sound_system",
+          "MX-ST40B",
+          "SN-SS-0099887",
+          160,
+          null
+        ]
+      ]
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "sb2GFkb2Air81WnzCZWA1Ir4/fXLIcrEhvrh8j3d2j0fF+SWsGM/61pzvVOf0EZoA+LF+q1dCGGjl1Yq6JEyBQ=="
+    }
+  ]
+}

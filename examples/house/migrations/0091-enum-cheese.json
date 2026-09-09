@@ -1,0 +1,28 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0091-enum-cheese",
+  "description": "Add cheese to house.food_kind.",
+  "rationale": "Same irreversibility as 0090. Placed after milk so the dairy labels sort together, because an enum's declared order is the order it compares and sorts in.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0016-type-food-kind"
+  ],
+  "intents": [
+    {
+      "kind": "add_enum_value",
+      "schema": "house",
+      "name": "food_kind",
+      "value": "cheese",
+      "after": "milk"
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "iUiTz3jRZg3plkXoWcpIz/a/nMfXerFFJGZ6HB1vfZcarjHKhPot00Lm0X6qh3dYx3OBjMJXwYy3ayP1UKBvAw=="
+    }
+  ]
+}

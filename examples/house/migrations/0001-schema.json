@@ -1,0 +1,23 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0001-schema",
+  "description": "Create the house schema, which every other object in this repository lives in.",
+  "rationale": "One schema rather than public: the inventory is the whole database, and naming it makes a GRANT on the schema a meaningful boundary later.",
+  "target": {
+    "environment": "dev"
+  },
+  "intents": [
+    {
+      "kind": "create_schema",
+      "schema": "house",
+      "comment": "Household inventory: every physical thing in the house, what it cost, and which room it is in."
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "eK/21JJ/OmzJaBHyXK1H4XSJWV3bkXLfjwaObYZyR9DGZPgVwhUtPNgy9EQT2PCZ5GLzPAxqoJi3hGODU2BCDQ=="
+    }
+  ]
+}

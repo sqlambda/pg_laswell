@@ -1,0 +1,55 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0096-lend-books",
+  "description": "Record that two books are out with friends.",
+  "rationale": "update_rows rather than backfill, because each row gets its OWN values and there is no expression to re-derive them from. That is also why assert_invariants is here: with per-row values there is no rule that says what the update should have done, so the check has to be stated. The pair constraint on house.book means borrowed_by and borrowed_on have to move together, which this does in one statement.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0086-seed-book"
+  ],
+  "intents": [
+    {
+      "kind": "update_rows",
+      "schema": "house",
+      "table": "book",
+      "key": "item_id",
+      "columns": [
+        "item_id",
+        "borrowed_by",
+        "borrowed_on"
+      ],
+      "values": [
+        [
+          7002,
+          "Marina",
+          "2026-07-19"
+        ],
+        [
+          7006,
+          "Tobias",
+          "2026-08-30"
+        ]
+      ],
+      "paced": false,
+      "assert_invariants": [
+        {
+          "name": "borrow_pair_never_half_set",
+          "query": "SELECT count(*)::text FROM house.book WHERE (borrowed_by IS NULL) <> (borrowed_on IS NULL)"
+        },
+        {
+          "name": "book_count_unchanged",
+          "query": "SELECT count(*)::text FROM house.book"
+        }
+      ]
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "gZmhmbxLF8aWCeEzn7iVq0aSp5mvy7wZPdZhuJ5wM53H6giT0rw2xpqgelmrO4uRqGndFNNbtgC6m2r1Og1xCw=="
+    }
+  ]
+}

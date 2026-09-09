@@ -1,0 +1,40 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0013-type-furniture-kind",
+  "description": "Enumerate the kinds of furniture.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0001-schema"
+  ],
+  "intents": [
+    {
+      "kind": "create_type",
+      "schema": "house",
+      "name": "furniture_kind",
+      "type_kind": "enum",
+      "base": "text",
+      "comment": "What a piece of furniture is. Seating first, then surfaces, then storage.",
+      "labels": [
+        "chair",
+        "stool",
+        "bench",
+        "sofa",
+        "bed",
+        "table",
+        "desk",
+        "shelf",
+        "cabinet",
+        "wardrobe"
+      ]
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "gYYp8JTOjWdAzXpudgZBa20aEY/tzlf44W2SeMC5HFxTqBRmkl1f7hSQZ4QyBRgvwaH8GdQXzvpeUBAFElMhCQ=="
+    }
+  ]
+}

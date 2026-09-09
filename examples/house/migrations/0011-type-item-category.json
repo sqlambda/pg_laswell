@@ -1,0 +1,38 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0011-type-item-category",
+  "description": "Enumerate the categories an inventory item can belong to.",
+  "rationale": "house.item is a supertype and this column says which detail table carries the rest of the row. An enum makes the set closed, so a category with no detail table cannot be written.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0001-schema"
+  ],
+  "intents": [
+    {
+      "kind": "create_type",
+      "schema": "house",
+      "name": "item_category",
+      "type_kind": "enum",
+      "base": "text",
+      "comment": "Which detail table extends this item: one label per subtype table in the house schema.",
+      "labels": [
+        "furniture",
+        "kitchenware",
+        "electronics",
+        "book",
+        "food",
+        "cleaning_product",
+        "tool"
+      ]
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "oRdbiLU9t843FJrqwaAoz2u6y+PFsxDGksWdKuo7GmAqqcbCPk46TOycsGoXqhEAy0xWRiiNO4isQdBgaDu0Cg=="
+    }
+  ]
+}

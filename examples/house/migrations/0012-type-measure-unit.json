@@ -1,0 +1,37 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0012-type-measure-unit",
+  "description": "Enumerate the units food weights and cleaning-product volumes are recorded in.",
+  "rationale": "Two tables need the same unit vocabulary, so it is one type rather than two check constraints that drift apart.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0001-schema"
+  ],
+  "intents": [
+    {
+      "kind": "create_type",
+      "schema": "house",
+      "name": "measure_unit",
+      "type_kind": "enum",
+      "base": "text",
+      "comment": "Unit a quantity is recorded in. Mass and volume share one type because a bottle of bleach is sold by volume and a bag of rice by mass, and both are stock.",
+      "labels": [
+        "mg",
+        "g",
+        "kg",
+        "ml",
+        "l",
+        "unit"
+      ]
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "S8Hr+3umF2tyop0Qdl+C6B55E4ETYognGfG7soI1ItdsJCPBuN0slF17fwU0zyI1rTxljBjL/K4O8s1kxzigDA=="
+    }
+  ]
+}

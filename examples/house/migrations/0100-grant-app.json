@@ -1,0 +1,67 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0100-grant-app",
+  "description": "Give the house_app role the access it needs, and nothing else.",
+  "rationale": "Last on purpose, and the dependency list is honest rather than defensive: GRANT ... ON ALL TABLES IN SCHEMA reaches the tables that exist when it runs and no others, so every table and view specification really is a prerequisite. A table added after this one is not covered by it, which is a fact about GRANT and not something a migration tool can paper over -- the next such table brings its own grant. house_app gets no DDL rights at all: it cannot create, drop or alter anything, which is the boundary a separate schema was created to make expressible. Note that a revoke takes effect on already-connected sessions at their next statement, so this is not a change that waits for a restart.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0060-view-item-overview",
+    "0061-view-electronics-catalogue",
+    "0062-view-borrowed-book",
+    "0064-index-room-value",
+    "0092-item-disposal",
+    "0099-rename-borrower"
+  ],
+  "intents": [
+    {
+      "kind": "grant",
+      "object_type": "SCHEMA",
+      "schema": "house",
+      "name": "house",
+      "privileges": [
+        "USAGE"
+      ],
+      "to": [
+        "house_app"
+      ]
+    },
+    {
+      "kind": "grant",
+      "object_type": "TABLE",
+      "schema": "house",
+      "table": "item",
+      "all_in_schema": true,
+      "privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "to": [
+        "house_app"
+      ]
+    },
+    {
+      "kind": "revoke",
+      "object_type": "TABLE",
+      "schema": "house",
+      "table": "item",
+      "all_in_schema": true,
+      "privileges": [
+        "TRUNCATE"
+      ],
+      "from": [
+        "house_app"
+      ]
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "8jaV24QY4TcxBTPUcKijM54ugrI+RdssnwRYybiZwEfpVDHerMflcByxMmhR9naxA2yup1Ve0wseNPvW/IDhBw=="
+    }
+  ]
+}

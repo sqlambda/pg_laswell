@@ -1,0 +1,104 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0044-table-cleaning-product",
+  "description": "Create house.cleaning_product, measured by volume or mass and flagged where it is hazardous.",
+  "rationale": "Bleach and dishwasher salt are bought by very different units, so the unit is a column rather than an assumption. hazardous is the one flag that changes where a thing may be stored.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0012-type-measure-unit",
+    "0030-table-item"
+  ],
+  "intents": [
+    {
+      "kind": "create_table",
+      "schema": "house",
+      "table": "cleaning_product",
+      "comment": "Detail for an item of category cleaning_product. One row per house.item row.",
+      "primary_key": [
+        "item_id"
+      ],
+      "columns": [
+        {
+          "name": "item_id",
+          "type": "bigint",
+          "nullable": false,
+          "comment": "The house.item row this extends."
+        },
+        {
+          "name": "net_volume",
+          "type": "numeric(10,3)",
+          "nullable": false,
+          "comment": "Net quantity in the container, in volume_unit. Named volume even where the unit is a mass, because that is what the label calls it."
+        },
+        {
+          "name": "volume_unit",
+          "type": "house.measure_unit",
+          "nullable": false,
+          "comment": "Unit net_volume is stated in."
+        },
+        {
+          "name": "hazardous",
+          "type": "boolean",
+          "default": "false",
+          "nullable": false,
+          "comment": "Whether it must be kept away from food and out of reach. Drives where it may be stored."
+        },
+        {
+          "name": "expiry_date",
+          "type": "date",
+          "nullable": true,
+          "comment": "Last day the maker vouches for it. Null for products that do not carry one."
+        },
+        {
+          "name": "scent",
+          "type": "text",
+          "nullable": true,
+          "comment": "Fragrance as sold: 'lemon', 'unscented'. Null where the label says nothing."
+        }
+      ]
+    },
+    {
+      "kind": "create_index",
+      "schema": "house",
+      "table": "cleaning_product",
+      "name": "cleaning_product_hazardous_idx",
+      "columns": [
+        "item_id"
+      ],
+      "where": "hazardous",
+      "comment": "Partial: the hazardous shortlist is short and is the only subset anybody audits."
+    },
+    {
+      "kind": "add_check_constraint",
+      "schema": "house",
+      "table": "cleaning_product",
+      "name": "cleaning_product_net_volume_positive",
+      "expression": "net_volume > 0"
+    },
+    {
+      "kind": "add_foreign_key",
+      "schema": "house",
+      "table": "cleaning_product",
+      "name": "cleaning_product_item_fk",
+      "columns": [
+        "item_id"
+      ],
+      "references_schema": "house",
+      "references_table": "item",
+      "references_columns": [
+        "item_id"
+      ],
+      "on_delete": "CASCADE",
+      "on_update": "CASCADE"
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "YmT8S3exGTlF1eLDzGnW/BqvetZbRbAwOM3/3EH5VJPiqTGDT/lAdsSGpcOelq3WOmQVsyT4MGoelm/vDuwkDQ=="
+    }
+  ]
+}

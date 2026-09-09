@@ -1,0 +1,41 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0016-type-food-kind",
+  "description": "Enumerate the kinds of food kept in the house.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0001-schema"
+  ],
+  "intents": [
+    {
+      "kind": "create_type",
+      "schema": "house",
+      "name": "food_kind",
+      "type_kind": "enum",
+      "base": "text",
+      "comment": "Staple category of a food item. Dry goods first, then perishables.",
+      "labels": [
+        "rice",
+        "beans",
+        "pasta",
+        "flour",
+        "sugar",
+        "salt",
+        "coffee",
+        "oil",
+        "meat",
+        "milk",
+        "eggs"
+      ]
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "ZuX5gLwdyxRNKdFjptRypbLaSXUiqco+5Rfi2hjmpIcq2MSTr0Vo43aLMPPg9uMCxgF2WwxMc9QwWeo/wq8/DQ=="
+    }
+  ]
+}

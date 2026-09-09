@@ -1,0 +1,104 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0045-table-tool",
+  "description": "Create house.tool: screwdrivers, hammers, axes, drills, saws.",
+  "rationale": "The only distinction that matters when storing tools is whether they need power, so powered is NOT NULL and a powered tool must state its voltage.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0017-type-tool-kind",
+    "0030-table-item"
+  ],
+  "intents": [
+    {
+      "kind": "create_table",
+      "schema": "house",
+      "table": "tool",
+      "comment": "Detail for an item of category tool. One row per house.item row.",
+      "primary_key": [
+        "item_id"
+      ],
+      "columns": [
+        {
+          "name": "item_id",
+          "type": "bigint",
+          "nullable": false,
+          "comment": "The house.item row this extends."
+        },
+        {
+          "name": "kind",
+          "type": "house.tool_kind",
+          "nullable": false,
+          "comment": "What the tool is."
+        },
+        {
+          "name": "powered",
+          "type": "boolean",
+          "nullable": false,
+          "comment": "Whether it needs mains or a battery. A hammer does not."
+        },
+        {
+          "name": "voltage",
+          "type": "smallint",
+          "nullable": true,
+          "comment": "Working voltage. Required when powered, meaningless otherwise, which the check constraint says exactly."
+        },
+        {
+          "name": "cordless",
+          "type": "boolean",
+          "default": "false",
+          "nullable": false,
+          "comment": "Whether a powered tool runs off a battery rather than a cable. False for everything unpowered."
+        }
+      ]
+    },
+    {
+      "kind": "create_index",
+      "schema": "house",
+      "table": "tool",
+      "name": "tool_kind_idx",
+      "columns": [
+        "kind"
+      ],
+      "comment": "Where is the drill."
+    },
+    {
+      "kind": "add_check_constraint",
+      "schema": "house",
+      "table": "tool",
+      "name": "tool_voltage_iff_powered",
+      "expression": "(powered AND voltage IS NOT NULL AND voltage > 0) OR (NOT powered AND voltage IS NULL)"
+    },
+    {
+      "kind": "add_check_constraint",
+      "schema": "house",
+      "table": "tool",
+      "name": "tool_cordless_needs_power",
+      "expression": "NOT cordless OR powered"
+    },
+    {
+      "kind": "add_foreign_key",
+      "schema": "house",
+      "table": "tool",
+      "name": "tool_item_fk",
+      "columns": [
+        "item_id"
+      ],
+      "references_schema": "house",
+      "references_table": "item",
+      "references_columns": [
+        "item_id"
+      ],
+      "on_delete": "CASCADE",
+      "on_update": "CASCADE"
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "GFqycXmtuxu1MoG77d4YTZDUxHqR4fQ3U9eWKCK1YV/hIV+JYOsf3uD0e4yuOCy5x1QLzb2qK90LEg9YU59ACw=="
+    }
+  ]
+}

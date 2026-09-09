@@ -1,0 +1,295 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0086-seed-book",
+  "description": "Seed the books, shelved on the furniture that holds them.",
+  "rationale": "shelf_item_id points at house.furniture, so a book can only be shelved on something that is actually a shelf or a bookcase. One book has no ISBN, which is the case a unique constraint over a nullable column has to tolerate: several nulls are not duplicates. Every book starts at home -- 0096 is what lends two of them out. Ids come from the 7000-7099 block.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0046-table-book",
+    "0080-seed-furniture",
+    "0070-seed-room"
+  ],
+  "intents": [
+    {
+      "kind": "insert_rows",
+      "schema": "house",
+      "table": "item",
+      "key": "item_id",
+      "overriding": "system",
+      "on_conflict": "skip",
+      "conflict_target": [
+        "item_id"
+      ],
+      "columns": [
+        "item_id",
+        "category",
+        "name",
+        "brand_id",
+        "room_id",
+        "purchase_date",
+        "purchase_price",
+        "current_price"
+      ],
+      "values": [
+        [
+          7001,
+          "book",
+          "The Art of PostgreSQL",
+          null,
+          8,
+          "2021-03-08",
+          "189.00",
+          null
+        ],
+        [
+          7002,
+          "book",
+          "Designing Data-Intensive Applications",
+          null,
+          8,
+          "2020-10-19",
+          "245.00",
+          null
+        ],
+        [
+          7003,
+          "book",
+          "The Pragmatic Programmer",
+          null,
+          8,
+          "2019-05-22",
+          "178.00",
+          null
+        ],
+        [
+          7004,
+          "book",
+          "SQL Performance Explained",
+          null,
+          8,
+          "2022-01-30",
+          "132.00",
+          null
+        ],
+        [
+          7005,
+          "book",
+          "Refactoring",
+          null,
+          8,
+          "2019-05-22",
+          "210.00",
+          null
+        ],
+        [
+          7006,
+          "book",
+          "The Left Hand of Darkness",
+          null,
+          2,
+          "2018-08-04",
+          "48.00",
+          null
+        ],
+        [
+          7007,
+          "book",
+          "Pale Fire",
+          null,
+          2,
+          "2018-08-04",
+          "52.00",
+          null
+        ],
+        [
+          7008,
+          "book",
+          "Grande Sertao: Veredas",
+          null,
+          2,
+          "2017-11-12",
+          "64.00",
+          null
+        ],
+        [
+          7009,
+          "book",
+          "The Hobbit",
+          null,
+          7,
+          "2022-12-24",
+          "59.00",
+          null
+        ],
+        [
+          7010,
+          "book",
+          "Charlotte's Web",
+          null,
+          7,
+          "2022-12-24",
+          "41.00",
+          null
+        ],
+        [
+          7011,
+          "book",
+          "O Menino Maluquinho",
+          null,
+          7,
+          "2023-06-15",
+          "37.00",
+          null
+        ],
+        [
+          7012,
+          "book",
+          "Grandmother's recipe book",
+          null,
+          2,
+          "2016-02-29",
+          "0.00",
+          null
+        ]
+      ]
+    },
+    {
+      "kind": "insert_rows",
+      "schema": "house",
+      "table": "book",
+      "key": "item_id",
+      "on_conflict": "skip",
+      "conflict_target": [
+        "item_id"
+      ],
+      "columns": [
+        "item_id",
+        "isbn",
+        "title",
+        "author",
+        "shelf_item_id",
+        "borrowed_by",
+        "borrowed_on"
+      ],
+      "values": [
+        [
+          7001,
+          "978-1-7333438-0-6",
+          "The Art of PostgreSQL",
+          "Dimitri Fontaine",
+          1014,
+          null,
+          null
+        ],
+        [
+          7002,
+          "978-1-4493-7332-0",
+          "Designing Data-Intensive Applications",
+          "Martin Kleppmann",
+          1014,
+          null,
+          null
+        ],
+        [
+          7003,
+          "978-0-13-595705-9",
+          "The Pragmatic Programmer",
+          "Andrew Hunt",
+          1014,
+          null,
+          null
+        ],
+        [
+          7004,
+          "978-3-9503078-2-5",
+          "SQL Performance Explained",
+          "Markus Winand",
+          1014,
+          null,
+          null
+        ],
+        [
+          7005,
+          "978-0-13-475759-9",
+          "Refactoring",
+          "Martin Fowler",
+          1014,
+          null,
+          null
+        ],
+        [
+          7006,
+          "978-0-441-47812-5",
+          "The Left Hand of Darkness",
+          "Ursula K. Le Guin",
+          1015,
+          null,
+          null
+        ],
+        [
+          7007,
+          "978-0-679-72342-2",
+          "Pale Fire",
+          "Vladimir Nabokov",
+          1015,
+          null,
+          null
+        ],
+        [
+          7008,
+          "978-85-209-1968-4",
+          "Grande Sertao: Veredas",
+          "Joao Guimaraes Rosa",
+          1015,
+          null,
+          null
+        ],
+        [
+          7009,
+          "978-0-547-92822-7",
+          "The Hobbit",
+          "J. R. R. Tolkien",
+          1019,
+          null,
+          null
+        ],
+        [
+          7010,
+          "978-0-06-440055-8",
+          "Charlotte's Web",
+          "E. B. White",
+          1019,
+          null,
+          null
+        ],
+        [
+          7011,
+          "978-85-06-05972-7",
+          "O Menino Maluquinho",
+          "Ziraldo",
+          1019,
+          null,
+          null
+        ],
+        [
+          7012,
+          null,
+          "Grandmother's recipe book",
+          "unknown",
+          1015,
+          null,
+          null
+        ]
+      ]
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "MGIntnOqKwOkmDHAWFVIsXNYDlS6HvMJOfvcDMiycQDrkoNq0jAzpZDPNWYfs91nVA+g9LwJtDe2347lmJJgCA=="
+    }
+  ]
+}

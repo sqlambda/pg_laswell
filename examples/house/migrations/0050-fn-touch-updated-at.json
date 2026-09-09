@@ -1,0 +1,31 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0050-fn-touch-updated-at",
+  "description": "Create house.touch_updated_at(), the trigger function that maintains updated_at.",
+  "rationale": "A DEFAULT only fires on INSERT, so updated_at is a lie without a trigger. One function serves every table because it names no column but the one it sets.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0001-schema"
+  ],
+  "intents": [
+    {
+      "kind": "create_function",
+      "schema": "house",
+      "name": "touch_updated_at",
+      "returns": "trigger",
+      "language": "plpgsql",
+      "volatility": "VOLATILE",
+      "comment": "BEFORE UPDATE trigger function: stamps NEW.updated_at with now(). Deliberately not SECURITY DEFINER -- it needs no privilege the writer does not already have.",
+      "body": "BEGIN NEW.updated_at := now(); RETURN NEW; END;"
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "I4vaGdwhbtlPHlH9YItVsr/RK6C60gv8rfpCWnl2kBQH0yHeWKLOgFs0yOg3wsF/xqyfPY5fER9Z/B3rIOSdDg=="
+    }
+  ]
+}

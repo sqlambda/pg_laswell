@@ -1,0 +1,87 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0022-table-color",
+  "description": "Create house.color, the palette kitchenware is described with.",
+  "rationale": "Colour is the one attribute the household actually searches kitchenware by -- 'the blue bowls' -- so it is a table with a stable id rather than free text.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0001-schema"
+  ],
+  "intents": [
+    {
+      "kind": "create_table",
+      "schema": "house",
+      "table": "color",
+      "comment": "A colour name, with an optional hex code for anything that has to render it.",
+      "primary_key": [
+        "color_id"
+      ],
+      "columns": [
+        {
+          "name": "color_id",
+          "type": "bigint",
+          "nullable": false,
+          "comment": "Surrogate key."
+        },
+        {
+          "name": "name",
+          "type": "text",
+          "nullable": false,
+          "comment": "Colour name in plain English. Unique."
+        },
+        {
+          "name": "hex_code",
+          "type": "varchar(7)",
+          "nullable": true,
+          "comment": "sRGB hex code, '#rrggbb'. Null where the name is all anybody recorded."
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz",
+          "default": "now()",
+          "nullable": false,
+          "comment": "When this row was written."
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamptz",
+          "default": "now()",
+          "nullable": false,
+          "comment": "When this row was last changed. Maintained by the house.touch_updated_at trigger."
+        }
+      ]
+    },
+    {
+      "kind": "set_identity",
+      "schema": "house",
+      "table": "color",
+      "column": "color_id",
+      "identity": "ALWAYS"
+    },
+    {
+      "kind": "add_unique_constraint",
+      "schema": "house",
+      "table": "color",
+      "name": "color_name_key",
+      "columns": [
+        "name"
+      ]
+    },
+    {
+      "kind": "add_check_constraint",
+      "schema": "house",
+      "table": "color",
+      "name": "color_hex_code_format",
+      "expression": "hex_code IS NULL OR hex_code ~ '^#[0-9a-f]{6}$'"
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "P67tZMsJTb9q1Z6KRXcRzlZ2AbBys3Z7SyEmb5arB06AHpExnn8DNyBUEyu10xmI62SO5lyxdhToHsjA6ueGCQ=="
+    }
+  ]
+}

@@ -1,0 +1,43 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0010-type-room-kind",
+  "description": "Enumerate the kinds of room a house has.",
+  "rationale": "A closed set that changes about once a decade, so an enum rather than a lookup table; add_enum_value is the migration when it does change.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0001-schema"
+  ],
+  "intents": [
+    {
+      "kind": "create_type",
+      "schema": "house",
+      "name": "room_kind",
+      "type_kind": "enum",
+      "base": "text",
+      "comment": "What a room is for. Ordered roughly from the rooms people gather in to the ones they store things in.",
+      "labels": [
+        "kitchen",
+        "living_room",
+        "dining_room",
+        "bedroom",
+        "bathroom",
+        "home_office",
+        "hallway",
+        "laundry",
+        "garage",
+        "basement",
+        "attic",
+        "garden"
+      ]
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "NP02KrOjvSjE6b9XmdGD1O8Wu7gLhvfPd0Mi3LW21If+afuy4BXjiBgSDFiYQc6Qaw9Qmsx6WQwn2370zGr5BA=="
+    }
+  ]
+}

@@ -1,0 +1,187 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0030-table-item",
+  "description": "Create house.item, the supertype every physical thing in the house is a row of.",
+  "rationale": "Every category shares four facts -- what it is called, what it cost, when it was bought and which room it is in -- and nothing else does. Putting them in one table means 'what did the house cost' is one query instead of a seven-way UNION, and each detail table then carries only what makes its category different.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0011-type-item-category",
+    "0020-table-room",
+    "0021-table-brand"
+  ],
+  "intents": [
+    {
+      "kind": "create_table",
+      "schema": "house",
+      "table": "item",
+      "comment": "One physical thing in the house. The category column says which detail table carries the rest of it.",
+      "primary_key": [
+        "item_id"
+      ],
+      "columns": [
+        {
+          "name": "item_id",
+          "type": "bigint",
+          "nullable": false,
+          "comment": "Surrogate key. The detail tables use this same value as their own primary key."
+        },
+        {
+          "name": "category",
+          "type": "house.item_category",
+          "nullable": false,
+          "comment": "Which detail table extends this row. Immutable in practice: a chair does not become a saucepan."
+        },
+        {
+          "name": "name",
+          "type": "text",
+          "nullable": false,
+          "comment": "What the household calls this thing."
+        },
+        {
+          "name": "brand_id",
+          "type": "bigint",
+          "nullable": true,
+          "comment": "Maker, where there is one. Null for anything hand-made or unbranded."
+        },
+        {
+          "name": "room_id",
+          "type": "bigint",
+          "nullable": true,
+          "comment": "Room the thing is in. Null while it is in transit, lent out, or nobody has looked."
+        },
+        {
+          "name": "purchase_date",
+          "type": "date",
+          "nullable": false,
+          "comment": "When it was bought. Required: an item nobody can date is an item nobody can depreciate."
+        },
+        {
+          "name": "purchase_price",
+          "type": "numeric(12,2)",
+          "nullable": false,
+          "comment": "What was paid, in the household currency. Zero is legal and means a gift."
+        },
+        {
+          "name": "current_price",
+          "type": "numeric(12,2)",
+          "nullable": true,
+          "comment": "What it would fetch today. Null until somebody values it; 0095 fills the first estimate."
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz",
+          "default": "now()",
+          "nullable": false,
+          "comment": "When this row was written."
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamptz",
+          "default": "now()",
+          "nullable": false,
+          "comment": "When this row was last changed. Maintained by the house.touch_updated_at trigger."
+        }
+      ]
+    },
+    {
+      "kind": "set_identity",
+      "schema": "house",
+      "table": "item",
+      "column": "item_id",
+      "identity": "ALWAYS"
+    },
+    {
+      "kind": "add_check_constraint",
+      "schema": "house",
+      "table": "item",
+      "name": "item_purchase_price_not_negative",
+      "expression": "purchase_price >= 0"
+    },
+    {
+      "kind": "add_check_constraint",
+      "schema": "house",
+      "table": "item",
+      "name": "item_current_price_not_negative",
+      "expression": "current_price IS NULL OR current_price >= 0"
+    },
+    {
+      "kind": "add_check_constraint",
+      "schema": "house",
+      "table": "item",
+      "name": "item_purchase_date_not_future",
+      "expression": "purchase_date <= DATE '2100-01-01'"
+    },
+    {
+      "kind": "create_index",
+      "schema": "house",
+      "table": "item",
+      "name": "item_category_purchase_date_idx",
+      "columns": [
+        "category",
+        "purchase_date"
+      ],
+      "comment": "The inventory screen lists one category, newest purchase first."
+    },
+    {
+      "kind": "create_index",
+      "schema": "house",
+      "table": "item",
+      "name": "item_brand_id_idx",
+      "columns": [
+        "brand_id"
+      ],
+      "comment": "Leads with the referencing column of item_brand_fk, so deleting a brand does not scan house.item."
+    },
+    {
+      "kind": "create_index",
+      "schema": "house",
+      "table": "item",
+      "name": "item_room_id_idx",
+      "columns": [
+        "room_id"
+      ],
+      "comment": "Leads with the referencing column of item_room_fk, and serves 'everything in this room'."
+    },
+    {
+      "kind": "add_foreign_key",
+      "schema": "house",
+      "table": "item",
+      "name": "item_brand_fk",
+      "columns": [
+        "brand_id"
+      ],
+      "references_schema": "house",
+      "references_table": "brand",
+      "references_columns": [
+        "brand_id"
+      ],
+      "on_delete": "SET NULL",
+      "on_update": "CASCADE"
+    },
+    {
+      "kind": "add_foreign_key",
+      "schema": "house",
+      "table": "item",
+      "name": "item_room_fk",
+      "columns": [
+        "room_id"
+      ],
+      "references_schema": "house",
+      "references_table": "room",
+      "references_columns": [
+        "room_id"
+      ],
+      "on_delete": "SET NULL",
+      "on_update": "CASCADE"
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "M60wLjww618VDPY4Iz5SxrWWc8thzAVjOBG3O7FY1jLMiYZZlrIYwuYVz7NMN1fK/ESZzNhLNQdaHlgeTbKjBA=="
+    }
+  ]
+}

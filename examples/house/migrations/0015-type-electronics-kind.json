@@ -1,0 +1,45 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0015-type-electronics-kind",
+  "description": "Enumerate the kinds of electronic appliance and device.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0001-schema"
+  ],
+  "intents": [
+    {
+      "kind": "create_type",
+      "schema": "house",
+      "name": "electronics_kind",
+      "type_kind": "enum",
+      "base": "text",
+      "comment": "What an electronic item is. This is the enum most likely to grow, which is why 0090 exists.",
+      "labels": [
+        "tv",
+        "sound_system",
+        "soundbar",
+        "camera",
+        "cellphone",
+        "computer",
+        "laptop",
+        "monitor",
+        "keyboard",
+        "mouse",
+        "video_game",
+        "printer_3d",
+        "dishwasher",
+        "microwave",
+        "oven"
+      ]
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "qtyulVWBr3kqmRXFUrAPZ2WE+mzp4xEVeNw0U2BR2zWoVC5EmHpDJxjuTP9x9md+DFyTDNtpUKzo6/egy4jFAg=="
+    }
+  ]
+}

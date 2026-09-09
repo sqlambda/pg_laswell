@@ -1,0 +1,35 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0097-expired-food",
+  "description": "Clear out the three food items that expired before September 2026.",
+  "rationale": "The date is written literally rather than as CURRENT_DATE, because a signed migration must do the same thing whenever it runs: a relative date would delete a different set on every database it reached, and the ledger would record a statement whose meaning depends on when somebody deployed. Deleting the house.food row leaves the house.item row behind, which is wrong, so the delete is on house.item and food_item_fk cascades -- one statement, and the cascade is declared in the schema rather than emitted here.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0083-seed-food"
+  ],
+  "intents": [
+    {
+      "kind": "delete_rows",
+      "schema": "house",
+      "table": "item",
+      "key": "item_id",
+      "where": "item.category = 'food' AND EXISTS (SELECT 1 FROM house.food AS f WHERE f.item_id = item.item_id AND f.expiry_date < DATE '2026-09-01')",
+      "verify_remaining": "category = 'food' AND item_id IN (SELECT item_id FROM house.food WHERE expiry_date < DATE '2026-09-01')",
+      "assert_invariants": [
+        {
+          "name": "no_orphan_food_detail",
+          "query": "SELECT count(*)::text FROM house.food f LEFT JOIN house.item i ON i.item_id = f.item_id WHERE i.item_id IS NULL"
+        }
+      ]
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "fz0RGfhMf5Wz2uaxtFJqXM3/G86K1nzCaSq8LAag9At8z/ZpceKQ6wuSWCs4OZnMZqDrt0oUsUGK8pl3mZBsBQ=="
+    }
+  ]
+}

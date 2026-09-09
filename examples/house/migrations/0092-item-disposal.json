@@ -1,0 +1,41 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0092-item-disposal",
+  "description": "Record when an item left the house, without deleting its row.",
+  "rationale": "Deleting a sold sofa loses what it cost and when it was bought, which is exactly what the inventory exists to remember. A nullable date is the whole change: nullable, because every row that exists today is still in the house and there is no value to backfill. Note what this does NOT do -- house.item_overview was created with its columns enumerated, so the new column does not appear there and will not until a replace_view says so.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0030-table-item"
+  ],
+  "intents": [
+    {
+      "kind": "add_column",
+      "schema": "house",
+      "table": "item",
+      "column": "disposed_on",
+      "type": "date",
+      "nullable": true,
+      "comment": "When the thing left the house -- sold, given away, thrown out. Null while it is still here, which is what makes the partial index below small."
+    },
+    {
+      "kind": "create_index",
+      "schema": "house",
+      "table": "item",
+      "name": "item_disposed_on_idx",
+      "columns": [
+        "disposed_on"
+      ],
+      "where": "disposed_on IS NOT NULL",
+      "comment": "Partial: almost every row is still in the house, so the index covers only the ones that left."
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "U1DLbTzFXejcWrgyRVljIv0IY4wIbSS1lKy9/mO4sXNeOBX5BRJskvrR7ajM56db89efUUXTI4V/mdOKpFlcAg=="
+    }
+  ]
+}

@@ -1,0 +1,116 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0020-table-room",
+  "description": "Create house.room, the places furniture and electronics live in.",
+  "rationale": "Rooms are the only spatial dimension this inventory has. Everything else is located by naming one.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0010-type-room-kind"
+  ],
+  "intents": [
+    {
+      "kind": "create_table",
+      "schema": "house",
+      "table": "room",
+      "comment": "A room in the house. Items are located by naming one of these.",
+      "primary_key": [
+        "room_id"
+      ],
+      "columns": [
+        {
+          "name": "room_id",
+          "type": "bigint",
+          "nullable": false,
+          "comment": "Surrogate key. Identity is added by the next intent, which is the only order PostgreSQL accepts."
+        },
+        {
+          "name": "name",
+          "type": "text",
+          "nullable": false,
+          "comment": "What the household calls this room. Unique: two rooms with one name is an inventory nobody can use."
+        },
+        {
+          "name": "kind",
+          "type": "house.room_kind",
+          "nullable": false,
+          "comment": "What the room is for."
+        },
+        {
+          "name": "floor",
+          "type": "smallint",
+          "nullable": false,
+          "comment": "Storey the room is on. 0 is ground, negative is below ground."
+        },
+        {
+          "name": "area_m2",
+          "type": "numeric(6,2)",
+          "nullable": true,
+          "comment": "Floor area in square metres. Null where nobody has measured it, which is the honest state for most rooms."
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz",
+          "default": "now()",
+          "nullable": false,
+          "comment": "When this row was written."
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamptz",
+          "default": "now()",
+          "nullable": false,
+          "comment": "When this row was last changed. Maintained by the house.touch_updated_at trigger."
+        }
+      ]
+    },
+    {
+      "kind": "set_identity",
+      "schema": "house",
+      "table": "room",
+      "column": "room_id",
+      "identity": "ALWAYS"
+    },
+    {
+      "kind": "add_unique_constraint",
+      "schema": "house",
+      "table": "room",
+      "name": "room_name_key",
+      "columns": [
+        "name"
+      ]
+    },
+    {
+      "kind": "add_check_constraint",
+      "schema": "house",
+      "table": "room",
+      "name": "room_floor_plausible",
+      "expression": "floor BETWEEN -2 AND 10"
+    },
+    {
+      "kind": "add_check_constraint",
+      "schema": "house",
+      "table": "room",
+      "name": "room_area_positive",
+      "expression": "area_m2 IS NULL OR area_m2 > 0"
+    },
+    {
+      "kind": "create_index",
+      "schema": "house",
+      "table": "room",
+      "name": "room_kind_idx",
+      "columns": [
+        "kind"
+      ],
+      "comment": "Rooms of one kind, for the per-kind rollups on the inventory screen."
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "8VcNfV73M5+nBPSrPK0N9h1gtKQ2zEQpCQW/aMZw2DvVZNq+qAev+amVizOAuJLTg2GESi33zrIh/AshYwCpDQ=="
+    }
+  ]
+}

@@ -1,0 +1,34 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0053-trigger-color",
+  "description": "Keep house.color.updated_at true by stamping it on every UPDATE.",
+  "rationale": "The trigger fires for rows changed from the commit onwards and for none of the rows already there, which is exactly right here: every existing row was just inserted and its updated_at is already correct.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0050-fn-touch-updated-at",
+    "0022-table-color"
+  ],
+  "intents": [
+    {
+      "kind": "create_trigger",
+      "schema": "house",
+      "table": "color",
+      "name": "color_touch_updated_at",
+      "timing": "BEFORE",
+      "events": [
+        "UPDATE"
+      ],
+      "for_each": "ROW",
+      "function": "house.touch_updated_at()"
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "Br+N5qhPhCysVMFRqWy4Al3nAXYivNUBoV0ix2Ou2jPTOnlfGC67DWRzAdBQeGc2BEMa0RJxXq3ghkeTs/waCg=="
+    }
+  ]
+}

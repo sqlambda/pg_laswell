@@ -1,0 +1,129 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0040-table-furniture",
+  "description": "Create house.furniture, with the self-reference that links chairs to the table they belong to.",
+  "rationale": "A dining set is one table and six chairs, and the household thinks of it as one thing. parent_item_id is that grouping, and it points at furniture rather than at item so a chair cannot be filed under a saucepan.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0013-type-furniture-kind",
+    "0030-table-item"
+  ],
+  "intents": [
+    {
+      "kind": "create_table",
+      "schema": "house",
+      "table": "furniture",
+      "comment": "Detail for an item of category furniture. One row per house.item row.",
+      "primary_key": [
+        "item_id"
+      ],
+      "columns": [
+        {
+          "name": "item_id",
+          "type": "bigint",
+          "nullable": false,
+          "comment": "The house.item row this extends. Primary key and foreign key at once, which is what makes the pair exactly one-to-one."
+        },
+        {
+          "name": "kind",
+          "type": "house.furniture_kind",
+          "nullable": false,
+          "comment": "What the piece is."
+        },
+        {
+          "name": "material",
+          "type": "text",
+          "nullable": false,
+          "comment": "Dominant material: oak, pine, steel, fabric."
+        },
+        {
+          "name": "seats",
+          "type": "smallint",
+          "nullable": true,
+          "comment": "How many people it seats. Null for anything that is not seating."
+        },
+        {
+          "name": "parent_item_id",
+          "type": "bigint",
+          "nullable": true,
+          "comment": "The piece this one belongs to -- the table a chair goes with. Null for a piece that stands alone."
+        }
+      ]
+    },
+    {
+      "kind": "create_index",
+      "schema": "house",
+      "table": "furniture",
+      "name": "furniture_parent_item_id_idx",
+      "columns": [
+        "parent_item_id"
+      ],
+      "comment": "Leads with the referencing column of furniture_parent_fk, and answers 'what goes with this table'."
+    },
+    {
+      "kind": "create_index",
+      "schema": "house",
+      "table": "furniture",
+      "name": "furniture_kind_idx",
+      "columns": [
+        "kind"
+      ],
+      "comment": "All the chairs, all the shelves."
+    },
+    {
+      "kind": "add_check_constraint",
+      "schema": "house",
+      "table": "furniture",
+      "name": "furniture_not_own_parent",
+      "expression": "parent_item_id IS NULL OR parent_item_id <> item_id"
+    },
+    {
+      "kind": "add_check_constraint",
+      "schema": "house",
+      "table": "furniture",
+      "name": "furniture_seats_positive",
+      "expression": "seats IS NULL OR seats > 0"
+    },
+    {
+      "kind": "add_foreign_key",
+      "schema": "house",
+      "table": "furniture",
+      "name": "furniture_item_fk",
+      "columns": [
+        "item_id"
+      ],
+      "references_schema": "house",
+      "references_table": "item",
+      "references_columns": [
+        "item_id"
+      ],
+      "on_delete": "CASCADE",
+      "on_update": "CASCADE"
+    },
+    {
+      "kind": "add_foreign_key",
+      "schema": "house",
+      "table": "furniture",
+      "name": "furniture_parent_fk",
+      "columns": [
+        "parent_item_id"
+      ],
+      "references_schema": "house",
+      "references_table": "furniture",
+      "references_columns": [
+        "item_id"
+      ],
+      "on_delete": "SET NULL",
+      "on_update": "CASCADE"
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "zNisjdJ5F+rLatL66X+alOTJszxjZQPKkwnmRRA76Zi2LVCwUqZsv37LdxFR2LUyA9HaJF86D/W/FF1cgrb7Bw=="
+    }
+  ]
+}

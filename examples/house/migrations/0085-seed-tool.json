@@ -1,0 +1,235 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0085-seed-tool",
+  "description": "Seed the tools in the garage.",
+  "rationale": "Eight hand tools and two powered ones, which is what makes the tool_voltage_iff_powered check worth having: it is satisfied in both directions by real rows rather than by one contrived case. Ids come from the 6000-6099 block.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0045-table-tool",
+    "0070-seed-room",
+    "0071-seed-brand"
+  ],
+  "intents": [
+    {
+      "kind": "insert_rows",
+      "schema": "house",
+      "table": "item",
+      "key": "item_id",
+      "overriding": "system",
+      "on_conflict": "skip",
+      "conflict_target": [
+        "item_id"
+      ],
+      "columns": [
+        "item_id",
+        "category",
+        "name",
+        "brand_id",
+        "room_id",
+        "purchase_date",
+        "purchase_price",
+        "current_price"
+      ],
+      "values": [
+        [
+          6001,
+          "tool",
+          "Screwdriver set",
+          5,
+          11,
+          "2019-09-14",
+          "129.00",
+          null
+        ],
+        [
+          6002,
+          "tool",
+          "Claw hammer",
+          5,
+          11,
+          "2019-09-14",
+          "74.00",
+          null
+        ],
+        [
+          6003,
+          "tool",
+          "Splitting axe",
+          5,
+          11,
+          "2020-06-27",
+          "185.00",
+          null
+        ],
+        [
+          6004,
+          "tool",
+          "Cordless drill",
+          6,
+          11,
+          "2022-03-05",
+          "899.00",
+          "620.00"
+        ],
+        [
+          6005,
+          "tool",
+          "Hand saw",
+          5,
+          11,
+          "2019-09-14",
+          "62.00",
+          null
+        ],
+        [
+          6006,
+          "tool",
+          "Adjustable wrench",
+          5,
+          11,
+          "2019-09-14",
+          "58.00",
+          null
+        ],
+        [
+          6007,
+          "tool",
+          "Combination pliers",
+          5,
+          11,
+          "2019-09-14",
+          "49.00",
+          null
+        ],
+        [
+          6008,
+          "tool",
+          "Wood chisel set",
+          5,
+          11,
+          "2021-04-18",
+          "156.00",
+          null
+        ],
+        [
+          6009,
+          "tool",
+          "Spirit level",
+          5,
+          11,
+          "2019-09-14",
+          "88.00",
+          null
+        ],
+        [
+          6010,
+          "tool",
+          "Orbital sander",
+          6,
+          11,
+          "2023-10-21",
+          "640.00",
+          "480.00"
+        ]
+      ]
+    },
+    {
+      "kind": "insert_rows",
+      "schema": "house",
+      "table": "tool",
+      "key": "item_id",
+      "on_conflict": "skip",
+      "conflict_target": [
+        "item_id"
+      ],
+      "columns": [
+        "item_id",
+        "kind",
+        "powered",
+        "voltage",
+        "cordless"
+      ],
+      "values": [
+        [
+          6001,
+          "screwdriver",
+          false,
+          null,
+          false
+        ],
+        [
+          6002,
+          "hammer",
+          false,
+          null,
+          false
+        ],
+        [
+          6003,
+          "axe",
+          false,
+          null,
+          false
+        ],
+        [
+          6004,
+          "drill",
+          true,
+          18,
+          true
+        ],
+        [
+          6005,
+          "saw",
+          false,
+          null,
+          false
+        ],
+        [
+          6006,
+          "wrench",
+          false,
+          null,
+          false
+        ],
+        [
+          6007,
+          "pliers",
+          false,
+          null,
+          false
+        ],
+        [
+          6008,
+          "chisel",
+          false,
+          null,
+          false
+        ],
+        [
+          6009,
+          "level",
+          false,
+          null,
+          false
+        ],
+        [
+          6010,
+          "sander",
+          true,
+          220,
+          false
+        ]
+      ]
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "PHxkTnP3PXsgcpvDC3PtgkqQWqSbJIx2HvbdxFRwhQ9SfduPyKUhl9+Wehu8jA4R48MYaYHp6VIzPhXBgxeJCQ=="
+    }
+  ]
+}

@@ -1,0 +1,319 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0081-seed-kitchenware",
+  "description": "Seed the kitchenware: knives, cutlery sets, pans, pots and tableware.",
+  "rationale": "Cutlery is counted in sets, so 'six dinner forks' is one row with piece_count 6 rather than six rows nobody would ever tell apart. Ids come from the 2000-2099 block.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0041-table-kitchenware",
+    "0070-seed-room",
+    "0071-seed-brand",
+    "0072-seed-color"
+  ],
+  "intents": [
+    {
+      "kind": "insert_rows",
+      "schema": "house",
+      "table": "item",
+      "key": "item_id",
+      "overriding": "system",
+      "on_conflict": "skip",
+      "conflict_target": [
+        "item_id"
+      ],
+      "columns": [
+        "item_id",
+        "category",
+        "name",
+        "brand_id",
+        "room_id",
+        "purchase_date",
+        "purchase_price",
+        "current_price"
+      ],
+      "values": [
+        [
+          2001,
+          "kitchenware",
+          "Chef knife",
+          4,
+          1,
+          "2018-04-02",
+          "59.90",
+          null
+        ],
+        [
+          2002,
+          "kitchenware",
+          "Bread knife",
+          4,
+          1,
+          "2018-04-02",
+          "42.50",
+          null
+        ],
+        [
+          2003,
+          "kitchenware",
+          "Dinner forks",
+          4,
+          1,
+          "2018-04-02",
+          "68.00",
+          null
+        ],
+        [
+          2004,
+          "kitchenware",
+          "Dinner spoons",
+          4,
+          1,
+          "2018-04-02",
+          "68.00",
+          null
+        ],
+        [
+          2005,
+          "kitchenware",
+          "Teaspoons",
+          4,
+          1,
+          "2018-04-02",
+          "44.00",
+          null
+        ],
+        [
+          2006,
+          "kitchenware",
+          "Frying pan",
+          7,
+          1,
+          "2021-12-18",
+          "189.00",
+          "150.00"
+        ],
+        [
+          2007,
+          "kitchenware",
+          "Stock pot",
+          7,
+          1,
+          "2021-12-18",
+          "259.00",
+          "200.00"
+        ],
+        [
+          2008,
+          "kitchenware",
+          "Dinner plates",
+          1,
+          1,
+          "2017-05-30",
+          "56.00",
+          null
+        ],
+        [
+          2009,
+          "kitchenware",
+          "Cereal bowls",
+          1,
+          1,
+          "2017-05-30",
+          "38.00",
+          null
+        ],
+        [
+          2010,
+          "kitchenware",
+          "Coffee mugs",
+          1,
+          1,
+          "2019-08-21",
+          "30.00",
+          null
+        ],
+        [
+          2011,
+          "kitchenware",
+          "Water glasses",
+          1,
+          1,
+          "2019-08-21",
+          "24.00",
+          null
+        ],
+        [
+          2012,
+          "kitchenware",
+          "Cutting board",
+          4,
+          1,
+          "2020-02-14",
+          "35.00",
+          null
+        ],
+        [
+          2013,
+          "kitchenware",
+          "Soup ladle",
+          4,
+          1,
+          "2018-04-02",
+          "22.00",
+          null
+        ],
+        [
+          2014,
+          "kitchenware",
+          "Balloon whisk",
+          4,
+          1,
+          "2018-04-02",
+          "18.00",
+          null
+        ]
+      ]
+    },
+    {
+      "kind": "insert_rows",
+      "schema": "house",
+      "table": "kitchenware",
+      "key": "item_id",
+      "on_conflict": "skip",
+      "conflict_target": [
+        "item_id"
+      ],
+      "columns": [
+        "item_id",
+        "kind",
+        "color_id",
+        "model",
+        "size_label",
+        "piece_count"
+      ],
+      "values": [
+        [
+          2001,
+          "knife",
+          7,
+          "Century",
+          "20 cm",
+          1
+        ],
+        [
+          2002,
+          "knife",
+          7,
+          "Century",
+          "23 cm",
+          1
+        ],
+        [
+          2003,
+          "fork",
+          7,
+          "Laguna",
+          null,
+          6
+        ],
+        [
+          2004,
+          "spoon",
+          7,
+          "Laguna",
+          null,
+          6
+        ],
+        [
+          2005,
+          "spoon",
+          7,
+          "Laguna",
+          null,
+          8
+        ],
+        [
+          2006,
+          "pan",
+          3,
+          "Signature",
+          "24 cm",
+          1
+        ],
+        [
+          2007,
+          "pot",
+          4,
+          "Signature",
+          "5 l",
+          1
+        ],
+        [
+          2008,
+          "plate",
+          2,
+          "Ofantligt",
+          "27 cm",
+          8
+        ],
+        [
+          2009,
+          "bowl",
+          4,
+          "Ofantligt",
+          "16 cm",
+          6
+        ],
+        [
+          2010,
+          "cup",
+          1,
+          "Vardagen",
+          "250 ml",
+          6
+        ],
+        [
+          2011,
+          "glass",
+          null,
+          "Pokal",
+          "350 ml",
+          8
+        ],
+        [
+          2012,
+          "cutting_board",
+          8,
+          null,
+          "38 cm",
+          1
+        ],
+        [
+          2013,
+          "ladle",
+          7,
+          "Utilita",
+          null,
+          1
+        ],
+        [
+          2014,
+          "whisk",
+          7,
+          "Utilita",
+          null,
+          1
+        ]
+      ]
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "qr6dcYqYqEkdyB7lcOBNgsXpoFIW3d14RiycYQh949JQtJM7vH8zinN6uMWCRe3JqwPWBRIQbhM4e1WxdU91AQ=="
+    }
+  ]
+}

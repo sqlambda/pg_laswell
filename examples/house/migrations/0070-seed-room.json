@@ -1,0 +1,118 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0070-seed-room",
+  "description": "Seed the eleven rooms of the house.",
+  "rationale": "Written as literal values rather than a select, so the rows themselves are inside the signature and readable in the ledger afterwards. Ids are explicit because every item seed refers to them by number; overriding system is what PostgreSQL requires to write a GENERATED ALWAYS identity, and pg_laswell follows the insert with the setval that stops the next application insert colliding. area_m2 is written as a string: floating-point values are refused anywhere in a specification, and numeric(6,2) is not a float -- sending it as one would round-trip through a double on the way to the signature.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0020-table-room"
+  ],
+  "intents": [
+    {
+      "kind": "insert_rows",
+      "schema": "house",
+      "table": "room",
+      "key": "room_id",
+      "overriding": "system",
+      "on_conflict": "skip",
+      "conflict_target": [
+        "room_id"
+      ],
+      "columns": [
+        "room_id",
+        "name",
+        "kind",
+        "floor",
+        "area_m2"
+      ],
+      "values": [
+        [
+          1,
+          "Kitchen",
+          "kitchen",
+          0,
+          "14.50"
+        ],
+        [
+          2,
+          "Living room",
+          "living_room",
+          0,
+          "28.00"
+        ],
+        [
+          3,
+          "Dining room",
+          "dining_room",
+          0,
+          "16.20"
+        ],
+        [
+          4,
+          "Hallway",
+          "hallway",
+          0,
+          "6.40"
+        ],
+        [
+          5,
+          "Guest toilet",
+          "bathroom",
+          0,
+          "3.10"
+        ],
+        [
+          6,
+          "Main bedroom",
+          "bedroom",
+          1,
+          "18.70"
+        ],
+        [
+          7,
+          "Kid bedroom",
+          "bedroom",
+          1,
+          "12.30"
+        ],
+        [
+          8,
+          "Study",
+          "home_office",
+          1,
+          "11.00"
+        ],
+        [
+          9,
+          "Bathroom",
+          "bathroom",
+          1,
+          "7.80"
+        ],
+        [
+          10,
+          "Laundry",
+          "laundry",
+          -1,
+          "5.50"
+        ],
+        [
+          11,
+          "Garage",
+          "garage",
+          -1,
+          "22.00"
+        ]
+      ]
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "0w2deqma9ywLtEptjAC09OjzCiYJ+AExvcrqRV/bIEv4uGOJMLDOsz9/2ozTrCc8qBVdFhV9FJkVo0BbUu8sBA=="
+    }
+  ]
+}

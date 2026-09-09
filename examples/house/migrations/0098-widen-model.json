@@ -1,0 +1,29 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0098-widen-model",
+  "description": "Widen house.electronics.model from varchar(60) to varchar(120), through the view that reads it.",
+  "rationale": "Manufacturers write model names like 'LS27AG320NLXZD Odyssey G3 27 inch 165 Hz Gaming Monitor' and 60 characters stopped being enough. Relaxing a type modifier rewrites nothing -- that is measured, not assumed -- but PostgreSQL refuses ALTER COLUMN TYPE outright while a view reads the column, whatever the change costs. So the cost here is not the rewrite; it is house.electronics_catalogue, which has to be dropped and recreated. A hand-written drop-and-recreate silently loses the view's comment, its grants, its column grants, its options, its INSTEAD OF triggers and its owner. This is the intent that puts that rebuild under test.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0042-table-electronics",
+    "0061-view-electronics-catalogue"
+  ],
+  "intents": [
+    {
+      "kind": "alter_column_type",
+      "schema": "house",
+      "table": "electronics",
+      "column": "model",
+      "type": "character varying(120)"
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "afcWCrO0nKCbuM4tmWb6WR25QOH8ufAJ+XFRVWd7Xb61MrKV8awj4dinvTxcwUb8l+QiWMosNuNYjhewfaxvBA=="
+    }
+  ]
+}

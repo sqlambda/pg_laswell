@@ -1,0 +1,32 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0064-index-room-value",
+  "description": "Add the unique index that makes REFRESH MATERIALIZED VIEW CONCURRENTLY legal on house.room_value.",
+  "rationale": "Split from 0063 rather than bundled with it: pg_laswell measures the real catalog, and house.room_value is not in it until 0063 commits. Without this index every refresh takes AccessExclusiveLock and the rollup is unreadable while it runs.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0063-matview-room-value"
+  ],
+  "intents": [
+    {
+      "kind": "create_index",
+      "schema": "house",
+      "table": "room_value",
+      "name": "room_value_room_id_key",
+      "unique": true,
+      "columns": [
+        "room_id"
+      ],
+      "comment": "Unique on the grouping key. Required by REFRESH MATERIALIZED VIEW CONCURRENTLY, which is the only reason this index exists."
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "zDPGUsgDdhPxkwNGBbIvZIO9Px2Y2BDxI2XvPRqAM3sLKzo4arZKK3zYaIFRdqjZzMe24xxIox862Z0sYvyLBg=="
+    }
+  ]
+}

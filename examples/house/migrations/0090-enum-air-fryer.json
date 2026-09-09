@@ -1,0 +1,28 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0090-enum-air-fryer",
+  "description": "Add air_fryer to house.electronics_kind.",
+  "rationale": "The household bought one, and the enum was closed. This is the migration that opens it. Adding a label is irreversible -- PostgreSQL has no way to drop an enum value -- so this specification has no revert, by hand or otherwise, and the plan says so. It takes its own transaction because a new label cannot be used until the transaction that added it commits.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0015-type-electronics-kind"
+  ],
+  "intents": [
+    {
+      "kind": "add_enum_value",
+      "schema": "house",
+      "name": "electronics_kind",
+      "value": "air_fryer",
+      "after": "oven"
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "89Pbipz2IgUtw/g8xL6LLLo8euaMdk7MU3H2w71k+pyG6QvlpcesM6FaQLvnkJ1/uxDTArXyk/iwujFyH7FhDQ=="
+    }
+  ]
+}

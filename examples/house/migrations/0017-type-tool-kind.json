@@ -1,0 +1,40 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0017-type-tool-kind",
+  "description": "Enumerate the kinds of tool.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0001-schema"
+  ],
+  "intents": [
+    {
+      "kind": "create_type",
+      "schema": "house",
+      "name": "tool_kind",
+      "type_kind": "enum",
+      "base": "text",
+      "comment": "What a tool is. Hand tools first, then the powered ones.",
+      "labels": [
+        "screwdriver",
+        "wrench",
+        "pliers",
+        "hammer",
+        "chisel",
+        "axe",
+        "saw",
+        "level",
+        "drill",
+        "sander"
+      ]
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "CgO4FxyZ8kcA//BSTPv/DxbHmneB5gxrmFDwHJ4t14ww8TFu5pC4vStfYlLvnyXvg/mWbIUuQU8sXTgaDZpADQ=="
+    }
+  ]
+}

@@ -1,0 +1,87 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0021-table-brand",
+  "description": "Create house.brand, the manufacturer shared by every category of item.",
+  "rationale": "Kitchenware, food, cleaning products, electronics and tools all carry a brand. One table rather than a text column per category, so 'everything by this maker' is a join and not a spelling contest.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0001-schema"
+  ],
+  "intents": [
+    {
+      "kind": "create_table",
+      "schema": "house",
+      "table": "brand",
+      "comment": "A manufacturer or label. Shared by every item category that has one.",
+      "primary_key": [
+        "brand_id"
+      ],
+      "columns": [
+        {
+          "name": "brand_id",
+          "type": "bigint",
+          "nullable": false,
+          "comment": "Surrogate key."
+        },
+        {
+          "name": "name",
+          "type": "text",
+          "nullable": false,
+          "comment": "Brand name as printed on the item. Unique."
+        },
+        {
+          "name": "country_code",
+          "type": "varchar(2)",
+          "nullable": true,
+          "comment": "ISO 3166-1 alpha-2 country of the maker, where anybody bothered to record it."
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz",
+          "default": "now()",
+          "nullable": false,
+          "comment": "When this row was written."
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamptz",
+          "default": "now()",
+          "nullable": false,
+          "comment": "When this row was last changed. Maintained by the house.touch_updated_at trigger."
+        }
+      ]
+    },
+    {
+      "kind": "set_identity",
+      "schema": "house",
+      "table": "brand",
+      "column": "brand_id",
+      "identity": "ALWAYS"
+    },
+    {
+      "kind": "add_unique_constraint",
+      "schema": "house",
+      "table": "brand",
+      "name": "brand_name_key",
+      "columns": [
+        "name"
+      ]
+    },
+    {
+      "kind": "add_check_constraint",
+      "schema": "house",
+      "table": "brand",
+      "name": "brand_country_code_upper",
+      "expression": "country_code IS NULL OR country_code ~ '^[A-Z]{2}$'"
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "SbIgrZ88oy5WskZakUY5kzYrCis4S4KY+hkMR0Tre7HpZs7lPzNDxZJvgafsKN+vpy8XyvfOOFKFP5297Q9eCA=="
+    }
+  ]
+}

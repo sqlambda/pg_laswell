@@ -1,0 +1,122 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0042-table-electronics",
+  "description": "Create house.electronics: everything with a plug or a battery.",
+  "rationale": "Serial number and warranty date are what an insurance claim asks for, and no other category has them. model is varchar(60) on purpose -- 0098 widens it, which is how the dependent-view rebuild gets exercised on a real view.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0015-type-electronics-kind",
+    "0030-table-item"
+  ],
+  "intents": [
+    {
+      "kind": "create_table",
+      "schema": "house",
+      "table": "electronics",
+      "comment": "Detail for an item of category electronics. One row per house.item row.",
+      "primary_key": [
+        "item_id"
+      ],
+      "columns": [
+        {
+          "name": "item_id",
+          "type": "bigint",
+          "nullable": false,
+          "comment": "The house.item row this extends."
+        },
+        {
+          "name": "kind",
+          "type": "house.electronics_kind",
+          "nullable": false,
+          "comment": "What the device is."
+        },
+        {
+          "name": "model",
+          "type": "varchar(60)",
+          "nullable": false,
+          "comment": "Manufacturer's model designation. Required: it is the only way to find a manual."
+        },
+        {
+          "name": "serial_number",
+          "type": "text",
+          "nullable": true,
+          "comment": "Serial number, where it is still legible. Unique across the house when present."
+        },
+        {
+          "name": "power_watts",
+          "type": "integer",
+          "nullable": true,
+          "comment": "Rated power draw in watts. Null where the label is gone."
+        },
+        {
+          "name": "warranty_until",
+          "type": "date",
+          "nullable": true,
+          "comment": "Last day the warranty covers. Null when there was none or nobody kept the receipt."
+        }
+      ]
+    },
+    {
+      "kind": "create_index",
+      "schema": "house",
+      "table": "electronics",
+      "name": "electronics_kind_idx",
+      "columns": [
+        "kind"
+      ],
+      "comment": "All the monitors, all the appliances."
+    },
+    {
+      "kind": "create_index",
+      "schema": "house",
+      "table": "electronics",
+      "name": "electronics_warranty_until_idx",
+      "columns": [
+        "warranty_until"
+      ],
+      "where": "warranty_until IS NOT NULL",
+      "comment": "Partial: only rows with a warranty are ever asked 'what expires next', and most rows have none."
+    },
+    {
+      "kind": "add_check_constraint",
+      "schema": "house",
+      "table": "electronics",
+      "name": "electronics_power_watts_positive",
+      "expression": "power_watts IS NULL OR power_watts > 0"
+    },
+    {
+      "kind": "add_unique_constraint",
+      "schema": "house",
+      "table": "electronics",
+      "name": "electronics_serial_number_key",
+      "columns": [
+        "serial_number"
+      ]
+    },
+    {
+      "kind": "add_foreign_key",
+      "schema": "house",
+      "table": "electronics",
+      "name": "electronics_item_fk",
+      "columns": [
+        "item_id"
+      ],
+      "references_schema": "house",
+      "references_table": "item",
+      "references_columns": [
+        "item_id"
+      ],
+      "on_delete": "CASCADE",
+      "on_update": "CASCADE"
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "siDZvpkONp+pw6ySYXovasCAAkHlxC8mu9FbICLMsabcqC2c3pEiH5Akzlbxoc1DIkyo2bQBntYlhSOM/pp1Dw=="
+    }
+  ]
+}

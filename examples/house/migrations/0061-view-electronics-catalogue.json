@@ -1,0 +1,28 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0061-view-electronics-catalogue",
+  "description": "Create house.electronics_catalogue, the warranty and serial-number listing.",
+  "rationale": "This view exists to be in the way. It reads house.electronics.model, which 0098 widens -- and PostgreSQL refuses ALTER COLUMN TYPE outright while a view reads the column, whatever the change costs. That is the drop-and-recreate stack pg_laswell rebuilds for you.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0042-table-electronics"
+  ],
+  "intents": [
+    {
+      "kind": "replace_view",
+      "schema": "house",
+      "name": "electronics_catalogue",
+      "comment": "Electronics with model, serial number and warranty date, for an insurance claim.",
+      "definition": "SELECT e.item_id, i.name, e.kind, e.model, e.serial_number, e.power_watts, e.warranty_until, i.purchase_date, i.purchase_price FROM house.electronics AS e JOIN house.item AS i ON i.item_id = e.item_id"
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "Ks7MvNESL/U/IWfPpvOp+Wcpin0x71uQ4vx33RCx0HV3wC19R6XKwlwGXtYdr+GwsKyfhbDOO2d6nE4WxaFaAg=="
+    }
+  ]
+}

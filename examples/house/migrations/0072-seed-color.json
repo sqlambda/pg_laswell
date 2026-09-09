@@ -1,0 +1,78 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0072-seed-color",
+  "description": "Seed the colour palette kitchenware is described with.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0022-table-color"
+  ],
+  "intents": [
+    {
+      "kind": "insert_rows",
+      "schema": "house",
+      "table": "color",
+      "key": "color_id",
+      "overriding": "system",
+      "on_conflict": "skip",
+      "conflict_target": [
+        "color_id"
+      ],
+      "columns": [
+        "color_id",
+        "name",
+        "hex_code"
+      ],
+      "values": [
+        [
+          1,
+          "black",
+          "#111111"
+        ],
+        [
+          2,
+          "white",
+          "#fefefe"
+        ],
+        [
+          3,
+          "red",
+          "#c62828"
+        ],
+        [
+          4,
+          "blue",
+          "#1565c0"
+        ],
+        [
+          5,
+          "green",
+          "#2e7d32"
+        ],
+        [
+          6,
+          "yellow",
+          "#f9a825"
+        ],
+        [
+          7,
+          "steel",
+          "#9e9e9e"
+        ],
+        [
+          8,
+          "wood",
+          "#8d6e63"
+        ]
+      ]
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "1aKBOLgUBgzBfNM0ivG//lcot1QGwqVR3pweysjg0JWlD1TSUYzla0XIBsoD1/nfZ1p4Rej23yaPxdV7rtMIBQ=="
+    }
+  ]
+}

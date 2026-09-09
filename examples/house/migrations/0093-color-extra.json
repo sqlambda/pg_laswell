@@ -1,0 +1,56 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0093-color-extra",
+  "description": "Add six more colours through COPY rather than INSERT.",
+  "rationale": "copy_rows is the one row kind that is never paced and cannot be: a COPY whose second row violates a constraint rolls back all of them, so it is one transaction whatever its size. Six rows is well inside that. No color_id is supplied here -- the identity column generates them, which is why this depends on 0072: if COPY ran first the sequence would hand out 1 to 6 and the explicit ids in the seed would then collide.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0072-seed-color"
+  ],
+  "intents": [
+    {
+      "kind": "copy_rows",
+      "schema": "house",
+      "table": "color",
+      "columns": [
+        "name",
+        "hex_code"
+      ],
+      "values": [
+        [
+          "grey",
+          "#757575"
+        ],
+        [
+          "beige",
+          "#d7ccc8"
+        ],
+        [
+          "orange",
+          "#ef6c00"
+        ],
+        [
+          "purple",
+          "#6a1b9a"
+        ],
+        [
+          "pink",
+          "#ec407a"
+        ],
+        [
+          "copper",
+          "#b87333"
+        ]
+      ]
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "4uyPeqUF9W2ekIYD96YTAYcqMKSvEDF3IZxjYqxPu2PT0u+1JhQhVd6Iu32FR83EM6Ny9azEn7KCsYYwOfKdAA=="
+    }
+  ]
+}

@@ -1,0 +1,318 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0083-seed-food",
+  "description": "Seed the pantry, including three items already past their expiry date.",
+  "rationale": "The three expired rows -- 4012, 4013 and 4014 -- are there so 0097 has something real to delete. Seeding a table with only valid rows and then testing a clean-up against it tests nothing. Weights are strings: a specification refuses floating-point values anywhere, and numeric(10,3) is not a float. Ids come from the 4000-4099 block.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0043-table-food",
+    "0070-seed-room",
+    "0071-seed-brand"
+  ],
+  "intents": [
+    {
+      "kind": "insert_rows",
+      "schema": "house",
+      "table": "item",
+      "key": "item_id",
+      "overriding": "system",
+      "on_conflict": "skip",
+      "conflict_target": [
+        "item_id"
+      ],
+      "columns": [
+        "item_id",
+        "category",
+        "name",
+        "brand_id",
+        "room_id",
+        "purchase_date",
+        "purchase_price",
+        "current_price"
+      ],
+      "values": [
+        [
+          4001,
+          "food",
+          "Long grain rice",
+          8,
+          1,
+          "2026-08-14",
+          "28.90",
+          null
+        ],
+        [
+          4002,
+          "food",
+          "Black beans",
+          8,
+          1,
+          "2026-08-14",
+          "11.50",
+          null
+        ],
+        [
+          4003,
+          "food",
+          "Spaghetti",
+          8,
+          1,
+          "2026-08-14",
+          "6.80",
+          null
+        ],
+        [
+          4004,
+          "food",
+          "Wheat flour",
+          8,
+          1,
+          "2026-07-02",
+          "9.20",
+          null
+        ],
+        [
+          4005,
+          "food",
+          "Refined sugar",
+          8,
+          1,
+          "2026-07-02",
+          "7.40",
+          null
+        ],
+        [
+          4006,
+          "food",
+          "Coarse salt",
+          8,
+          1,
+          "2026-03-19",
+          "4.10",
+          null
+        ],
+        [
+          4007,
+          "food",
+          "Ground coffee",
+          8,
+          1,
+          "2026-08-29",
+          "32.00",
+          null
+        ],
+        [
+          4008,
+          "food",
+          "Sunflower oil",
+          8,
+          1,
+          "2026-08-14",
+          "14.70",
+          null
+        ],
+        [
+          4009,
+          "food",
+          "Beef mince",
+          null,
+          1,
+          "2026-09-05",
+          "46.30",
+          null
+        ],
+        [
+          4010,
+          "food",
+          "Whole milk",
+          null,
+          1,
+          "2026-09-05",
+          "6.90",
+          null
+        ],
+        [
+          4011,
+          "food",
+          "Free-range eggs",
+          null,
+          1,
+          "2026-09-05",
+          "22.40",
+          null
+        ],
+        [
+          4012,
+          "food",
+          "Whole milk (old)",
+          null,
+          1,
+          "2026-05-30",
+          "6.50",
+          null
+        ],
+        [
+          4013,
+          "food",
+          "Pork loin (old)",
+          null,
+          1,
+          "2026-05-02",
+          "38.00",
+          null
+        ],
+        [
+          4014,
+          "food",
+          "Ground coffee (old)",
+          8,
+          1,
+          "2025-11-11",
+          "29.00",
+          null
+        ]
+      ]
+    },
+    {
+      "kind": "insert_rows",
+      "schema": "house",
+      "table": "food",
+      "key": "item_id",
+      "on_conflict": "skip",
+      "conflict_target": [
+        "item_id"
+      ],
+      "columns": [
+        "item_id",
+        "kind",
+        "expiry_date",
+        "net_weight",
+        "weight_unit",
+        "opened"
+      ],
+      "values": [
+        [
+          4001,
+          "rice",
+          "2027-06-30",
+          "5.000",
+          "kg",
+          false
+        ],
+        [
+          4002,
+          "beans",
+          "2027-04-30",
+          "1.000",
+          "kg",
+          true
+        ],
+        [
+          4003,
+          "pasta",
+          "2027-09-30",
+          "500.000",
+          "g",
+          false
+        ],
+        [
+          4004,
+          "flour",
+          "2027-01-31",
+          "1.000",
+          "kg",
+          true
+        ],
+        [
+          4005,
+          "sugar",
+          "2028-07-31",
+          "2.000",
+          "kg",
+          false
+        ],
+        [
+          4006,
+          "salt",
+          "2029-03-31",
+          "1.000",
+          "kg",
+          true
+        ],
+        [
+          4007,
+          "coffee",
+          "2027-02-28",
+          "500.000",
+          "g",
+          true
+        ],
+        [
+          4008,
+          "oil",
+          "2027-05-31",
+          "900.000",
+          "ml",
+          false
+        ],
+        [
+          4009,
+          "meat",
+          "2026-09-12",
+          "1.000",
+          "kg",
+          false
+        ],
+        [
+          4010,
+          "milk",
+          "2026-09-20",
+          "1.000",
+          "l",
+          false
+        ],
+        [
+          4011,
+          "eggs",
+          "2026-09-28",
+          "12.000",
+          "unit",
+          true
+        ],
+        [
+          4012,
+          "milk",
+          "2026-06-14",
+          "1.000",
+          "l",
+          true
+        ],
+        [
+          4013,
+          "meat",
+          "2026-05-15",
+          "1.200",
+          "kg",
+          false
+        ],
+        [
+          4014,
+          "coffee",
+          "2026-08-31",
+          "500.000",
+          "g",
+          true
+        ]
+      ]
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "sqH951U5mOEwZsY04HGzx+J/F8D/ZyPLiNnV/zjOSZytXCjHGnpYeRpD3iZxmKvG5NXPtGpXO+jp7FrZB56DAg=="
+    }
+  ]
+}

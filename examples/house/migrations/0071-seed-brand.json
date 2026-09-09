@@ -1,0 +1,99 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0071-seed-brand",
+  "description": "Seed the brands the household already owns something from.",
+  "rationale": "Reference data the item seeds join to. Kept small on purpose: a brand nobody owns anything by is a row nobody can check.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0021-table-brand"
+  ],
+  "intents": [
+    {
+      "kind": "insert_rows",
+      "schema": "house",
+      "table": "brand",
+      "key": "brand_id",
+      "overriding": "system",
+      "on_conflict": "skip",
+      "conflict_target": [
+        "brand_id"
+      ],
+      "columns": [
+        "brand_id",
+        "name",
+        "country_code"
+      ],
+      "values": [
+        [
+          1,
+          "Ikea",
+          "SE"
+        ],
+        [
+          2,
+          "Bosch",
+          "DE"
+        ],
+        [
+          3,
+          "Samsung",
+          "KR"
+        ],
+        [
+          4,
+          "Tramontina",
+          "BR"
+        ],
+        [
+          5,
+          "Stanley",
+          "US"
+        ],
+        [
+          6,
+          "Makita",
+          "JP"
+        ],
+        [
+          7,
+          "Le Creuset",
+          "FR"
+        ],
+        [
+          8,
+          "Camil",
+          "BR"
+        ],
+        [
+          9,
+          "Ype",
+          "BR"
+        ],
+        [
+          10,
+          "Logitech",
+          "CH"
+        ],
+        [
+          11,
+          "Prusa",
+          "CZ"
+        ],
+        [
+          12,
+          "Nintendo",
+          "JP"
+        ]
+      ]
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "fRXpVzNCU7h5bleXv+7BzDjQTuu/3EpLgo0dj+ePq3NyR4XAm4p/Pau5U7FiEbfVxLUtYQMavXQvrwH6BEVaBg=="
+    }
+  ]
+}

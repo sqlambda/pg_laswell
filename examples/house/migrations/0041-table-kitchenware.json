@@ -1,0 +1,129 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0041-table-kitchenware",
+  "description": "Create house.kitchenware: knives, forks, spoons, pans and the rest, with brand, colour, model and size.",
+  "rationale": "Cutlery is counted in sets rather than individually, so piece_count is on the row and one item is 'six forks' rather than six items.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0014-type-kitchenware-kind",
+    "0022-table-color",
+    "0030-table-item"
+  ],
+  "intents": [
+    {
+      "kind": "create_table",
+      "schema": "house",
+      "table": "kitchenware",
+      "comment": "Detail for an item of category kitchenware. One row per house.item row; the brand is on house.item.",
+      "primary_key": [
+        "item_id"
+      ],
+      "columns": [
+        {
+          "name": "item_id",
+          "type": "bigint",
+          "nullable": false,
+          "comment": "The house.item row this extends."
+        },
+        {
+          "name": "kind",
+          "type": "house.kitchenware_kind",
+          "nullable": false,
+          "comment": "What the piece is."
+        },
+        {
+          "name": "color_id",
+          "type": "bigint",
+          "nullable": true,
+          "comment": "Colour, where the household distinguishes by it. Null for bare steel."
+        },
+        {
+          "name": "model",
+          "type": "text",
+          "nullable": true,
+          "comment": "Manufacturer's model name, where the box still exists."
+        },
+        {
+          "name": "size_label",
+          "type": "text",
+          "nullable": true,
+          "comment": "Size as the maker states it: '24 cm', 'large', '2 l'. Text because there is no unit the makers agree on."
+        },
+        {
+          "name": "piece_count",
+          "type": "smallint",
+          "nullable": false,
+          "comment": "How many identical pieces this row stands for. A set of six forks is one row with piece_count 6."
+        }
+      ]
+    },
+    {
+      "kind": "create_index",
+      "schema": "house",
+      "table": "kitchenware",
+      "name": "kitchenware_color_id_idx",
+      "columns": [
+        "color_id"
+      ],
+      "comment": "Leads with the referencing column of kitchenware_color_fk, and answers 'the blue ones'."
+    },
+    {
+      "kind": "create_index",
+      "schema": "house",
+      "table": "kitchenware",
+      "name": "kitchenware_kind_idx",
+      "columns": [
+        "kind"
+      ],
+      "comment": "All the knives, all the pans."
+    },
+    {
+      "kind": "add_check_constraint",
+      "schema": "house",
+      "table": "kitchenware",
+      "name": "kitchenware_piece_count_positive",
+      "expression": "piece_count > 0"
+    },
+    {
+      "kind": "add_foreign_key",
+      "schema": "house",
+      "table": "kitchenware",
+      "name": "kitchenware_item_fk",
+      "columns": [
+        "item_id"
+      ],
+      "references_schema": "house",
+      "references_table": "item",
+      "references_columns": [
+        "item_id"
+      ],
+      "on_delete": "CASCADE",
+      "on_update": "CASCADE"
+    },
+    {
+      "kind": "add_foreign_key",
+      "schema": "house",
+      "table": "kitchenware",
+      "name": "kitchenware_color_fk",
+      "columns": [
+        "color_id"
+      ],
+      "references_schema": "house",
+      "references_table": "color",
+      "references_columns": [
+        "color_id"
+      ],
+      "on_delete": "SET NULL",
+      "on_update": "CASCADE"
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "LfqBGgvoAFq88Vy7Oiw1WCnxljwej9bBXdv/1aL9o9aZtP+/6oMwuDqGLS/DA71m4NkLCVAYg6cmwTXhDPdwAA=="
+    }
+  ]
+}

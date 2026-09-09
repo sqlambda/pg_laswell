@@ -1,0 +1,48 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0095-price-backfill",
+  "description": "Give every item without a current price a first estimate: what it cost.",
+  "rationale": "A predicate-driven backfill, so its own where clause is the record of what remains and no preserve table is needed -- there is nothing to preserve, because the rows it touches had NULL. It depends on all seven item seeds for a real reason and not a cosmetic one: a backfill against an empty table succeeds having done nothing, and would be marked applied and never run again.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0080-seed-furniture",
+    "0081-seed-kitchenware",
+    "0082-seed-electronics",
+    "0083-seed-food",
+    "0084-seed-cleaning-product",
+    "0085-seed-tool",
+    "0086-seed-book"
+  ],
+  "intents": [
+    {
+      "kind": "backfill",
+      "schema": "house",
+      "table": "item",
+      "key": "item_id",
+      "set": {
+        "current_price": "item.purchase_price"
+      },
+      "where": "item.current_price IS NULL",
+      "verify_remaining": "current_price IS NULL",
+      "assert_invariants": [
+        {
+          "name": "item_count_unchanged",
+          "query": "SELECT count(*)::text FROM house.item"
+        },
+        {
+          "name": "purchase_total_unchanged",
+          "query": "SELECT sum(purchase_price)::text FROM house.item"
+        }
+      ]
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "sbuQieW4HuEb8Plh7qMSbaomRHuQ208pegKEx1APv9BTP/qHF29wsuM6Qqm39IDgl5KwyV+34YGApSG+lzfrAw=="
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0062-view-borrowed-book",
+  "description": "Create house.borrowed_book, the list of books currently out of the house.",
+  "rationale": "Also in the way on purpose: 0099 renames the column underneath it. A rename repairs the view definition by itself, but the view keeps its OWN output column name -- so the view still exposes borrowed_by after the column becomes borrowed_by_friend, and nothing errors to say so.",
+  "target": {
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0046-table-book"
+  ],
+  "intents": [
+    {
+      "kind": "replace_view",
+      "schema": "house",
+      "name": "borrowed_book",
+      "comment": "Books that are out on loan, oldest loan first.",
+      "definition": "SELECT b.item_id, b.title, b.author, b.isbn, b.borrowed_by, b.borrowed_on, CURRENT_DATE - b.borrowed_on AS days_out FROM house.book AS b WHERE b.borrowed_by IS NOT NULL"
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:3fbcbb3b5f464502",
+      "algorithm": "ed25519",
+      "signature": "kPNAD7HKMV4/ckKAzP4jv32+9SeAA5r0tSPFfSAWygNw3VeCopyBiX0krdv5h2mjfqbVf3Syu9G0BPe8hg5bCQ=="
+    }
+  ]
+}
