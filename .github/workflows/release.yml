@@ -173,12 +173,27 @@ jobs:
       # The tag is the source of truth for the version. A tag that disagrees
       # with the project() version means one of them is wrong, and shipping
       # either would make the ledger's record of which binary ran unreliable.
+      #
+      # A pre-release tag carries a suffix -- v0.1.0-alpha0 -- and only the
+      # numeric part is compared. That is not a convenience: project(VERSION)
+      # accepts nothing but numbers, so the suffix CANNOT live in CMakeLists
+      # and the two could never be string-equal. The suffix is what marks the
+      # GitHub release as a pre-release, in the publish job below.
       - name: The tag must match the project version
         run: |
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
-          WANT="${TAG#v}"
+          # Shape checked before it is taken apart. Without this a typo like
+          # "v0.1.0-" or "v1.2" still splits into something that compares
+          # equal, and the first sign of trouble would be a published release
+          # named after the typo -- which is not something a tag can take back.
+          echo "$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$' || {
+            echo "::error::tag $TAG is not vMAJOR.MINOR.PATCH[-PRERELEASE]"
+            exit 1
+          }
+          VERSION="${TAG#v}"
+          WANT="${VERSION%%-*}"
           HAVE=$(grep -oE 'project\(pg_laswell_mcp VERSION [0-9.]+' cpp/CMakeLists.txt | grep -oE '[0-9.]+$')
-          echo "tag=$WANT  CMakeLists=$HAVE"
+          echo "tag=$VERSION  numeric=$WANT  CMakeLists=$HAVE"
           [ "$WANT" = "$HAVE" ] || {
             echo "::error::tag $TAG does not match project version $HAVE"
             exit 1
@@ -349,11 +364,18 @@ jobs:
       # CHANGES.md must carry the version being released. A release whose
       # changelog does not mention it is a release nobody can read afterwards,
       # which is the same failure the ledger exists to prevent in the database.
+      # Matched on the numeric part, so v0.1.0-alpha0 and the v0.1.0 that
+      # eventually follows it read the same entry. A pre-release is a build of
+      # a version, not a version of its own, and asking for a separate heading
+      # per alpha would leave the changelog describing the build process
+      # instead of the changes.
       - name: CHANGES.md must mention this version
         run: |
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
-          grep -q "## ${TAG#v}" CHANGES.md || {
-            echo "::error::CHANGES.md has no entry for ${TAG#v}"
+          VERSION="${TAG#v}"
+          NUMERIC="${VERSION%%-*}"
+          grep -q "## $NUMERIC" CHANGES.md || {
+            echo "::error::CHANGES.md has no entry for $NUMERIC"
             exit 1
           }
 
@@ -386,9 +408,26 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          # A suffix on the tag is the whole signal. Without --prerelease a
+          # test build becomes the repository's "Latest" and is what anyone
+          # arriving at the page downloads, which is the opposite of what an
+          # alpha is for.
+          case "${TAG#v}" in
+            *-*) PRERELEASE=--prerelease ;;
+            *)   PRERELEASE= ;;
+          esac
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" dist/* --clobber
+            # Re-asserted on a re-run: the upload branch would otherwise leave
+            # a release created by hand, or before this flag existed, marked
+            # as the latest one. Written as an if rather than
+            # `[ -n "$X" ] && cmd`, which returns 1 when the test is false and
+            # would fail the step on every stable re-release, since it is the
+            # last command the branch runs.
+            if [ -n "$PRERELEASE" ]; then
+              gh release edit "$TAG" $PRERELEASE
+            fi
           else
             gh release create "$TAG" dist/* \
-              --title "$TAG" --generate-notes
+              --title "$TAG" --generate-notes $PRERELEASE
           fi
