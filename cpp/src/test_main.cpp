@@ -5711,7 +5711,7 @@ TEST(Planner, MergeRowsNamesItsCursorFromTheBatchAndNotFromItsOwnReturning) {
   ASSERT_NE(step, nullptr);
   EXPECT_EQ(step->txn_class, pglaswell::TxnClass::kOwnTxnPerBatch);
   const auto sql = all_sql(*step);
-  EXPECT_NE(sql.find("MERGE INTO shop.orders USING batch"), std::string::npos) << sql;
+  EXPECT_NE(sql.find("MERGE INTO \"shop\".\"orders\" USING batch"), std::string::npos) << sql;
   EXPECT_NE(sql.find("WHEN MATCHED THEN UPDATE SET"), std::string::npos) << sql;
   EXPECT_NE(sql.find("WHEN NOT MATCHED THEN INSERT"), std::string::npos) << sql;
   // The cursor comes from the batch, ordered, and NOT from the MERGE.
@@ -8703,7 +8703,12 @@ TEST(Planner, PreserveCapturesInTheSameStatementAsTheUpdate) {
   EXPECT_NE(sql.find(", preserved AS ("), std::string::npos) << sql;
   EXPECT_NE(sql.find("INSERT INTO \"archive\".\"orders_before\" (\"id\", \"fulfilment_region\")"),
             std::string::npos) << sql;
-  EXPECT_LT(sql.find("preserved AS ("), sql.find("UPDATE shop.orders"))
+  // Quoted, and asserted to BE there before the ordering is compared: with an
+  // unquoted needle this found npos, and "preserved AS (" < npos is true for
+  // any position at all, so the ordering check passed without checking.
+  const auto update_at = sql.find("UPDATE \"shop\".\"orders\"");
+  ASSERT_NE(update_at, std::string::npos) << sql;
+  EXPECT_LT(sql.find("preserved AS ("), update_at)
       << "the capture must be part of the same statement as the update";
 }
 

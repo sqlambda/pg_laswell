@@ -243,6 +243,66 @@ inline std::vector<Case> cases() {
      /*single_txn_rows=*/1,
      /*min_server_version=*/170000},
 
+    // The paced INSERT, UPDATE and DELETE, which -- like the paced MERGE above
+    // -- nothing executed until now. The pure planner tests that force pacing
+    // never touch a server, so the statements the executor actually drives for
+    // these three had never run anywhere; that is how all four came to splice
+    // an unquoted schema.table and stay that way. `single_txn_rows = 1` is what
+    // forces the paced branch on a case small enough to read.
+    {"insert_rows_paced", {},
+     json{{"kind","insert_rows"},{"schema","cf"},{"table","t"},{"key","id"},
+          {"columns",json::array({"id","amount","code"})},
+          {"values",json::array({json::array({401,1,"pi1"}),
+                                 json::array({402,2,"pi2"})})}},
+     "SELECT string_agg(code,',' ORDER BY id) FROM cf.t WHERE id IN (401,402)",
+     "pi1,pi2",
+     /*single_txn_rows=*/1},
+
+    // Per-row values through the batch: 401 and 402 take different codes, so a
+    // walk that carried one row's value to the other would be caught.
+    {"update_rows_paced", {},
+     json{{"kind","update_rows"},{"schema","cf"},{"table","t"},{"key","id"},
+          {"columns",json::array({"id","code"})},
+          {"values",json::array({json::array({401,"pu1"}),
+                                 json::array({402,"pu2"})})}},
+     "SELECT string_agg(code,',' ORDER BY id) FROM cf.t WHERE id IN (401,402)",
+     "pu1,pu2",
+     /*single_txn_rows=*/1},
+
+    // And the paced DELETE by key list. 402 survives, so this proves the walk
+    // removed what it named rather than everything it saw.
+    {"delete_rows_paced", {},
+     json{{"kind","delete_rows"},{"schema","cf"},{"table","t"},{"key","id"},
+          {"columns",json::array({"id"})},
+          {"values",json::array({json::array({401})})}},
+     "SELECT string_agg(code,',' ORDER BY id) FROM cf.t WHERE id IN (401,402)",
+     "pu2",
+     /*single_txn_rows=*/1},
+
+    // The quoting, EXECUTED. The three cases above prove the paced statements
+    // run; they cannot prove they are quoted, because cf.t needs no quoting and
+    // the unquoted form is valid SQL for it. This one targets a table whose
+    // schema-qualified name is a syntax error unquoted in every position, so
+    // the paced INSERT the executor drives either carries "cf"."order" or the
+    // case fails outright. Before the four mutation CTEs were fixed, it did.
+    // The SCHEMA is the reserved word, not the table, and that distinction is
+    // the whole case. Measured on 18.6: `INSERT INTO cf.order` parses fine --
+    // PostgreSQL accepts a reserved word after a qualifier -- while
+    // `INSERT INTO user.t` is a syntax error at "user". So a case targeting a
+    // reserved TABLE would have passed against the broken planner and proved
+    // nothing; this one targets "user"."order" and fails outright unless the
+    // paced INSERT the executor drives carries both halves quoted.
+    {"insert_rows_paced_reserved_words",
+     {"DROP SCHEMA IF EXISTS \"user\" CASCADE",
+      "CREATE SCHEMA \"user\"",
+      "CREATE TABLE \"user\".\"order\" (\"end\" bigint PRIMARY KEY, \"desc\" text)"},
+     json{{"kind","insert_rows"},{"schema","user"},{"table","order"},{"key","end"},
+          {"columns",json::array({"end","desc"})},
+          {"values",json::array({json::array({1,"a"}), json::array({2,"b"})})}},
+     "SELECT string_agg(\"desc\", ',' ORDER BY \"end\") FROM \"user\".\"order\"",
+     "a,b",
+     /*single_txn_rows=*/1},
+
     {"copy_rows", {},
      json{{"kind","copy_rows"},{"schema","cf"},{"table","t"},
           {"columns",json::array({"id","amount","code"})},
@@ -272,13 +332,14 @@ inline std::vector<Case> cases() {
           {"values",json::array({json::array({201}), json::array({202}),
                                  json::array({203}), json::array({204}),
                                  json::array({205}),
-                                 // ...and the three the paced merge case above
-                                 // left behind. The cases below this one COUNT
+                                 // ...the three the paced merge case above left
+                                 // behind, and the one the paced insert/update
+                                 // pair left. The cases below this one COUNT
                                  // cf.t, so anything this family adds has to be
                                  // removed here or it fails a later case with a
                                  // message about the wrong thing entirely.
                                  json::array({301}), json::array({302}),
-                                 json::array({303})})}},
+                                 json::array({303}), json::array({402})})}},
      "SELECT count(*)::text FROM cf.t", "40"},
 
     {"set_not_null", {},

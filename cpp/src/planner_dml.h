@@ -684,6 +684,14 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
 // A batch CTE that names the rows, the mutation as a data-modifying CTE beside
 // it, and an outer SELECT that hands the executor its cursor.
 //
+// Every relation in here is the QUOTED form. The four paced mutations spliced
+// the raw "schema.table" while their unpaced twins beside them used the quoted
+// one, so a paced insert into "user"."order" emitted INSERT INTO user.order --
+// a syntax error, caught by the dry run, which made every paced row-level kind
+// unusable on a reserved-word schema while the unpaced form worked. It lasted
+// because the tests that force pacing are all pure planner tests and the
+// reserved-word transcript covered only add_column, create_index and backfill.
+//
 // The outer SELECT is the part that is easy to get wrong, so it is stated once
 // here and shared by all four kinds. The obvious shape -- letting the mutation's
 // own RETURNING advance the cursor, as backfill does -- is WRONG for anything
@@ -1001,7 +1009,7 @@ inline void plan_insert_rows(const Intent& in, const Observations& obs,
     }
     const auto mutation =
         "ins AS (\n"
-        "  INSERT INTO " + qualified + " " + column_list + "\n"
+        "  INSERT INTO " + sql_rel + " " + column_list + "\n"
         "  " + (overriding_clause.empty() ? "" : overriding_clause + "  ") +
         "SELECT " + detail::join(selected, ", ") + " FROM batch\n" +
         (conflict_clause.empty() ? "" : "  " + conflict_clause + "\n") +
@@ -1164,7 +1172,7 @@ inline void plan_update_rows(const Intent& in, const Observations& obs,
         (preserved ? detail::preserve_cte(pv, sql_rel, sql_rel, key, "batch") + ",\n"
                    : std::string()) +
         "upd AS (\n"
-        "  UPDATE " + qualified + "\n"
+        "  UPDATE " + sql_rel + "\n"
         "     SET " + assignments("batch") + "\n"
         "    FROM batch\n"
         "   WHERE " + sql_rel + "." + k + " = batch." + k + "\n"
@@ -1329,7 +1337,7 @@ inline void plan_delete_rows(const Intent& in, const Observations& obs,
         (preserved ? detail::preserve_cte(pv, sql_rel, sql_rel, key, "batch") + ",\n"
                    : std::string()) +
         "del AS (\n"
-        "  DELETE FROM " + qualified + "\n"
+        "  DELETE FROM " + sql_rel + "\n"
         "   USING batch\n"
         "   WHERE " + sql_rel + "." + k + " = batch." + k + "\n"
         "  RETURNING 1\n"
@@ -1605,8 +1613,8 @@ inline void plan_merge_rows(const Intent& in, const Observations& obs,
         (preserved ? detail::preserve_cte(pv, sql_rel, sql_rel, key, "batch") + ",\n"
                    : std::string()) +
         "m AS (\n"
-        "  MERGE INTO " + qualified + " USING batch\n"
-        "     ON " + qualified + "." + k + " = batch." + k + "\n" +
+        "  MERGE INTO " + sql_rel + " USING batch\n"
+        "     ON " + sql_rel + "." + k + " = batch." + k + "\n" +
         branches("batch") +
         "  RETURNING 1\n"
         ")";

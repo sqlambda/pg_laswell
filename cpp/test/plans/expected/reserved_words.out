@@ -1,4 +1,4 @@
-Plan for 0009-reserved-words  (digest 02af752a535f…)
+Plan for 0009-reserved-words  (digest 13523d18c4aa…)
 
 -- transaction group 1 ---------------- atomic --
  0. add_column
@@ -29,3 +29,75 @@ UPDATE "user"."order"
 RETURNING "order"."end";
     lock: RowExclusiveLock plus row locks, released at every commit
     why:  20 rows estimated; keyset walk on end via order_pkey, 1000 rows per batch, committing on a lock waiter or 1000ms
+
+-- transaction group 3 ---------------- NOT atomic: paced, many commits --
+ 3. insert_rows
+    WITH src AS (
+  SELECT * FROM (VALUES (1::bigint, 'a'::text),
+        (2, 'b')) AS v ("end", "desc")
+), batch AS (
+  SELECT * FROM src WHERE src."end" > $1 ORDER BY src."end" LIMIT $2
+), ins AS (
+  INSERT INTO "user"."order" ("end", "desc")
+  SELECT batch."end", batch."desc" FROM batch
+  RETURNING 1
+)
+SELECT batch."end" FROM batch ORDER BY batch."end";
+    lock: RowExclusiveLock on user.order plus row locks, released at every commit
+    why:  2 literal rows; pacing was set explicitly to true in the spec
+
+-- transaction group 4 ---------------- NOT atomic: paced, many commits --
+ 4. update_rows
+    WITH src AS (
+  SELECT * FROM (VALUES (1::bigint, 'c'::text),
+        (2, 'd')) AS v ("end", "desc")
+), batch AS (
+  SELECT * FROM src WHERE src."end" > $1 ORDER BY src."end" LIMIT $2
+), upd AS (
+  UPDATE "user"."order"
+     SET "desc" = batch."desc"
+    FROM batch
+   WHERE "user"."order"."end" = batch."end"
+  RETURNING 1
+)
+SELECT batch."end" FROM batch ORDER BY batch."end";
+    lock: RowExclusiveLock on user.order plus row locks, released at every commit
+    why:  2 literal rows; pacing was set explicitly to true in the spec; each row takes its own values, which no expression can derive -- so there is no record of the previous values unless "preserve" asks for one
+
+-- transaction group 5 ---------------- NOT atomic: paced, many commits --
+ 5. delete_rows
+    WITH src AS (
+  SELECT * FROM (VALUES (1::bigint),
+        (2)) AS v ("end")
+), batch AS (
+  SELECT * FROM src WHERE src."end" > $1 ORDER BY src."end" LIMIT $2
+), del AS (
+  DELETE FROM "user"."order"
+   USING batch
+   WHERE "user"."order"."end" = batch."end"
+  RETURNING 1
+)
+SELECT batch."end" FROM batch ORDER BY batch."end";
+    lock: RowExclusiveLock on user.order plus row locks, released at every commit
+    why:  2 literal rows; pacing was set explicitly to true in the spec
+
+-- transaction group 6 ---------------- NOT atomic: paced, many commits --
+ 6. merge_rows
+    WITH src AS (
+  SELECT * FROM (VALUES (3::bigint, 'e'::text)) AS v ("end", "desc")
+), batch AS (
+  SELECT * FROM src WHERE src."end" > $1 ORDER BY src."end" LIMIT $2
+), m AS (
+  MERGE INTO "user"."order" USING batch
+     ON "user"."order"."end" = batch."end"
+  WHEN MATCHED THEN UPDATE SET "desc" = batch."desc"
+  WHEN NOT MATCHED THEN INSERT ("end", "desc") VALUES (batch."end", batch."desc")
+  RETURNING 1
+)
+SELECT batch."end" FROM batch ORDER BY batch."end";
+    lock: RowExclusiveLock on user.order plus row locks, released at every commit
+    why:  1 literal rows; pacing was set explicitly to true in the spec; ON end is backed by order_pkey, which is what makes one source row match at most one target row
+
+ warn: update_rows on user.order overwrites values with no record of what they were. A backfill has its own WHERE clause as that record -- re-running it says what is left -- and per-row values have nothing equivalent. "preserve" captures the pre-image in the SAME transaction as the change, which makes it durable and doubles as the revert path; "assert_invariants" catches a transform that completed and still broke a total.
+
+ warn: a delete does not shrink user.order on disk: the rows become dead tuples and the space is reused by future inserts, not returned to the filesystem. Autovacuum will reclaim it for reuse; only VACUUM FULL or pg_repack returns it, and neither is a migration. pg_licht tableBloat shows what is actually there afterwards.

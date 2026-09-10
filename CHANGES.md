@@ -7,6 +7,12 @@ ledger. 354 tests green on GCC 14.2 and Clang 22, under AddressSanitizer/UBSan
 and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
 `--call` contract test.
 
+- **Paced row-level DML quotes its target.** The paced `INSERT`, `UPDATE`,
+  `DELETE` and `MERGE` spliced the raw `schema.table` while the unpaced forms
+  beside them used the quoted one, so every paced row-level kind was a syntax
+  error on a reserved-word schema. Measured: `INSERT INTO user.t` fails at
+  `user`, while `INSERT INTO cf.order` parses -- it is the schema that has to be
+  quoted, which is why a case naming only a reserved table proves nothing.
 - **`target.database` is enforced instead of ignored.** It was parsed, covered
   by the signature, and read by nothing, so naming a database gave exactly the
   protection of naming none. It is now compared to `current_database()` in the
