@@ -411,9 +411,21 @@ inline json start_migration(ToolContext& ctx, const json& args) {
   // it at the point of action, so a caller cannot route around the analysis.
   try {
     const auto spec_probe = parse_spec(args["spec"]);
-    if (!spec_probe.target_environment.empty() || !spec_probe.release.empty()) {
+    if (!spec_probe.target_database.empty() ||
+        !spec_probe.target_environment.empty() || !spec_probe.release.empty()) {
       Ledger ledger(ctx.connection(args), ctx.cache);
       const auto st = ledger.status();
+      if (!spec_probe.target_database.empty() && !st.database.empty() &&
+          spec_probe.target_database != st.database) {
+        return json{
+            {"accepted", false},
+            {"error", "this database is \"" + st.database +
+                          "\" and the spec targets \"" +
+                          spec_probe.target_database + "\""},
+            {"hint", "current_database() is what this compares against. A name "
+                     "proves less than target.environment, which is read from "
+                     "a table only the owner of the laswell schema can write."}};
+      }
       if (!spec_probe.target_environment.empty() &&
           spec_probe.target_environment != st.environment) {
         return json{

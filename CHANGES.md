@@ -7,6 +7,12 @@ ledger. 354 tests green on GCC 14.2 and Clang 22, under AddressSanitizer/UBSan
 and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
 `--call` contract test.
 
+- **`target.database` is enforced instead of ignored.** It was parsed, covered
+  by the signature, and read by nothing, so naming a database gave exactly the
+  protection of naming none. It is now compared to `current_database()` in the
+  repository listing and in `startMigration`. A mismatch is reported as
+  `wrong_database` and is not a failure, like `wrong_environment`. The man page
+  now documents all three target gates, which were undocumented.
 - **`preserve` is honoured by `update_rows`, `merge_rows` and `delete_rows`.**
   All three accepted the option and emitted nothing for it, and `update_rows`
   said in its plan that the previous values were preserved. One implementation

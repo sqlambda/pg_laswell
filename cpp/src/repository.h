@@ -60,6 +60,7 @@ enum class RepoStatus {
   // a healthy repository, which is why neither is a `problem`: a deployment
   // that skips them has done its job correctly.
   kWrongEnvironment,
+  kWrongDatabase,
   kHeldForRelease
 };
 
@@ -72,6 +73,7 @@ inline const char* to_string(RepoStatus s) {
     case RepoStatus::kFailed: return "failed";
     case RepoStatus::kUnreadable: return "unreadable";
     case RepoStatus::kWrongEnvironment: return "wrong_environment";
+    case RepoStatus::kWrongDatabase: return "wrong_database";
     case RepoStatus::kHeldForRelease: return "held_for_release";
   }
   return "unknown";
@@ -87,6 +89,7 @@ struct RepoEntry {
   std::string error;
   std::string hint;
   std::string applied_digest;  // set when status is kModified
+  std::string database;        // target.database, as the spec declares it
   std::string environment;     // target.environment, as the spec declares it
   std::string release;         // the release tag gating it, if any
 };
@@ -270,12 +273,14 @@ class MigrationRepository {
     try {
       Ledger ledger(cfg_, cache_);
       const auto st = ledger.status();
+      ledger_db_ = st.database;
       ledger_env_ = st.environment;
       ledger_ready_ = st.releases_ready;
     } catch (const std::exception&) {
       // Unreadable ledger is reported by the tools that need it; here it means
       // "nothing is labelled and nothing is approved", which holds every gated
       // spec rather than releasing it.
+      ledger_db_.clear();
       ledger_env_.clear();
       ledger_ready_.clear();
     }
@@ -293,6 +298,7 @@ class MigrationRepository {
         entry.spec_id = spec.id;
         entry.digest = spec.digest;
         entry.depends_on = spec.depends_on;
+        entry.database = spec.target_database;
         entry.environment = spec.target_environment;
         entry.release = spec.release;
         parsed[spec.id] = spec;
@@ -433,6 +439,22 @@ class MigrationRepository {
   // the tool would be exactly that.
   void gate(RepoEntry& e) {
     if (e.status != RepoStatus::kPending && e.status != RepoStatus::kFailed) {
+      return;
+    }
+
+    // The database's own name first: it is the most concrete of the three and
+    // needs nothing to have been set up. It is also the weakest -- see
+    // LedgerStatus::database -- so it is a check the author asked for rather
+    // than a substitute for the environment label.
+    if (!e.database.empty() && !ledger_db_.empty() && e.database != ledger_db_) {
+      e.status = RepoStatus::kWrongDatabase;
+      e.error = "\"" + e.spec_id + "\" targets database \"" + e.database +
+                "\" and this is \"" + ledger_db_ + "\"";
+      e.hint = "Nothing is wrong: this specification names another database by "
+               "name, so it will never be applied to this one. A database name "
+               "proves less than an environment label -- a dump restored "
+               "elsewhere keeps neither -- so target.environment is the "
+               "stronger statement if what you mean is \"production only\".";
       return;
     }
 
@@ -694,6 +716,7 @@ class MigrationRepository {
 
   // Read once per scan, in scan(), so every gate in one listing answers
   // against the same reading.
+  std::string ledger_db_;
   std::string ledger_env_;
   std::set<std::string> ledger_ready_;
   ConnConfig cfg_;

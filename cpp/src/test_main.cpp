@@ -744,7 +744,7 @@ json minimal_spec() {
     "laswell_spec_version": 1,
     "id": "0001-orders-fulfilment-region",
     "description": "Route orders by warehouse region without a join at read time.",
-    "target": { "database": "shop_prod", "min_server_version": 150000 },
+    "target": { "min_server_version": 150000 },
     "intents": [
       { "kind": "add_column", "schema": "shop", "table": "orders",
         "column": "fulfilment_region", "type": "text", "nullable": true,
@@ -777,8 +777,15 @@ std::string spec_error(const json& doc) {
 TEST(Spec, ParsesTheWorkedExample) {
   const auto s = pglaswell::parse_spec(minimal_spec());
   EXPECT_EQ(s.id, "0001-orders-fulfilment-region");
-  EXPECT_EQ(s.target_database, "shop_prod");
+  EXPECT_TRUE(s.target_database.empty())
+      << "the shared fixture names no database: target.database is now GATED "
+         "against current_database(), so pinning it here would refuse every "
+         "test that uses this spec on any server not called shop_prod";
   EXPECT_EQ(s.min_server_version, 150000);
+  // Parsed when present, which is the half this fixture no longer covers.
+  json named = minimal_spec();
+  named["target"]["database"] = "shop_prod";
+  EXPECT_EQ(pglaswell::parse_spec(named).target_database, "shop_prod");
   ASSERT_EQ(s.intents.size(), 3u);
   EXPECT_EQ(s.intents[0].kind, pglaswell::IntentKind::kAddColumn);
   EXPECT_EQ(s.intents[1].kind, pglaswell::IntentKind::kBackfill);
@@ -3383,6 +3390,48 @@ TEST_F(ToolTest, TwoJobsForTheSameSpecCannotRunAtOnce) {
     return st == "cancelled" || st == "succeeded";
   });
 }
+// target.database was parsed into Spec::target_database, covered by the
+// signature, and read by nothing -- an author could name a database and get
+// exactly the protection of naming none. Now it is compared to
+// current_database(), which is an assertion by the server rather than by
+// whoever launched the tool, and enforced in both places the environment gate
+// is: the repository listing a deployment reads, and startMigration, so a
+// direct call cannot route around the listing.
+TEST_F(ToolTest, ASpecNamingAnotherDatabaseByNameIsNotAppliedHere) {
+  pglaswell::Ledger ledger(cfg());
+  const auto here = ledger.status().database;
+  ASSERT_FALSE(here.empty()) << "current_database() is never absent";
+
+  const auto spec_for = [&](const std::string& db) {
+    json doc = minimal_spec();
+    doc["id"] = "0001-targeted-" + db;
+    doc["target"]["database"] = db;
+    return signed_doc(doc);
+  };
+
+  // Somewhere else: reported, and NOT a failure -- the same treatment
+  // wrong_environment gets, because a spec for another database is somebody
+  // else's migration rather than this deployment's problem.
+  const auto elsewhere = payload(call(
+      "startMigration", json{{"spec", spec_for("some_other_database")}}));
+  EXPECT_FALSE(elsewhere.value("accepted", false)) << elsewhere.dump(2);
+  EXPECT_NE(elsewhere.value("error", "").find("some_other_database"),
+            std::string::npos) << elsewhere.dump(2);
+  EXPECT_NE(elsewhere.value("error", "").find(here), std::string::npos)
+      << "the refusal must name the database it actually is: " << elsewhere.dump(2);
+
+  // And naming THIS database is not an obstacle: the gate is a comparison, not
+  // a prohibition on the key existing.
+  make_shop(cfg());
+  const auto ok = payload(call("startMigration", json{{"spec", spec_for(here)}}));
+  EXPECT_TRUE(ok.value("accepted", false)) << ok.dump(2);
+  call("cancelJob", json{{"jobId", ok["jobId"]}});
+  wait_for_status(*this, ok["jobId"], [](const json& st) {
+    const auto v = st.value("state", "");
+    return v == "cancelled" || v == "succeeded";
+  });
+}
+
 TEST_F(ToolTest, AFailedStepFailsTheJobAndTheLedgerSaysWhich) {
   make_shop(cfg());
   // A backfill expression that parses and plans but fails at runtime: a cast

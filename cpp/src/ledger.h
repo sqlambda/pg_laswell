@@ -47,6 +47,13 @@ struct LedgerStatus {
   // environment means unlabelled, which is not the same as "any": a spec that
   // declares an environment cannot be checked against a database that declines
   // to say what it is, and is refused rather than assumed to match.
+  //
+  // `database` is current_database(), which needs no table and cannot be
+  // absent. It is weaker evidence than the environment label and that is why
+  // both exist: a name survives a dump restored into the wrong place, where a
+  // label written by whoever owns the schema does not. A spec naming a
+  // database gets the check it asked for, and the message says what it proves.
+  std::string database;
   std::string environment;
   std::set<std::string> releases_ready;
   std::string error;
@@ -58,6 +65,7 @@ struct LedgerStatus {
            {"expectedVersion", kLedgerSchemaVersion},
            {"usable", usable},
            {"trustedKeyIds", trusted_key_ids},
+           {"database", database},
            {"environment", environment},
            {"releasesReady", releases_ready}};
     if (!error.empty()) j["error"] = error;
@@ -101,6 +109,7 @@ class Ledger {
     const auto r = s.txn().exec(R"SQL(
       SELECT JSONB_BUILD_OBJECT(
         'version', (SELECT MAX(version) FROM laswell.schema_version),
+        'database', current_database(),
         'keys', COALESCE((SELECT JSONB_AGG(key_id ORDER BY key_id)
                             FROM laswell.trusted_key
                            WHERE revoked_at IS NULL), '[]'::jsonb),
@@ -121,6 +130,7 @@ class Ledger {
     if (!r.empty() && !r[0][0].is_null()) {
       const auto j = json::parse(r[0][0].as<std::string>());
       st.version = j.value("version", 0);
+      st.database = j.value("database", "");
       for (const auto& k : j.value("keys", json::array())) {
         st.trusted_key_ids.push_back(k.get<std::string>());
       }

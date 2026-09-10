@@ -317,6 +317,53 @@ ran.
 Floating-point values are refused anywhere in a specification.
 Nothing a migration intent needs is a float, and refusing removes the one
 genuinely error-prone clause of RFC 8785.
+.Ss Where a specification may be applied
+Three optional gates, all inside the signature, all answered by the target
+database rather than by whoever runs the tool.
+A specification that fails one is
+.Em not
+a failure: it is reported, skipped, and left pending, because a migration for
+somewhere else is somebody else's, and one awaiting approval is this database's
+and waiting.
+.Bl -tag -width Ds
+.It Va target.database
+Compared to
+.Fn current_database .
+The weakest of the three and the only one needing no setup: a name survives a
+dump restored into the wrong place, and a rename breaks every specification
+that named it.
+Use it to catch an obvious mistake, not to express intent.
+.It Va target.environment
+Compared to the single row of
+.Va laswell.environment ,
+which the migrating role may read and may not write.
+This is the one to reach for.
+An
+.Em unlabelled
+database does not match anything: a specification asking which environment this
+is cannot be answered by a database that has not said, so it is held rather
+than assumed to match.
+.It Va release
+A tag, looked up in
+.Va laswell.release .
+Held until that tag is marked ready there, and a tag with no row at all behaves
+exactly as one marked not ready -- absence and false mean the same thing to a
+gate, which is what makes held the safe default.
+.El
+.Pp
+Both tables are written by whoever owns the
+.Va laswell
+schema and are
+.Ic GRANT Ns ed
+.Ic SELECT
+to the migrating role, for the reason
+.Va laswell.trusted_key
+is: a role that could label its own database, or approve its own release, is a
+gate that exists only as a comment.
+Each is enforced twice -- in the repository listing a deployment reads, and
+again in
+.Ic startMigration ,
+so a direct call cannot route around the listing.
 .Ss Intent kinds
 The set of kinds a binary knows is exactly the set it implements: there is no
 recognised-but-unsupported kind, and an unknown one refuses the whole

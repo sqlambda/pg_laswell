@@ -121,7 +121,7 @@ class Deployment {
       const auto status = m.value("status", "");
       if (status == "pending") ++pending;
       if (status == "held_for_release") ++held;
-      if (status == "wrong_environment") ++elsewhere;
+      if (status == "wrong_environment" || status == "wrong_database") ++elsewhere;
     }
 
     report_plan(out, listing, pending);
@@ -132,7 +132,8 @@ class Deployment {
     // a broken one, and a pipeline would learn to ignore the code.
     for (const auto& m : listing.value("migrations", json::array())) {
       const auto status = m.value("status", "");
-      if (status == "held_for_release" || status == "wrong_environment") {
+      if (status == "held_for_release" || status == "wrong_environment" ||
+          status == "wrong_database") {
         out << "  " << m.value("specId", "") << ": " << status;
         if (m.contains("error")) {
           out << " -- " << m["error"].get<std::string>();
@@ -142,7 +143,7 @@ class Deployment {
     }
     if (held || elsewhere) {
       out << "  (" << held << " held, " << elsewhere
-          << " for another environment)\n";
+          << " for another database or environment)\n";
     }
     if (opts_.status_only || pending == 0) return DeployResult::kOk;
 
