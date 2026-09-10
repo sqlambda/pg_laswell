@@ -1,0 +1,4 @@
+Plan for 0010-merge-status-composite  (digest bc233463f811…)
+
+REFUSED. Nothing will run.
+  conflict: shop.orders has no valid unique index on (status) alone (orders_status_id_key is UNIQUE (status, id), which permits the same status on rows that differ in the other column(s)), and MERGE's ON clause is not a key constraint. Measured on 18.6: with duplicate target rows, one source row updated BOTH of them -- no error, nothing in the row count to notice, and the extra row silently carrying values meant for another. Create the index first: CREATE UNIQUE INDEX CONCURRENTLY ... ON shop.orders (status);

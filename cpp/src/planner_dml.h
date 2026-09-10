@@ -279,6 +279,76 @@ inline void emit_sequence_catchup(const Intent& in, const json& columns,
   }
 }
 
+// Whether a valid unique index PROVES `key` unique, and which one. This is the
+// difference between a keyset walk that is correct and one that skips or
+// repeats rows, and -- for merge_rows and update_rows -- between a statement
+// that changes one row per source row and one that silently changes several.
+//
+// "Leads with the key" was the whole test, and it is not enough. Measured on
+// 18.6: a table with UNIQUE (id, tenant) and two rows sharing id = 1 was
+// accepted as proof that id is unique, and the MERGE keyed on id updated both
+// rows -- the exact failure this check exists to refuse, reached through the
+// check itself. A composite index permits repeats of its leading column, and a
+// partial index says nothing about the rows its predicate excludes. Both facts
+// are in the observation (`columns`, `predicate`) and both were ignored.
+//
+// Missing evidence counts as absent, not as satisfied. An index observation
+// with no `columns` or no `predicate` cannot prove anything, and refusing on
+// incomplete evidence is this planner's rule everywhere else; the catalog
+// always supplies both, so only a hand-built observation ever hits it.
+//
+// `index_name` receives the proving index or, when none proves it, the nearest
+// candidate, for the message. `reason` says why that candidate does not count,
+// so a refusal can name the actual problem instead of saying "no unique index"
+// about a table that visibly has one.
+inline bool unique_key_index(const json& t, const std::string& key,
+                             std::string& index_name,
+                             std::string* reason = nullptr) {
+  const json indexes = t.value("indexes", json::object());
+  std::string why;
+  const auto note = [&](const std::string& r) { if (why.empty()) why = r; };
+  for (auto it = indexes.begin(); it != indexes.end(); ++it) {
+    const auto& ix = it.value();
+    if (ix.value("leading_column", "") != key) continue;
+    if (index_name.empty()) index_name = it.key();
+    if (!ix.value("is_unique", false)) {
+      note(it.key() + " leads with it but is not unique");
+      continue;
+    }
+    if (!ix.value("is_valid", false)) {
+      note(it.key() + " is unique but not valid -- a CREATE INDEX CONCURRENTLY "
+           "that failed leaves exactly this behind");
+      continue;
+    }
+    if (!ix.contains("columns") || !ix["columns"].is_array() ||
+        !ix.contains("predicate")) {
+      note(it.key() + " is unique, but this observation does not say which "
+           "columns it covers or whether it is partial, so it proves nothing");
+      continue;
+    }
+    if (ix["columns"].size() != 1) {
+      std::vector<std::string> names;
+      for (const auto& c : ix["columns"]) {
+        names.push_back(c.is_string() ? c.get<std::string>() : "<expression>");
+      }
+      note(it.key() + " is UNIQUE (" + join(names, ", ") + "), which permits "
+           "the same " + key + " on rows that differ in the other column(s)");
+      continue;
+    }
+    const auto predicate = ix.value("predicate", "");
+    if (!predicate.empty()) {
+      note(it.key() + " is unique but PARTIAL (WHERE " + predicate + "), which "
+           "says nothing about the rows outside its predicate");
+      continue;
+    }
+    index_name = it.key();
+    if (reason) reason->clear();
+    return true;
+  }
+  if (reason) *reason = why;
+  return false;
+}
+
 // What an author cannot see from the plan and will not see from an error.
 inline void warn_about_row_security(const json& t, const std::string& qualified,
                                     bool writes_new_rows, Plan& plan) {
@@ -349,8 +419,6 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
   // A keyset walk needs a unique key, or the cursor can skip or repeat rows.
   // Refused loudly rather than falling back to OFFSET, which degrades to a
   // full scan per batch and is quadratic in the table size.
-  bool key_is_unique = false;
-  std::string supporting_index;
   // Bound to a local: json::value() returns BY VALUE, so calling it in both
   // begin() and end() yields iterators into two different temporaries. Same
   // defect class as std::ostringstream::str() -- it compiles, and nlohmann
@@ -358,20 +426,17 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
   // containers", which is a much better outcome than the silent corruption
   // the equivalent std:: idiom would give.
   const json indexes = t.value("indexes", json::object());
-  for (auto it = indexes.begin(); it != indexes.end(); ++it) {
-    if (it.value().value("leading_column", "") != key) continue;
-    supporting_index = it.key();
-    if (it.value().value("is_unique", false) && it.value().value("is_valid", false)) {
-      key_is_unique = true;
-      break;
-    }
-  }
-  if (!key_is_unique) {
+  // The same proof merge_rows and update_rows demand, from the same helper:
+  // this used to be a private copy that checked only the leading column, and
+  // a copy is how one of them gets fixed and the other does not.
+  std::string supporting_index, unproven;
+  if (!detail::unique_key_index(t, key, supporting_index, &unproven)) {
     step.action = Action::kConflict;
-    step.why = "no unique index leads with " + key;
+    step.why = "no unique index proves " + key + " unique";
     plan.conflicts.push_back(
-        qualified + " has no valid unique index whose leading column is \"" + key +
-        "\", so a keyset walk could skip or repeat rows. Create one first: "
+        qualified + " has no valid unique index on (" + key + ") alone" +
+        (unproven.empty() ? "" : " (" + unproven + ")") +
+        ", so a keyset walk could skip or repeat rows. Create one first: "
         "CREATE UNIQUE INDEX CONCURRENTLY ... ON " + qualified + " (" + key + ");");
     return;
   }
@@ -692,26 +757,6 @@ inline bool row_target_ok(const json& t, const std::string& qualified,
   return true;
 }
 
-// Whether a unique index leads with `key`, and which one. This is the
-// difference between a keyset walk that is correct and one that skips or
-// repeats rows, and -- for merge_rows -- between a MERGE that updates one row
-// and one that silently updates several.
-inline bool unique_key_index(const json& t, const std::string& key,
-                             std::string& index_name) {
-  const json indexes = t.value("indexes", json::object());
-  bool found = false;
-  for (auto it = indexes.begin(); it != indexes.end(); ++it) {
-    if (it.value().value("leading_column", "") != key) continue;
-    if (index_name.empty()) index_name = it.key();
-    if (it.value().value("is_unique", false) && it.value().value("is_valid", false)) {
-      index_name = it.key();
-      found = true;
-      break;
-    }
-  }
-  return found;
-}
-
 // Two rows in `values` claiming the same key. Every kind here breaks on it, and
 // each breaks differently: an INSERT hits the unique constraint, a MERGE raises
 // "MERGE command cannot affect row a second time" (measured), and an UPDATE
@@ -1029,13 +1074,14 @@ inline void plan_update_rows(const Intent& in, const Observations& obs,
   // rows, and every one of them silently takes the value meant for one. Same
   // refusal backfill makes, for a reason that is worse here: backfill's
   // expression would at least be correct for each row it hit.
-  std::string supporting_index;
-  if (!detail::unique_key_index(t, key, supporting_index)) {
+  std::string supporting_index, unproven;
+  if (!detail::unique_key_index(t, key, supporting_index, &unproven)) {
     step.action = Action::kConflict;
-    step.why = "no unique index leads with " + key;
+    step.why = "no unique index proves " + key + " unique";
     plan.conflicts.push_back(
-        qualified + " has no valid unique index whose leading column is \"" +
-        key + "\", so one row of \"values\" could match several rows of the "
+        qualified + " has no valid unique index on (" + key + ") alone" +
+        (unproven.empty() ? "" : " (" + unproven + ")") +
+        ", so one row of \"values\" could match several rows of the "
         "table and every one of them would take a value meant for a single "
         "row -- with no error anywhere. Create one first: CREATE UNIQUE INDEX "
         "CONCURRENTLY ... ON " + qualified + " (" + key + ");");
@@ -1312,13 +1358,14 @@ inline void plan_merge_rows(const Intent& in, const Observations& obs,
     return;
   }
 
-  std::string supporting_index;
-  if (!detail::unique_key_index(t, key, supporting_index)) {
+  std::string supporting_index, unproven;
+  if (!detail::unique_key_index(t, key, supporting_index, &unproven)) {
     step.action = Action::kConflict;
-    step.why = "no unique index leads with " + key;
+    step.why = "no unique index proves " + key + " unique";
     plan.conflicts.push_back(
-        qualified + " has no valid unique index whose leading column is \"" +
-        key + "\", and MERGE's ON clause is not a key constraint. Measured on "
+        qualified + " has no valid unique index on (" + key + ") alone" +
+        (unproven.empty() ? "" : " (" + unproven + ")") +
+        ", and MERGE's ON clause is not a key constraint. Measured on "
         "18.6: with duplicate target rows, one source row updated BOTH of them "
         "-- no error, nothing in the row count to notice, and the extra row "
         "silently carrying values meant for another. Create the index first: "

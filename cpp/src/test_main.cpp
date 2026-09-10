@@ -1590,6 +1590,12 @@ pglaswell::Observations observations(long long size_bytes, long long rows,
        json{{"orders_pkey",
              {{"is_valid", true}, {"is_unique", true}, {"is_primary", true},
               {"leading_column", "id"},
+              // What the catalog always reports and a key proof now needs:
+              // the whole column list and the predicate. A fixture that
+              // carried only the leading column described an index the
+              // planner can no longer accept as proof of anything.
+              {"columns", json::array({"id"})}, {"predicate", ""},
+              {"has_expressions", false},
               {"definition", "CREATE UNIQUE INDEX orders_pkey ON shop.orders USING btree (id)"}}}}}};
   return obs;
 }
@@ -2817,6 +2823,51 @@ TEST_F(ToolTest, AnUnsignedDraftCanBePlannedButIsMarkedUnexecutable) {
   pglaswell::WriteSession c(cfg());
   c.begin("pg_laswell/test/cleanup");
   c.txn().exec("DROP SCHEMA shop CASCADE");
+  c.commit();
+}
+
+// The measurement itself, against a real server: the table the review used,
+// with the composite unique index and the two rows sharing an id. Before the
+// fix this planned, and the MERGE updated both rows.
+TEST_F(ToolTest, ACompositeUniqueIndexDoesNotLetAMergeReachTwoRows) {
+  pglaswell::WriteSession w(cfg());
+  w.begin("pg_laswell/test/composite-fixture");
+  w.txn().exec("DROP SCHEMA IF EXISTS demo CASCADE");
+  w.txn().exec("CREATE SCHEMA demo");
+  w.txn().exec("CREATE TABLE demo.t(id bigint NOT NULL, tenant int NOT NULL, v int,"
+               " CONSTRAINT t_id_tenant_key UNIQUE (id, tenant))");
+  w.txn().exec("INSERT INTO demo.t VALUES (1, 1, 0), (1, 2, 0)");
+  w.commit();
+
+  const json spec{{"laswell_spec_version", 1},
+                  {"id", "0001-composite-merge"},
+                  {"description", "merge keyed on a column only a composite index covers"},
+                  {"intents", json::array({json{
+                      {"kind", "merge_rows"}, {"schema", "demo"}, {"table", "t"},
+                      {"key", "id"}, {"columns", json::array({"id", "v"})},
+                      {"values", json::array({json::array({1, 9})})},
+                      {"paced", false}}})}};
+  const auto p = payload(call("planMigration", json{{"spec", spec}, {"skipTrustChecks", true}}));
+  EXPECT_FALSE(p.value("ok", true)) << p.dump(2);
+  bool named = false;
+  for (const auto& c : p.value("conflicts", json::array())) {
+    const auto text = c.get<std::string>();
+    if (text.find("t_id_tenant_key") != std::string::npos &&
+        text.find("permits the same id") != std::string::npos) named = true;
+  }
+  EXPECT_TRUE(named) << p.dump(2);
+
+  {
+    // Scoped: the read transaction holds AccessShareLock on demo.t until it
+    // ends, and the DROP below would wait on it past lock_timeout.
+    pglaswell::ReadSession r(cfg());
+    EXPECT_EQ(r.txn().exec("SELECT count(*) FROM demo.t WHERE v = 9")[0][0].as<int>(), 0)
+        << "planning must not have touched the rows";
+  }
+
+  pglaswell::WriteSession c(cfg());
+  c.begin("pg_laswell/test/cleanup");
+  c.txn().exec("DROP SCHEMA demo CASCADE");
   c.commit();
 }
 
@@ -5371,6 +5422,81 @@ TEST(Planner, UpdateRowsRefusesWithoutAUniqueIndexOnItsKey) {
     if (c.find("with no error anywhere") != std::string::npos) named = true;
   }
   EXPECT_TRUE(named) << plan.render();
+}
+
+// The gap that was measured, not inferred. A table with UNIQUE (id, tenant)
+// and two rows sharing id = 1 was accepted as proof that id is unique, and the
+// MERGE keyed on id updated both rows -- the failure the refusal exists to
+// prevent, reached through the refusal's own check, which looked only at the
+// leading column. A composite index permits repeats of its leading column and
+// a partial one says nothing about the rows it excludes; both facts are in
+// the observation. All three kinds that walk or match by key are asserted,
+// because they share the helper and would ship the same wrong answer.
+TEST(Planner, AUniqueIndexThatIsCompositeOrPartialDoesNotProveTheKeyUnique) {
+  const auto intents = json::array({
+      json{{"kind", "merge_rows"}, {"schema", "shop"}, {"table", "orders"},
+           {"key", "id"}, {"columns", json::array({"id", "fulfilment_region"})},
+           {"values", json::array({json::array({1, "NA"})})}},
+      json{{"kind", "update_rows"}, {"schema", "shop"}, {"table", "orders"},
+           {"key", "id"}, {"columns", json::array({"id", "fulfilment_region"})},
+           {"values", json::array({json::array({1, "NA"})})}},
+      json{{"kind", "backfill"}, {"schema", "shop"}, {"table", "orders"},
+           {"key", "id"}, {"set", json{{"fulfilment_region", "'x'"}}},
+           {"where", "fulfilment_region IS NULL"}}});
+
+  // Positive control first: the single-column pkey proves it, all three plan.
+  for (const auto& in : intents) {
+    const auto plan = pglaswell::plan_migration(spec_of(json::array({in})), obs_dml(), {});
+    EXPECT_TRUE(plan.ok) << in.value("kind", "") << ": " << plan.render();
+  }
+
+  struct Shape { const char* name; const char* expect; };
+  for (const Shape shape : {Shape{"composite", "permits the same id"},
+                            Shape{"partial", "PARTIAL (WHERE"},
+                            Shape{"unstated", "does not say which columns"}}) {
+    for (const auto& in : intents) {
+      auto obs = obs_dml();
+      auto& ix = obs.tables["shop.orders"]["indexes"]["orders_pkey"];
+      const std::string s = shape.name;
+      if (s == "composite") ix["columns"] = json::array({"id", "warehouse_id"});
+      if (s == "partial") ix["predicate"] = "status = 'open'";
+      if (s == "unstated") ix.erase("columns");  // incomplete evidence: refuse
+      const auto plan = pglaswell::plan_migration(spec_of(json::array({in})), obs, {});
+      EXPECT_FALSE(plan.ok) << shape.name << " " << in.value("kind", "") << ": "
+                            << plan.render();
+      bool named = false;
+      for (const auto& c : plan.conflicts) {
+        if (c.find("orders_pkey") != std::string::npos &&
+            c.find(shape.expect) != std::string::npos) named = true;
+      }
+      EXPECT_TRUE(named) << shape.name << " " << in.value("kind", "")
+                         << ": the refusal must name the index and say why it "
+                            "does not count:\n" << plan.render();
+    }
+  }
+}
+
+// The projection has to say the same things about a planned index that the
+// catalog says about a real one, or "create the unique index, then walk on
+// it" refuses the walk. A planned partial unique index must NOT count.
+TEST(Planner, AProjectedUniqueIndexProvesTheKeyOnlyWhenTheCatalogVersionWould) {
+  auto obs = obs_dml();
+  obs.tables["shop.orders"]["indexes"].erase("orders_pkey");
+  const auto walk = json{{"kind", "update_rows"}, {"schema", "shop"},
+                         {"table", "orders"}, {"key", "warehouse_id"},
+                         {"columns", json::array({"warehouse_id", "fulfilment_region"})},
+                         {"values", json::array({json::array({7, "NA"})})}};
+  const auto index = [](bool partial) {
+    json ix{{"kind", "create_index"}, {"schema", "shop"}, {"table", "orders"},
+            {"name", "orders_wh_key"}, {"columns", json::array({"warehouse_id"})},
+            {"unique", true}, {"method", "btree"}, {"comment", "test"}};
+    if (partial) ix["where"] = "status = 'open'";
+    return ix;
+  };
+  const auto full = pglaswell::plan_migration(spec_of(json::array({index(false), walk})), obs, {});
+  EXPECT_TRUE(full.ok) << full.render();
+  const auto part = pglaswell::plan_migration(spec_of(json::array({index(true), walk})), obs, {});
+  EXPECT_FALSE(part.ok) << part.render();
 }
 
 TEST(Planner, UpdateRowsGivesEachRowItsOwnValuesAndCastsTheFirstOne) {

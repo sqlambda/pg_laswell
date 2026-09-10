@@ -1,4 +1,4 @@
 Plan for 0008-merge-status  (digest 2b2850724bdc…)
 
 REFUSED. Nothing will run.
-  conflict: shop.orders has no valid unique index whose leading column is "status", and MERGE's ON clause is not a key constraint. Measured on 18.6: with duplicate target rows, one source row updated BOTH of them -- no error, nothing in the row count to notice, and the extra row silently carrying values meant for another. Create the index first: CREATE UNIQUE INDEX CONCURRENTLY ... ON shop.orders (status);
+  conflict: shop.orders has no valid unique index on (status) alone, and MERGE's ON clause is not a key constraint. Measured on 18.6: with duplicate target rows, one source row updated BOTH of them -- no error, nothing in the row count to notice, and the extra row silently carrying values meant for another. Create the index first: CREATE UNIQUE INDEX CONCURRENTLY ... ON shop.orders (status);

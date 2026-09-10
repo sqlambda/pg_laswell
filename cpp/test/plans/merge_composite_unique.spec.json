@@ -1,0 +1,28 @@
+{
+ "laswell_spec_version": 1,
+ "id": "0010-merge-status-composite",
+ "description": "Upsert order status, on a table whose only unique index on status is composite.",
+ "rationale": "The refusal merge_no_unique shows, in the form that was actually missed: a UNIQUE (status, id) index LEADS with status and does not make status unique. Measured on 18.6, a table with UNIQUE (id, tenant) and two rows sharing id = 1 was accepted as proof, and the MERGE updated both rows. The transcript shows the refusal naming the index and saying why it does not count.",
+ "intents": [
+  {
+   "kind": "merge_rows",
+   "schema": "shop",
+   "table": "orders",
+   "key": "status",
+   "columns": [
+    "status",
+    "amount"
+   ],
+   "values": [
+    [
+     "open",
+     1
+    ],
+    [
+     "closed",
+     2
+    ]
+   ]
+  }
+ ]
+}

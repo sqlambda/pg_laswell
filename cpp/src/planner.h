@@ -217,10 +217,21 @@ inline void project(const Intent& in, const Step& step, Observations& projected)
       for (const auto& c : in.body.value("columns", json::array())) {
         cols.push_back(c.get<std::string>());
       }
+      // The full column list and the predicate, not just the leading column.
+      // unique_key_index() proves a key unique only from those two -- a
+      // composite or partial unique index does not make its leading column
+      // unique -- so a projection that carried the leading column alone would
+      // make "create the unique index, then backfill on it" refuse the
+      // backfill against a real database. The catalog reports both for a
+      // real index; the projection has to say the same things about a
+      // planned one.
       projected.tables[qualified]["indexes"][in.body.value("name", "")] =
           json{{"is_valid", true},
                {"is_unique", in.body.value("unique", false)},
                {"leading_column", cols.empty() ? "" : cols[0]},
+               {"columns", cols},
+               {"predicate", in.body.value("where", "")},
+               {"has_expressions", false},
                {"definition", "(planned by step " + std::to_string(step.ordinal) + ")"},
                {"projected_by_step", step.ordinal}};
       return;
