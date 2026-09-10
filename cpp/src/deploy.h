@@ -221,11 +221,25 @@ class Deployment {
         try {
           spec = detail::read_spec_file(by_id[id].value("path", ""));
         } catch (const std::exception& e) {
+          // Drained like the other two ways out. The file parsed during the
+          // scan and does not now, so something changed the repository under a
+          // running deployment -- which makes this the LEAST safe moment to
+          // walk away from migrations still writing. join_all() in main would
+          // still let them finish, so nothing is corrupted either way; what
+          // was lost is the record. Their outcome never reached the log, and
+          // exit 2 was printed while they were mid-flight, so the deployment
+          // reported a repository problem and said nothing about the
+          // migrations it had already started.
           out << "  " << id << ": " << e.what() << "\n";
+          drain(out, running);
           return DeployResult::kRepoProblem;
         }
 
         if (opts_.dry_run) {
+          // No drain: a dry run starts nothing, so `running` is empty here by
+          // construction. Said rather than left to be noticed, because every
+          // other exit from this loop drains and a reader is owed the reason
+          // this one does not.
           const auto plan = plan_migration_tool(ctx_, json{{"spec", spec}});
           const auto outcome = report_plan_outcome(out, id, plan);
           if (outcome != DeployResult::kOk) return outcome;
