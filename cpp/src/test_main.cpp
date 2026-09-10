@@ -3344,45 +3344,45 @@ TEST_F(ToolTest, JobStatusReportsContentionThresholdsAndItsOwnBlindSpot) {
 }
 
 TEST_F(ToolTest, TwoJobsForTheSameSpecCannotRunAtOnce) {
-  make_big_shop(cfg(), 30000);
-  auto c = cfg();
-  c.executor.batch_rows = 100;
-  c.executor.commit_interval_ms = 25;
-  c.executor.max_concurrent_jobs = 4;  // not the limit under test
-  // The first job must still be RUNNING when the second asks, and "30 000
-  // rows is enough work" is not a guarantee: a CI runner finished it before
-  // the second call had planned, and the second was admitted. So the first
-  // job is pinned instead: a session below holds a row lock its very first
-  // batch needs, and lock_timeout is raised so it waits rather than fails.
-  // The second call's dry run would wait on that row too, so its timeout is
-  // cut short -- an unverified dry run still yields a plan, and the refusal
-  // under test happens after planning, at the advisory lock.
-  c.executor.lock_timeout_ms = 60000;
-  c.executor.dry_run_statement_timeout_ms = 300;
-  set_executor(c.executor);
+  make_shop(cfg());
 
-  pglaswell::WriteSession holder(cfg());
-  holder.begin("pg_laswell/test/holder");
-  holder.txn().exec("SELECT id FROM shop.orders WHERE id = 1 FOR UPDATE");
+  // The serialization is a per-spec SESSION advisory lock, taken in open_job
+  // with pg_try_advisory_lock. Proven by holding that exact lock and watching
+  // a job be refused -- not by racing two real backfills and hoping the first
+  // is still running when the second asks. That race is real: a CI runner
+  // finished a 30 000-row job before the second startMigration had planned,
+  // the lock was free, the job was admitted, and a planner change that never
+  // touched concurrency failed here. Holding the lock directly tests the
+  // mechanism itself, deterministically. advisory_key() is the function
+  // open_job uses, so the key is the same one a real concurrent job contends
+  // for; the "laswell:spec:" prefix is open_job's, too.
+  pglaswell::ReadSession holder(cfg());
+  const long long spec_key =
+      pglaswell::advisory_key("laswell:spec:0001-orders-fulfilment-region");
+  holder.txn().exec(
+      pqxx::zview("SELECT pg_advisory_lock($1)"), pqxx::params{spec_key});
 
-  const auto first = payload(call("startMigration", json{{"spec", signed_spec()}}));
-  ASSERT_TRUE(first.value("accepted", false)) << first.dump(2);
-
-  const auto second = payload(call("startMigration", json{{"spec", signed_spec()}}));
-  EXPECT_FALSE(second.value("accepted", false))
-      << "a second job for the same spec was admitted: " << second.dump(2);
-  EXPECT_NE(second.value("error", "").find("already holds the advisory lock"),
+  const auto refused = payload(call("startMigration", json{{"spec", signed_spec()}}));
+  EXPECT_FALSE(refused.value("accepted", false))
+      << "a job was admitted while the spec's advisory lock was held: "
+      << refused.dump(2);
+  EXPECT_NE(refused.value("error", "").find("already holds the advisory lock"),
             std::string::npos)
-      << "refused for the right reason -- the lock, not the concurrency cap: "
-      << second.dump(2);
+      << "refused for the right reason -- the lock, not planning or the "
+         "concurrency cap: " << refused.dump(2);
 
-  holder.commit();  // let the first job go
-  call("cancelJob", json{{"jobId", first["jobId"]}});
-  wait_for_status(*this, first["jobId"], [](const json& s) {
-    return s.value("state", "") == "cancelled" || s.value("state", "") == "succeeded";
+  // Release it, and the very same spec now starts: the refusal was the lock
+  // and nothing else.
+  holder.txn().exec(
+      pqxx::zview("SELECT pg_advisory_unlock($1)"), pqxx::params{spec_key});
+  const auto ok = payload(call("startMigration", json{{"spec", signed_spec()}}));
+  EXPECT_TRUE(ok.value("accepted", false)) << ok.dump(2);
+  call("cancelJob", json{{"jobId", ok["jobId"]}});
+  wait_for_status(*this, ok["jobId"], [](const json& s) {
+    const auto st = s.value("state", "");
+    return st == "cancelled" || st == "succeeded";
   });
 }
-
 TEST_F(ToolTest, AFailedStepFailsTheJobAndTheLedgerSaysWhich) {
   make_shop(cfg());
   // A backfill expression that parses and plans but fails at runtime: a cast
