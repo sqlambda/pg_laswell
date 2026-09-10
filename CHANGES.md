@@ -7,6 +7,10 @@ ledger. 354 tests green on GCC 14.2 and Clang 22, under AddressSanitizer/UBSan
 and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
 `--call` contract test.
 
+- **A dry run says why a specification was refused when there is no plan to
+  show.** A refusal that never reached a plan -- an untrusted signature, either
+  trust gate -- carries `error` and `hint` rather than `conflicts`, and
+  `--dry-run` printed the spec id, the word REFUSED, and an empty list.
 - **A version 1 ledger is refused by version, not by exception.** `status()`
   read the two version 2 tables with `to_regclass` in a `WHERE`, which does
   nothing for a table named in the `FROM` -- PostgreSQL resolves that at parse

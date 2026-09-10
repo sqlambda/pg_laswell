@@ -227,7 +227,8 @@ class Deployment {
 
         if (opts_.dry_run) {
           const auto plan = plan_migration_tool(ctx_, json{{"spec", spec}});
-          if (!report_plan_outcome(out, id, plan)) return DeployResult::kRefused;
+          const auto outcome = report_plan_outcome(out, id, plan);
+          if (outcome != DeployResult::kOk) return outcome;
           continue;
         }
 
@@ -334,21 +335,42 @@ class Deployment {
     return json::object();
   }
 
-  bool report_plan_outcome(std::ostream& out, const std::string& id,
-                           const json& plan) const {
+  // A refusal arrives in one of two shapes and only one of them was printed.
+  // A plan that was built and rejected carries `conflicts`; a spec that never
+  // got as far as a plan -- an untrusted signature, either gate -- carries
+  // `error` and `hint` instead, and this printed "REFUSED" followed by an
+  // empty conflict list. The spec id, the word, and nothing else: the reason
+  // was sitting in `error` the whole time.
+  //
+  // Still exit 1 in both cases, which is the documented contract: "a plan was
+  // refused, a specification was untrusted, or a job failed". The exit code
+  // was never the defect here. A configuration fault cannot reach this point,
+  // because the listing above already needed the connection and the
+  // repository -- measured: pg_laswell against a dead port never gets here,
+  // it exits 3 from main's handler before the first spec is read.
+  DeployResult report_plan_outcome(std::ostream& out, const std::string& id,
+                                   const json& plan) const {
+    if (plan.contains("error")) {
+      out << "  " << id << ": REFUSED\n";
+      out << "      " << plan["error"].get<std::string>() << "\n";
+      if (plan.contains("hint")) {
+        out << "      " << plan["hint"].get<std::string>() << "\n";
+      }
+      return DeployResult::kRefused;
+    }
     if (!plan.value("ok", false)) {
       out << "  " << id << ": REFUSED\n";
       for (const auto& c : plan.value("conflicts", json::array())) {
         out << "      " << c.get<std::string>() << "\n";
       }
-      return false;
+      return DeployResult::kRefused;
     }
     out << "  " << id << ": " << plan.value("steps", json::array()).size()
         << " step(s), plan " << plan.value("planDigest", "").substr(0, 12) << "\n";
     for (const auto& w : plan.value("warnings", json::array())) {
       out << "      warning: " << w.get<std::string>() << "\n";
     }
-    return true;
+    return DeployResult::kOk;
   }
 
   static void report_failure(std::ostream& out, const json& st) {

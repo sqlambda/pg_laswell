@@ -10309,6 +10309,35 @@ TEST_F(DeployTest, ARefusedPlanStopsTheRunAndNamesTheConflict) {
   EXPECT_NE(text.find("ca"), std::string::npos) << text;
 }
 
+// A refusal that carries no plan carries `error` and `hint` instead of
+// `conflicts`, and the dry run printed only the word REFUSED and an empty
+// list -- the spec id, the verdict, and no reason at all, which is the one
+// thing a deployment log exists to record. An untrusted signature is how that
+// shape is reached in practice: the listing succeeds, because the file parses
+// and its id is pending, and planning is where trust is decided.
+TEST_F(DeployTest, ADryRunSaysWhyASpecWasRefusedWhenThereIsNoPlanToShow) {
+  exec("DROP SCHEMA IF EXISTS shop CASCADE");
+  exec("CREATE SCHEMA shop");
+  exec("CREATE TABLE shop.orders(id bigint PRIMARY KEY)");
+
+  // Signed by a key nobody trusts: valid JSON, valid signature, wrong signer.
+  json doc = add_column_spec("untrusted", "orders", "cu");
+  const auto parsed = pglaswell::parse_spec(doc);
+  doc["signatures"] = json::array({{{"key_id", "ed25519:0000000000000000"},
+                                    {"algorithm", "ed25519"},
+                                    {"signature", base64(sign(parsed.canonical_bytes))}}});
+  std::ofstream(dir_ + "/untrusted.json") << doc.dump(2);
+
+  const auto [result, text] = deploy(/*dry_run=*/true);
+  EXPECT_EQ(result, pglaswell::DeployResult::kRefused) << text;
+  EXPECT_NE(text.find("untrusted"), std::string::npos) << text;
+  // The point of the test: a reason, not just the verdict.
+  EXPECT_NE(text.find("REFUSED"), std::string::npos) << text;
+  EXPECT_NE(text.find("not accepted by this machine"), std::string::npos)
+      << "the refusal must say WHY, and this is the gate that said no:\n" << text;
+  EXPECT_EQ(column_count("orders", "cu"), 0) << "a dry run applied something";
+}
+
 TEST_F(DeployTest, HeldAndNotForHereAreReportedAndAreNotFailures) {
   exec("DROP SCHEMA IF EXISTS shop CASCADE");
   exec("CREATE SCHEMA shop");
