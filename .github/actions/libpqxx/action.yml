@@ -17,6 +17,12 @@ inputs:
   version:
     description: libpqxx release tag to build.
     required: true
+  sha256:
+    description: >
+      SHA-256 of the release tarball. Required, with no default, because a
+      default is the one thing that would let a caller forget it and still
+      build -- which is the state this input exists to end.
+    required: true
 
 runs:
   using: composite
@@ -41,8 +47,21 @@ runs:
       if: steps.pqxx.outputs.cache-hit != 'true'
       shell: bash
       run: |
-        curl -fsSL "https://github.com/jtv/libpqxx/archive/refs/tags/${{ inputs.version }}.tar.gz" \
-          | tar -xz -C /tmp
+        # To a file and verified before anything is unpacked, rather than
+        # piped straight into tar. The tarball is fetched by TAG, and a tag is
+        # a moving reference: whoever can move it can put anything into every
+        # binary this project ships, statically linked, with nothing in the
+        # build log to notice. curl -f catches a 404, not a substitution.
+        #
+        # If this ever fails on an unchanged version, do not paste in the new
+        # sum. GitHub generates these archives on demand and has changed their
+        # compression before, so a mismatch is either that or an attack, and
+        # only one of those is safe to wave through: check the upstream tag
+        # first.
+        curl -fsSL -o /tmp/libpqxx.tar.gz \
+          "https://github.com/jtv/libpqxx/archive/refs/tags/${{ inputs.version }}.tar.gz"
+        echo "${{ inputs.sha256 }}  /tmp/libpqxx.tar.gz" | sha256sum -c -
+        tar -xzf /tmp/libpqxx.tar.gz -C /tmp
         cmake -S "/tmp/libpqxx-${{ inputs.version }}" -B /tmp/libpqxx-build \
           -DCMAKE_BUILD_TYPE=Release \
           -DBUILD_SHARED_LIBS=OFF \

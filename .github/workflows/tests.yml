@@ -20,6 +20,7 @@ env:
   # version a runner happens to package is not a supported input. release.yml
   # pins the same version for the same reason; keep the two in step.
   PQXX_VERSION: 8.0.2
+  PQXX_SHA256: 028c5fba4982e759fe182af1103ccd08b02bb4e1f9f12a551e01d21cac0c4440
 
 jobs:
   # Compile each distinct configuration ONCE and hand the binary to the jobs
@@ -78,6 +79,7 @@ jobs:
         uses: ./.github/actions/libpqxx
         with:
           version: ${{ env.PQXX_VERSION }}
+          sha256: ${{ env.PQXX_SHA256 }}
 
       - name: Configure
         run: |
@@ -373,6 +375,7 @@ jobs:
         uses: ./.github/actions/libpqxx
         with:
           version: ${{ env.PQXX_VERSION }}
+          sha256: ${{ env.PQXX_SHA256 }}
       - name: Build packages
         run: |
           cmake -S cpp -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF

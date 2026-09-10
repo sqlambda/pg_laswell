@@ -29,6 +29,12 @@ env:
   # purpose: its C ABI is stable across versions and platforms patch it
   # independently, so it should come from the target's own repository.
   PQXX_VERSION: 8.0.2
+  # Verified before it is unpacked, on every target. The tarball is fetched by
+  # TAG and a tag is a moving reference; whoever can move it can put anything
+  # into every binary this project ships, statically linked. A mismatch on an
+  # unchanged version is either GitHub regenerating the archive or an attack --
+  # check the upstream tag, do not paste in the new sum.
+  PQXX_SHA256: 028c5fba4982e759fe182af1103ccd08b02bb4e1f9f12a551e01d21cac0c4440
 
 jobs:
   build:
@@ -99,7 +105,16 @@ jobs:
           apt-get install -y --no-install-recommends \
             curl ca-certificates cmake build-essential pkg-config dpkg-dev file \
             binutils libpq-dev libssl-dev nlohmann-json3-dev
-          curl -fsSL "https://github.com/jtv/libpqxx/archive/refs/tags/${PQXX_VERSION}.tar.gz" | tar -xz -C /tmp
+          curl -fsSL -o /tmp/libpqxx.tar.gz \
+            "https://github.com/jtv/libpqxx/archive/refs/tags/${PQXX_VERSION}.tar.gz"
+          # sha256sum on Linux, shasum on macOS: the same check, spelled the
+          # way each platform spells it, rather than skipped on one of them.
+          if command -v sha256sum >/dev/null 2>&1; then
+            echo "${PQXX_SHA256}  /tmp/libpqxx.tar.gz" | sha256sum -c -
+          else
+            echo "${PQXX_SHA256}  /tmp/libpqxx.tar.gz" | shasum -a 256 -c -
+          fi
+          tar -xzf /tmp/libpqxx.tar.gz -C /tmp
           cmake -S "/tmp/libpqxx-${PQXX_VERSION}" -B /tmp/libpqxx-build \
             -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DSKIP_BUILD_TEST=ON
           cmake --build /tmp/libpqxx-build -j"$(nproc)"
@@ -113,7 +128,16 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             cmake build-essential pkg-config file binutils \
             curl ca-certificates libpq-dev libssl-dev nlohmann-json3-dev
-          curl -fsSL "https://github.com/jtv/libpqxx/archive/refs/tags/${PQXX_VERSION}.tar.gz" | tar -xz -C /tmp
+          curl -fsSL -o /tmp/libpqxx.tar.gz \
+            "https://github.com/jtv/libpqxx/archive/refs/tags/${PQXX_VERSION}.tar.gz"
+          # sha256sum on Linux, shasum on macOS: the same check, spelled the
+          # way each platform spells it, rather than skipped on one of them.
+          if command -v sha256sum >/dev/null 2>&1; then
+            echo "${PQXX_SHA256}  /tmp/libpqxx.tar.gz" | sha256sum -c -
+          else
+            echo "${PQXX_SHA256}  /tmp/libpqxx.tar.gz" | shasum -a 256 -c -
+          fi
+          tar -xzf /tmp/libpqxx.tar.gz -C /tmp
           cmake -S "/tmp/libpqxx-${PQXX_VERSION}" -B /tmp/libpqxx-build \
             -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DSKIP_BUILD_TEST=ON
           cmake --build /tmp/libpqxx-build -j"$(nproc)"
@@ -146,7 +170,16 @@ jobs:
           echo "CXX=/opt/rh/gcc-toolset-13/root/usr/bin/g++" >> $GITHUB_ENV
           export CC=/opt/rh/gcc-toolset-13/root/usr/bin/gcc
           export CXX=/opt/rh/gcc-toolset-13/root/usr/bin/g++
-          curl -fsSL "https://github.com/jtv/libpqxx/archive/refs/tags/${PQXX_VERSION}.tar.gz" | tar -xz -C /tmp
+          curl -fsSL -o /tmp/libpqxx.tar.gz \
+            "https://github.com/jtv/libpqxx/archive/refs/tags/${PQXX_VERSION}.tar.gz"
+          # sha256sum on Linux, shasum on macOS: the same check, spelled the
+          # way each platform spells it, rather than skipped on one of them.
+          if command -v sha256sum >/dev/null 2>&1; then
+            echo "${PQXX_SHA256}  /tmp/libpqxx.tar.gz" | sha256sum -c -
+          else
+            echo "${PQXX_SHA256}  /tmp/libpqxx.tar.gz" | shasum -a 256 -c -
+          fi
+          tar -xzf /tmp/libpqxx.tar.gz -C /tmp
           cmake -S "/tmp/libpqxx-${PQXX_VERSION}" -B /tmp/libpqxx-build \
             -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DSKIP_BUILD_TEST=ON
           cmake --build /tmp/libpqxx-build -j"$(nproc)"
@@ -163,7 +196,16 @@ jobs:
           brew install cmake libpq nlohmann-json pkg-config openssl@3
           echo "PKG_CONFIG_PATH=$(brew --prefix libpq)/lib/pkgconfig:/usr/local/lib/pkgconfig" >> $GITHUB_ENV
           echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> $GITHUB_ENV
-          curl -fsSL "https://github.com/jtv/libpqxx/archive/refs/tags/${PQXX_VERSION}.tar.gz" | tar -xz -C /tmp
+          curl -fsSL -o /tmp/libpqxx.tar.gz \
+            "https://github.com/jtv/libpqxx/archive/refs/tags/${PQXX_VERSION}.tar.gz"
+          # sha256sum on Linux, shasum on macOS: the same check, spelled the
+          # way each platform spells it, rather than skipped on one of them.
+          if command -v sha256sum >/dev/null 2>&1; then
+            echo "${PQXX_SHA256}  /tmp/libpqxx.tar.gz" | sha256sum -c -
+          else
+            echo "${PQXX_SHA256}  /tmp/libpqxx.tar.gz" | shasum -a 256 -c -
+          fi
+          tar -xzf /tmp/libpqxx.tar.gz -C /tmp
           cmake -S "/tmp/libpqxx-${PQXX_VERSION}" -B /tmp/libpqxx-build \
             -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DSKIP_BUILD_TEST=ON \
             -DCMAKE_PREFIX_PATH="$(brew --prefix libpq)"
