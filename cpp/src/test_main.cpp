@@ -3349,7 +3349,21 @@ TEST_F(ToolTest, TwoJobsForTheSameSpecCannotRunAtOnce) {
   c.executor.batch_rows = 100;
   c.executor.commit_interval_ms = 25;
   c.executor.max_concurrent_jobs = 4;  // not the limit under test
+  // The first job must still be RUNNING when the second asks, and "30 000
+  // rows is enough work" is not a guarantee: a CI runner finished it before
+  // the second call had planned, and the second was admitted. So the first
+  // job is pinned instead: a session below holds a row lock its very first
+  // batch needs, and lock_timeout is raised so it waits rather than fails.
+  // The second call's dry run would wait on that row too, so its timeout is
+  // cut short -- an unverified dry run still yields a plan, and the refusal
+  // under test happens after planning, at the advisory lock.
+  c.executor.lock_timeout_ms = 60000;
+  c.executor.dry_run_statement_timeout_ms = 300;
   set_executor(c.executor);
+
+  pglaswell::WriteSession holder(cfg());
+  holder.begin("pg_laswell/test/holder");
+  holder.txn().exec("SELECT id FROM shop.orders WHERE id = 1 FOR UPDATE");
 
   const auto first = payload(call("startMigration", json{{"spec", signed_spec()}}));
   ASSERT_TRUE(first.value("accepted", false)) << first.dump(2);
@@ -3357,7 +3371,12 @@ TEST_F(ToolTest, TwoJobsForTheSameSpecCannotRunAtOnce) {
   const auto second = payload(call("startMigration", json{{"spec", signed_spec()}}));
   EXPECT_FALSE(second.value("accepted", false))
       << "a second job for the same spec was admitted: " << second.dump(2);
+  EXPECT_NE(second.value("error", "").find("already holds the advisory lock"),
+            std::string::npos)
+      << "refused for the right reason -- the lock, not the concurrency cap: "
+      << second.dump(2);
 
+  holder.commit();  // let the first job go
   call("cancelJob", json{{"jobId", first["jobId"]}});
   wait_for_status(*this, first["jobId"], [](const json& s) {
     return s.value("state", "") == "cancelled" || s.value("state", "") == "succeeded";
