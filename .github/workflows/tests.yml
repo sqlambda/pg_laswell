@@ -385,20 +385,66 @@ jobs:
           cmake --build build --target pg_laswell pg_laswell_mcp
           cd build && cpack -G DEB && cpack -G RPM && cpack -G TGZ
       - name: The package must carry both binaries, both manuals and bootstrap.sql
+        shell: bash
         run: |
+          set -euo pipefail
           cd build
-          # Both, checked by name. A package that shipped only the MCP server
-          # would leave a deployment with nothing to run, and the failure would
-          # not appear until somebody tried it on a release night.
-          dpkg-deb -c ./*.deb | tee /dev/stderr | grep -qE 'bin/pg_laswell$'
-          dpkg-deb -c ./*.deb | grep -q 'bin/pg_laswell_mcp'
-          dpkg-deb -c ./*.deb | grep -q 'man1/pg_laswell.1'
-          dpkg-deb -c ./*.deb | grep -q 'man1/pg_laswell_mcp.1'
+          # Captured once and then grepped, rather than piped into `grep -q`
+          # five times: grep -q exits at the first match and closes the pipe,
+          # which kills dpkg-deb with SIGPIPE. It passed anyway only because
+          # the default shell sets no pipefail -- and this step now does.
+          LIST=$(dpkg-deb -c ./*.deb)
+          for want in bin/pg_laswell bin/pg_laswell_mcp \
+                      man1/pg_laswell.1 man1/pg_laswell_mcp.1 \
+                      share/pg_laswell/bootstrap.sql; do
+            printf '%s\n' "$LIST" | grep -q "$want" || {
+              echo "::error::$want is missing from the package"; exit 1; }
+          done
           # Shipped alongside the binary precisely because the binary must
           # never run it: an owner of laswell.trusted_key can grant itself
           # trust.
-          dpkg-deb -c ./*.deb | grep -q 'share/pg_laswell/bootstrap.sql'
           dpkg-deb -f ./*.deb Depends | grep -q libpq5
+          printf '%s\n' "$LIST"
+
+      # Inspecting metadata is not evidence that a package works, and this job
+      # used to stop at inspecting it. The check above is the one this project
+      # has already watched pass on a package whose binary died at exec with
+      # "libpqxx-7.10.so: cannot open shared object file" -- a wrong Depends
+      # line still contains the string it is grepped for. release.yml learned
+      # to install and run; that only happens on a tag, so every ordinary push
+      # kept the weaker gate. Same evidence, every push.
+      - name: Install the package and run both binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd build
+          sudo apt-get install -y --no-install-recommends ./*.deb
+          # Static libpqxx is the whole point of building it from source, and a
+          # silent fall back to a shared copy produces a package that installs
+          # and then cannot start. Asserted where it is actually visible.
+          for b in pg_laswell pg_laswell_mcp; do
+            LINKED=$(objdump -p "$(command -v $b)")
+            printf '%s\n' "$LINKED" | grep NEEDED || true
+            if printf '%s\n' "$LINKED" | grep -q 'pqxx'; then
+              echo "::error::libpqxx was linked dynamically into $b"
+              exit 1
+            fi
+          done
+          # getSpecDigest needs no database and still exercises loading, the
+          # canonicaliser and OpenSSL -- the three things that break when a
+          # package is wrong about its dependencies.
+          SPEC='{"spec":{"laswell_spec_version":1,"id":"x","description":"d","intents":[{"kind":"add_column","schema":"s","table":"t","column":"c","type":"text","nullable":true,"comment":"c"}]}}'
+          pg_laswell_mcp --version
+          OUT=$(pg_laswell_mcp --call getSpecDigest --args "$SPEC")
+          printf '%s\n' "$OUT" | grep -q '"digest"' || {
+            echo "::error::the installed binary did not answer: $OUT"; exit 1; }
+          pg_laswell --version
+          # And the documented exit code, from the installed binary rather than
+          # from the build tree: 3 is "a configuration problem", which is what
+          # no --repo is.
+          set +e; pg_laswell >/dev/null 2>&1; rc=$?; set -e
+          [ "$rc" -eq 3 ] || {
+            echo "::error::pg_laswell with no --repo exited $rc, expected 3"; exit 1; }
       - uses: actions/upload-artifact@v4
         with:
           name: packages
