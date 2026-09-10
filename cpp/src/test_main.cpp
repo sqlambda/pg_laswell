@@ -2424,6 +2424,49 @@ TEST_F(BootstrappedTest, AnAbsentSchemaIsAnAnswerNotAnException) {
       << "the hint should say why the tool does not do this for you";
 }
 
+// A version 1 ledger is what an operator has the moment they install this
+// binary and have not yet re-run bootstrap.sql. It must be REFUSED, clearly,
+// naming the version -- and for a while it threw instead. status() read
+// laswell.environment and laswell.release with to_regclass in the WHERE, which
+// does nothing for a table named in the FROM: PostgreSQL resolves that when the
+// statement is parsed. So the query died with "relation does not exist", and
+// repository.h, which swallows exceptions from this call, reported every gated
+// spec as belonging to an unlabelled database.
+TEST_F(BootstrappedTest, AVersionOneLedgerIsRefusedByVersionRatherThanByException) {
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/downgrade-to-v1");
+    // Exactly the shape bootstrap.sql version 1 leaves: the two tables version
+    // 2 adds are simply not there.
+    w.txn().exec("DROP TABLE IF EXISTS laswell.environment");
+    w.txn().exec("DROP TABLE IF EXISTS laswell.release");
+    w.txn().exec("DELETE FROM laswell.schema_version");
+    w.txn().exec("INSERT INTO laswell.schema_version(version) VALUES (1)");
+    w.commit();
+  }
+
+  pglaswell::LedgerStatus st;
+  ASSERT_NO_THROW(st = pglaswell::Ledger(cfg()).status())
+      << "a ledger this binary cannot use must be an ANSWER, not an exception";
+  EXPECT_TRUE(st.installed);
+  EXPECT_FALSE(st.usable);
+  EXPECT_EQ(st.version, 1);
+  EXPECT_NE(st.error.find("version 1"), std::string::npos) << st.error;
+  EXPECT_NE(st.error.find(std::to_string(pglaswell::kLedgerSchemaVersion)),
+            std::string::npos) << st.error;
+  EXPECT_NE(st.hint.find("bootstrap"), std::string::npos) << st.hint;
+  // Everything the older ledger DOES have is still read: the refusal is about
+  // the version, so the answer must not be hollowed out on the way to it.
+  EXPECT_FALSE(st.database.empty());
+  EXPECT_FALSE(st.trusted_key_ids.empty());
+  EXPECT_TRUE(st.environment.empty());
+  EXPECT_TRUE(st.releases_ready.empty());
+
+  // Nothing is restored here on purpose: BootstrappedTest::SetUp drops the
+  // schema and re-runs the shipped bootstrap.sql for every test, so the next
+  // one gets a clean version 2 ledger without this test hand-building one.
+}
+
 TEST_F(BootstrappedTest, AWrongLedgerVersionIsRefusedRatherThanUpgraded) {
   pglaswell::WriteSession w(cfg());
   w.begin("pg_laswell/test/bump-version");

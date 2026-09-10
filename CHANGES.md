@@ -7,6 +7,13 @@ ledger. 354 tests green on GCC 14.2 and Clang 22, under AddressSanitizer/UBSan
 and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
 `--call` contract test.
 
+- **A version 1 ledger is refused by version, not by exception.** `status()`
+  read the two version 2 tables with `to_regclass` in a `WHERE`, which does
+  nothing for a table named in the `FROM` -- PostgreSQL resolves that at parse
+  time. Installing this binary before re-running `bootstrap.sql` therefore
+  raised "relation laswell.environment does not exist" instead of saying which
+  version the ledger is, and the repository listing, which swallows the
+  exception, then called every gated specification's database unlabelled.
 - **Paced row-level DML quotes its target.** The paced `INSERT`, `UPDATE`,
   `DELETE` and `MERGE` spliced the raw `schema.table` while the unpaced forms
   beside them used the quoted one, so every paced row-level kind was a syntax

@@ -113,20 +113,19 @@ class Ledger {
         'keys', COALESCE((SELECT JSONB_AGG(key_id ORDER BY key_id)
                             FROM laswell.trusted_key
                            WHERE revoked_at IS NULL), '[]'::jsonb),
-        -- to_regclass, not a plain SELECT: this same query has to answer for a
-        -- version 1 ledger, where neither table exists, and it answers "not
-        -- labelled, nothing approved" rather than failing. The version check
-        -- below is what refuses such a ledger; this must not fail first with a
-        -- less useful message.
-        'environment', (SELECT name FROM laswell.environment
-                         WHERE to_regclass('laswell.environment') IS NOT NULL
-                         LIMIT 1),
-        'releases', COALESCE((SELECT JSONB_AGG(tag ORDER BY tag)
-                                FROM laswell.release
-                               WHERE ready
-                                 AND to_regclass('laswell.release') IS NOT NULL),
-                             '[]'::jsonb))
+        -- Whether the version-2 tables are THERE, asked without naming them in
+        -- a FROM. An earlier version put to_regclass in a WHERE clause beside
+        -- `FROM laswell.environment` and a comment claiming that let one query
+        -- answer for a version 1 ledger too. It does not: a FROM is resolved
+        -- when the statement is PARSED, long before any WHERE runs, so against
+        -- a version 1 ledger the whole query died with "relation
+        -- laswell.environment does not exist" -- and the caller that swallows
+        -- exceptions here then reported the gated specs as belonging to an
+        -- unlabelled database, which is a different and untrue thing.
+        'hasEnvironment', to_regclass('laswell.environment') IS NOT NULL,
+        'hasRelease', to_regclass('laswell.release') IS NOT NULL)
     )SQL");
+    bool has_environment = false, has_release = false;
     if (!r.empty() && !r[0][0].is_null()) {
       const auto j = json::parse(r[0][0].as<std::string>());
       st.version = j.value("version", 0);
@@ -134,11 +133,34 @@ class Ledger {
       for (const auto& k : j.value("keys", json::array())) {
         st.trusted_key_ids.push_back(k.get<std::string>());
       }
-      if (j.contains("environment") && !j["environment"].is_null()) {
-        st.environment = j["environment"].get<std::string>();
-      }
-      for (const auto& t : j.value("releases", json::array())) {
-        st.releases_ready.insert(t.get<std::string>());
+      has_environment = j.value("hasEnvironment", false);
+      has_release = j.value("hasRelease", false);
+    }
+
+    // A second statement, because only now is it known to be parseable. Keyed
+    // on the tables existing rather than on the version number, so a ledger
+    // caught halfway through an upgrade answers for whichever half is there
+    // instead of failing on the other.
+    if (has_environment || has_release) {
+      const auto g = s.txn().exec(
+          "SELECT JSONB_BUILD_OBJECT('environment'," +
+          std::string(has_environment
+                          ? "(SELECT name FROM laswell.environment LIMIT 1)"
+                          : "NULL") +
+          ", 'releases', " +
+          std::string(has_release
+                          ? "COALESCE((SELECT JSONB_AGG(tag ORDER BY tag)"
+                            " FROM laswell.release WHERE ready), '[]'::jsonb)"
+                          : "'[]'::jsonb") +
+          ")");
+      if (!g.empty() && !g[0][0].is_null()) {
+        const auto j = json::parse(g[0][0].as<std::string>());
+        if (j.contains("environment") && !j["environment"].is_null()) {
+          st.environment = j["environment"].get<std::string>();
+        }
+        for (const auto& t : j.value("releases", json::array())) {
+          st.releases_ready.insert(t.get<std::string>());
+        }
       }
     }
 
