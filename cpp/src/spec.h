@@ -1682,6 +1682,15 @@ inline void parse_row_source(Intent& in, const std::string& at,
 
   if (has_select) {
     (void)require_string(in.body, "select", at);
+    // The same rule the values form applies. Quoting makes an odd name safe to
+    // EMIT, so this is not a correctness fix -- it is that one form of one
+    // intent rejected a name the other accepted, which is the kind of
+    // difference an author discovers by having a spec refused for a reason
+    // that does not apply to the spec beside it.
+    for (const auto& c : in.body.value("columns", json::array())) {
+      if (!c.is_string()) fail(at + ".columns entries must be strings", "");
+      require_identifier(c.get<std::string>(), "columns", in.ordinal);
+    }
     if (!key_role.empty() || true) {
       // A select is ALWAYS paced (its size is not derivable), and a keyset walk
       // needs a key to walk. Refused here rather than in the planner so the
@@ -1773,6 +1782,40 @@ inline void parse_row_source(Intent& in, const std::string& at,
 }
 
 // preserve and assert_invariants, shared with backfill, which had them first.
+// Every name in `update_columns` has to be one the source actually carries.
+// The two kinds that take the key break differently without this and neither
+// break is loud: a merge_rows names src.<col> in its SET and PostgreSQL raises
+// "column src.x does not exist" at execution, after planning said the spec was
+// fine; an insert_rows names EXCLUDED.<col>, which is legal for any column of
+// the TABLE, so it silently sets that column to whatever the proposed row had
+// -- the default, for a column the spec never supplied. The second is worse
+// for being valid SQL.
+inline void require_update_columns_supplied(const Intent& in,
+                                            const std::string& at) {
+  if (!in.body.contains("update_columns")) return;
+  std::set<std::string> supplied;
+  for (const auto& c : in.body.value("columns", json::array())) {
+    if (c.is_string()) supplied.insert(c.get<std::string>());
+  }
+  if (supplied.empty()) return;  // its own error, reported elsewhere
+  for (const auto& c : in.body["update_columns"]) {
+    if (!c.is_string()) continue;
+    const auto name = c.get<std::string>();
+    if (supplied.count(name) == 0) {
+      std::string list;
+      for (const auto& x : supplied) {
+        if (!list.empty()) list += ", ";
+        list += x;
+      }
+      fail(at + ".update_columns names \"" + name +
+               "\", which is not one of the columns this intent supplies",
+           "A column can only be written from a value the source carries, and "
+           "this intent's \"columns\" are: " + list +
+           ". Add it there if the rows have it.");
+    }
+  }
+}
+
 inline void parse_preserve_and_invariants(Intent& in, const std::string& at) {
   if (in.body.contains("preserve")) {
     const auto& p = in.body["preserve"];
@@ -1919,6 +1962,7 @@ inline void parse_insert_rows(Intent& in) {
       if (!c.is_string()) detail::fail(at + ".update_columns entries must be strings", "");
       detail::require_identifier(c.get<std::string>(), "update_columns", in.ordinal);
     }
+    detail::require_update_columns_supplied(in, at);
   }
   if (in.body.contains("overriding")) {
     const auto o = in.body.value("overriding", "");
@@ -2053,6 +2097,7 @@ inline void parse_merge_rows(Intent& in) {
       if (!c.is_string()) detail::fail(at + ".update_columns entries must be strings", "");
       detail::require_identifier(c.get<std::string>(), "update_columns", in.ordinal);
     }
+    detail::require_update_columns_supplied(in, at);
   }
   detail::parse_preserve_and_invariants(in, at);
 }

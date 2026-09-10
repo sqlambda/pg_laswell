@@ -19,6 +19,7 @@
 #include <nlohmann/json.hpp>
 
 #include "observations.h"
+#include "planner_base.h"  // quote_identifier, and nothing that reaches pqxx
 #include "session.h"
 
 namespace pglaswell {
@@ -624,35 +625,44 @@ class Catalog {
   // spirit, by executor.h::run_copy -- pqxx::stream_to is the only sanctioned
   // way to send COPY data through libpqxx 7.10, and it builds the statement
   // itself, which is why the planner emits exactly the form it produces.
-  static void stream_copy(WriteSession& session, const json& detail) {
+  // ONE implementation, called by the dry run here and by executor.h::run_copy.
+  // There were two, differing in ways that were nobody's intent: one quoted
+  // column names by concatenating a quote character, the other did the same a
+  // few lines later, and the cell loop was written out twice. A COPY payload
+  // is the one place where "what ran" is not entirely in the SQL, so the two
+  // halves of the project that send one had better send it identically.
+  //
+  // `written` is a reference rather than a return value because the caller
+  // needs the count even when this throws: a failed COPY records how many rows
+  // had been handed to the stream before the server refused one.
+  static void stream_copy(WriteSession& session, const json& detail,
+                          long long& written) {
     std::vector<std::string> columns;
     for (const auto& c : detail.value("copy_columns", json::array())) {
-      columns.push_back("\"" + c.get<std::string>() + "\"");
-    }
-    std::string column_list;
-    for (std::size_t i = 0; i < columns.size(); ++i) {
-      if (i != 0) column_list += ", ";
-      column_list += columns[i];
+      columns.push_back(pglaswell::detail::quote_identifier(c.get<std::string>()));
     }
     // copy_relation, not qualified: stream_to splices the path straight into
     // the COPY statement, so it has to be the quoted form.
     auto stream = pqxx::stream_to::raw_table(
         session.txn(),
         detail.value("copy_relation", detail.value("qualified", "")),
-        column_list);
+        pglaswell::detail::join(columns, ", "));
     for (const auto& row : detail.value("copy_rows", json::array())) {
+      // Each cell as its own optional<string>: a JSON null becomes a real SQL
+      // NULL rather than the four characters "null", which is the difference
+      // between an absent value and a literal that happens to spell one.
+      // Numbers and booleans go as their canonical text, which is what COPY's
+      // text format expects and what the column's own type then parses.
       std::vector<std::optional<std::string>> cells;
       cells.reserve(row.size());
       for (const auto& cell : row) {
-        // A JSON null becomes a real SQL NULL rather than the four characters
-        // "null", which is the difference between an absent value and a literal
-        // that happens to spell one.
         if (cell.is_null()) cells.emplace_back(std::nullopt);
         else if (cell.is_string()) cells.emplace_back(cell.get<std::string>());
         else if (cell.is_boolean()) cells.emplace_back(cell.get<bool>() ? "true" : "false");
         else cells.emplace_back(cell.dump());
       }
       stream.write_row(cells);
+      ++written;
     }
     stream.complete();
   }
@@ -712,7 +722,8 @@ class Catalog {
       }
       if (i < copy_payloads.size() && copy_payloads[i].is_object()) {
         try {
-          stream_copy(session, copy_payloads[i]);
+          long long sent = 0;
+          stream_copy(session, copy_payloads[i], sent);
         } catch (const pqxx::sql_error& e) {
           out.problems.push_back(
               "step " + std::to_string(steps[i].first) + " (COPY): " + e.what());

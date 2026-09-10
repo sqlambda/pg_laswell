@@ -47,6 +47,19 @@ struct RelationSet {
   bool complete() const { return opaque.empty(); }
 };
 
+// The hint tells an operator what to paste into psql, so the tag goes in as a
+// SQL literal rather than between two apostrophes. A tag with an apostrophe in
+// it produced advice that does not parse -- and advice that does not parse is
+// the kind a tired operator edits until it runs.
+inline std::string quote_sql_literal(const std::string& v) {
+  std::string out = "'";
+  for (const char c : v) {
+    if (c == '\'') out += '\'';
+    out += c;
+  }
+  return out + "'";
+}
+
 enum class RepoStatus {
   kPending,     // never applied here
   kApplied,     // this exact digest succeeded
@@ -492,7 +505,8 @@ class MigrationRepository {
       e.hint =
           "Approve it as the owner of the laswell schema: INSERT INTO "
           "laswell.release(tag, ready, marked_ready_at, marked_by, note) "
-          "VALUES ('" + e.release + "', true, now(), current_user, '...') "
+          "VALUES (" + quote_sql_literal(e.release) +
+          ", true, now(), current_user, '...') "
           "ON CONFLICT (tag) DO UPDATE SET ready = EXCLUDED.ready, "
           "marked_ready_at = EXCLUDED.marked_ready_at, "
           "marked_by = EXCLUDED.marked_by, note = EXCLUDED.note;";

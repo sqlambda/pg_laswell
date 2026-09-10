@@ -35,7 +35,7 @@ CREATE TABLE IF NOT EXISTS laswell.schema_version (
   installed_at timestamptz NOT NULL DEFAULT now(),
   installed_by text        NOT NULL DEFAULT current_user
 );
-COMMENT ON TABLE  laswell.schema_version              IS 'One row: the ledger schema version this database carries.';
+COMMENT ON TABLE  laswell.schema_version              IS 'One row per version installed; the highest is the one this database carries. An upgrade appends rather than replaces, so when the schema changed is on the record.';
 COMMENT ON COLUMN laswell.schema_version.version      IS 'Ledger schema version. pg_laswell refuses to run against a version it does not know.';
 COMMENT ON COLUMN laswell.schema_version.installed_at IS 'When this version was installed.';
 COMMENT ON COLUMN laswell.schema_version.installed_by IS 'Role that ran bootstrap.sql.';
@@ -265,6 +265,12 @@ ON CONFLICT (key_id) DO NOTHING;
 -- --------------------------------------------------------------------------
 
 REVOKE ALL ON laswell.trusted_key FROM PUBLIC;
+-- The same for the two tables that answer where a migration may be applied.
+-- PUBLIC holds nothing on a freshly created table, so this grants no new
+-- protection today; it states the intent, and it means a later GRANT ... TO
+-- PUBLIC on the schema cannot quietly hand these away.
+REVOKE ALL ON laswell.environment FROM PUBLIC;
+REVOKE ALL ON laswell.release     FROM PUBLIC;
 
 \if :{?laswell_role}
 GRANT USAGE ON SCHEMA laswell TO :"laswell_role";

@@ -38,7 +38,6 @@ enum class JobState {
   kRunning,
   kThrottled,
   kPausedContention,
-  kStalled,
   kSucceeded,
   kFailed,
   kCancelled,
@@ -51,7 +50,6 @@ inline const char* to_string(JobState s) {
     case JobState::kRunning: return "running";
     case JobState::kThrottled: return "throttled";
     case JobState::kPausedContention: return "paused_contention";
-    case JobState::kStalled: return "stalled";
     case JobState::kSucceeded: return "succeeded";
     case JobState::kFailed: return "failed";
     case JobState::kCancelled: return "cancelled";

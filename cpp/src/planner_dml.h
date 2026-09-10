@@ -126,6 +126,12 @@ struct RowSource {
   long long row_count = -1;   // exact for values, -1 when not derivable
   bool paced = false;
   std::string why;            // the reading that decided it, in full
+  // Pacing was wanted and could not be had. Recorded rather than only
+  // described, because the caller has to WARN about it: a step that wanted
+  // short transactions and got one long one is exactly the shape this tool
+  // exists to prevent, and saying so at the end of a `why` nobody reads to the
+  // end of is not saying it.
+  bool unpaced_for_want_of_a_key = false;
 };
 
 inline RowSource decide_pacing(const Intent& in, const ExecutorConfig& cfg,
@@ -177,6 +183,7 @@ inline RowSource decide_pacing(const Intent& in, const ExecutorConfig& cfg,
   if (want && !key_available) {
     s.why += ". It could NOT be paced: no key column was given, so there is "
              "nothing to walk by, and it runs in one transaction";
+    s.unpaced_for_want_of_a_key = true;
   }
   return s;
 }
@@ -577,16 +584,6 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
   // writing this SQL by hand would do, and it needs no explanation -- an alias
   // would be a convention every author had to learn from a footnote.
   //
-  // The `from` items appear in BOTH the CTE and the outer UPDATE, because the
-  // filter may reference them: a backfill whose predicate joins to another
-  // table is the ordinary case. An earlier version put them only in the outer
-  // UPDATE, producing a CTE that referenced an alias not in scope -- SQL that
-  // renders convincingly and does not parse.
-  //
-  // FOR UPDATE OF <target>, not a bare FOR UPDATE: with a join, a bare FOR
-  // UPDATE locks rows in every table named, so the backfill would take row
-  // locks on the lookup table it merely reads. That is contention this tool
-  // exists to avoid, inflicted by its own batch statement.
   // The target referenced by its own bare name, quoted. The contract that a
   // spec's `where` and `set` name the target by its own name is unchanged;
   // what changes is that "order"."end" is emitted rather than order.end, which
@@ -1066,6 +1063,23 @@ inline void plan_insert_rows(const Intent& in, const Observations& obs,
                                   "these rows changes nothing"
                                 : "ON CONFLICT DO UPDATE, so existing rows are "
                                   "overwritten with the values in the spec");
+  }
+
+  // Wanted short transactions, got one long one. The `why` says so at the end
+  // of a sentence, which is not where an operator scanning a plan for risks
+  // will find it. A row-level intent large enough to want pacing and lacking
+  // the key to walk by holds its locks for the whole list.
+  if (src.unpaced_for_want_of_a_key) {
+    plan.warnings.push_back(
+        "insert_rows on " + qualified + " supplies " +
+        std::to_string(src.row_count) +
+        " rows, above dml_single_txn_rows (" +
+        std::to_string(cfg.dml_single_txn_rows) +
+        "), so it would be paced -- but it names no \"key\", and a keyset walk "
+        "needs a column to walk by. It runs in ONE transaction instead, "
+        "holding RowExclusiveLock and its row locks for the whole list. Add "
+        "\"key\" naming a column the rows carry, or say \"paced\": false to "
+        "record that one transaction is what you meant.");
   }
 
   // A missing parent is the failure that hurts most under pacing: it arrives

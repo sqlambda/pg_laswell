@@ -353,13 +353,25 @@ def _cxx_value(t, i):
     m = re.match(r'(-?\d+\.?\d*)', t[i:])
     if m:
         txt = m.group(1)
-        return (float(txt) if '.' in txt else int(txt)), i + len(txt)
+        # int() rejects a trailing dot that float() accepts ("1." parses as
+        # 1.0), and the regex above can produce one. Decided by whether the
+        # dot is followed by a digit, so a stray "1." is an int rather than a
+        # crash in the middle of generating a page.
+        return (float(txt) if re.search(r'\.\d', txt) else int(txt.rstrip('.'))), \
+               i + len(txt)
     if t.startswith('true', i):
         return True, i + 4
     if t.startswith('false', i):
         return False, i + 5
     if t.startswith('nullptr', i):
         return None, i + 7
+    # Nothing this parser knows. Skipping one character and carrying on is
+    # what lets the whole reference generate from a file with one construct
+    # in it that nobody has taught this about -- but it is also how a silently
+    # wrong page gets published, so it says so on stderr. The JSON it emits is
+    # re-parsed by a test, which is the gate that actually catches it.
+    print("gen-manual: skipping an unparsed token at %r" % t[i:i + 24],
+          file=sys.stderr)
     return None, i + 1
 
 

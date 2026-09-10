@@ -21,6 +21,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
+#include <functional>
 #include <set>
 #include <sstream>
 #include <string>
@@ -5687,6 +5688,42 @@ TEST(Planner, WithoutPreserveTheRowLevelPlansAreUnchanged) {
   EXPECT_FALSE(plan.steps[0].detail.contains("preserve"));
 }
 
+// A seed big enough to want pacing, with no key to walk by, runs as one long
+// transaction. decide_pacing said so at the end of a `why`; a reader scanning
+// a plan for risks reads warnings, so it is one.
+TEST(Planner, ASeedTooBigForOneTransactionAndWithNoKeyToWalkWarnsThatItIsNot) {
+  json values = json::array();
+  for (int i = 1; i <= 5; ++i) {
+    values.push_back(json::array({i, "r" + std::to_string(i)}));
+  }
+  const json intent{{"kind", "insert_rows"}, {"schema", "shop"}, {"table", "orders"},
+                    {"columns", json::array({"id", "fulfilment_region"})},
+                    {"values", values}};  // no "key"
+  pglaswell::ExecutorConfig cfg;
+  cfg.dml_single_txn_rows = 2;  // so five rows is "too many for one"
+  const auto plan = pglaswell::plan_migration(spec_of(json::array({intent})), obs_dml(), cfg);
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto* step = only_step(plan, "insert_rows");
+  ASSERT_NE(step, nullptr);
+  EXPECT_EQ(step->txn_class, pglaswell::TxnClass::kRequired) << "one transaction";
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("names no \"key\"") != std::string::npos &&
+        w.find("ONE transaction") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned) << "the plan must warn, not only explain in `why`:\n"
+                      << plan.render();
+
+  // With a key it paces, and there is nothing to warn about.
+  json keyed = intent;
+  keyed["key"] = "id";
+  const auto ok = pglaswell::plan_migration(spec_of(json::array({keyed})), obs_dml(), cfg);
+  ASSERT_TRUE(ok.ok) << ok.render();
+  for (const auto& w : ok.warnings) {
+    EXPECT_EQ(w.find("names no \"key\""), std::string::npos) << w;
+  }
+}
+
 TEST(Planner, UpdateRowsGivesEachRowItsOwnValuesAndCastsTheFirstOne) {
   const auto plan = pglaswell::plan_migration(
       spec_of(json::array({json{{"kind", "update_rows"}, {"schema", "shop"},
@@ -8755,6 +8792,45 @@ TEST(Planner, PreserveCapturesInTheSameStatementAsTheUpdate) {
       << "the capture must be part of the same statement as the update";
 }
 
+// A column can only be written from a value the source carries, and the two
+// kinds taking update_columns broke differently without saying so: merge_rows
+// emits src.<col> and PostgreSQL raises "column src.x does not exist" at
+// execution, while insert_rows emits EXCLUDED.<col>, which is legal for any
+// column of the table and silently writes the default for one the spec never
+// supplied.
+TEST(Spec, UpdateColumnsMustNameColumnsTheIntentSupplies) {
+  // std::function, not auto: the two lambdas have different closure types and
+  // an initializer_list needs one type to deduce.
+  const std::function<json(json)> merge = [](json cols) {
+    return json{{"kind", "merge_rows"}, {"schema", "shop"}, {"table", "orders"},
+                {"key", "id"}, {"columns", json::array({"id", "fulfilment_region"})},
+                {"values", json::array({json::array({1, "NA"})})},
+                {"update_columns", cols}};
+  };
+  const std::function<json(json)> insert = [](json cols) {
+    return json{{"kind", "insert_rows"}, {"schema", "shop"}, {"table", "orders"},
+                {"key", "id"}, {"columns", json::array({"id", "fulfilment_region"})},
+                {"values", json::array({json::array({1, "NA"})})},
+                {"on_conflict", "update"}, {"conflict_target", json::array({"id"})},
+                {"update_columns", cols}};
+  };
+  const auto with = [](json intent) {
+    json doc = minimal_spec();
+    doc["intents"] = json::array({std::move(intent)});
+    return doc;
+  };
+  for (const auto& make : std::vector<std::function<json(json)>>{merge, insert}) {
+    // Supplied: accepted.
+    EXPECT_NO_THROW(
+        pglaswell::parse_spec(with(make(json::array({"fulfilment_region"})))));
+    // Not supplied: refused, naming the column and what IS available.
+    const auto err = spec_error(with(make(json::array({"warehouse_id"}))));
+    EXPECT_NE(err.find("warehouse_id"), std::string::npos) << err;
+    EXPECT_NE(err.find("fulfilment_region"), std::string::npos)
+        << "the refusal should list what the intent does supply: " << err;
+  }
+}
+
 TEST(Spec, PreservingIntoTheTableBeingBackfilledIsRefused) {
   json doc = minimal_spec();
   doc["intents"] = json::array({json{
@@ -10105,7 +10181,8 @@ TEST_F(DatabaseTest, ReservedWordIdentifiersAreQuotedEverywhereTheyAreEmitted) {
       if (step.kind == "copy_rows" && step.detail.contains("copy_rows")) {
         pglaswell::WriteSession w(cfg);
         w.begin("pg_laswell/test/reserved-copy");
-        pglaswell::Catalog::stream_copy(w, step.detail);
+        long long sent = 0;
+        pglaswell::Catalog::stream_copy(w, step.detail, sent);
         w.commit();
         continue;
       }

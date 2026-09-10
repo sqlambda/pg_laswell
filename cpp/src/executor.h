@@ -26,6 +26,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "catalog.h"  // Catalog::stream_copy, shared with the dry run
 #include "jobs.h"
 #include "ledger.h"
 #include "planner.h"
@@ -230,46 +231,13 @@ class Executor {
   // refuses ON_ERROR and friends rather than accepting keys that cannot travel.
   void run_copy(WriteSession& w, int ordinal, const json& step) {
     const auto started = detail::steady_ms();
-    const auto detail_json = step.value("detail", json::object());
-    const auto qualified =
-        detail_json.value("copy_relation", detail_json.value("qualified", ""));
-    const auto rows = detail_json.value("copy_rows", json::array());
-
-    std::vector<std::string> columns;
-    for (const auto& c : detail_json.value("copy_columns", json::array())) {
-      columns.push_back("\"" + c.get<std::string>() + "\"");
-    }
-
     long long written = 0;
     try {
-      {
-        auto stream = pqxx::stream_to::raw_table(
-            w.txn(), qualified, detail::join(columns, ", "));
-        for (const auto& row : rows) {
-          // Each cell as its own optional<string>: a JSON null becomes a real
-          // SQL NULL rather than the four characters "null", which is the
-          // difference between an absent value and a literal that happens to
-          // spell one. Numbers and booleans go as their canonical text, which
-          // is what COPY's text format expects and what the cast on the
-          // column's own type then parses.
-          std::vector<std::optional<std::string>> cells;
-          cells.reserve(row.size());
-          for (const auto& cell : row) {
-            if (cell.is_null()) {
-              cells.emplace_back(std::nullopt);
-            } else if (cell.is_string()) {
-              cells.emplace_back(cell.get<std::string>());
-            } else if (cell.is_boolean()) {
-              cells.emplace_back(cell.get<bool>() ? "true" : "false");
-            } else {
-              cells.emplace_back(cell.dump());
-            }
-          }
-          stream.write_row(cells);
-          ++written;
-        }
-        stream.complete();
-      }
+      // Catalog::stream_copy, the same call the dry run makes. This had its
+      // own copy of the streaming loop, which is how the two came to quote
+      // column names slightly differently while both being correct only
+      // because require_identifier restricts them to [a-z0-9_].
+      Catalog::stream_copy(w, step.value("detail", json::object()), written);
     } catch (const pqxx::sql_error& e) {
       record_step(ordinal, step, "failed", 0,
                   json{{"sqlstate", e.sqlstate()},
