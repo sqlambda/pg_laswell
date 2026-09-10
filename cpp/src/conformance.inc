@@ -204,6 +204,18 @@ inline std::vector<Case> cases() {
      "SELECT string_agg(code,',' ORDER BY id) FROM cf.t WHERE id IN (201,202)",
      "u1,u2"},
 
+    // The pre-image, executed: the row's value BEFORE this update lands in
+    // cf.t_before in the same statement. update_rows above left 201 as "u1";
+    // this changes it and the archive must hold what it was.
+    {"update_rows_preserved", {},
+     json{{"kind","update_rows"},{"schema","cf"},{"table","t"},{"key","id"},
+          {"columns",json::array({"id","code"})},
+          // Not "p1": code is unique from add_unique_constraint above, and
+          // merge_rows_paced seeds a row with that code later.
+          {"values",json::array({json::array({201,"kept1"})})},
+          {"preserve",json{{"schema","cf"},{"table","t_before"}}}},
+     "SELECT code FROM cf.t_before WHERE id = 201", "u1"},
+
     // MERGE doing both halves at once: 202 exists and is updated, 203 does not
     // and is inserted.
     {"merge_rows", {},
@@ -242,8 +254,18 @@ inline std::vector<Case> cases() {
      "SELECT string_agg(code,',' ORDER BY id) FROM cf.t WHERE id IN (204,205)",
      "z4,z5"},
 
+    // A deleted row's WHOLE pre-image, not just its key: copy_rows above wrote
+    // 205 as z5, and after this delete the archive must still say so.
+    {"delete_rows_preserved", {},
+     json{{"kind","delete_rows"},{"schema","cf"},{"table","t"},{"key","id"},
+          {"columns",json::array({"id"})},
+          {"values",json::array({json::array({205})})},
+          {"preserve",json{{"schema","cf"},{"table","t_deleted"}}}},
+     "SELECT code FROM cf.t_deleted WHERE id = 205", "z5"},
+
     // Clear the rows this family added, so the cases below it -- which count
-    // and constrain cf.t -- see the table they were written against.
+    // and constrain cf.t -- see the table they were written against. 205 is
+    // already gone; a key list naming a missing row is a no-op, by design.
     {"delete_rows_by_key", {},
      json{{"kind","delete_rows"},{"schema","cf"},{"table","t"},{"key","id"},
           {"columns",json::array({"id"})},

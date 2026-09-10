@@ -349,6 +349,109 @@ inline bool unique_key_index(const json& t, const std::string& key,
   return false;
 }
 
+// --- the pre-image ------------------------------------------------------------
+//
+// Captured in the SAME STATEMENT as the change, for every kind that changes
+// rows it can name by key.
+//
+// Data-modifying CTEs all see one snapshot, so an INSERT ... SELECT reading
+// the target inside the statement sees the rows as they were BEFORE the
+// mutation beside it. That is what makes the capture atomic with the change:
+// there is no window in which one committed and the other did not, and a
+// crash leaves the backup and the data agreeing.
+//
+// This is what replaced the pinned-snapshot idea. A snapshot lets you LOOK at
+// the old values while holding back the xmin horizon for the whole job; this
+// KEEPS them, durably, and doubles as the revert path -- which a snapshot can
+// never be.
+//
+// One implementation, because there used to be one and three claims. backfill
+// implemented it; update_rows, merge_rows and delete_rows accepted the key,
+// and update_rows told the author "the previous values are preserved in the
+// same transaction as the change" -- and emitted nothing. A signed option that
+// reads like a guarantee and does nothing is worse than a refusal.
+struct Preserved {
+  std::string qualified;           // raw schema.table, for detail and prose
+  std::string sql_rel;             // quoted, for SQL
+  std::vector<std::string> cols;   // saved columns, key first, raw
+};
+
+// Emits the side-table step and says what the mutation must splice. `changed`
+// is what the change can touch; the key is always saved with it, because a
+// pre-image that cannot be matched back to its row is a list of values, not a
+// revert path. Returns false when the intent asks for no pre-image.
+inline bool plan_preserve(const Intent& in, const json& columns,
+                          const std::string& target_sql_rel,
+                          const std::string& key,
+                          const std::vector<std::string>& changed,
+                          std::vector<Step>& out, Preserved& pv) {
+  if (!in.body.contains("preserve")) return false;
+  pv.qualified = in.body["preserve"].value("schema", "") + "." +
+                 in.body["preserve"].value("table", "");
+  pv.sql_rel = quote_qualified(pv.qualified);
+  pv.cols = {key};
+  for (const auto& c : changed) {
+    if (std::find(pv.cols.begin(), pv.cols.end(), c) == pv.cols.end()) pv.cols.push_back(c);
+  }
+
+  // Created by its own step, from the target's real column types -- LIKE would
+  // carry constraints and defaults that have no business on a backup.
+  std::string cols_ddl;
+  for (const auto& c : pv.cols) {
+    const auto type = columns.contains(c) ? columns[c].value("type", "text")
+                                          : std::string("text");
+    if (!cols_ddl.empty()) cols_ddl += ", ";
+    cols_ddl += quote_identifier(c) + " " + type;
+  }
+  Step create;
+  create.kind = in.kind_name;
+  create.txn_class = TxnClass::kRequired;
+  create.own_transaction = true;
+  create.lock = "AccessExclusiveLock on the new table only";
+  create.sql.push_back("CREATE TABLE IF NOT EXISTS " + pv.sql_rel + " (" + cols_ddl +
+                       ", laswell_saved_at timestamptz NOT NULL DEFAULT now());");
+  create.sql.push_back(
+      "COMMENT ON TABLE " + pv.sql_rel + " IS " +
+      quote_literal("Pre-image captured by pg_laswell before " + in.kind_name +
+                    " changed " + target_sql_rel +
+                    ". Each row is what the target looked like before the "
+                    "change, written in the same statement as the change "
+                    "itself.") + ";");
+  create.why = "preserve: the pre-image needs somewhere to live, and it must "
+               "exist before the first batch writes to it";
+  out.push_back(std::move(create));
+  return true;
+}
+
+// The CTE that does the capture: rows of the target that `source_alias` --
+// the batch, or the whole source when unpaced -- names by key. Spliced into the
+// same statement as the mutation; the mutation's own CTE reads nothing from it.
+inline std::string preserve_cte(const Preserved& pv,
+                                const std::string& target_sql_rel,
+                                const std::string& target_ref,
+                                const std::string& key,
+                                const std::string& source_alias) {
+  const auto k = quote_identifier(key);
+  std::vector<std::string> quoted, selected;
+  for (const auto& c : pv.cols) {
+    quoted.push_back(quote_identifier(c));
+    selected.push_back(target_ref + "." + quote_identifier(c));
+  }
+  return "preserved AS (\n"
+         "  INSERT INTO " + pv.sql_rel + " (" + join(quoted, ", ") + ")\n"
+         "  SELECT " + join(selected, ", ") + "\n"
+         "    FROM " + target_sql_rel + ", " + source_alias + " AS pb\n"
+         "   WHERE " + target_ref + "." + k + " = pb." + k + "\n"
+         ")";
+}
+
+// Every column the observation knows, for a kind whose change is the whole row.
+inline std::vector<std::string> all_columns(const json& columns) {
+  std::vector<std::string> names;
+  for (auto it = columns.begin(); it != columns.end(); ++it) names.push_back(it.key());
+  return names;
+}
+
 // What an author cannot see from the plan and will not see from an error.
 inline void warn_about_row_security(const json& t, const std::string& qualified,
                                     bool writes_new_rows, Plan& plan) {
@@ -491,77 +594,19 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
   // reserved word.
   const std::string rel = detail::quote_identifier(in.table());
 
-  // The pre-image, captured in the SAME STATEMENT as the update.
-  //
-  // Data-modifying CTEs all see one snapshot, so an INSERT ... SELECT reading
-  // the target inside this statement sees the rows as they were BEFORE the
-  // UPDATE in the same statement. That is what makes the capture atomic with
-  // the change: there is no window in which one committed and the other did
-  // not, and a crash leaves the backup and the data agreeing.
-  //
-  // This is what replaced the pinned-snapshot idea. A snapshot lets you LOOK at
-  // the old values while holding back the xmin horizon for the whole backfill;
-  // this KEEPS them, durably, and doubles as the revert path -- which a
-  // snapshot can never be.
+  // The pre-image, when asked for. See plan_preserve(): one implementation
+  // shared with update_rows, merge_rows and delete_rows.
   std::string preserve_cte;
-  if (in.body.contains("preserve")) {
-    const auto pschema = in.body["preserve"].value("schema", "");
-    const auto ptable = in.body["preserve"].value("table", "");
-    const auto preserved = pschema + "." + ptable;
-    // Raw above for the prose and the step detail; quoted here for SQL.
-    const auto sql_preserved = detail::quote_qualified(preserved);
-
-    std::vector<std::string> saved_cols{key};
+  {
+    std::vector<std::string> changed;
     for (auto it = in.body["set"].begin(); it != in.body["set"].end(); ++it) {
-      saved_cols.push_back(it.key());
+      changed.push_back(it.key());
     }
-
-    // The side table is created by its own step, from the target's real column
-    // types -- LIKE would carry constraints and defaults that have no business
-    // on a backup.
-    std::vector<std::string> quoted_saved_cols;
-    for (const auto& c : saved_cols) {
-      quoted_saved_cols.push_back(detail::quote_identifier(c));
+    detail::Preserved pv;
+    if (detail::plan_preserve(in, columns, sql_rel, key, changed, out, pv)) {
+      preserve_cte = ", " + detail::preserve_cte(pv, sql_rel, rel, key, "batch");
+      step.detail["preserve"] = pv.qualified;
     }
-
-    std::string cols_ddl;
-    for (const auto& c : saved_cols) {
-      const auto type = columns.contains(c)
-                            ? columns[c].value("type", "text")
-                            : std::string("text");
-      if (!cols_ddl.empty()) cols_ddl += ", ";
-      cols_ddl += detail::quote_identifier(c) + " " + type;
-    }
-    Step create;
-    create.kind = in.kind_name;
-    create.txn_class = TxnClass::kRequired;
-    create.own_transaction = true;
-    create.lock = "AccessExclusiveLock on the new table only";
-    create.sql.push_back("CREATE TABLE IF NOT EXISTS " + sql_preserved + " (" +
-                         cols_ddl + ", laswell_saved_at timestamptz NOT NULL DEFAULT now());");
-    create.sql.push_back("COMMENT ON TABLE " + sql_preserved + " IS " +
-                         detail::quote_literal(
-                             "Pre-image captured by pg_laswell before backfilling " +
-                             sql_rel + ". Each row is what the target looked "
-                             "like before the change, written in the same "
-                             "transaction as the change itself.") + ";");
-    create.why = "preserve: the pre-image needs somewhere to live, and it must "
-                 "exist before the first batch writes to it";
-    out.push_back(std::move(create));
-
-    std::string select_cols;
-    for (const auto& c : saved_cols) {
-      if (!select_cols.empty()) select_cols += ", ";
-      select_cols += rel + "." + detail::quote_identifier(c);
-    }
-    preserve_cte = ", preserved AS (\n"
-                   "  INSERT INTO " + sql_preserved + " (" +
-                   detail::join(quoted_saved_cols, ", ") + ")\n"
-                   "  SELECT " + select_cols + "\n"
-                   "    FROM " + sql_rel + ", batch AS pb\n"
-                   "   WHERE " + rel + "." + detail::quote_identifier(key) + " = pb." + detail::quote_identifier(key) + "\n"
-                   ")";
-    step.detail["preserve"] = preserved;
   }
 
   const std::string batch_sql =
@@ -1108,8 +1153,16 @@ inline void plan_update_rows(const Intent& in, const Observations& obs,
     return detail::join(sets, ", ");
   };
 
+  // After every refusal above, so a refused plan carries no side-table step.
+  detail::Preserved pv;
+  const bool preserved =
+      detail::plan_preserve(in, columns, sql_rel, key, set_columns, out, pv);
+  if (preserved) step.detail["preserve"] = pv.qualified;
+
   if (src.paced) {
     const auto mutation =
+        (preserved ? detail::preserve_cte(pv, sql_rel, sql_rel, key, "batch") + ",\n"
+                   : std::string()) +
         "upd AS (\n"
         "  UPDATE " + qualified + "\n"
         "     SET " + assignments("batch") + "\n"
@@ -1126,16 +1179,28 @@ inline void plan_update_rows(const Intent& in, const Observations& obs,
     step.txn_class = TxnClass::kRequired;
     step.lock = "RowExclusiveLock on " + qualified +
                 " for one transaction; no table-level exclusive lock";
-    const auto relation =
-        in.body.contains("select")
-            ? "(" + in.body.value("select", "") + ") AS v"
-            : detail::values_relation(in.body["values"], in.body["columns"],
-                                      names, "v", columns);
-    step.sql.push_back(
-        "UPDATE " + sql_rel + "\n"
-        "   SET " + assignments("v") + "\n"
-        "  FROM " + relation + "\n"
-        " WHERE " + sql_rel + "." + k + " = v." + k + ";");
+    if (preserved) {
+      // The source becomes a CTE so the capture can join to it in the same
+      // statement; the plain form below stays as it was for everyone else.
+      step.sql.push_back(
+          "WITH src AS (\n" + detail::source_relation(in, names, columns) + "\n"
+          "), " + detail::preserve_cte(pv, sql_rel, sql_rel, key, "src") + "\n"
+          "UPDATE " + sql_rel + "\n"
+          "   SET " + assignments("src") + "\n"
+          "  FROM src\n"
+          " WHERE " + sql_rel + "." + k + " = src." + k + ";");
+    } else {
+      const auto relation =
+          in.body.contains("select")
+              ? "(" + in.body.value("select", "") + ") AS v"
+              : detail::values_relation(in.body["values"], in.body["columns"],
+                                        names, "v", columns);
+      step.sql.push_back(
+          "UPDATE " + sql_rel + "\n"
+          "   SET " + assignments("v") + "\n"
+          "  FROM " + relation + "\n"
+          " WHERE " + sql_rel + "." + k + " = v." + k + ";");
+    }
     step.detail["rows"] = src.row_count;
   }
 
@@ -1218,6 +1283,14 @@ inline void plan_delete_rows(const Intent& in, const Observations& obs,
                             : in.body.contains("values") ? "values" : "select";
   step.detail["paced"] = src.paced;
 
+  // The whole row: a delete changes every column, and a pre-image holding
+  // only the key of a row that no longer exists is not a revert path.
+  const json columns = t.value("columns", json::object());
+  detail::Preserved pv;
+  const bool preserved = detail::plan_preserve(
+      in, columns, sql_rel, key, detail::all_columns(columns), out, pv);
+  if (preserved) step.detail["preserve"] = pv.qualified;
+
   if (by_predicate) {
     // The batch is a keyset walk over the TARGET under the predicate, so FOR
     // UPDATE and the resume staleness check both apply -- and here the cursor
@@ -1233,7 +1306,9 @@ inline void plan_delete_rows(const Intent& in, const Observations& obs,
         "   ORDER BY " + sql_rel + "." + k + "\n"
         "   LIMIT $2\n"
         "   FOR UPDATE\n"
-        ")\n"
+        ")" +
+        (preserved ? ", " + detail::preserve_cte(pv, sql_rel, sql_rel, key, "batch")
+                   : std::string()) + "\n"
         "DELETE FROM " + sql_rel + "\n"
         " USING batch AS b\n"
         " WHERE " + sql_rel + "." + k + " = b." + k + "\n"
@@ -1251,6 +1326,8 @@ inline void plan_delete_rows(const Intent& in, const Observations& obs,
         "would hold its locks for the whole of it";
   } else if (src.paced) {
     const auto mutation =
+        (preserved ? detail::preserve_cte(pv, sql_rel, sql_rel, key, "batch") + ",\n"
+                   : std::string()) +
         "del AS (\n"
         "  DELETE FROM " + qualified + "\n"
         "   USING batch\n"
@@ -1258,8 +1335,7 @@ inline void plan_delete_rows(const Intent& in, const Observations& obs,
         "  RETURNING 1\n"
         ")";
     step.sql.push_back(paced_statement(
-        detail::source_relation(in, names, t.value("columns", json::object())),
-        key, mutation));
+        detail::source_relation(in, names, columns), key, mutation));
     // Empty for the same reason insert_rows leaves it empty: the keys come from
     // the spec, so a recorded cursor cannot be re-checked against the target.
     // A key that is already gone must still advance the cursor -- which is
@@ -1272,18 +1348,30 @@ inline void plan_delete_rows(const Intent& in, const Observations& obs,
     step.txn_class = TxnClass::kRequired;
     step.lock = "RowExclusiveLock on " + qualified +
                 " for one transaction; no table-level exclusive lock";
-    const auto relation =
-        in.body.contains("select")
-            ? "(" + in.body.value("select", "") + ") AS v"
-            : detail::values_relation(in.body["values"], in.body["columns"],
-                                      names, "v",
-                                      t.value("columns", json::object()));
-    step.sql.push_back(
-        "DELETE FROM " + sql_rel + "\n"
-        " USING " + relation + "\n"
-        " WHERE " + sql_rel + "." + k + " = v." + k + ";");
+    if (preserved) {
+      step.sql.push_back(
+          "WITH src AS (\n" + detail::source_relation(in, names, columns) + "\n"
+          "), " + detail::preserve_cte(pv, sql_rel, sql_rel, key, "src") + "\n"
+          "DELETE FROM " + sql_rel + "\n"
+          " USING src\n"
+          " WHERE " + sql_rel + "." + k + " = src." + k + ";");
+    } else {
+      const auto relation =
+          in.body.contains("select")
+              ? "(" + in.body.value("select", "") + ") AS v"
+              : detail::values_relation(in.body["values"], in.body["columns"],
+                                        names, "v", columns);
+      step.sql.push_back(
+          "DELETE FROM " + sql_rel + "\n"
+          " USING " + relation + "\n"
+          " WHERE " + sql_rel + "." + k + " = v." + k + ";");
+    }
     step.detail["rows"] = src.row_count;
     step.why = src.why;
+  }
+  if (preserved) {
+    step.why += "; every column of each deleted row is preserved in " +
+                pv.qualified + " in the same statement as the delete";
   }
 
   if (in.body.contains("verify_remaining")) {
@@ -1501,8 +1589,21 @@ inline void plan_merge_rows(const Intent& in, const Observations& obs,
   step.detail["when_not_matched"] = not_matched;
   step.detail["when_not_matched_by_source"] = by_source;
 
+  // What a matched row can lose: the updated columns, or -- when a match
+  // deletes -- all of them. Rows the source does not mention are captured by
+  // key like everything else, which is why WHEN NOT MATCHED BY SOURCE DELETE
+  // is the one branch this does NOT cover: those rows are exactly the ones
+  // the source cannot name. The warning for that branch already says so.
+  detail::Preserved pv;
+  const bool preserved = detail::plan_preserve(
+      in, columns, sql_rel, key,
+      matched == "delete" ? detail::all_columns(columns) : update_cols, out, pv);
+  if (preserved) step.detail["preserve"] = pv.qualified;
+
   if (src.paced) {
     const auto mutation =
+        (preserved ? detail::preserve_cte(pv, sql_rel, sql_rel, key, "batch") + ",\n"
+                   : std::string()) +
         "m AS (\n"
         "  MERGE INTO " + qualified + " USING batch\n"
         "     ON " + qualified + "." + k + " = batch." + k + "\n" +
@@ -1522,20 +1623,32 @@ inline void plan_merge_rows(const Intent& in, const Observations& obs,
                      ? " -- but the statement scans the WHOLE table to find the "
                        "rows the source does not mention"
                      : "");
-    const auto relation =
-        in.body.contains("select")
-            ? "(" + in.body.value("select", "") + ") AS s"
-            : detail::values_relation(in.body["values"], in.body["columns"],
-                                      names, "s", columns);
-    step.sql.push_back(
-        "MERGE INTO " + sql_rel + " USING " + relation + "\n"
-        "   ON " + sql_rel + "." + k + " = s." + k + "\n" +
-        branches("s") + ";");
+    if (preserved) {
+      step.sql.push_back(
+          "WITH src AS (\n" + detail::source_relation(in, names, columns) + "\n"
+          "), " + detail::preserve_cte(pv, sql_rel, sql_rel, key, "src") + "\n"
+          "MERGE INTO " + sql_rel + " USING src\n"
+          "   ON " + sql_rel + "." + k + " = src." + k + "\n" +
+          branches("src") + ";");
+    } else {
+      const auto relation =
+          in.body.contains("select")
+              ? "(" + in.body.value("select", "") + ") AS s"
+              : detail::values_relation(in.body["values"], in.body["columns"],
+                                        names, "s", columns);
+      step.sql.push_back(
+          "MERGE INTO " + sql_rel + " USING " + relation + "\n"
+          "   ON " + sql_rel + "." + k + " = s." + k + "\n" +
+          branches("s") + ";");
+    }
     step.detail["rows"] = src.row_count;
   }
 
   step.why = src.why + "; ON " + key + " is backed by " + supporting_index +
-             ", which is what makes one source row match at most one target row";
+             ", which is what makes one source row match at most one target row" +
+             (preserved ? "; matched rows are preserved in " + pv.qualified +
+                              " in the same statement as the merge"
+                        : "");
 
   if (by_source == "delete") {
     plan.warnings.push_back(

@@ -423,6 +423,23 @@ The capture is a data-modifying CTE of the very statement that updates, so it
 reads the rows as they were before that update and commits with it.
 There is no window in which one landed and the other did not.
 .Pp
+The same option, with the same guarantee, is accepted by
+.Cm update_rows ,
+.Cm merge_rows
+and
+.Cm delete_rows :
+a change saves the key and the columns it touches, and a delete saves the
+whole row, because a pre-image of a deleted row that held only its key could
+not be put back.
+A
+.Cm merge_rows
+with
+.Va when_not_matched_by_source
+set to
+.Ql delete
+is the one form it does not cover, since the rows that branch removes are
+exactly the ones the source cannot name.
+.Pp
 This is deliberately not a pinned snapshot.
 A snapshot lets you look at the old values while holding back the xmin horizon
 for the whole backfill, blocking vacuum throughout; this keeps them, durably,

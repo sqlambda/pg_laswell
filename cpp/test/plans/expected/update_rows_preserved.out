@@ -1,0 +1,24 @@
+Plan for 0011-region-rename-preserved  (digest a7f4e650f5fc…)
+
+-- transaction group 1 ---------------- atomic --
+ 0. update_rows
+    CREATE TABLE IF NOT EXISTS "archive"."region_before" ("id" bigint, "code" text, laswell_saved_at timestamptz NOT NULL DEFAULT now());
+    COMMENT ON TABLE "archive"."region_before" IS 'Pre-image captured by pg_laswell before update_rows changed "shop"."region". Each row is what the target looked like before the change, written in the same statement as the change itself.';
+    lock: AccessExclusiveLock on the new table only
+    why:  preserve: the pre-image needs somewhere to live, and it must exist before the first batch writes to it
+ 1. update_rows
+    WITH src AS (
+  SELECT * FROM (VALUES (1::bigint, 'NAM'::text),
+        (2, 'EUR')) AS v ("id", "code")
+), preserved AS (
+  INSERT INTO "archive"."region_before" ("id", "code")
+  SELECT "shop"."region"."id", "shop"."region"."code"
+    FROM "shop"."region", src AS pb
+   WHERE "shop"."region"."id" = pb."id"
+)
+UPDATE "shop"."region"
+   SET "code" = src."code"
+  FROM src
+ WHERE "shop"."region"."id" = src."id";
+    lock: RowExclusiveLock on shop.region for one transaction; no table-level exclusive lock
+    why:  2 literal rows, at or below dml_single_txn_rows (1000), so this runs in ONE transaction and is all-or-nothing -- a half-applied set of literal rows is worse than one that failed; each row takes its own values, which no expression can derive -- so the previous values are preserved in the same transaction as the change

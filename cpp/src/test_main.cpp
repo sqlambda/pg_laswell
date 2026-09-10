@@ -5499,6 +5499,83 @@ TEST(Planner, AProjectedUniqueIndexProvesTheKeyOnlyWhenTheCatalogVersionWould) {
   EXPECT_FALSE(part.ok) << part.render();
 }
 
+// `preserve` was accepted by three kinds that did nothing with it, and one of
+// them said in its plan that the previous values were preserved. Every form
+// of every kind is asserted: the side table is created first, the capture is
+// a CTE of the SAME statement as the mutation, it joins to the batch (paced)
+// or the whole source (unpaced) by key, and a delete saves the whole row.
+TEST(Planner, PreserveIsRealForEveryRowLevelKindAndEveryForm) {
+  const json preserve{{"schema", "archive"}, {"table", "orders_before"}};
+  const auto values = json::array({json::array({1, "NA"}), json::array({2, "EU"})});
+  const json update{{"kind", "update_rows"}, {"schema", "shop"}, {"table", "orders"},
+                    {"key", "id"}, {"columns", json::array({"id", "fulfilment_region"})},
+                    {"values", values}, {"preserve", preserve}};
+  const json merge{{"kind", "merge_rows"}, {"schema", "shop"}, {"table", "orders"},
+                   {"key", "id"}, {"columns", json::array({"id", "fulfilment_region"})},
+                   {"values", values}, {"preserve", preserve}};
+  const json del_values{{"kind", "delete_rows"}, {"schema", "shop"}, {"table", "orders"},
+                        {"key", "id"}, {"columns", json::array({"id"})},
+                        {"values", json::array({json::array({1}), json::array({2})})},
+                        {"preserve", preserve}};
+  const json del_where{{"kind", "delete_rows"}, {"schema", "shop"}, {"table", "orders"},
+                       {"key", "id"}, {"where", "status = 'old'"}, {"preserve", preserve}};
+
+  struct Form { json intent; bool paced; const char* join_alias; };
+  for (const Form& f : {Form{update, false, "src"}, Form{update, true, "batch"},
+                       Form{merge, false, "src"}, Form{merge, true, "batch"},
+                       Form{del_values, false, "src"}, Form{del_values, true, "batch"},
+                       Form{del_where, true, "batch"}}) {
+    pglaswell::ExecutorConfig cfg;
+    if (f.paced) cfg.dml_single_txn_rows = 1;  // force the paced form
+    const auto plan = pglaswell::plan_migration(spec_of(json::array({f.intent})), obs_dml(), cfg);
+    const std::string label = f.intent.value("kind", "") + (f.paced ? " paced" : " unpaced");
+    ASSERT_TRUE(plan.ok) << label << ": " << plan.render();
+    ASSERT_EQ(plan.steps.size(), 2u) << label << ": side table, then the change:\n" << plan.render();
+
+    const auto& create = plan.steps[0];
+    const auto& change = plan.steps[1];
+    EXPECT_NE(all_sql(create).find("CREATE TABLE IF NOT EXISTS \"archive\".\"orders_before\""),
+              std::string::npos) << label << ": " << all_sql(create);
+    EXPECT_TRUE(create.own_transaction) << label;
+
+    const auto sql = all_sql(change);
+    EXPECT_NE(sql.find("preserved AS ("), std::string::npos) << label << ": " << sql;
+    EXPECT_NE(sql.find("INSERT INTO \"archive\".\"orders_before\""), std::string::npos) << label << ": " << sql;
+    EXPECT_NE(sql.find(std::string(", ") + f.join_alias + " AS pb"), std::string::npos)
+        << label << ": the capture must join to the rows this statement changes:\n" << sql;
+    EXPECT_NE(sql.find("= pb.\"id\""), std::string::npos) << label << ": " << sql;
+    EXPECT_EQ(change.detail.value("preserve", ""), "archive.orders_before") << label;
+    EXPECT_EQ(change.sql.size(), 1u) << label << ": ONE statement, or the capture is not atomic with the change";
+
+    // What is saved. A change saves the key and what it touches; a delete
+    // saves the whole row, because a pre-image of a deleted row that holds
+    // only its key is not something anyone can put back.
+    const auto ddl = all_sql(create);
+    if (f.intent.value("kind", "") == "delete_rows") {
+      for (const char* c : {"\"id\" bigint", "\"warehouse_id\" bigint", "\"fulfilment_region\" text"}) {
+        EXPECT_NE(ddl.find(c), std::string::npos) << label << ": " << ddl;
+      }
+    } else {
+      EXPECT_NE(ddl.find("\"id\" bigint, \"fulfilment_region\" text, laswell_saved_at"),
+                std::string::npos) << label << ": " << ddl;
+      EXPECT_EQ(ddl.find("warehouse_id"), std::string::npos) << label << ": untouched columns are not saved";
+    }
+  }
+}
+
+// Without preserve nothing changes: no side table, one step, the plain
+// statement -- so the golden transcripts for the plain forms stay as they are.
+TEST(Planner, WithoutPreserveTheRowLevelPlansAreUnchanged) {
+  const json update{{"kind", "update_rows"}, {"schema", "shop"}, {"table", "orders"},
+                    {"key", "id"}, {"columns", json::array({"id", "fulfilment_region"})},
+                    {"values", json::array({json::array({1, "NA"})})}};
+  const auto plan = pglaswell::plan_migration(spec_of(json::array({update})), obs_dml(), {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  ASSERT_EQ(plan.steps.size(), 1u);
+  EXPECT_EQ(all_sql(plan.steps[0]).find("preserved"), std::string::npos);
+  EXPECT_FALSE(plan.steps[0].detail.contains("preserve"));
+}
+
 TEST(Planner, UpdateRowsGivesEachRowItsOwnValuesAndCastsTheFirstOne) {
   const auto plan = pglaswell::plan_migration(
       spec_of(json::array({json{{"kind", "update_rows"}, {"schema", "shop"},

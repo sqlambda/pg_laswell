@@ -7,6 +7,16 @@ ledger. 354 tests green on GCC 14.2 and Clang 22, under AddressSanitizer/UBSan
 and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
 `--call` contract test.
 
+- **`preserve` is honoured by `update_rows`, `merge_rows` and `delete_rows`.**
+  All three accepted the option and emitted nothing for it, and `update_rows`
+  said in its plan that the previous values were preserved. One implementation
+  now serves the four kinds: the side table, then a `preserved` CTE in the same
+  statement as the change. A delete saves the whole row.
+- **A unique index proves a key unique only when the key is the whole index.**
+  `UNIQUE (id, tenant)` was accepted as proof that `id` is unique, and a
+  `merge_rows` keyed on `id` updated two rows -- measured. Composite and partial
+  unique indexes no longer count, for `merge_rows`, `update_rows` and
+  `backfill`; the refusal names the index and says why.
 - **Row-level DML: `insert_rows`, `update_rows`, `merge_rows`, `copy_rows`, and
   two new forms for `delete_rows`.** 84 kinds. Every PostgreSQL statement that
   writes rows except `TRUNCATE`, which stays deliberately absent. Each names its

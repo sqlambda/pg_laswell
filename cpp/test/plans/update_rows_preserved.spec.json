@@ -1,0 +1,32 @@
+{
+ "laswell_spec_version": 1,
+ "id": "0011-region-rename-preserved",
+ "description": "Correct two region codes, keeping what they were.",
+ "rationale": "update_rows with preserve. The transcript shows the two steps this produces: the side table, then ONE statement whose preserved CTE captures the rows the change touches before the UPDATE beside it runs -- the same snapshot, so the archive and the data cannot disagree. This is the option update_rows accepted and did not honour until 2026-09-10.",
+ "intents": [
+  {
+   "kind": "update_rows",
+   "schema": "shop",
+   "table": "region",
+   "key": "id",
+   "columns": [
+    "id",
+    "code"
+   ],
+   "values": [
+    [
+     1,
+     "NAM"
+    ],
+    [
+     2,
+     "EUR"
+    ]
+   ],
+   "preserve": {
+    "schema": "archive",
+    "table": "region_before"
+   }
+  }
+ ]
+}
