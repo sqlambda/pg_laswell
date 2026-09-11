@@ -105,20 +105,10 @@ jobs:
           apt-get install -y --no-install-recommends \
             curl ca-certificates cmake build-essential pkg-config dpkg-dev file \
             binutils libpq-dev libssl-dev nlohmann-json3-dev
-          curl -fsSL -o /tmp/libpqxx.tar.gz \
-            "https://github.com/jtv/libpqxx/archive/refs/tags/${PQXX_VERSION}.tar.gz"
-          # sha256sum on Linux, shasum on macOS: the same check, spelled the
-          # way each platform spells it, rather than skipped on one of them.
-          if command -v sha256sum >/dev/null 2>&1; then
-            echo "${PQXX_SHA256}  /tmp/libpqxx.tar.gz" | sha256sum -c -
-          else
-            echo "${PQXX_SHA256}  /tmp/libpqxx.tar.gz" | shasum -a 256 -c -
-          fi
-          tar -xzf /tmp/libpqxx.tar.gz -C /tmp
-          cmake -S "/tmp/libpqxx-${PQXX_VERSION}" -B /tmp/libpqxx-build \
-            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DSKIP_BUILD_TEST=ON
-          cmake --build /tmp/libpqxx-build -j"$(nproc)"
-          cmake --install /tmp/libpqxx-build
+          # Fetched, checksummed and built by the one script both workflows
+          # call. See .github/scripts/build-libpqxx.sh for why there is one.
+          sh .github/scripts/build-libpqxx.sh \
+            "${PQXX_VERSION}" "${PQXX_SHA256}" ""
           echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig" >> $GITHUB_ENV
 
       - name: Install dependencies (Ubuntu)
@@ -128,20 +118,10 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             cmake build-essential pkg-config file binutils \
             curl ca-certificates libpq-dev libssl-dev nlohmann-json3-dev
-          curl -fsSL -o /tmp/libpqxx.tar.gz \
-            "https://github.com/jtv/libpqxx/archive/refs/tags/${PQXX_VERSION}.tar.gz"
-          # sha256sum on Linux, shasum on macOS: the same check, spelled the
-          # way each platform spells it, rather than skipped on one of them.
-          if command -v sha256sum >/dev/null 2>&1; then
-            echo "${PQXX_SHA256}  /tmp/libpqxx.tar.gz" | sha256sum -c -
-          else
-            echo "${PQXX_SHA256}  /tmp/libpqxx.tar.gz" | shasum -a 256 -c -
-          fi
-          tar -xzf /tmp/libpqxx.tar.gz -C /tmp
-          cmake -S "/tmp/libpqxx-${PQXX_VERSION}" -B /tmp/libpqxx-build \
-            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DSKIP_BUILD_TEST=ON
-          cmake --build /tmp/libpqxx-build -j"$(nproc)"
-          sudo cmake --install /tmp/libpqxx-build
+          # Fetched, checksummed and built by the one script both workflows
+          # call. See .github/scripts/build-libpqxx.sh for why there is one.
+          sh .github/scripts/build-libpqxx.sh \
+            "${PQXX_VERSION}" "${PQXX_SHA256}" ""
           echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig" >> $GITHUB_ENV
 
       - name: Install dependencies (Rocky Linux)
@@ -170,20 +150,10 @@ jobs:
           echo "CXX=/opt/rh/gcc-toolset-13/root/usr/bin/g++" >> $GITHUB_ENV
           export CC=/opt/rh/gcc-toolset-13/root/usr/bin/gcc
           export CXX=/opt/rh/gcc-toolset-13/root/usr/bin/g++
-          curl -fsSL -o /tmp/libpqxx.tar.gz \
-            "https://github.com/jtv/libpqxx/archive/refs/tags/${PQXX_VERSION}.tar.gz"
-          # sha256sum on Linux, shasum on macOS: the same check, spelled the
-          # way each platform spells it, rather than skipped on one of them.
-          if command -v sha256sum >/dev/null 2>&1; then
-            echo "${PQXX_SHA256}  /tmp/libpqxx.tar.gz" | sha256sum -c -
-          else
-            echo "${PQXX_SHA256}  /tmp/libpqxx.tar.gz" | shasum -a 256 -c -
-          fi
-          tar -xzf /tmp/libpqxx.tar.gz -C /tmp
-          cmake -S "/tmp/libpqxx-${PQXX_VERSION}" -B /tmp/libpqxx-build \
-            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DSKIP_BUILD_TEST=ON
-          cmake --build /tmp/libpqxx-build -j"$(nproc)"
-          cmake --install /tmp/libpqxx-build
+          # Fetched, checksummed and built by the one script both workflows
+          # call. See .github/scripts/build-libpqxx.sh for why there is one.
+          sh .github/scripts/build-libpqxx.sh \
+            "${PQXX_VERSION}" "${PQXX_SHA256}" ""
           echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig" >> $GITHUB_ENV
 
       # macOS needs OpenSSL explicitly, which pg_licht never did: Apple ships
@@ -196,21 +166,11 @@ jobs:
           brew install cmake libpq nlohmann-json pkg-config openssl@3
           echo "PKG_CONFIG_PATH=$(brew --prefix libpq)/lib/pkgconfig:/usr/local/lib/pkgconfig" >> $GITHUB_ENV
           echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> $GITHUB_ENV
-          curl -fsSL -o /tmp/libpqxx.tar.gz \
-            "https://github.com/jtv/libpqxx/archive/refs/tags/${PQXX_VERSION}.tar.gz"
-          # sha256sum on Linux, shasum on macOS: the same check, spelled the
-          # way each platform spells it, rather than skipped on one of them.
-          if command -v sha256sum >/dev/null 2>&1; then
-            echo "${PQXX_SHA256}  /tmp/libpqxx.tar.gz" | sha256sum -c -
-          else
-            echo "${PQXX_SHA256}  /tmp/libpqxx.tar.gz" | shasum -a 256 -c -
-          fi
-          tar -xzf /tmp/libpqxx.tar.gz -C /tmp
-          cmake -S "/tmp/libpqxx-${PQXX_VERSION}" -B /tmp/libpqxx-build \
-            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DSKIP_BUILD_TEST=ON \
+          # Fetched, checksummed and built by the one script both workflows
+          # call. See .github/scripts/build-libpqxx.sh for why there is one.
+          sh .github/scripts/build-libpqxx.sh \
+            "${PQXX_VERSION}" "${PQXX_SHA256}" "" \
             -DCMAKE_PREFIX_PATH="$(brew --prefix libpq)"
-          cmake --build /tmp/libpqxx-build -j"$(sysctl -n hw.ncpu)"
-          sudo cmake --install /tmp/libpqxx-build
 
       # The tag is the source of truth for the version. A tag that disagrees
       # with the project() version means one of them is wrong, and shipping
