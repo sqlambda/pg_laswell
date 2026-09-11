@@ -24,6 +24,12 @@ and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
   error on a reserved-word schema. Measured: `INSERT INTO user.t` fails at
   `user`, while `INSERT INTO cf.order` parses -- it is the schema that has to be
   quoted, which is why a case naming only a reserved table proves nothing.
+- **`max_concurrent_operations`: a ceiling on migration statements in flight**,
+  across every job the process runs, answering a different question from
+  `max_concurrent_jobs`. Jobs are how much work is underway; operations are how
+  much of it is touching the server at this instant. Zero, the default,
+  declares no ceiling. The observer, ledger and coordination connections are
+  never counted.
 - **`target.database` is enforced instead of ignored.** It was parsed, covered
   by the signature, and read by nothing, so naming a database gave exactly the
   protection of naming none. It is now compared to `current_database()` in the

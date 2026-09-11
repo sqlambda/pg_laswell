@@ -68,6 +68,24 @@ struct ExecutorConfig {
   int observer_tick_ms = 250;
   int max_concurrent_jobs = 2;
 
+  // A ceiling on how many migration STATEMENTS are in flight at once across
+  // every job, which is a different question from how many jobs are underway.
+  // Jobs are how much work this process has taken on; operations are how much
+  // of it is touching the server at this instant, and the second is what an
+  // operator means by "how hard is this leaning on my database right now".
+  //
+  // Zero is not a limit of zero -- it is "no ceiling declared", the same way
+  // host_vcpus and maintenance_work_mem_mb mean not declared. A setting that
+  // changed behaviour the moment the field existed would be a setting nobody
+  // chose.
+  //
+  // Set BELOW max_concurrent_jobs and jobs will queue behind each other at
+  // each statement rather than at the start, which is the point: a migration
+  // already underway keeps its place and simply waits its turn to speak. See
+  // OperationGate in jobs.h for the wait this composes with row locks into,
+  // and what bounds it.
+  int max_concurrent_operations = 0;
+
   // Declared by an operator, never measured, and reported as such. PostgreSQL
   // exposes no CPU count in SQL -- the only cpu-named settings are planner cost
   // constants -- so this is configuration or nothing. pg_licht reached the same
@@ -307,6 +325,7 @@ inline bool apply_executor_key(ExecutorConfig& e, const std::string& key,
   if (key == "batch_rows") { e.batch_rows = detail::positive_int(value, key, w); return true; }
   if (key == "commit_interval_ms") { e.commit_interval_ms = detail::positive_int(value, key, w); return true; }
   if (key == "batch_cap_rows") { e.batch_cap_rows = detail::positive_int(value, key, w); return true; }
+  if (key == "max_concurrent_operations") { e.max_concurrent_operations = detail::non_negative_int(value, key, w); return true; }
   if (key == "dml_single_txn_rows") { e.dml_single_txn_rows = detail::positive_int(value, key, w); return true; }
   if (key == "lock_timeout_ms") { e.lock_timeout_ms = detail::positive_int(value, key, w); return true; }
   if (key == "dry_run_statement_timeout_ms") { e.dry_run_statement_timeout_ms = detail::positive_int(value, key, w); return true; }

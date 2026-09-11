@@ -135,6 +135,121 @@ struct Job {
 };
 
 // The process-wide registry. One mutex, snapshot reads.
+// A process-wide ceiling on how many MIGRATION STATEMENTS are in flight at
+// once, across every job this process is running.
+//
+// It answers a different question from max_concurrent_jobs, which is why both
+// exist. Jobs are how much work is UNDERWAY; operations are how much of it is
+// touching the server at this instant. Today a job runs its steps one at a
+// time, so the two numbers meet -- but they are not the same claim, and only
+// one of them is what an operator means by "how hard is this thing leaning on
+// my database right now".
+//
+// Zero means no ceiling, the same way host_vcpus and maintenance_work_mem_mb
+// mean "not declared" rather than "zero of them". A setting that changed
+// behaviour the moment the field existed would be a setting nobody chose.
+//
+// WHAT IT DOES NOT GATE, deliberately: the observer, the ledger, and the
+// coordination connection. Those are how the tool watches and records itself,
+// and starving them would disable the contention breaker exactly when the
+// server is busiest -- which is the one moment it is for.
+//
+// THE HAZARD, written down because it is invisible from either side. A job can
+// hold a transaction open while it waits here for a slot, and the job holding
+// the slot can be waiting on a row lock that the first job's transaction owns.
+// PostgreSQL cannot see that cycle: half of it is a condition variable in this
+// process. It does not hang -- lock_timeout bounds the statement holding the
+// slot, and the observer cancels one that starves a waiter past
+// max_waiter_wait_ms -- so it resolves as a timeout rather than a deadlock.
+// Set this below max_concurrent_jobs and that trade is what you are buying.
+class OperationGate {
+ public:
+  // Raising the limit wakes whoever is waiting; lowering it does not interrupt
+  // work already in flight, which would mean abandoning a statement mid-run.
+  void configure(int limit) {
+    {
+      std::lock_guard<std::mutex> lock(m_);
+      limit_ = limit;
+    }
+    cv_.notify_all();
+  }
+
+  int limit() const {
+    std::lock_guard<std::mutex> lock(m_);
+    return limit_;
+  }
+
+  // The most that were ever in flight at once. The gate measuring itself,
+  // which is worth exactly what that is worth -- but it is the only vantage
+  // point that sees every job, and a test can assert on it.
+  int peak() const {
+    std::lock_guard<std::mutex> lock(m_);
+    return peak_;
+  }
+
+  int in_flight() const {
+    std::lock_guard<std::mutex> lock(m_);
+    return in_flight_;
+  }
+
+  class Slot {
+   public:
+    Slot() = default;
+    explicit Slot(OperationGate* g) : gate_(g) {}
+    Slot(Slot&& o) noexcept : gate_(o.gate_) { o.gate_ = nullptr; }
+    Slot& operator=(Slot&& o) noexcept {
+      if (this != &o) { release(); gate_ = o.gate_; o.gate_ = nullptr; }
+      return *this;
+    }
+    Slot(const Slot&) = delete;
+    Slot& operator=(const Slot&) = delete;
+    ~Slot() { release(); }
+    bool held() const { return gate_ != nullptr; }
+
+   private:
+    void release() {
+      if (gate_ == nullptr) return;
+      {
+        std::lock_guard<std::mutex> lock(gate_->m_);
+        --gate_->in_flight_;
+      }
+      gate_->cv_.notify_one();
+      gate_ = nullptr;
+    }
+    OperationGate* gate_ = nullptr;
+  };
+
+  // Waits up to `wait_ms` for room. Bounded rather than indefinite so a caller
+  // can re-check whether its job was cancelled: a thread parked forever in
+  // here would ignore cancelJob, and a cancel that does not cancel is worse
+  // than a queue that is slow.
+  Slot try_acquire_for(int wait_ms) {
+    std::unique_lock<std::mutex> lock(m_);
+    if (limit_ <= 0) return Slot();  // no ceiling: nothing to hold
+    if (!cv_.wait_for(lock, std::chrono::milliseconds(wait_ms),
+                      [this] { return limit_ <= 0 || in_flight_ < limit_; })) {
+      return Slot();
+    }
+    if (limit_ <= 0) return Slot();
+    ++in_flight_;
+    if (in_flight_ > peak_) peak_ = in_flight_;
+    return Slot(this);
+  }
+
+  // True when a caller must keep waiting: a ceiling is set and it is full.
+  bool would_block() const {
+    std::lock_guard<std::mutex> lock(m_);
+    return limit_ > 0 && in_flight_ >= limit_;
+  }
+
+ private:
+  mutable std::mutex m_;
+  std::condition_variable cv_;
+  int limit_ = 0;
+  int in_flight_ = 0;
+  int peak_ = 0;
+};
+
 class JobRegistry {
  public:
   std::shared_ptr<Job> create(const std::string& job_id) {
@@ -168,6 +283,12 @@ class JobRegistry {
     return n;
   }
 
+  // The process-wide statement ceiling. One per registry rather than one per
+  // job, because "how much is in flight" is a question about the server, and
+  // every job in this process is leaning on the same one.
+  OperationGate& operations() { return operations_; }
+  const OperationGate& operations() const { return operations_; }
+
   // Joins every worker thread. Called before the process exits, so a thread is
   // never racing PQfinish against static destruction -- the same reasoning
   // that makes ConnectionCache's reaper joined rather than detached.
@@ -179,6 +300,7 @@ class JobRegistry {
 
  private:
   mutable std::mutex m_;
+  OperationGate operations_;
   std::map<std::string, std::shared_ptr<Job>> jobs_;
 };
 

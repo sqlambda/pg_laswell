@@ -317,6 +317,56 @@ ran.
 Floating-point values are refused anywhere in a specification.
 Nothing a migration intent needs is a float, and refusing removes the one
 genuinely error-prone clause of RFC 8785.
+.Ss How much runs at once
+Two ceilings, answering two questions.
+.Bl -tag -width Ds
+.It Va max_concurrent_jobs
+How many migrations are underway at once.
+Default 2.
+.Ic startMigration
+refuses a caller who asks for one too many;
+.Xr pg_laswell 1
+waits for a slot instead, because a deployment asking itself for more than it
+allows is a self-inflicted failure.
+.It Va max_concurrent_operations
+How many migration
+.Em statements
+are in flight at once, across every job this process runs.
+Zero -- the default -- declares no ceiling, in the same sense
+.Va host_vcpus
+and
+.Va maintenance_work_mem_mb
+do: not a limit of zero, but a number nobody has stated.
+.El
+.Pp
+The second is not the first said differently.
+Jobs are how much work has been taken on; operations are how much of it is
+touching the server at this instant, which is what an operator means by asking
+how hard this is leaning on the database.
+A job runs its steps one at a time, so with no ceiling declared the two numbers
+meet -- set
+.Va max_concurrent_operations
+below
+.Va max_concurrent_jobs
+and migrations already underway queue at each statement rather than at the
+start, keeping their place and waiting their turn to speak.
+.Pp
+The observer, the ledger and the coordination connection are never counted.
+They are how this tool watches and records itself, and starving them would
+disable the contention breaker at exactly the moment it exists for.
+.Pp
+One consequence worth stating, because it is invisible from either side: a job
+can hold a transaction open while it waits for a slot, and the job holding that
+slot can be waiting on a row lock the first job owns.
+PostgreSQL cannot see that cycle -- half of it is a condition variable inside
+this process.
+It does not hang:
+.Va lock_timeout
+bounds the statement holding the slot, and the observer cancels one that
+starves a waiter past
+.Va max_waiter_wait_ms ,
+so it resolves as a timeout rather than as a deadlock.
+That trade is what setting the ceiling below the job count buys.
 .Ss Where a specification may be applied
 Three optional gates, all inside the signature, all answered by the target
 database rather than by whoever runs the tool.

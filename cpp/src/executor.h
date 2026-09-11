@@ -73,8 +73,12 @@ inline std::string strip_semicolon(const std::string& s) {
 
 class Executor {
  public:
-  Executor(ConnConfig cfg, std::shared_ptr<Job> job, Ledger* ledger)
-      : cfg_(std::move(cfg)), job_(std::move(job)), ledger_(ledger) {}
+  Executor(ConnConfig cfg, std::shared_ptr<Job> job, Ledger* ledger,
+           OperationGate* operations = nullptr)
+      : cfg_(std::move(cfg)),
+        job_(std::move(job)),
+        ledger_(ledger),
+        operations_(operations) {}
 
   void run() {
     try {
@@ -183,6 +187,22 @@ class Executor {
     return "pg_laswell/" + job_->job_id + "/step-" + std::to_string(ordinal);
   }
 
+  // A slot for ONE statement, waited for in bounded steps so a cancel still
+  // lands. Returns an unheld Slot when no ceiling is configured, which is the
+  // default and costs a single atomic read.
+  //
+  // Cancellation wins over the queue: a job told to stop should stop, not
+  // finish waiting for permission to do work nobody wants any more.
+  OperationGate::Slot operation_slot() {
+    if (operations_ == nullptr) return OperationGate::Slot();
+    OperationGate::Slot slot = operations_->try_acquire_for(0);
+    while (!slot.held() && operations_->would_block()) {
+      if (job_->pacing.cancel_stop.load()) return OperationGate::Slot();
+      slot = operations_->try_acquire_for(50);
+    }
+    return slot;
+  }
+
   void run_in_transaction(WriteSession& w, int ordinal, const json& step) {
     const auto started = detail::steady_ms();
     long long rows = 0;
@@ -190,6 +210,7 @@ class Executor {
       const auto stmt = detail::strip_semicolon(raw.get<std::string>());
       if (stmt.empty()) continue;
       try {
+        const auto slot = operation_slot();
         const auto r = w.txn().exec(stmt);
         rows += r.affected_rows();
       } catch (const pqxx::sql_error& e) {
@@ -237,6 +258,7 @@ class Executor {
       // own copy of the streaming loop, which is how the two came to quote
       // column names slightly differently while both being correct only
       // because require_identifier restricts them to [a-z0-9_].
+      const auto slot = operation_slot();
       Catalog::stream_copy(w, step.value("detail", json::object()), written);
     } catch (const pqxx::sql_error& e) {
       record_step(ordinal, step, "failed", 0,
@@ -277,6 +299,10 @@ class Executor {
         for (const auto& raw : step.value("sql", json::array())) {
           const auto stmt = detail::strip_semicolon(raw.get<std::string>());
           if (stmt.empty()) continue;
+          // CREATE INDEX CONCURRENTLY is the longest single statement this
+          // tool issues and the one most worth counting: it is also the one
+          // that takes parallel workers on the server side.
+          const auto slot = operation_slot();
           w.exec_nontransactional(stmt);
         }
         return 0;
@@ -418,6 +444,7 @@ class Executor {
                               : e.batch_rows;
         long long affected = 0;
         try {
+          const auto slot = operation_slot();
           const auto r = pqxx_exec(w.txn(), sql, pqxx::params{cursor, batch});
           affected = static_cast<long long>(r.size());
           for (const auto& row : r) {
@@ -788,6 +815,7 @@ class Executor {
   ConnConfig cfg_;
   std::shared_ptr<Job> job_;
   Ledger* ledger_;
+  OperationGate* operations_ = nullptr;  // null: no ceiling
 };
 
 }  // namespace pglaswell

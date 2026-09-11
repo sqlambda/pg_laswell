@@ -528,8 +528,13 @@ inline json start_migration(ToolContext& ctx, const json& args) {
   }
 
   if (ctx.observer) ctx.observer->start();
-  job->worker = std::thread([cfg, job, ledger] {
-    Executor(cfg, job, ledger.get()).run();
+  // The ceiling is process-wide, so it lives on the registry rather than on a
+  // job. Re-declared on every start because a caller may name a different
+  // connection, and the last word wins -- raising it wakes whoever is waiting.
+  ctx.jobs->operations().configure(cfg.executor.max_concurrent_operations);
+  OperationGate* gate = &ctx.jobs->operations();
+  job->worker = std::thread([cfg, job, ledger, gate] {
+    Executor(cfg, job, ledger.get(), gate).run();
   });
 
   return json{{"jobId", job->job_id},

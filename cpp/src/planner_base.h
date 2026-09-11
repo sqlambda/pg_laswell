@@ -281,7 +281,20 @@ inline json compute_budget(const Observations& obs, const ExecutorConfig& cfg) {
          {"maxWorkerProcesses", obs.server.value("max_worker_processes", 0)},
          {"parallelWorkersActive", workers_busy},
          {"parallelWorkersFree", std::max(0, max_workers - workers_busy)},
-         {"maxConcurrentJobs", jobs}};
+         {"maxConcurrentJobs", jobs},
+         // The statement ceiling, reported whether or not it is set, because
+         // "no ceiling" is a reading an operator should be able to see rather
+         // than infer from a missing key.
+         {"maxConcurrentOperations", cfg.max_concurrent_operations},
+         {"operationsCeiling",
+          cfg.max_concurrent_operations > 0
+              ? "at most " + std::to_string(cfg.max_concurrent_operations) +
+                    " migration statement(s) in flight at once across every "
+                    "job this process runs"
+              : std::string(
+                    "not declared, so statements are bounded only by "
+                    "max_concurrent_jobs -- each job runs one statement at a "
+                    "time")}};
   if (cfg.host_vcpus > 0) {
     w["hostVcpus"] = cfg.host_vcpus;
     w["hostVcpusSource"] = "configuration -- declared by an operator";

@@ -775,6 +775,72 @@ std::string spec_error(const json& doc) {
 
 }  // namespace
 
+// --- the statement ceiling -------------------------------------------------
+
+TEST(Operations, NoCeilingIsTheDefaultAndCostsNothing) {
+  pglaswell::OperationGate g;
+  EXPECT_EQ(g.limit(), 0);
+  EXPECT_FALSE(g.would_block());
+  // Zero is "no ceiling declared", not "a ceiling of zero" -- a setting that
+  // stopped all work the moment the field existed would be one nobody chose.
+  std::vector<pglaswell::OperationGate::Slot> held;
+  for (int i = 0; i < 64; ++i) held.push_back(g.try_acquire_for(0));
+  for (const auto& slot : held) EXPECT_FALSE(slot.held()) << "nothing to hold";
+  EXPECT_EQ(g.in_flight(), 0);
+  EXPECT_EQ(g.peak(), 0);
+}
+
+TEST(Operations, TheCeilingHoldsUnderThreads) {
+  for (const int limit : {1, 2, 3}) {
+    pglaswell::OperationGate g;
+    g.configure(limit);
+    std::atomic<int> concurrent{0}, observed_peak{0}, done{0};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 8; ++t) {
+      threads.emplace_back([&] {
+        for (int i = 0; i < 25; ++i) {
+          pglaswell::OperationGate::Slot slot;
+          while (!slot.held()) slot = g.try_acquire_for(20);
+          const int now = ++concurrent;
+          // Counted independently of the gate: the gate's own peak is the
+          // gate marking its own homework, and this is the second opinion.
+          int prev = observed_peak.load();
+          while (now > prev && !observed_peak.compare_exchange_weak(prev, now)) {}
+          std::this_thread::sleep_for(std::chrono::microseconds(200));
+          --concurrent;
+          ++done;
+        }
+      });
+    }
+    for (auto& th : threads) th.join();
+    EXPECT_EQ(done.load(), 200) << "every unit of work ran; the gate queues, it does not drop";
+    EXPECT_LE(observed_peak.load(), limit)
+        << "limit " << limit << ": more statements were in flight than allowed";
+    EXPECT_LE(g.peak(), limit) << "limit " << limit;
+    EXPECT_EQ(g.in_flight(), 0) << "every slot was released";
+  }
+}
+
+TEST(Operations, RaisingTheCeilingWakesWhoeverIsWaiting) {
+  pglaswell::OperationGate g;
+  g.configure(1);
+  auto held = g.try_acquire_for(0);
+  ASSERT_TRUE(held.held());
+  EXPECT_TRUE(g.would_block());
+
+  std::atomic<bool> got{false};
+  std::thread waiter([&] {
+    pglaswell::OperationGate::Slot s;
+    for (int i = 0; i < 200 && !s.held(); ++i) s = g.try_acquire_for(20);
+    got = s.held();
+  });
+  // Without the notify, this waiter would sit out its whole timeout on every
+  // attempt; with it, room appearing is news that travels.
+  g.configure(4);
+  waiter.join();
+  EXPECT_TRUE(got.load()) << "raising the ceiling must admit a waiter";
+}
+
 TEST(Spec, ParsesTheWorkedExample) {
   const auto s = pglaswell::parse_spec(minimal_spec());
   EXPECT_EQ(s.id, "0001-orders-fulfilment-region");
@@ -3474,6 +3540,76 @@ TEST_F(ToolTest, ASpecNamingAnotherDatabaseByNameIsNotAppliedHere) {
     const auto v = st.value("state", "");
     return v == "cancelled" || v == "succeeded";
   });
+}
+
+// The ceiling, against a real server, with two migrations running at once.
+// The unit tests prove the gate counts; this proves it is WIRED -- that the
+// statements the executor drives actually pass through it, which is the half
+// a gate can pass without doing anything for.
+TEST_F(ToolTest, AStatementCeilingHoldsAcrossConcurrentJobs) {
+  make_big_shop(cfg(), 4000);
+  auto c = cfg();
+  c.executor.batch_rows = 50;          // many batches, so there is real overlap
+  c.executor.commit_interval_ms = 10;
+  c.executor.max_concurrent_jobs = 4;  // jobs are NOT the limit under test
+  c.executor.max_concurrent_operations = 1;
+  set_executor(c.executor);
+
+  // Two specs touching DIFFERENT tables, so nothing serialises them except the
+  // ceiling: same-table work would queue on locks and prove nothing.
+  json a = minimal_spec();
+  a["id"] = "0001-ceiling-a";
+  json b = a;
+  b["id"] = "0002-ceiling-b";
+  b["intents"] = json::array({json{{"kind", "backfill"}, {"schema", "shop"},
+                                   {"table", "widgets"}, {"key", "id"},
+                                   {"set", {{"tag", "'x'"}}},
+                                   {"where", "tag IS NULL"}}});
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/ceiling");
+    w.txn().exec("CREATE TABLE shop.widgets(id bigint GENERATED ALWAYS AS IDENTITY"
+                 " PRIMARY KEY, tag text)");
+    w.txn().exec("INSERT INTO shop.widgets(tag) SELECT NULL FROM generate_series(1,4000)");
+    w.commit();
+  }
+
+  // The plan says what the ceiling is, so an operator reading a plan does not
+  // have to go and find the configuration to know what it will be held to.
+  {
+    const auto planned = payload(call(
+        "planMigration", json{{"spec", signed_doc(a)}}));
+    const auto w = planned.value("budget", json::object()).value("workers", json::object());
+    EXPECT_EQ(w.value("maxConcurrentOperations", -1), 1) << planned.dump(2);
+    EXPECT_NE(w.value("operationsCeiling", "").find("in flight at once"),
+              std::string::npos) << w.dump(2);
+  }
+
+  const auto ja = payload(call("startMigration", json{{"spec", signed_doc(a)}}));
+  const auto jb = payload(call("startMigration", json{{"spec", signed_doc(b)}}));
+  ASSERT_TRUE(ja.value("accepted", false)) << ja.dump(2);
+  ASSERT_TRUE(jb.value("accepted", false)) << jb.dump(2);
+
+  for (const auto* id : {&ja, &jb}) {
+    ASSERT_TRUE(wait_for_status(*this, (*id)["jobId"], [](const json& st) {
+      const auto v = st.value("state", "");
+      return v == "succeeded" || v == "failed" || v == "cancelled";
+    })) << (*id).dump(2);
+    EXPECT_EQ(status_of((*id)["jobId"]).value("state", ""), "succeeded")
+        << "the ceiling must queue work, not break it: " << (*id).dump(2);
+  }
+
+  EXPECT_LE(jobs_->operations().peak(), 1)
+      << "two jobs ran more than one statement at a time under a ceiling of 1";
+  EXPECT_GT(jobs_->operations().peak(), 0)
+      << "nothing passed through the gate at all, so this test proves nothing "
+         "-- the executor is not wired to it";
+  EXPECT_EQ(jobs_->operations().in_flight(), 0) << "a slot was leaked";
+
+  // And the work really happened, on both tables.
+  pglaswell::ReadSession r(cfg());
+  EXPECT_EQ(r.txn().exec("SELECT count(*) FROM shop.widgets WHERE tag IS NULL")[0][0]
+                .as<int>(), 0);
 }
 
 TEST_F(ToolTest, AFailedStepFailsTheJobAndTheLedgerSaysWhich) {
