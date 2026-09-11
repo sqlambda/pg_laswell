@@ -3549,8 +3549,15 @@ TEST_F(ToolTest, ASpecNamingAnotherDatabaseByNameIsNotAppliedHere) {
 TEST_F(ToolTest, AStatementCeilingHoldsAcrossConcurrentJobs) {
   make_big_shop(cfg(), 4000);
   auto c = cfg();
-  c.executor.batch_rows = 50;          // many batches, so there is real overlap
-  c.executor.commit_interval_ms = 10;
+  c.executor.batch_rows = 50;  // many batches, so there is real overlap
+  // NOT smaller. begin() derives idle_in_transaction_session_timeout from this
+  // as commit_interval_ms * 3, so 10 here is a 30ms window -- and under
+  // Valgrind the ordinary work between two statements of one transaction, a
+  // ledger write among it, does not fit in 30ms. Measured: with the ceiling
+  // switched OFF and this at 10, the same test still lost both jobs to
+  // "terminating connection due to idle-in-transaction timeout". That is the
+  // test being wrong about the machine, not the tool being wrong.
+  c.executor.commit_interval_ms = 250;
   c.executor.max_concurrent_jobs = 4;  // jobs are NOT the limit under test
   c.executor.max_concurrent_operations = 1;
   set_executor(c.executor);
@@ -3595,8 +3602,9 @@ TEST_F(ToolTest, AStatementCeilingHoldsAcrossConcurrentJobs) {
       const auto v = st.value("state", "");
       return v == "succeeded" || v == "failed" || v == "cancelled";
     })) << (*id).dump(2);
-    EXPECT_EQ(status_of((*id)["jobId"]).value("state", ""), "succeeded")
-        << "the ceiling must queue work, not break it: " << (*id).dump(2);
+    const auto final_status = status_of((*id)["jobId"]);
+    EXPECT_EQ(final_status.value("state", ""), "succeeded")
+        << "the ceiling must queue work, not break it: " << final_status.dump(2);
   }
 
   EXPECT_LE(jobs_->operations().peak(), 1)

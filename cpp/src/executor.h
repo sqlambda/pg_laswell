@@ -113,6 +113,9 @@ class Executor {
     const auto& steps = job_->plan["steps"];
     int current_group = -1;
     bool group_open = false;
+    // Held for as long as the group's transaction is open, and taken before it
+    // opens. Declared out here so committing the group releases it.
+    OperationGate::Slot group_slot;
 
     for (const auto& step : steps) {
       if (job_->pacing.cancel_stop.load()) {
@@ -141,6 +144,7 @@ class Executor {
         if (group_open) {
           worker.commit();
           group_open = false;
+          group_slot = OperationGate::Slot();  // released with the transaction
         }
         current_group = group;
       }
@@ -165,6 +169,7 @@ class Executor {
       if (kind == "copy_rows" && step.value("detail", json::object())
                                      .contains("copy_rows")) {
         if (!group_open) {
+          group_slot = operation_slot();
           worker.begin(app_name(ordinal));
           group_open = true;
         }
@@ -173,13 +178,17 @@ class Executor {
       }
 
       if (!group_open) {
+        group_slot = operation_slot();
         worker.begin(app_name(ordinal));
         group_open = true;
       }
       run_in_transaction(worker, ordinal, step);
     }
 
-    if (group_open) worker.commit();
+    if (group_open) {
+      worker.commit();
+      group_slot = OperationGate::Slot();
+    }
     succeed();
   }
 
@@ -187,20 +196,42 @@ class Executor {
     return "pg_laswell/" + job_->job_id + "/step-" + std::to_string(ordinal);
   }
 
-  // A slot for ONE statement, waited for in bounded steps so a cancel still
-  // lands. Returns an unheld Slot when no ceiling is configured, which is the
-  // default and costs a single atomic read.
+  // A slot, taken BEFORE a transaction opens and held until it closes.
   //
-  // Cancellation wins over the queue: a job told to stop should stop, not
-  // finish waiting for permission to do work nobody wants any more.
+  // Never while one is open, and the reason is not a preference. begin() sets
+  // idle_in_transaction_session_timeout to commit_interval_ms * 3 as a
+  // self-guard -- "the tool must not be able to hurt the database by
+  // malfunctioning quietly", session.h -- and a worker parked on this gate
+  // with a transaction open is precisely that malfunction: holding locks while
+  // doing nothing. The first version of this queued per statement, inside the
+  // group, and the server did exactly what it is configured to do:
+  //
+  //   FATAL: terminating connection due to idle-in-transaction timeout
+  //
+  // Both jobs died and 3450 of 4000 rows went unwritten. The guard was right.
+  // So the ceiling counts transactions rather than individual statements: a
+  // group of DDL holds one slot for its whole transaction, a paced batch holds
+  // one for its batch, and a CREATE INDEX CONCURRENTLY -- which runs in no
+  // transaction at all -- holds one for the statement. That is a tighter bound
+  // than counting statements, never a looser one, which is the direction an
+  // upper bound is allowed to be wrong in.
+  //
+  // Waits in bounded steps so a cancelled job still cancels rather than
+  // queueing for permission to do work nobody wants any more.
   OperationGate::Slot operation_slot() {
-    if (operations_ == nullptr) return OperationGate::Slot();
-    OperationGate::Slot slot = operations_->try_acquire_for(0);
-    while (!slot.held() && operations_->would_block()) {
-      if (job_->pacing.cancel_stop.load()) return OperationGate::Slot();
-      slot = operations_->try_acquire_for(50);
+    if (operations_ == nullptr || operations_->limit() <= 0) {
+      return OperationGate::Slot();
     }
-    return slot;
+    for (;;) {
+      auto slot = operations_->try_acquire_for(50);
+      if (slot.held()) return slot;
+      // Re-read rather than trusting the first look: the ceiling can be raised
+      // while a job waits, and an unheld slot returned because there is no
+      // ceiling any more is correct, while one returned because the gate
+      // happened to be momentarily free is a statement running uncounted.
+      if (operations_->limit() <= 0) return OperationGate::Slot();
+      if (job_->pacing.cancel_stop.load()) return OperationGate::Slot();
+    }
   }
 
   void run_in_transaction(WriteSession& w, int ordinal, const json& step) {
@@ -210,7 +241,6 @@ class Executor {
       const auto stmt = detail::strip_semicolon(raw.get<std::string>());
       if (stmt.empty()) continue;
       try {
-        const auto slot = operation_slot();
         const auto r = w.txn().exec(stmt);
         rows += r.affected_rows();
       } catch (const pqxx::sql_error& e) {
@@ -258,7 +288,6 @@ class Executor {
       // own copy of the streaming loop, which is how the two came to quote
       // column names slightly differently while both being correct only
       // because require_identifier restricts them to [a-z0-9_].
-      const auto slot = operation_slot();
       Catalog::stream_copy(w, step.value("detail", json::object()), written);
     } catch (const pqxx::sql_error& e) {
       record_step(ordinal, step, "failed", 0,
@@ -429,6 +458,12 @@ class Executor {
         return;
       }
 
+      // Before the batch transaction opens, never inside it.
+      const auto batch_slot = operation_slot();
+      if (job_->pacing.cancel_stop.load()) {
+        cancelled();
+        return;
+      }
       w.begin(app_name(ordinal));
       const auto txn_started = detail::steady_ms();
       long long rows_this_txn = 0;
@@ -444,7 +479,6 @@ class Executor {
                               : e.batch_rows;
         long long affected = 0;
         try {
-          const auto slot = operation_slot();
           const auto r = pqxx_exec(w.txn(), sql, pqxx::params{cursor, batch});
           affected = static_cast<long long>(r.size());
           for (const auto& row : r) {
