@@ -2683,8 +2683,8 @@ class ToolTest : public BootstrappedTest {
     ctx_ = std::make_unique<pglaswell::ToolContext>(
         pglaswell::Registry::from_url(url_, "pg-laswell/test"), nullptr);
     ctx_->jobs = jobs_.get();
-    observer_ = std::make_unique<pglaswell::Observer>(cfg(), jobs_.get(), 25);
-    ctx_->observer = observer_.get();
+    observers_ = std::make_unique<pglaswell::ObserverPool>(jobs_.get());
+    ctx_->observers = observers_.get();
     // Gate 1 trusts the suite key, so gate 2 is the one under test.
     ctx_->registry.mutable_trust() = policy_trusting_test_key();
     server_ = std::make_unique<pglaswell::McpServer>(pglaswell::make_tools(*ctx_));
@@ -2710,7 +2710,7 @@ class ToolTest : public BootstrappedTest {
       for (const auto& j : jobs_->all()) j->pacing.cancel_stop = true;
       jobs_->join_all();
     }
-    if (observer_) observer_->stop();
+    if (observers_) observers_->stop_all();
   }
 
   // The status of one job, as an agent would read it.
@@ -2727,7 +2727,7 @@ class ToolTest : public BootstrappedTest {
   }
 
   std::unique_ptr<pglaswell::JobRegistry> jobs_;
-  std::unique_ptr<pglaswell::Observer> observer_;
+  std::unique_ptr<pglaswell::ObserverPool> observers_;
   std::unique_ptr<pglaswell::ToolContext> ctx_;
   std::unique_ptr<pglaswell::McpServer> server_;
 };
@@ -10475,6 +10475,305 @@ class DeployTest : public RepoTest {
 };
 
 }  // namespace
+
+// --- a repository across two databases --------------------------------------
+//
+// The mechanism the replication case needs, proved without needing logical
+// replication to prove it: a specification names the connection it runs
+// against, is classified against THAT database's ledger, and depends_on
+// crosses databases -- so the consumer waits for the producer even though
+// neither can see the other's tables.
+class TwoDatabaseTest : public RepoTest {
+ public:
+  void SetUp() override {
+    RepoTest::SetUp();
+    if (::testing::Test::IsSkipped()) return;
+
+    // A second database on the same cluster. Same server, different database:
+    // enough to be a different ledger, a different catalog and a different
+    // connection, which is all this is about.
+    {
+      pglaswell::WriteSession w(cfg());
+      w.exec_nontransactional("DROP DATABASE IF EXISTS laswell_second");
+      w.exec_nontransactional("CREATE DATABASE laswell_second");
+    }
+    second_url_ = url_with_dbname("laswell_second");
+    bootstrap_into(second_url_);
+
+    // A registry with BOTH, built through the real INI path rather than a
+    // test-only back door, so the configuration shape a user writes is the
+    // one under test.
+    ini_ = dir_ + "/two.ini";
+    {
+      std::ofstream f(ini_);
+      f << "[first]\n" << conn_section(url_)
+        << "\n[second]\n" << conn_section(second_url_);
+    }
+    ::chmod(ini_.c_str(), 0600);
+
+    ctx_->registry = pglaswell::Registry::from_ini(ini_, "pg-laswell/test");
+    ctx_->registry.mutable_trust() = policy_trusting_test_key();
+    for (const auto& name : ctx_->registry.order()) {
+      ctx_->registry.mutable_get(name).executor.observer_tick_ms = 25;
+    }
+    server_ = std::make_unique<pglaswell::McpServer>(pglaswell::make_tools(*ctx_));
+    initialize(*server_);
+  }
+
+  void TearDown() override {
+    if (!::testing::Test::IsSkipped()) {
+      try {
+        pglaswell::ConnConfig c;
+        c.name = "t";
+        c.conninfo = url_;
+        pglaswell::WriteSession w(c);
+        w.exec_nontransactional("DROP DATABASE IF EXISTS laswell_second");
+      } catch (...) {
+      }
+    }
+    RepoTest::TearDown();
+  }
+
+  std::string url_with_dbname(const std::string& db) {
+    // The fixture's URL with its database swapped. Both forms of conninfo are
+    // in use across this suite, so both are handled.
+    if (url_.rfind("postgresql://", 0) == 0 || url_.rfind("postgres://", 0) == 0) {
+      const auto q = url_.find('?');
+      const auto base = q == std::string::npos ? url_ : url_.substr(0, q);
+      const auto slash = base.rfind('/');
+      return base.substr(0, slash + 1) + db + (q == std::string::npos ? "" : url_.substr(q));
+    }
+    std::string out;
+    std::istringstream in(url_);
+    std::string tok;
+    while (in >> tok) {
+      if (tok.rfind("dbname=", 0) == 0) continue;
+      out += tok + " ";
+    }
+    return out + "dbname=" + db;
+  }
+
+  static std::string conn_section(const std::string& url) {
+    // Parsed by hand rather than with std::regex: four fields, and both
+    // conninfo spellings appear in this suite.
+    std::string host = "127.0.0.1", port = "5432", db = "postgres", user = "postgres";
+    const auto scheme = url.find("://");
+    if (scheme != std::string::npos) {
+      std::string rest = url.substr(scheme + 3);
+      const auto q = rest.find('?');
+      if (q != std::string::npos) rest = rest.substr(0, q);
+      const auto at = rest.find('@');
+      if (at != std::string::npos) {
+        std::string cred = rest.substr(0, at);
+        const auto colon = cred.find(':');
+        user = colon == std::string::npos ? cred : cred.substr(0, colon);
+        rest = rest.substr(at + 1);
+      }
+      const auto slash = rest.find('/');
+      std::string hostport = slash == std::string::npos ? rest : rest.substr(0, slash);
+      if (slash != std::string::npos) db = rest.substr(slash + 1);
+      const auto colon = hostport.find(':');
+      if (colon == std::string::npos) {
+        host = hostport;
+      } else {
+        host = hostport.substr(0, colon);
+        port = hostport.substr(colon + 1);
+      }
+    } else {
+      std::istringstream in(url);
+      std::string tok;
+      while (in >> tok) {
+        const auto eq = tok.find('=');
+        if (eq == std::string::npos) continue;
+        const auto k = tok.substr(0, eq), v = tok.substr(eq + 1);
+        if (k == "host") host = v;
+        if (k == "port") port = v;
+        if (k == "dbname") db = v;
+        if (k == "user") user = v;
+      }
+    }
+    return "host = " + host + "\nport = " + port + "\ndbname = " + db +
+           "\nuser = " + user + "\n";
+  }
+
+  void bootstrap_into(const std::string& url) {
+    const std::string key_b64 = pglaswell::Registry::base64_encode(test_key().pub);
+    const std::string cmd =
+        "PSQLRC=/dev/null psql -X -q -v ON_ERROR_STOP=1 "
+        "-v laswell_role=laswell_runner "
+        "-v first_key_id=" + test_key().key_id +
+        " -v first_key_b64=" + key_b64 +
+        " -v first_key_label=suite "
+        "-f " + std::string(PGLASWELL_BOOTSTRAP_SQL) + " \"" + url + "\" 2>&1";
+    ASSERT_EQ(std::system(cmd.c_str()), 0) << "bootstrap.sql failed on " << url;
+  }
+
+  std::string second_url_, ini_;
+};
+
+TEST_F(TwoDatabaseTest, ASpecificationRunsWhereItSaysAndWaitsForAnotherDatabase) {
+  const auto table_spec = [](const std::string& id, const std::string& conn,
+                             const std::string& table,
+                             const std::vector<std::string>& deps) {
+    json d{{"laswell_spec_version", 1},
+           {"id", id},
+           {"description", "creates " + table},
+           {"target", json{{"connection", conn}}},
+           {"intents", json::array({json{{"kind", "create_table"},
+                                         {"schema", "public"},
+                                         {"table", table},
+                                         {"comment", "test"},
+                                         {"primary_key", json::array({"id"})},
+                                         {"columns", json::array({json{
+                                              {"name", "id"},
+                                              {"type", "bigint"},
+                                              {"nullable", false},
+                                              {"comment", "pk"}}})}}})}};
+    if (!deps.empty()) d["depends_on"] = deps;
+    return d;
+  };
+
+  // The producer on one database; the consumer on the other, waiting for it.
+  write_spec("a.json", table_spec("0001-producer", "first", "produced", {}));
+  write_spec("b.json", table_spec("0002-consumer", "second", "consumed",
+                                  {"0001-producer"}));
+
+  const auto listing = scan(/*derive=*/false);
+  ASSERT_TRUE(listing.value("problems", json::array()).empty()) << listing.dump(2);
+
+  // Each is routed, and the listing says where.
+  std::map<std::string, std::string> where;
+  for (const auto& m : listing["migrations"]) {
+    where[m.value("specId", "")] = m.value("connection", "");
+    EXPECT_EQ(m.value("status", ""), "pending") << m.dump(2);
+  }
+  EXPECT_EQ(where["0001-producer"], "first");
+  EXPECT_EQ(where["0002-consumer"], "second");
+
+  // And the dependency is honoured ACROSS the databases: two levels, not one.
+  const auto order = listing["order"];
+  ASSERT_EQ(order.size(), 2u) << "a cross-database dependency must still be a "
+                                 "dependency:\n" << order.dump(2);
+  EXPECT_EQ(order[0]["groups"][0]["specs"][0], "0001-producer");
+  EXPECT_EQ(order[1]["groups"][0]["specs"][0], "0002-consumer");
+}
+
+// And deployed: each specification applied in ITS database, the dependency
+// respected across the gap, and each ledger recording only its own.
+TEST_F(TwoDatabaseTest, DeployAppliesEachSpecificationInItsOwnDatabase) {
+  const auto table_spec = [](const std::string& id, const std::string& conn,
+                             const std::string& table,
+                             const std::vector<std::string>& deps) {
+    json d{{"laswell_spec_version", 1},
+           {"id", id},
+           {"description", "creates " + table},
+           {"target", json{{"connection", conn}}},
+           {"intents", json::array({json{{"kind", "create_table"},
+                                         {"schema", "public"},
+                                         {"table", table},
+                                         {"comment", "test"},
+                                         {"primary_key", json::array({"id"})},
+                                         {"columns", json::array({json{
+                                              {"name", "id"},
+                                              {"type", "bigint"},
+                                              {"nullable", false},
+                                              {"comment", "pk"}}})}}})}};
+    if (!deps.empty()) d["depends_on"] = deps;
+    return d;
+  };
+  write_spec("a.json", table_spec("0001-producer", "first", "produced", {}));
+  write_spec("b.json", table_spec("0002-consumer", "second", "consumed",
+                                  {"0001-producer"}));
+
+  std::ostringstream out;
+  pglaswell::DeployOptions opts;
+  opts.repo = dir_;
+  opts.poll_ms = 50;
+  opts.out = &out;
+  pglaswell::Deployment run(*ctx_, opts);
+  const auto result = run.run();
+  const auto text = out.str();
+  EXPECT_EQ(result, pglaswell::DeployResult::kOk) << text;
+  EXPECT_NE(text.find("across 2 databases"), std::string::npos)
+      << "a run that reaches two servers should say so: " << text;
+
+  // The tables landed in the right databases, and NOT in the wrong ones.
+  const auto has_table = [&](const std::string& url, const std::string& t) {
+    pglaswell::ConnConfig c;
+    c.name = "probe";
+    c.conninfo = url;
+    pglaswell::ReadSession r(c);
+    return pglaswell::pqxx_exec(
+               r.txn(), "SELECT count(*) FROM pg_class c JOIN pg_namespace n"
+                        " ON n.oid = c.relnamespace WHERE n.nspname = 'public'"
+                        " AND c.relname = $1", pqxx::params{t})[0][0].as<int>();
+  };
+  EXPECT_EQ(has_table(url_, "produced"), 1) << text;
+  EXPECT_EQ(has_table(second_url_, "consumed"), 1) << text;
+  EXPECT_EQ(has_table(url_, "consumed"), 0) << "the consumer ran in the wrong database";
+  EXPECT_EQ(has_table(second_url_, "produced"), 0) << "the producer ran in the wrong database";
+
+  // Each ledger records its own and only its own -- there is no shared ledger
+  // and no cross-database transaction, which is the whole reason the boundary
+  // is the specification.
+  const auto ledger_has = [&](const std::string& url, const std::string& id) {
+    pglaswell::ConnConfig c;
+    c.name = "probe";
+    c.conninfo = url;
+    pglaswell::ReadSession r(c);
+    return pglaswell::pqxx_exec(
+               r.txn(), "SELECT count(*) FROM laswell.migration WHERE spec_id = $1",
+               pqxx::params{id})[0][0].as<int>();
+  };
+  EXPECT_EQ(ledger_has(url_, "0001-producer"), 1);
+  EXPECT_EQ(ledger_has(second_url_, "0002-consumer"), 1);
+  EXPECT_EQ(ledger_has(url_, "0002-consumer"), 0);
+  EXPECT_EQ(ledger_has(second_url_, "0001-producer"), 0);
+
+  // Re-running is a no-op in both: applied is applied, wherever it was applied.
+  std::ostringstream again_out;
+  opts.out = &again_out;
+  pglaswell::Deployment again(*ctx_, opts);
+  EXPECT_EQ(again.run(), pglaswell::DeployResult::kOk) << again_out.str();
+  EXPECT_NE(again_out.str().find("0 pending"), std::string::npos) << again_out.str();
+}
+
+// A specification naming a connection the configuration does not define is a
+// repository problem, not a gate: every other status answers "should this run
+// here", and this one says the question could not be asked at all.
+TEST_F(TwoDatabaseTest, AnUndefinedConnectionIsARepositoryProblem) {
+  json d{{"laswell_spec_version", 1},
+         {"id", "0001-nowhere"},
+         {"description", "targets a connection that does not exist"},
+         {"target", json{{"connection", "typo"}}},
+         {"intents", json::array({json{{"kind", "create_table"},
+                                       {"schema", "public"},
+                                       {"table", "nowhere"},
+                                       {"comment", "test"},
+                                       {"primary_key", json::array({"id"})},
+                                       {"columns", json::array({json{
+                                            {"name", "id"},
+                                            {"type", "bigint"},
+                                            {"nullable", false},
+                                            {"comment", "pk"}}})}}})}};
+  write_spec("a.json", d);
+  const auto listing = scan(/*derive=*/false);
+  const auto problems = listing.value("problems", json::array());
+  ASSERT_FALSE(problems.empty()) << listing.dump(2);
+  EXPECT_NE(problems[0].get<std::string>().find("typo"), std::string::npos)
+      << problems.dump(2);
+  EXPECT_EQ(listing["migrations"][0].value("status", ""), "unknown_connection")
+      << listing.dump(2);
+
+  // And a deployment refuses the repository rather than applying the rest of
+  // it: what is unknown includes where that file sat in the order.
+  std::ostringstream out;
+  pglaswell::DeployOptions opts;
+  opts.repo = dir_;
+  opts.out = &out;
+  pglaswell::Deployment run(*ctx_, opts);
+  EXPECT_EQ(run.run(), pglaswell::DeployResult::kRepoProblem) << out.str();
+}
 
 TEST_F(DeployTest, AppliesEverythingPendingAndSaysNothingIsLeft) {
   exec("DROP SCHEMA IF EXISTS shop CASCADE");

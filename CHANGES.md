@@ -24,6 +24,15 @@ and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
   error on a reserved-word schema. Measured: `INSERT INTO user.t` fails at
   `user`, while `INSERT INTO cf.order` parses -- it is the schema that has to be
   quoted, which is why a case naming only a reserved table proves nothing.
+- **A repository may span several databases.** A specification names
+  `target.connection`, is classified against THAT database's ledger, and is
+  applied there; `depends_on` crosses databases freely, so the subscription on
+  one server waits for the publication on another. A change is always
+  single-database -- PostgreSQL has no cross-database transaction, so a
+  specification spanning two would be atomic in neither -- and the boundary
+  stays at the specification, which keeps each half separately recorded and
+  separately resumable. Observers are now one per connection: a job is watched
+  in the database it runs in, or the contention breaker is watching nothing.
 - **`max_concurrent_operations`: a ceiling on migration statements in flight**,
   across every job the process runs, answering a different question from
   `max_concurrent_jobs`. Jobs are how much work is underway; operations are how

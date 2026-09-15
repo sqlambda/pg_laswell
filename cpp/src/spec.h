@@ -296,6 +296,22 @@ struct Spec {
   std::string id;
   std::string description;
   std::string rationale;
+  // WHICH DATABASE THIS RUNS AGAINST, by the name of a connection in the
+  // configuration -- as distinct from target_database, which is a GUARD
+  // compared to current_database() once you are there. One routes, the other
+  // double-checks the routing arrived.
+  //
+  // A change is always single-database. It may REQUIRE a change on a different
+  // one -- a subscription needs its publication first -- and that is what
+  // depends_on is for, which crosses databases freely. There is no
+  // cross-database transaction in PostgreSQL, so a specification that spanned
+  // two would be atomic in neither; keeping the boundary at the specification
+  // is what keeps each half atomic where atomicity actually exists.
+  //
+  // Not to be confused with intents[i].connection on create_subscription,
+  // which is the libpq string the SUBSCRIPTION itself dials out on -- a
+  // PostgreSQL concept, nothing to do with this tool's configuration.
+  std::string target_connection;
   std::string target_database;
   // Which environment this specification is FOR, and which release gates it.
   //
@@ -2455,8 +2471,13 @@ inline Spec parse_spec(const json& doc) {
       detail::fail("\"target\" must be an object", "");
     }
     detail::reject_unknown_keys(
-        doc["target"], {"database", "environment", "min_server_version"},
+        doc["target"],
+        {"connection", "database", "environment", "min_server_version"},
         "target");
+    if (doc["target"].contains("connection")) {
+      s.target_connection =
+          detail::require_string(doc["target"], "connection", "target");
+    }
     s.target_database = doc["target"].value("database", "");
     if (doc["target"].contains("environment")) {
       s.target_environment = detail::require_string(doc["target"], "environment",

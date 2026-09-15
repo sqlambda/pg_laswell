@@ -74,7 +74,11 @@ enum class RepoStatus {
   // that skips them has done its job correctly.
   kWrongEnvironment,
   kWrongDatabase,
-  kHeldForRelease
+  kHeldForRelease,
+  // The specification names a connection this configuration does not define.
+  // A repository problem rather than a gate: every other status answers "should
+  // this run here", and this one says the question could not be asked.
+  kUnknownConnection
 };
 
 inline const char* to_string(RepoStatus s) {
@@ -88,6 +92,7 @@ inline const char* to_string(RepoStatus s) {
     case RepoStatus::kWrongEnvironment: return "wrong_environment";
     case RepoStatus::kWrongDatabase: return "wrong_database";
     case RepoStatus::kHeldForRelease: return "held_for_release";
+    case RepoStatus::kUnknownConnection: return "unknown_connection";
   }
   return "unknown";
 }
@@ -102,6 +107,7 @@ struct RepoEntry {
   std::string error;
   std::string hint;
   std::string applied_digest;  // set when status is kModified
+  std::string connection;      // which configured connection it runs against
   std::string database;        // target.database, as the spec declares it
   std::string environment;     // target.environment, as the spec declares it
   std::string release;         // the release tag gating it, if any
@@ -254,11 +260,63 @@ class RelationAnalyzer {
   ConnectionCache* cache_ = nullptr;
 };
 
-// A directory of specs, classified against one database's ledger.
+// A directory of specs, each classified against the ledger of the database it
+// targets -- which need not be the same database for all of them.
+//
+// One repository, many databases. A specification names a connection in
+// `target.connection` and is classified, gated and applied there; one that
+// names none uses the caller's. depends_on crosses databases freely, because
+// the ordering question -- "has that one been applied yet" -- is answerable
+// wherever it ran, and the ledger that answers it lives in ITS database.
+//
+// What does NOT cross is atomicity. A change is single-database; it may
+// require a change on another. PostgreSQL has no cross-database transaction,
+// so the specification stays the unit, and each unit is atomic where
+// atomicity actually exists.
 class MigrationRepository {
  public:
-  MigrationRepository(ConnConfig cfg, ConnectionCache* cache)
-      : cfg_(std::move(cfg)), cache_(cache) {}
+  MigrationRepository(const Registry& registry, std::string default_connection,
+                      ConnectionCache* cache)
+      : registry_(&registry),
+        default_connection_(std::move(default_connection)),
+        cache_(cache) {}
+
+ private:
+  // Everything one database says about itself, read ONCE per listing. Two
+  // entries targeting the same connection answer against the same reading,
+  // which a per-entry query could not promise.
+  struct View {
+    bool reachable = false;
+    std::string error;
+    std::string database;
+    std::string environment;
+    std::set<std::string> releases_ready;
+    json applied = json::object();
+  };
+
+  const View& view_for(const std::string& connection) {
+    const auto it = views_.find(connection);
+    if (it != views_.end()) return it->second;
+    View v;
+    try {
+      const auto& cfg = registry_->get(connection);
+      Ledger ledger(cfg, cache_);
+      const auto st = ledger.status();
+      v.database = st.database;
+      v.environment = st.environment;
+      v.releases_ready = st.releases_ready;
+      v.applied = applied_index(cfg);
+      v.reachable = true;
+    } catch (const std::exception& e) {
+      // Unreachable is reported by the tools that need it; here it means
+      // nothing is labelled, nothing approved and nothing applied, which HOLDS
+      // every gated spec rather than releasing it.
+      v.error = e.what();
+    }
+    return views_.emplace(connection, std::move(v)).first->second;
+  }
+
+ public:
 
   json scan(const std::string& dir, bool derive_relations) {
     namespace fs = std::filesystem;
@@ -280,25 +338,6 @@ class MigrationRepository {
     }
     std::sort(files.begin(), files.end());
 
-    // What this database says about itself, read once. Every gate below is a
-    // lookup against these two, so the answer cannot drift between entries in
-    // one listing the way a per-entry query could.
-    try {
-      Ledger ledger(cfg_, cache_);
-      const auto st = ledger.status();
-      ledger_db_ = st.database;
-      ledger_env_ = st.environment;
-      ledger_ready_ = st.releases_ready;
-    } catch (const std::exception&) {
-      // Unreadable ledger is reported by the tools that need it; here it means
-      // "nothing is labelled and nothing is approved", which holds every gated
-      // spec rather than releasing it.
-      ledger_db_.clear();
-      ledger_env_.clear();
-      ledger_ready_.clear();
-    }
-
-    const auto applied = applied_index();
     std::map<std::string, Spec> parsed;
 
     for (const auto& path : files) {
@@ -314,9 +353,29 @@ class MigrationRepository {
         entry.database = spec.target_database;
         entry.environment = spec.target_environment;
         entry.release = spec.release;
+        // Routed before it is classified, because WHICH ledger answers "has
+        // this been applied" is the first question, not a detail of the
+        // answer.
+        entry.connection = spec.target_connection.empty()
+                               ? default_connection_
+                               : spec.target_connection;
         parsed[spec.id] = spec;
-        classify(entry, applied);
-        gate(entry);
+        if (!registry_->has(entry.connection)) {
+          entry.status = RepoStatus::kUnknownConnection;
+          entry.error = "\"" + spec.id + "\" targets connection \"" +
+                        entry.connection +
+                        "\", which this configuration does not define";
+          entry.hint =
+              "Add a [" + entry.connection +
+              "] section naming its host, port, dbname and user, or correct "
+              "target.connection. A specification cannot be classified at all "
+              "until it is known which database's ledger to ask.";
+          entries.push_back(std::move(entry));
+          continue;
+        }
+        const auto& view = view_for(entry.connection);
+        classify(entry, view.applied);
+        gate(entry, view);
       } catch (const SpecError& e) {
         entry.status = RepoStatus::kUnreadable;
         entry.error = e.what();
@@ -336,6 +395,10 @@ class MigrationRepository {
     // of a repository whose remainder is unknown -- and what is unknown
     // includes where that file sat in the dependency order.
     for (const auto& e : entries) {
+      if (e.status == RepoStatus::kUnknownConnection) {
+        problems.push_back(e.error + ". " + e.hint);
+        continue;
+      }
       if (e.status != RepoStatus::kUnreadable) continue;
       problems.push_back(
           e.path + " does not parse, so what it changes and where it belongs in "
@@ -343,17 +406,27 @@ class MigrationRepository {
           (e.error.empty() ? std::string("no detail") : e.error));
     }
 
-    // Anything the ledger knows that the directory does not.
+    // Anything a ledger knows that the directory does not -- asked of EVERY
+    // database this listing touched, and answered with the name of the one
+    // that knows, because "applied here" is now a question with several
+    // possible heres.
+    //
+    // The default connection is read even when no specification names it: it
+    // is where an unrouted specification would go, so its ledger is part of
+    // this repository's story whether or not a file currently points there.
+    if (registry_->has(default_connection_)) (void)view_for(default_connection_);
     std::set<std::string> on_disk;
     for (const auto& e : entries) {
       if (!e.spec_id.empty()) on_disk.insert(e.spec_id);
     }
-    for (auto it = applied.begin(); it != applied.end(); ++it) {
-      if (on_disk.count(it.key()) == 0) {
-        problems.push_back(
-            "the ledger records \"" + it.key() +
-            "\" as applied here, and no file in the repository has that id. It "
-            "was applied from somewhere else, or the file was deleted.");
+    for (const auto& [conn, view] : views_) {
+      for (auto it = view.applied.begin(); it != view.applied.end(); ++it) {
+        if (on_disk.count(it.key()) == 0) {
+          problems.push_back(
+              "the ledger of \"" + conn + "\" records \"" + it.key() +
+              "\" as applied, and no file in the repository has that id. It "
+              "was applied from somewhere else, or the file was deleted.");
+        }
       }
     }
 
@@ -363,8 +436,8 @@ class MigrationRepository {
 
  private:
   // spec_id -> {digest -> best state}
-  json applied_index() {
-    ReadSession s(cfg_, std::nullopt, cache_, 2000);
+  json applied_index(const ConnConfig& cfg) {
+    ReadSession s(cfg, std::nullopt, cache_, 2000);
     const auto probe =
         s.txn().exec("SELECT to_regclass('laswell.migration') IS NOT NULL");
     if (probe.empty() || !probe[0][0].as<bool>()) return json::object();
@@ -450,7 +523,7 @@ class MigrationRepository {
   // configuration must not be able to talk a production database into running
   // the development migration, and an environment asserted by whoever launched
   // the tool would be exactly that.
-  void gate(RepoEntry& e) {
+  void gate(RepoEntry& e, const View& view) {
     if (e.status != RepoStatus::kPending && e.status != RepoStatus::kFailed) {
       return;
     }
@@ -459,10 +532,10 @@ class MigrationRepository {
     // needs nothing to have been set up. It is also the weakest -- see
     // LedgerStatus::database -- so it is a check the author asked for rather
     // than a substitute for the environment label.
-    if (!e.database.empty() && !ledger_db_.empty() && e.database != ledger_db_) {
+    if (!e.database.empty() && !view.database.empty() && e.database != view.database) {
       e.status = RepoStatus::kWrongDatabase;
       e.error = "\"" + e.spec_id + "\" targets database \"" + e.database +
-                "\" and this is \"" + ledger_db_ + "\"";
+                "\" and this is \"" + view.database + "\"";
       e.hint = "Nothing is wrong: this specification names another database by "
                "name, so it will never be applied to this one. A database name "
                "proves less than an environment label -- a dump restored "
@@ -472,7 +545,7 @@ class MigrationRepository {
     }
 
     if (!e.environment.empty()) {
-      if (ledger_env_.empty()) {
+      if (view.environment.empty()) {
         // Cannot be checked, so it is not assumed to pass. An unlabelled
         // database is a database that has not said what it is, and a spec that
         // names an environment is asking a question it cannot answer.
@@ -486,10 +559,10 @@ class MigrationRepository {
             "set_by = current_user;";
         return;
       }
-      if (e.environment != ledger_env_) {
+      if (e.environment != view.environment) {
         e.status = RepoStatus::kWrongEnvironment;
         e.error = "\"" + e.spec_id + "\" targets environment \"" +
-                  e.environment + "\" and this database is \"" + ledger_env_ +
+                  e.environment + "\" and this database is \"" + view.environment +
                   "\"";
         e.hint = "Nothing is wrong: this specification is for another "
                  "database. It will stay listed here and will never be applied "
@@ -498,7 +571,7 @@ class MigrationRepository {
       }
     }
 
-    if (!e.release.empty() && ledger_ready_.count(e.release) == 0) {
+    if (!e.release.empty() && view.releases_ready.count(e.release) == 0) {
       e.status = RepoStatus::kHeldForRelease;
       e.error = "\"" + e.spec_id + "\" is held: release \"" + e.release +
                 "\" is not marked ready in this database";
@@ -515,12 +588,19 @@ class MigrationRepository {
 
   void derive(std::vector<RepoEntry>& entries,
               const std::map<std::string, Spec>& parsed) {
-    RelationAnalyzer analyzer(cfg_, cache_);
-    Catalog cat(cfg_, cache_);
+    // Per connection, because relations are only comparable within the
+    // database that holds them: "shop.orders" in one database and
+    // "shop.orders" in another are different tables that happen to be spelled
+    // the same, and treating them as one would serialise work that cannot
+    // conflict -- or worse, let the name coincidence stand in for evidence.
     for (auto& e : entries) {
-      if (e.status == RepoStatus::kUnreadable || e.status == RepoStatus::kApplied) {
+      if (e.status == RepoStatus::kUnreadable || e.status == RepoStatus::kApplied ||
+          e.status == RepoStatus::kUnknownConnection) {
         continue;
       }
+      const auto& cfg = registry_->get(e.connection);
+      RelationAnalyzer analyzer(cfg, cache_);
+      Catalog cat(cfg, cache_);
       const auto it = parsed.find(e.spec_id);
       if (it == parsed.end()) continue;
       try {
@@ -530,7 +610,7 @@ class MigrationRepository {
           tables.push_back(in.table());
         }
         const auto obs = cat.observe(schemas, tables);
-        const auto plan = plan_migration(it->second, obs, cfg_.executor);
+        const auto plan = plan_migration(it->second, obs, cfg.executor);
         e.relations = analyzer.analyze(it->second, plan.to_json());
       } catch (const std::exception& ex) {
         e.relations.opaque.push_back(
@@ -632,6 +712,7 @@ class MigrationRepository {
              {"specId", e.spec_id},
              {"digest", e.digest},
              {"status", to_string(e.status)},
+             {"connection", e.connection},
              {"dependsOn", e.depends_on}};
       if (!e.relations.relations.empty()) {
         j["relations"] = e.relations.relations;
@@ -681,8 +762,20 @@ class MigrationRepository {
       const bool complete_i = by_id.at(ready[i])->relations.complete();
       taken[i] = true;
 
+      const auto& conn_i = by_id.at(ready[i])->connection;
       for (std::size_t k = i + 1; k < ready.size(); ++k) {
         if (taken[k]) continue;
+        // Different databases cannot touch each other's tables, so two
+        // specifications on different connections are independent by
+        // construction rather than by evidence -- the one case where this
+        // grants concurrency without having to prove anything. Nothing
+        // crosses a database but the dependency the author declared, and a
+        // dependency puts them in different LEVELS, never this list.
+        if (by_id.at(ready[k])->connection != conn_i) {
+          group.push_back(ready[k]);
+          taken[k] = true;
+          continue;
+        }
         const auto& other = by_id.at(ready[k])->relations;
         bool overlaps = false;
         std::string shared;
@@ -728,12 +821,9 @@ class MigrationRepository {
     return level;
   }
 
-  // Read once per scan, in scan(), so every gate in one listing answers
-  // against the same reading.
-  std::string ledger_db_;
-  std::string ledger_env_;
-  std::set<std::string> ledger_ready_;
-  ConnConfig cfg_;
+  const Registry* registry_ = nullptr;
+  std::string default_connection_;
+  std::map<std::string, View> views_;
   ConnectionCache* cache_ = nullptr;
 };
 

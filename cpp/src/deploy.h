@@ -174,6 +174,19 @@ class Deployment {
  private:
   void report_plan(std::ostream& out, const json& listing, int pending) const {
     out << "repository " << opts_.repo << ": " << pending << " pending\n";
+    // Which databases this deployment touches, named up front: a run that
+    // reaches two servers should say so before it reaches either.
+    std::set<std::string> connections;
+    for (const auto& m : listing.value("migrations", json::array())) {
+      if (m.value("status", "") == "pending") {
+        connections.insert(m.value("connection", ""));
+      }
+    }
+    if (connections.size() > 1) {
+      out << "  across " << connections.size() << " databases:";
+      for (const auto& c : connections) out << " " << c;
+      out << "\n";
+    }
     int level_no = 0;
     for (const auto& level : listing.value("order", json::array())) {
       ++level_no;
@@ -185,6 +198,7 @@ class Deployment {
         } else if (!specs.empty()) {
           out << "  level " << level_no << ": " << specs[0].get<std::string>() << "\n";
         }
+
       }
       // Named, not hidden. This is the one place a human or an agent could do
       // better than this runner, and saying so is the honest report.
@@ -240,13 +254,22 @@ class Deployment {
           // construction. Said rather than left to be noticed, because every
           // other exit from this loop drains and a reader is owed the reason
           // this one does not.
-          const auto plan = plan_migration_tool(ctx_, json{{"spec", spec}});
+          const auto connection = by_id[id].value("connection", "");
+          json plan_args{{"spec", spec}};
+          if (!connection.empty()) plan_args["connection"] = connection;
+          const auto plan = plan_migration_tool(ctx_, plan_args);
           const auto outcome = report_plan_outcome(out, id, plan);
           if (outcome != DeployResult::kOk) return outcome;
           continue;
         }
 
-        const auto started = start_migration(ctx_, json{{"spec", spec}});
+        // Routed to the connection the listing says this specification runs
+        // against, which need not be the one the deployment was pointed at. A
+        // dependency may cross databases; a change may not.
+        const auto connection = by_id[id].value("connection", "");
+        json start_args{{"spec", spec}};
+        if (!connection.empty()) start_args["connection"] = connection;
+        const auto started = start_migration(ctx_, start_args);
         if (!started.value("accepted", false)) {
           // `accepted` is false for two different reasons and they read very
           // differently to whoever is looking at a failed deployment: the plan

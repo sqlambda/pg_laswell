@@ -376,6 +376,40 @@ a failure: it is reported, skipped, and left pending, because a migration for
 somewhere else is somebody else's, and one awaiting approval is this database's
 and waiting.
 .Bl -tag -width Ds
+.It Va target.connection
+Which configured connection this specification runs against, by the name of its
+section in the configuration file.
+Absent, it runs against the connection the caller named -- which for
+.Xr pg_laswell 1
+is the one it was pointed at.
+.Pp
+This is the one that ROUTES.
+.Va target.database
+below is the one that CHECKS the routing arrived.
+.Pp
+A change is always single-database.
+It may
+.Em require
+a change on a different one -- a subscription needs its publication to exist
+first -- and that is what
+.Va depends_on
+is for, which crosses databases freely: a specification on one connection may
+depend on one applied to another, and is held until that one has been.
+Each database keeps its own ledger, so the question "has that been applied" is
+answered where it ran.
+.Pp
+What does not cross is atomicity.
+PostgreSQL has no cross-database transaction, so a specification spanning two
+would be atomic in neither; keeping the boundary at the specification is what
+keeps each half atomic where atomicity actually exists, separately recorded and
+separately resumable.
+.Pp
+Not to be confused with the
+.Va connection
+of a
+.Cm create_subscription
+intent, which is the libpq string the subscription itself dials out on -- a
+PostgreSQL concept, nothing to do with this tool's configuration.
 .It Va target.database
 Compared to
 .Fn current_database .

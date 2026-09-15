@@ -582,6 +582,51 @@ class Observer {
 // A job id. Random rather than sequential: a ledger row whose id reveals how
 // many migrations preceded it is a small information leak, and more usefully a
 // random id cannot be guessed by a caller poking at jobStatus.
+// One observer per connection, made on demand.
+//
+// The observer watches pg_locks and pg_stat_activity in ONE database: that is
+// where a job's waiters are, and a connection to a different database cannot
+// see them. With every job on one connection a single observer was right; the
+// moment a specification can name its own connection, a job on "sub" watched
+// by an observer attached to "pub" is not watched at all -- and the observer
+// is the contention breaker, so losing it silently loses the one mechanism
+// that stops a migration from hurting the server it is running on.
+//
+// Kept for the life of the pool rather than per job, because a second job on a
+// connection should not pay to reconnect, and because an Observer joins its
+// thread on destruction.
+class ObserverPool {
+ public:
+  ObserverPool(JobRegistry* jobs) : jobs_(jobs) {}
+
+  Observer* get(const ConnConfig& cfg) {
+    std::lock_guard<std::mutex> lock(m_);
+    auto it = observers_.find(cfg.name);
+    if (it == observers_.end()) {
+      it = observers_
+               .emplace(cfg.name, std::make_unique<Observer>(
+                                      cfg, jobs_, cfg.executor.observer_tick_ms))
+               .first;
+    }
+    return it->second.get();
+  }
+
+  // Stopped explicitly before the pool dies, for the reason join_all exists:
+  // a thread racing PQfinish against static destruction is the classic
+  // intermittent crash at shutdown.
+  void stop_all() {
+    std::lock_guard<std::mutex> lock(m_);
+    for (auto& [name, o] : observers_) o->stop();
+  }
+
+  ~ObserverPool() { stop_all(); }
+
+ private:
+  mutable std::mutex m_;
+  JobRegistry* jobs_ = nullptr;
+  std::map<std::string, std::unique_ptr<Observer>> observers_;
+};
+
 inline std::string new_job_id() {
   static std::mt19937_64 rng{std::random_device{}()};
   static std::mutex m;

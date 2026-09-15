@@ -172,12 +172,10 @@ int main(int argc, char* argv[]) {
     // because a placeholder conninfo is an empty string and libpq reads that as
     // "connect to the local socket with defaults" -- an observer thread quietly
     // connecting to whatever happens to be on this machine.
-    std::optional<pglaswell::Observer> observer;
-    if (!ctx.registry.default_name().empty()) {
-      const auto& first = ctx.registry.get(ctx.registry.default_name());
-      observer.emplace(first, &jobs, first.executor.observer_tick_ms);
-      ctx.observer = &*observer;
-    }
+    // One per connection, created on demand: a specification may name its own
+    // connection, and a job must be watched in the database it runs in.
+    pglaswell::ObserverPool observers(&jobs);
+    ctx.observers = &observers;
 
     pglaswell::McpServer server(pglaswell::make_tools(ctx));
 
@@ -246,7 +244,7 @@ int main(int argc, char* argv[]) {
 
     // Joined, never abandoned. A worker thread racing PQfinish against static
     // destruction is the classic intermittent crash at shutdown.
-    if (observer) observer->stop();
+    observers.stop_all();
     jobs.join_all();
   } catch (const std::exception& e) {
     std::cerr << "Fatal: " << e.what() << std::endl;

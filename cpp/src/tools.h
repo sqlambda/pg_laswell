@@ -40,7 +40,9 @@ struct ToolContext {
   Registry registry;
   ConnectionCache* cache = nullptr;
   JobRegistry* jobs = nullptr;
-  Observer* observer = nullptr;
+  // One per connection: a job is watched by an observer attached to the
+  // database it is running in, or it is not watched at all.
+  ObserverPool* observers = nullptr;
 
   const ConnConfig& connection(const json& args) const {
     const auto name = args.value("connection", registry.default_name());
@@ -527,7 +529,10 @@ inline json start_migration(ToolContext& ctx, const json& args) {
                 {"hint", "Call jobStatus to see the job that holds it."}};
   }
 
-  if (ctx.observer) ctx.observer->start();
+  // The observer for THIS job's database, not for whichever one happened to be
+  // default. Started here rather than at construction so a configuration with
+  // ten connections opens observer connections only to the ones it uses.
+  if (ctx.observers) ctx.observers->get(cfg)->start();
   // The ceiling is process-wide, so it lives on the registry rather than on a
   // job. Re-declared on every start because a caller may name a different
   // connection, and the last word wins -- raising it wakes whoever is waiting.
@@ -662,8 +667,10 @@ inline json list_migrations(ToolContext& ctx, const json& args) {
     return json{{"error", "listMigrations needs a \"directory\""},
                 {"hint", "Point it at the folder holding the migration specs."}};
   }
+  // The caller's connection is the DEFAULT for specifications that name none;
+  // each one that names its own is classified against that database instead.
   const auto& cfg = ctx.connection(args);
-  MigrationRepository repo(cfg, ctx.cache);
+  MigrationRepository repo(ctx.registry, cfg.name, ctx.cache);
   auto out = repo.scan(dir, args.value("deriveRelations", true));
   out["connection"] = cfg.name;
   out["database"] = cfg.dbname;

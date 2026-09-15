@@ -117,19 +117,17 @@ int main(int argc, char* argv[]) {
     // measures transitive waiters and sets `throttled`, and cancels a batch
     // that has starved one past max_waiter_wait_ms. Without it this binary
     // would still be correct and would no longer be the tool it claims to be.
-    std::optional<pglaswell::Observer> observer;
-    if (!ctx.registry.default_name().empty()) {
-      const auto& first = ctx.registry.get(ctx.registry.default_name());
-      observer.emplace(first, &jobs, first.executor.observer_tick_ms);
-      ctx.observer = &*observer;
-    }
+    // One per connection, created on demand: a specification may name its own
+    // connection, and a job must be watched in the database it runs in.
+    pglaswell::ObserverPool observers(&jobs);
+    ctx.observers = &observers;
 
     pglaswell::Deployment run(ctx, opts);
     const auto result = run.run();
 
     // Joined, never abandoned: a worker thread racing PQfinish against static
     // destruction is the classic intermittent crash at shutdown.
-    if (observer) observer->stop();
+    observers.stop_all();
     jobs.join_all();
     return static_cast<int>(result);
   } catch (const std::exception& e) {
