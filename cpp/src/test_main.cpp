@@ -10556,7 +10556,12 @@ class TwoDatabaseTest : public RepoTest {
   static std::string conn_section(const std::string& url) {
     // Parsed by hand rather than with std::regex: four fields, and both
     // conninfo spellings appear in this suite.
-    std::string host = "127.0.0.1", port = "5432", db = "postgres", user = "postgres";
+    // The password is carried too. Dropping it is invisible under the trust
+    // auth a developer's scratch cluster uses and fatal against CI's, which
+    // wants one: "fe_sendauth: no password supplied", from a test that passed
+    // on every machine that could not notice.
+    std::string host = "127.0.0.1", port = "5432", db = "postgres",
+                user = "postgres", password;
     const auto scheme = url.find("://");
     if (scheme != std::string::npos) {
       std::string rest = url.substr(scheme + 3);
@@ -10566,7 +10571,12 @@ class TwoDatabaseTest : public RepoTest {
       if (at != std::string::npos) {
         std::string cred = rest.substr(0, at);
         const auto colon = cred.find(':');
-        user = colon == std::string::npos ? cred : cred.substr(0, colon);
+        if (colon == std::string::npos) {
+          user = cred;
+        } else {
+          user = cred.substr(0, colon);
+          password = cred.substr(colon + 1);
+        }
         rest = rest.substr(at + 1);
       }
       const auto slash = rest.find('/');
@@ -10590,10 +10600,12 @@ class TwoDatabaseTest : public RepoTest {
         if (k == "port") port = v;
         if (k == "dbname") db = v;
         if (k == "user") user = v;
+        if (k == "password") password = v;
       }
     }
     return "host = " + host + "\nport = " + port + "\ndbname = " + db +
-           "\nuser = " + user + "\n";
+           "\nuser = " + user + "\n" +
+           (password.empty() ? "" : "password = " + password + "\n");
   }
 
   void bootstrap_into(const std::string& url) {
