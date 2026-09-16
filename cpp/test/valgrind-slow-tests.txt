@@ -26,3 +26,13 @@ ToolTest.CancellingAJobStopsItAndLeavesTheCursorCommitted
 ToolTest.TwoJobsForTheSameSpecCannotRunAtOnce
 ToolTest.WithNoWaiterTheIntervalIsWhatCommits
 ToolTest.ASucceededJobsCursorIsNotResumedFrom
+# Two paced backfills at once under a statement ceiling: the same wall-clock
+# shape as the five above, and one more way to be bounded by elapsed time.
+# begin() derives idle_in_transaction_session_timeout from commit_interval_ms,
+# so on a runner under Valgrind the ordinary work between two statements of one
+# transaction -- a ledger write among it -- can outlast the window and the
+# server closes the connection, exactly as it is configured to. Measured: it
+# fails with "Connection lost." at 25s there and passes in 1.6s under Valgrind
+# locally. ADDRESS_UNDEFINED and THREAD both run it, and THREAD is the one that
+# matters for a gate shared by two jobs.
+ToolTest.AStatementCeilingHoldsAcrossConcurrentJobs
