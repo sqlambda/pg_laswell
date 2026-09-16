@@ -44,12 +44,27 @@ def conformance_cases():
 
 
 def tests():
-    """gtest's own count, from the built binary when there is one.
+    """How many tests the suite has, counted from the source and CHECKED.
 
-    Absent a binary this returns None and the caller leaves the number out
-    rather than guessing: a test count is the one claim on the page that cannot
-    be derived from source text, since a TEST_P or a loop is not one line.
+    The count was "380+" on the published page, from a fallback that fired
+    because the site job builds no test binary. Vague, and needlessly: every
+    test here is a plain TEST or TEST_F macro, one macro one test, so the
+    source says it exactly.
+
+    That is only true while no macro GENERATES tests -- TEST_P, TYPED_TEST and
+    friends turn one line into many -- so their absence is asserted rather than
+    assumed, and when a binary happens to be lying around the two numbers are
+    compared. Disagreement is fatal: a page that quietly reports the wrong
+    number is worse than one that admits it does not know.
     """
+    src = _read('cpp', 'src', 'test_main.cpp')
+    generators = re.findall(r'^(TEST_P|TYPED_TEST|TYPED_TEST_P|INSTANTIATE_\w+)\(',
+                            src, re.M)
+    counted = len(re.findall(r'^TEST(?:_F)?\(', src, re.M))
+    if generators:
+        counted = None  # one macro is no longer one test
+
+    measured = None
     for candidate in ('cpp/build/pg_laswell_mcp_test', 'build/pg_laswell_mcp_test'):
         path = os.path.join(ROOT, candidate)
         if not os.path.exists(path):
@@ -57,13 +72,19 @@ def tests():
         try:
             out = subprocess.run([path, '--gtest_list_tests'], capture_output=True,
                                  text=True, timeout=120).stdout
-            n = sum(1 for line in out.splitlines() if line.startswith('  ') and
-                    not line.strip().startswith('#'))
+            n = sum(1 for line in out.splitlines()
+                    if line.startswith('  ') and not line.strip().startswith('#'))
             if n:
-                return n
+                measured = n
+                break
         except Exception:
             pass
-    return None
+
+    if counted is not None and measured is not None and counted != measured:
+        sys.exit('gen-site: the source says %d tests and the binary says %d. One '
+                 'macro is no longer one test, so the count on the page cannot '
+                 'be trusted until this is understood.' % (counted, measured))
+    return measured or counted
 
 
 def version():
@@ -88,7 +109,7 @@ def main():
         'CASES': str(conformance_cases()),
         'VERSION': version(),
         'TARGETS': str(release_targets()),
-        'TESTS': str(n_tests) if n_tests else '380+',
+        'TESTS': str(n_tests) if n_tests else '380+',  # fallback: generators present
     }
 
     page = _read('site', 'index.html')
