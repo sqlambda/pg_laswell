@@ -725,7 +725,15 @@ inline void parse_publication(Intent& in) {
   const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
   detail::reject_unknown_keys(
       in.body, {"kind", "name", "tables", "all_tables", "operations", "add_tables",
-                "drop_tables"}, at);
+                "drop_tables", "publish_via_partition_root"}, at);
+  if (in.body.contains("publish_via_partition_root") &&
+      !in.body["publish_via_partition_root"].is_boolean()) {
+    detail::fail(at + ".publish_via_partition_root must be a boolean",
+                 "true publishes a change as the PARTITIONED table's own row, "
+                 "so a subscriber may be an ordinary table; false -- the "
+                 "PostgreSQL default -- publishes the leaf partition, and the "
+                 "subscriber must have a partition of the same name.");
+  }
   detail::require_identifier(detail::require_string(in.body, "name", at), "name", in.ordinal);
   for (const char* k : {"tables", "add_tables", "drop_tables"}) {
     if (!in.body.contains(k)) continue;

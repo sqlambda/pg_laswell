@@ -24,6 +24,13 @@ and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
   error on a reserved-word schema. Measured: `INSERT INTO user.t` fails at
   `user`, while `INSERT INTO cf.order` parses -- it is the schema that has to be
   quoted, which is why a case naming only a reserved table proves nothing.
+- **`publish_via_partition_root` on `create_publication` and
+  `alter_publication`.** Without it a partitioned table replicates its leaf
+  partitions, and the subscriber needs a partition of each matching name; with
+  it the change travels as the root table's, so the subscriber may be an
+  ordinary table. A publisher keeping a rolling window and a subscriber keeping
+  full history is the reason to want it. The plan warns either way, because
+  neither arrangement errors until a row has nowhere to land.
 - **A repository may span several databases.** A specification names
   `target.connection`, is classified against THAT database's ledger, and is
   applied there; `depends_on` crosses databases freely, so the subscription on

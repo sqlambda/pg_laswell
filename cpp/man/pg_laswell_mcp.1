@@ -981,6 +981,44 @@ which rows are matched at all.
 Measured on 18.6, a delete naming two ids removed one, reported
 .Ql DELETE 1 ,
 and said nothing about the other.
+.Ss Publishing a partitioned table
+.Va publish_via_partition_root
+decides which table name a change travels under, and it is the difference
+between a topology that works and one that silently drops rows.
+.Pp
+False, which is PostgreSQL's default, publishes the
+.Em leaf partition :
+a change to
+.Ql store.audit_log_2026_09
+arrives as a change to a table of that name, and the subscriber must have one.
+A publisher that rotates partitions therefore needs the subscriber to rotate the
+same names, or the rows have nowhere to land.
+.Pp
+True publishes the change as the
+.Em root
+table's, so the subscriber may be an ordinary unpartitioned table, or be
+partitioned on something else entirely.
+A publisher keeping a rolling window while a subscriber keeps full history is
+the ordinary reason to want it.
+.Pp
+Two consequences the plan warns about, because neither errors until a row has
+nowhere to go: the subscriber's table must be named after the ROOT rather than
+after the partitions, and
+.Em detaching a partition publishes nothing ,
+so rows removed from the publisher by a detach stay on the subscriber -- which
+is usually the point when the subscriber is an archive, and a surprise
+otherwise.
+.Pp
+Measured on 15.19 and 18.6: it shares one
+.Ic WITH
+clause with
+.Va publish ,
+and it is accepted from PostgreSQL 15, the floor this tool supports, so it needs
+no version gate.
+It is recorded in
+.Li pg_publication.pubviaroot ,
+which is what the conformance suite asserts -- the statement running is not
+evidence that the option took.
 .Ss Dependent views
 PostgreSQL refuses
 .Ic ALTER COLUMN ... TYPE

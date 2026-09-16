@@ -1241,11 +1241,22 @@ inline void plan_replication(const Intent& in, const Observations& obs,
       } else if (in.body.contains("tables")) {
         sql += " FOR TABLE " + tables_clause("tables");
       }
+      // One WITH, carrying whichever options were asked for. Measured on 15.19
+      // and 18.6: publish and publish_via_partition_root sit in the same
+      // clause, and both are accepted from 15 -- the floor this tool supports
+      // -- so neither needs a version gate.
+      std::vector<std::string> options;
       if (in.body.contains("operations")) {
         std::vector<std::string> ops;
         for (const auto& o : in.body["operations"]) ops.push_back(o.get<std::string>());
-        sql += " WITH (publish = '" + detail::join(ops, ", ") + "')";
+        options.push_back("publish = '" + detail::join(ops, ", ") + "'");
       }
+      if (in.body.contains("publish_via_partition_root")) {
+        options.push_back(
+            std::string("publish_via_partition_root = ") +
+            (in.body["publish_via_partition_root"].get<bool>() ? "true" : "false"));
+      }
+      if (!options.empty()) sql += " WITH (" + detail::join(options, ", ") + ")";
       step.sql.push_back(sql + ";");
       step.lock = "ShareUpdateExclusiveLock on each published table";
       step.why = "measured: a publication is created inside a transaction like "
@@ -1263,6 +1274,25 @@ inline void plan_replication(const Intent& in, const Observations& obs,
             "publication sends -- including tables nobody intended to "
             "replicate.");
       }
+      if (in.body.value("publish_via_partition_root", false)) {
+        plan.warnings.push_back(
+            "publish_via_partition_root is on, so a change to a partition is "
+            "published as a change to the ROOT table. That is what lets the "
+            "subscriber be an ordinary table, or be partitioned differently -- "
+            "a publisher keeping a rolling window and a subscriber keeping full "
+            "history is the ordinary case for it. Two consequences worth "
+            "knowing: the subscriber must have a table named after the ROOT "
+            "and not after the partitions, and detaching a partition on this "
+            "side does not remove its rows from the subscriber, because the "
+            "detach publishes nothing.");
+      } else if (in.body.contains("tables")) {
+        plan.warnings.push_back(
+            "publish_via_partition_root is not set, so it is false -- "
+            "PostgreSQL's default. If any table above is PARTITIONED, its leaf "
+            "partitions are what replicate, and the subscriber needs a "
+            "partition of each matching name or the change has nowhere to land. "
+            "Set it true to publish as the root instead.");
+      }
       return;
     }
 
@@ -1276,11 +1306,28 @@ inline void plan_replication(const Intent& in, const Observations& obs,
         sql.push_back("ALTER PUBLICATION " + name + " DROP TABLE " +
                       tables_clause("drop_tables") + ";");
       }
+      std::vector<std::string> options;
       if (in.body.contains("operations")) {
         std::vector<std::string> ops;
         for (const auto& o : in.body["operations"]) ops.push_back(o.get<std::string>());
-        sql.push_back("ALTER PUBLICATION " + name + " SET (publish = '" +
-                      detail::join(ops, ", ") + "');");
+        options.push_back("publish = '" + detail::join(ops, ", ") + "'");
+      }
+      if (in.body.contains("publish_via_partition_root")) {
+        options.push_back(
+            std::string("publish_via_partition_root = ") +
+            (in.body["publish_via_partition_root"].get<bool>() ? "true" : "false"));
+      }
+      if (!options.empty()) {
+        sql.push_back("ALTER PUBLICATION " + name + " SET (" +
+                      detail::join(options, ", ") + ");");
+      }
+      if (in.body.contains("publish_via_partition_root")) {
+        plan.warnings.push_back(
+            "changing publish_via_partition_root changes WHICH TABLE NAME the "
+            "subscriber sees, so an existing subscription starts looking for a "
+            "different table: as the root when this is turned on, as the leaf "
+            "partitions when it is turned off. Neither side errors until a row "
+            "has nowhere to land.");
       }
       step.sql = std::move(sql);
       step.lock = "ShareUpdateExclusiveLock on each table added or removed";
