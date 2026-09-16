@@ -1,11 +1,17 @@
 # Changes
 
-## 0.1.0 (unreleased)
+## 0.1.1
+
+Everything below shipped as the pre-release `v0.1.0-alpha0` or was added after
+it. 0.1.0 was never released as a final version: the alpha existed to exercise
+packaging on all seven targets, and it did its job by failing on two of them.
+
 
 The whole path works: repository, signing, planning, dry run, paced execution,
-ledger. 354 tests green on GCC 14.2 and Clang 22, under AddressSanitizer/UBSan
-and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
-`--call` contract test.
+ledger. 383 tests green on GCC 14.2 and Clang 22 against real PostgreSQL 15,
+16, 17 and 18, under AddressSanitizer/UBSan and ThreadSanitizer,
+Valgrind-clean, plus a mandoc lint and a process-level `--call` contract
+test.
 
 - **A dry run says why a specification was refused when there is no plan to
   show.** A refusal that never reached a plan -- an untrusted signature, either
@@ -24,6 +30,13 @@ and ThreadSanitizer, Valgrind-clean, plus a mandoc lint and a process-level
   error on a reserved-word schema. Measured: `INSERT INTO user.t` fails at
   `user`, while `INSERT INTO cf.order` parses -- it is the schema that has to be
   quoted, which is why a case naming only a reserved table proves nothing.
+- **`publish_via_partition_root` on `create_publication` and
+  `alter_publication`.** Without it a partitioned table replicates its leaf
+  partitions, and the subscriber needs a partition of each matching name; with
+  it the change travels as the root table's, so the subscriber may be an
+  ordinary table. A publisher keeping a rolling window and a subscriber keeping
+  full history is the reason to want it. The plan warns either way, because
+  neither arrangement errors until a row has nowhere to land.
 - **A repository may span several databases.** A specification names
   `target.connection`, is classified against THAT database's ledger, and is
   applied there; `depends_on` crosses databases freely, so the subscription on

@@ -545,9 +545,43 @@ inline std::vector<Case> cases() {
           {"add_tables",json::array({"cf.pub2"})}},
      "SELECT count(*)::text FROM pg_publication_tables WHERE pubname='cf_pub'", "2"},
 
+    // The option the audit topology needs: a change to a partition published as
+    // the ROOT table's, so a subscriber can be an ordinary table or be
+    // partitioned differently. Asserted through pg_publication.pubviaroot,
+    // which is where PostgreSQL records it -- the statement running is not
+    // evidence that the option took.
+    {"alter_publication_via_root",
+     {},
+     json{{"kind","alter_publication"},{"name","cf_pub"},
+          {"publish_via_partition_root",true}},
+     "SELECT pubviaroot::text FROM pg_publication WHERE pubname='cf_pub'", "true"},
+
     {"drop_publication", {},
      json{{"kind","drop_publication"},{"name","cf_pub"}},
      "SELECT count(*)::text FROM pg_publication WHERE pubname='cf_pub'", "0"},
+
+    // And on CREATE, where it sits in the same WITH as publish. Measured on
+    // 15.19 and 18.6: the two options share one clause, and both are accepted
+    // from 15, so neither needs a version gate.
+    {"create_publication_via_root",
+     // PRIMARY KEY (id, at), not (id): PostgreSQL refuses a unique constraint on
+     // a partitioned table that does not include every partitioning column --
+     // "lacks column at which is part of the partition key". A replica identity
+     // is exactly what a published table needs, so getting it wrong here would
+     // have been a fixture that could not be published anyway.
+     {"CREATE TABLE cf.pub_root(id int, at date, PRIMARY KEY (id, at)) PARTITION BY RANGE (at)",
+      "CREATE TABLE cf.pub_root_2026 PARTITION OF cf.pub_root"
+      " FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')"},
+     json{{"kind","create_publication"},{"name","cf_root_pub"},
+          {"tables",json::array({"cf.pub_root"})},
+          {"operations",json::array({"insert","update"})},
+          {"publish_via_partition_root",true}},
+     "SELECT pubviaroot::text || ',' || pubinsert::text || ',' || pubdelete::text"
+     "  FROM pg_publication WHERE pubname='cf_root_pub'", "true,true,false"},
+
+    {"drop_publication_root", {},
+     json{{"kind","drop_publication"},{"name","cf_root_pub"}},
+     "SELECT count(*)::text FROM pg_publication WHERE pubname='cf_root_pub'", "0"},
 
     {"create_schema", {},   // second use: the partition parent lives elsewhere
      json{{"kind","create_schema"},{"schema","cfp"},{"comment","Partitions."}},

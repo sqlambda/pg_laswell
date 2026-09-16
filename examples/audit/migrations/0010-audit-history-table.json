@@ -1,0 +1,145 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0010-audit-history-table",
+  "description": "The history table on the audit database: every row change, kept forever.",
+  "rationale": "The shape the PostgreSQL wiki's audit trigger has used for years, so existing queries mean what they already meant. Unpartitioned on purpose: the store keeps a rolling window and this keeps everything, which is the whole reason the publication has to publish via the partition root -- a change arriving as the ROOT table's is a change this ordinary table can accept. The primary key is (event_id, action_tstamp_tx), matching the publisher's, and that is not cosmetic: the store MUST include the partition key in its key, so a narrower key here would reject rows the publisher considers distinct and stall the subscription with a duplicate-key error that neither side reports as a migration failure.",
+  "target": {
+    "connection": "audit",
+    "environment": "dev"
+  },
+  "intents": [
+    {
+      "kind": "create_schema",
+      "schema": "audit",
+      "comment": "Row-level history received from the store database."
+    },
+    {
+      "kind": "create_table",
+      "schema": "audit",
+      "table": "logged_actions",
+      "comment": "One row per row change on the publisher. Never rotated.",
+      "primary_key": [
+        "event_id",
+        "action_tstamp_tx"
+      ],
+      "columns": [
+        {
+          "name": "event_id",
+          "type": "bigint",
+          "nullable": false,
+          "comment": "Monotonic id assigned by the publisher."
+        },
+        {
+          "name": "schema_name",
+          "type": "text",
+          "nullable": false,
+          "comment": "Schema of the changed table."
+        },
+        {
+          "name": "table_name",
+          "type": "text",
+          "nullable": false,
+          "comment": "Table that changed."
+        },
+        {
+          "name": "relid",
+          "type": "oid",
+          "nullable": false,
+          "comment": "OID of that table on the publisher."
+        },
+        {
+          "name": "session_user_name",
+          "type": "text",
+          "nullable": true,
+          "comment": "Login role at the time of the change."
+        },
+        {
+          "name": "action_tstamp_tx",
+          "type": "timestamptz",
+          "nullable": false,
+          "comment": "Transaction start time. The partition key on the publisher."
+        },
+        {
+          "name": "action_tstamp_stm",
+          "type": "timestamptz",
+          "nullable": false,
+          "comment": "Statement start time."
+        },
+        {
+          "name": "action_tstamp_clk",
+          "type": "timestamptz",
+          "nullable": false,
+          "comment": "Wall-clock time the trigger fired."
+        },
+        {
+          "name": "transaction_id",
+          "type": "bigint",
+          "nullable": true,
+          "comment": "Publisher transaction id."
+        },
+        {
+          "name": "application_name",
+          "type": "text",
+          "nullable": true,
+          "comment": "application_name of the session that made the change."
+        },
+        {
+          "name": "client_addr",
+          "type": "inet",
+          "nullable": true,
+          "comment": "Client address, when there was one."
+        },
+        {
+          "name": "client_port",
+          "type": "integer",
+          "nullable": true,
+          "comment": "Client port, when there was one."
+        },
+        {
+          "name": "client_query",
+          "type": "text",
+          "nullable": true,
+          "comment": "The statement that caused the change."
+        },
+        {
+          "name": "action",
+          "type": "text",
+          "nullable": false,
+          "comment": "I, D, U or T."
+        },
+        {
+          "name": "row_data",
+          "type": "hstore",
+          "nullable": true,
+          "comment": "The row before the change, as key/value."
+        },
+        {
+          "name": "changed_fields",
+          "type": "hstore",
+          "nullable": true,
+          "comment": "Only the columns an UPDATE altered."
+        },
+        {
+          "name": "statement_only",
+          "type": "boolean",
+          "nullable": false,
+          "comment": "True for a statement-level trigger with no row."
+        }
+      ]
+    },
+    {
+      "kind": "add_check_constraint",
+      "schema": "audit",
+      "table": "logged_actions",
+      "name": "logged_actions_action_check",
+      "expression": "action IN ('I','D','U','T')"
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:e3e822982ea40003",
+      "algorithm": "ed25519",
+      "signature": "vSCxQFMHHUnOJgsVIYWvyDO9AAF+s0UXl1qTz+/iF/WCtzLCphlWwPYVKLrPNO3LuYJTIAiFngdNFqhzsIHUAA=="
+    }
+  ]
+}

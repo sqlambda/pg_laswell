@@ -1,0 +1,33 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0030-publication",
+  "description": "Publish the store's audit log, as the partition root.",
+  "rationale": "publish_via_partition_root is the point of this specification. Without it the LEAF partitions replicate under their own names and the audit database would need a partition of each matching name -- which defeats a subscriber whose whole job is to keep everything the publisher rotates away. publish is insert only: an audit log is append-only, and sending updates or deletes would let a mistake on the store erase history on the audit side.",
+  "target": {
+    "connection": "store",
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0020-store-audit-log"
+  ],
+  "intents": [
+    {
+      "kind": "create_publication",
+      "name": "store_audit",
+      "tables": [
+        "audit.logged_actions"
+      ],
+      "operations": [
+        "insert"
+      ],
+      "publish_via_partition_root": true
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:e3e822982ea40003",
+      "algorithm": "ed25519",
+      "signature": "qnPNu/GqieHNq5guZrAadpTDooHy0IG3YOjU3oeH0y6jpgv/cnCt+EhCcReDKi73PQqZp9QHWtkLwkYNRxy3Aw=="
+    }
+  ]
+}
