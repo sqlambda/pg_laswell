@@ -453,3 +453,40 @@ jobs:
             build/*.rpm
             build/*.tar.gz
           retention-days: 7
+
+  # One check to require in branch protection, instead of twenty-one.
+  #
+  # Required checks are matched by NAME, and half of these names are matrix
+  # coordinates: "valgrind (2)" exists because that job is sharded four ways,
+  # and it was sharded differently last week. Requiring them individually makes
+  # protection depend on how a job happens to be split today -- rename or
+  # re-shard one and every merge blocks on a check that will never report
+  # again, which looks exactly like a hung CI.
+  #
+  # This depends on all of them and does nothing, so the list lives here, in
+  # the file that defines the jobs, rather than in a settings page nobody reads
+  # beside them. `always()` with an explicit result check, not the default: a
+  # needs: job is SKIPPED when a dependency fails, and a skipped required check
+  # is not a failing one -- protection would let the merge through.
+  ci-ok:
+    name: ci-ok
+    if: always()
+    needs:
+      - build
+      - test
+      - sanitizers
+      - valgrind
+      - call_mode
+      - replication
+      - pooled
+      - packages
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every job must have succeeded
+        run: |
+          echo "results: ${{ join(needs.*.result, ', ') }}"
+          for r in ${{ join(needs.*.result, ' ') }}; do
+            [ "$r" = "success" ] || { echo "::error::a required job reported $r"; exit 1; }
+          done
+          echo "all green"
