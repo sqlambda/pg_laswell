@@ -1,0 +1,139 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0020-store-audit-log",
+  "description": "The rolling audit log on the store database, partitioned by transaction time.",
+  "rationale": "Same table name as the history table on audit, and that is required rather than tidy: with publish_via_partition_root a change travels under the ROOT table's name, so the subscriber must have a table called audit.logged_actions too. Partitioned here because the store keeps a window; pg_cron rotates it, which is not a migration because it repeats.",
+  "target": {
+    "connection": "store",
+    "environment": "dev"
+  },
+  "intents": [
+    {
+      "kind": "create_schema",
+      "schema": "audit",
+      "comment": "Row-level history written by the store's triggers."
+    },
+    {
+      "kind": "create_table",
+      "schema": "audit",
+      "table": "logged_actions",
+      "comment": "Rolling window of row changes. Published to the audit database.",
+      "partition_by": "RANGE (action_tstamp_tx)",
+      "primary_key": [
+        "event_id",
+        "action_tstamp_tx"
+      ],
+      "columns": [
+        {
+          "name": "event_id",
+          "type": "bigint",
+          "nullable": false,
+          "comment": "Monotonic id."
+        },
+        {
+          "name": "schema_name",
+          "type": "text",
+          "nullable": false,
+          "comment": "Schema of the changed table."
+        },
+        {
+          "name": "table_name",
+          "type": "text",
+          "nullable": false,
+          "comment": "Table that changed."
+        },
+        {
+          "name": "relid",
+          "type": "oid",
+          "nullable": false,
+          "comment": "OID of that table."
+        },
+        {
+          "name": "session_user_name",
+          "type": "text",
+          "nullable": true,
+          "comment": "Login role at the time of the change."
+        },
+        {
+          "name": "action_tstamp_tx",
+          "type": "timestamptz",
+          "nullable": false,
+          "comment": "Transaction start time. The partition key."
+        },
+        {
+          "name": "action_tstamp_stm",
+          "type": "timestamptz",
+          "nullable": false,
+          "comment": "Statement start time."
+        },
+        {
+          "name": "action_tstamp_clk",
+          "type": "timestamptz",
+          "nullable": false,
+          "comment": "Wall-clock time the trigger fired."
+        },
+        {
+          "name": "transaction_id",
+          "type": "bigint",
+          "nullable": true,
+          "comment": "Transaction id."
+        },
+        {
+          "name": "application_name",
+          "type": "text",
+          "nullable": true,
+          "comment": "application_name of the session."
+        },
+        {
+          "name": "client_addr",
+          "type": "inet",
+          "nullable": true,
+          "comment": "Client address."
+        },
+        {
+          "name": "client_port",
+          "type": "integer",
+          "nullable": true,
+          "comment": "Client port."
+        },
+        {
+          "name": "client_query",
+          "type": "text",
+          "nullable": true,
+          "comment": "The statement that caused the change."
+        },
+        {
+          "name": "action",
+          "type": "text",
+          "nullable": false,
+          "comment": "I, D, U or T."
+        },
+        {
+          "name": "row_data",
+          "type": "hstore",
+          "nullable": true,
+          "comment": "The row before the change."
+        },
+        {
+          "name": "changed_fields",
+          "type": "hstore",
+          "nullable": true,
+          "comment": "Columns an UPDATE altered."
+        },
+        {
+          "name": "statement_only",
+          "type": "boolean",
+          "nullable": false,
+          "comment": "Statement-level trigger with no row."
+        }
+      ]
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:e3e822982ea40003",
+      "algorithm": "ed25519",
+      "signature": "H83Vj6FS56aBMC9yC2/OtVQdlMra3uoz25RfKKP621WreeFmulTQZOFqxIAds6tJfO7fdusA2vMnjKCztbUUDQ=="
+    }
+  ]
+}

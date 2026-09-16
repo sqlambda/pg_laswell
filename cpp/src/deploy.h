@@ -344,9 +344,7 @@ class Deployment {
     }
     out << "  " << id << ": not accepted\n";
     for (const char* k : {"error", "hint"}) {
-      if (started.contains(k)) {
-        out << "      " << started[k].get<std::string>() << "\n";
-      }
+      if (started.contains(k)) out << "      " << as_text(started[k]) << "\n";
     }
     // A trust failure says which gate refused, and that is the whole answer.
     for (const char* gate : {"clientTrust", "databaseTrust"}) {
@@ -389,10 +387,8 @@ class Deployment {
                                    const json& plan) const {
     if (plan.contains("error")) {
       out << "  " << id << ": REFUSED\n";
-      out << "      " << plan["error"].get<std::string>() << "\n";
-      if (plan.contains("hint")) {
-        out << "      " << plan["hint"].get<std::string>() << "\n";
-      }
+      out << "      " << as_text(plan["error"]) << "\n";
+      if (plan.contains("hint")) out << "      " << as_text(plan["hint"]) << "\n";
       return DeployResult::kRefused;
     }
     if (!plan.value("ok", false)) {
@@ -410,18 +406,45 @@ class Deployment {
     return DeployResult::kOk;
   }
 
+  // A json value as one line of text, whatever shape it arrived in.
+  //
+  // `error` is a string on some paths and an OBJECT on others -- a failed job
+  // carries {"error": "...", "hint": "..."} -- and get<std::string>() on the
+  // object THROWS. That threw out of Deployment::run(), which nothing caught
+  // until main, so a migration failing at runtime crashed the deployment
+  // instead of reporting it: the one thing this binary exists to do, defeated
+  // by the shape of the message it was trying to print.
+  static std::string as_text(const json& v) {
+    if (v.is_string()) return v.get<std::string>();
+    if (v.is_object()) {
+      // The two keys the tool actually writes, in the order a reader wants
+      // them; anything else is dumped whole rather than dropped.
+      std::string out;
+      for (const char* k : {"error", "hint"}) {
+        if (v.contains(k) && v[k].is_string()) {
+          if (!out.empty()) out += " -- ";
+          out += v[k].get<std::string>();
+        }
+      }
+      return out.empty() ? v.dump() : out;
+    }
+    return v.dump();
+  }
+
   static void report_failure(std::ostream& out, const json& st) {
     // The ledger has the statement; this says where to look rather than
     // reprinting it, because a deployment log is not the place a failure is
     // diagnosed and pretending otherwise encourages reading the wrong thing.
     if (st.contains("error")) {
-      out << "      " << st["error"].get<std::string>() << "\n";
+      out << "      " << as_text(st["error"]) << "\n";
     }
     for (const auto& s : st.value("steps", json::array())) {
       if (s.value("state", "") == "failed") {
+        const auto detail = s.value("detail", json::object());
         out << "      step " << s.value("ordinal", 0) << " "
-            << s.value("kind", "") << ": " << s.value("detail", json::object())
-                                                 .value("error", "") << "\n";
+            << s.value("kind", "") << ": "
+            << (detail.contains("error") ? as_text(detail["error"]) : std::string())
+            << "\n";
       }
     }
     out << "      laswell.step in the target database has the statement and "

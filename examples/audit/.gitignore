@@ -1,0 +1,7 @@
+# The throwaway cluster and everything the example generates locally.
+.cluster/
+laswell.ini
+keys/*.pem
+keys/*.der
+keys/*.b64
+keys/*.key_id

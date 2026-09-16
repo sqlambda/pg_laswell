@@ -289,6 +289,19 @@ class JobRegistry {
   OperationGate& operations() { return operations_; }
   const OperationGate& operations() const { return operations_; }
 
+  // The same join, guaranteed rather than remembered.
+  //
+  // join_all() was called on the way out of main and nowhere else, so ANY
+  // exception escaping the deployment skipped it: unwinding destroyed this map
+  // with worker threads still joinable, std::thread's destructor called
+  // std::terminate, and the process aborted BEFORE the handler could say what
+  // had gone wrong. A crash instead of a message, from a bug that was only
+  // ever a message.
+  //
+  // Doing it here makes the guarantee structural: no exit from main, ordinary
+  // or exceptional, can leave a worker unjoined.
+  ~JobRegistry() { join_all(); }
+
   // Joins every worker thread. Called before the process exits, so a thread is
   // never racing PQfinish against static destruction -- the same reasoning
   // that makes ConnectionCache's reaper joined rather than detached.

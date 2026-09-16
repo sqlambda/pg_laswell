@@ -1,0 +1,31 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0040-subscription",
+  "description": "Consume the store's audit log into the history database.",
+  "rationale": "The dependency that crosses databases. This runs on audit and cannot be applied until 0030 has been applied on store -- pg_laswell holds it until store's OWN ledger records that publication as applied, because that is where the answer lives. It also needs the history table, so it depends on 0010 here. No password in the connection string: pg_laswell refuses one rather than redacting it, because the ledger records what ran and a redacted entry would no longer be what ran.",
+  "target": {
+    "connection": "audit",
+    "environment": "dev"
+  },
+  "depends_on": [
+    "0010-audit-history-table",
+    "0030-publication"
+  ],
+  "intents": [
+    {
+      "kind": "create_subscription",
+      "name": "audit_from_store",
+      "connection": "host=127.0.0.1 port=__PORT__ dbname=store user=postgres",
+      "publications": [
+        "store_audit"
+      ]
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:e3e822982ea40003",
+      "algorithm": "ed25519",
+      "signature": "nR8F6CJpSr4O2VkpNpzr1EPqZHMyop+fVDf2ku4C2l3052rrMqsr5BdIKC55tFolVnQ9usJVthSFXJRX+vUdAg=="
+    }
+  ]
+}
