@@ -1,0 +1,386 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pg_laswell</title>
+<meta name="description" content="Migrations that refuse what they cannot prove, commit when the database asks, and record what actually ran.">
+<!--
+  A template. tools/gen-site.py fills the double-braced names from the SOURCE at
+  build time, so no count on this page can disagree with the commit it ships
+  with. Every claim below is about pg_laswell itself and was measured, not
+  assumed; where a number is written by hand, its source is noted here:
+    - 48 of 63 commits on a lock waiter, zero on the interval, same wall time
+      as an uncontended run: 300 000 rows with an application contending,
+      2026-09-05
+    - the transitive waiter count sees 6 where a direct-blocker count sees 1
+      (spike S11, 2026-09-05)
+    - one source row updating two target rows through MERGE with no unique
+      index (spike S21, measured on 18.6)
+-->
+<style>
+  :root {
+    --bg: #fbfaf7; --panel: #ffffff; --fg: #1c1e21; --muted: #5d636b; --rule: #e4e1d9;
+    --accent: #1f5fa8; --accent-soft: #e8f0f9; --code-bg: #f2efe7;
+    --ok: #1f7a4d; --warn: #9a5b10; --warn-soft: #fbf1e3;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #131518; --panel: #1a1d21; --fg: #e6e4df; --muted: #9ba1a8; --rule: #2b2f34;
+      --accent: #7fb2f0; --accent-soft: #1b2733; --code-bg: #1f2227;
+      --ok: #6fcf9c; --warn: #e2ad63; --warn-soft: #2b2418;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 17px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    padding-inline: 20px;
+  }
+  main { max-width: 64rem; margin: 0 auto; padding-block: 3.5rem 3rem; }
+  a { color: var(--accent); }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .9em; }
+  pre { background: var(--code-bg); border-radius: 8px; padding: 1rem 1.1rem; overflow-x: auto;
+        font-size: .88rem; line-height: 1.5; margin: 0; }
+  nav.top { display: flex; justify-content: space-between; align-items: center; gap: 1rem;
+            flex-wrap: wrap; font-size: .92rem; margin-bottom: 3rem; }
+  nav.top .brand { font-weight: 650; letter-spacing: -.01em; color: var(--fg); text-decoration: none; }
+  nav.top .links { display: flex; gap: 1.2rem; flex-wrap: wrap; }
+  nav.top .links a { color: var(--muted); text-decoration: none; }
+  nav.top .links a:hover { color: var(--accent); }
+
+  .hero h1 { font-size: clamp(2rem, 5vw, 3.1rem); line-height: 1.12; letter-spacing: -.025em;
+             margin: 0 0 1rem; max-width: 46rem; }
+  .hero p.lede { font-size: 1.2rem; color: var(--muted); max-width: 44rem; margin: 0 0 1.8rem; }
+  .cta { display: flex; gap: .8rem; flex-wrap: wrap; margin-bottom: 2.5rem; }
+  .btn { display: inline-block; padding: .6rem 1.1rem; border-radius: 7px; text-decoration: none;
+         font-weight: 600; font-size: .95rem; border: 1px solid var(--rule); color: var(--fg);
+         background: var(--panel); }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--bg); }
+
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr)); gap: 1px;
+           background: var(--rule); border: 1px solid var(--rule); border-radius: 10px; overflow: hidden;
+           margin-bottom: 4rem; }
+  .stat { background: var(--panel); padding: 1.1rem 1.2rem; }
+  .stat b { display: block; font-size: 1.7rem; letter-spacing: -.02em; line-height: 1.2; }
+  .stat span { color: var(--muted); font-size: .88rem; }
+
+  section { margin-bottom: 4rem; }
+  section > h2 { font-size: 1.6rem; letter-spacing: -.015em; margin: 0 0 .6rem; }
+  section > p.intro { color: var(--muted); max-width: 46rem; margin: 0 0 1.6rem; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr)); gap: 1rem; }
+  .feature { background: var(--panel); border: 1px solid var(--rule); border-radius: 10px; padding: 1.2rem 1.3rem; }
+  .feature h3 { margin: 0 0 .45rem; font-size: 1.02rem; }
+  .feature p { margin: 0; color: var(--muted); font-size: .95rem; }
+  .feature p + p { margin-top: .6rem; }
+
+  .diagram { background: var(--panel); border: 1px solid var(--rule); border-radius: 10px;
+             padding: 1.4rem; margin-bottom: 1.2rem; overflow-x: auto; }
+  .diagram .mermaid { text-align: center; }
+  .caption { color: var(--muted); font-size: .9rem; margin: .8rem 0 0; }
+
+  .note { background: var(--accent-soft); border-radius: 10px; padding: 1.2rem 1.3rem; }
+  .note h3 { margin: 0 0 .5rem; font-size: 1.02rem; }
+  .note p { margin: 0; font-size: .95rem; }
+  .warn { background: var(--warn-soft); border-left: 3px solid var(--warn); border-radius: 6px;
+          padding: 1rem 1.2rem; font-size: .94rem; }
+
+  table.kinds { width: 100%; border-collapse: collapse; font-size: .92rem; }
+  table.kinds th, table.kinds td { text-align: left; padding: .5rem .6rem; border-bottom: 1px solid var(--rule); }
+  table.kinds th { color: var(--muted); font-size: .78rem; text-transform: uppercase; letter-spacing: .05em; }
+  footer { border-top: 1px solid var(--rule); padding-top: 1.4rem; color: var(--muted); font-size: .88rem; }
+</style>
+</head>
+<body>
+<main>
+
+<nav class="top">
+  <a class="brand" href="#">pg_laswell</a>
+  <div class="links">
+    <a href="reference/index.html">Reference</a>
+    <a href="pg_laswell.1.html">pg_laswell(1)</a>
+    <a href="pg_laswell_mcp.1.html">pg_laswell_mcp(1)</a>
+    <a href="https://github.com/sqlambda/pg_laswell">GitHub</a>
+  </div>
+</nav>
+
+<div class="hero">
+  <h1>Migrations that refuse what they cannot prove.</h1>
+  <p class="lede">
+    pg_laswell plans a schema change against the live catalog, tells you what it
+    will do and why, commits when the database asks rather than on a timer, and
+    records every statement it ran. It refuses anything it cannot justify from a
+    reading — and names the reading.
+  </p>
+  <div class="cta">
+    <a class="btn primary" href="https://github.com/sqlambda/pg_laswell/releases">Download {{VERSION}}</a>
+    <a class="btn" href="reference/index.html">Browse the {{KINDS}} intent kinds</a>
+  </div>
+</div>
+
+<div class="stats">
+  <div class="stat"><b>{{KINDS}}</b><span>intent kinds, each executed against a real PostgreSQL on every test run</span></div>
+  <div class="stat"><b>{{TESTS}}</b><span>tests, green on PostgreSQL 15 through 18</span></div>
+  <div class="stat"><b>{{CASES}}</b><span>conformance cases, applied to a live database</span></div>
+  <div class="stat"><b>0</b><span>agents required to deploy</span></div>
+  <div class="stat"><b>{{TARGETS}}</b><span>release targets, deb, rpm and tarball</span></div>
+</div>
+
+<section id="why">
+  <h2>What you are buying into</h2>
+  <p class="intro">
+    Every one of these is a decision the tool makes from a measurement, not a
+    preference it was configured with.
+  </p>
+  <div class="grid">
+    <div class="feature">
+      <h3>What ran is what you were shown</h3>
+      <p>
+        A plan carries a digest over its statements, the reasoning behind each
+        one, the locks each takes, and the refusals. <code>startMigration</code>
+        recomputes it and must agree. The receipt covers what will run — never
+        the server's load at that instant, which is measured again precisely
+        because it goes stale.
+      </p>
+    </div>
+    <div class="feature">
+      <h3>It commits when the database asks</h3>
+      <p>
+        A paced change commits on a lock waiter, on an interval, or on a row
+        cap — whichever comes first. Measured on 300 000 rows with an
+        application contending: <b>48 of 63 commits fired on a waiter and zero
+        on the interval</b>, finishing in the same wall time as an uncontended
+        run. Committing on contention rather than on a schedule costs nothing
+        and bounds the harm.
+      </p>
+    </div>
+    <div class="feature">
+      <h3>It refuses, and names the measurement</h3>
+      <p>
+        A <code>MERGE</code> keyed on a column with only a composite unique
+        index is refused: measured on 18.6, one source row updated two target
+        rows with no error and nothing in the row count to notice. A paced
+        <code>MERGE</code> on PostgreSQL 15 or 16 is refused because
+        <code>MERGE … RETURNING</code> is a syntax error there — measured
+        against real clusters, not read off a release note.
+      </p>
+    </div>
+    <div class="feature">
+      <h3>The database decides what may run</h3>
+      <p>
+        The trust root, the environment label and the release approvals live in
+        tables the migrating role can read and cannot write. A permissive client
+        configuration cannot talk a production database into accepting a
+        development migration.
+      </p>
+    </div>
+    <div class="feature">
+      <h3>It measures harm it is causing</h3>
+      <p>
+        An observer counts the <b>transitive</b> waiters queued behind the
+        migration — a direct-blocker count sees 1 where the real pile-up is 6 —
+        throttles, pauses, and cancels a statement that starves a waiter past
+        its limit. The migration stops; the application does not.
+      </p>
+    </div>
+    <div class="feature">
+      <h3>No agent in the deployment path</h3>
+      <p>
+        <code>pg_laswell</code> applies a repository and exits with a code a
+        pipeline can branch on. The MCP server is for <em>authoring</em> a
+        migration, not for running one. Nothing about the safety decisions
+        needs a model at four in the morning.
+      </p>
+    </div>
+  </div>
+</section>
+
+<section id="topology">
+  <h2>One repository, several databases</h2>
+  <p class="intro">
+    A change is always single-database — PostgreSQL has no cross-database
+    transaction, so a change spanning two would be atomic in neither. A change
+    may <em>require</em> a change on a different database, and that is what
+    <code>depends_on</code> is for. It crosses databases freely; each database
+    keeps its own ledger, so “has that been applied” is answered where it ran.
+  </p>
+
+  <div class="diagram">
+    <pre class="mermaid">
+flowchart TB
+  subgraph repo ["one signed repository"]
+    direction TB
+    S1["<b>0010-audit-schema</b><br/>connection: audit<br/>create_schema, create_table<br/>audit.logged_actions"]
+    S2["<b>0020-store-audit-log</b><br/>connection: store<br/>create_table PARTITION BY RANGE<br/>+ attach_partition"]
+    S3["<b>0030-publication</b><br/>connection: store<br/>create_publication"]
+    S4["<b>0040-subscription</b><br/>connection: audit<br/>create_subscription<br/><i>depends_on 0030</i>"]
+    S2 --> S3
+    S1 --> S4
+    S3 -.->|"depends_on<br/>crosses the gap"| S4
+  end
+
+  subgraph store ["store — the operating database"]
+    direction TB
+    ST["public.orders, public.customer"]
+    AL["store.audit_log<br/>PARTITION BY RANGE (action_tstamp_tx)"]
+    P1["audit_log_2026_09"]
+    P2["audit_log_2026_10"]
+    AL --- P1
+    AL --- P2
+    ST -->|"row trigger"| AL
+  end
+
+  subgraph audit ["audit — the history database"]
+    LA["audit.logged_actions<br/>full history, never rotated"]
+  end
+
+  CRON(["pg_cron<br/>nightly"]) -->|"creates next, detaches oldest<br/><b>not a migration: it repeats</b>"| AL
+
+  S2 ==> AL
+  S1 ==> LA
+  S3 ==> PUB{{"PUBLICATION store_audit"}}
+  PUB -->|"logical replication"| SUB{{"SUBSCRIPTION audit_from_store"}}
+  S4 ==> SUB
+  AL -.->|"INSERTs stream"| PUB
+  SUB --> LA
+
+  classDef spec fill:#e8f0f9,stroke:#1f5fa8,color:#12243a;
+  classDef db fill:#ffffff,stroke:#b9b4a6,color:#1c1e21;
+  class S1,S2,S3,S4 spec;
+  class ST,AL,P1,P2,LA db;
+    </pre>
+    <p class="caption">
+      Four specifications, two databases, one dependency that crosses between
+      them. pg_laswell applies <code>0030</code> on <code>store</code> and holds
+      <code>0040</code> until that is recorded applied <em>in store's own
+      ledger</em> — then applies it on <code>audit</code>. Neither database can
+      see the other's tables; only the dependency crosses.
+    </p>
+  </div>
+
+  <div class="warn">
+    <b>pg_cron is drawn outside the repository on purpose.</b> pg_laswell holds
+    that a migration is a change to schema state applied <em>exactly once</em>:
+    the ledger keys on the specification digest, and a digest that has succeeded
+    is never listed pending again. Rotating a partition every night runs
+    repeatedly, so it is not a migration and pg_laswell will not pretend to own
+    it. Creating the partitioned table, attaching a partition once, and building
+    the publication are structural changes applied once — those are migrations.
+  </div>
+</section>
+
+<section id="topologies">
+  <h2>Any-to-any, not just a pair</h2>
+  <p class="intro">
+    The dependency graph is global and the ledgers are local, so the shapes a
+    deployment can express are whatever the graph can draw.
+  </p>
+  <div class="diagram">
+    <pre class="mermaid">
+flowchart LR
+  subgraph fan ["fan-in: many shards, one history"]
+    direction LR
+    A1[(store_eu)] --> H[(audit)]
+    A2[(store_us)] --> H
+    A3[(store_ap)] --> H
+  end
+
+  subgraph ring ["ring: each publishes to the next"]
+    direction LR
+    R1[(a)] --> R2[(b)] --> R3[(c)] --> R1
+  end
+
+  subgraph cascade ["cascade: relay onward"]
+    direction LR
+    C1[(primary)] --> C2[(regional)] --> C3[(reporting)]
+  end
+    </pre>
+    <p class="caption">
+      Each arrow is a <code>depends_on</code> between specifications on
+      different connections. A cycle in the dependency graph is refused by name
+      — pg_laswell reports which specifications form it — so a replication
+      <em>ring</em> is expressed as the acyclic order that builds it, not as a
+      cycle in the repository.
+    </p>
+  </div>
+</section>
+
+<section id="audit">
+  <h2>The audit table is the one you already know</h2>
+  <p class="intro">
+    The history database holds <code>audit.logged_actions</code> in the shape
+    the PostgreSQL wiki's audit trigger has used for years — so the rows mean
+    what your existing queries expect them to mean.
+  </p>
+  <pre>{
+  "laswell_spec_version": 1,
+  "id": "0040-subscription",
+  "description": "Consume the store's audit log into the history database.",
+  "rationale": "The store keeps a rolling window; audit keeps everything.",
+  "target": { "connection": "audit", "environment": "production" },
+  "depends_on": ["0030-publication"],
+  "intents": [
+    {
+      "kind": "create_subscription",
+      "name": "audit_from_store",
+      "connection": "service=store_publisher",
+      "publications": ["store_audit"],
+      "comment": "Full history of every row change in store."
+    }
+  ]
+}</pre>
+  <p class="caption">
+    The <code>connection</code> inside the intent is the libpq string the
+    SUBSCRIPTION itself dials out on — a PostgreSQL concept. The
+    <code>target.connection</code> above it is which database pg_laswell applies
+    this specification to. A credential is refused rather than redacted here:
+    the ledger records what ran, and a redacted ledger entry would no longer be
+    what ran. Name a service instead.
+  </p>
+</section>
+
+<section id="docs">
+  <h2>Every kind, documented from the source</h2>
+  <p class="intro">
+    The reference is generated from <code>spec.h</code> and
+    <code>conformance.inc</code> rather than written beside them, so it cannot
+    drift: the options on a page are the keys the parser enforces, and the
+    example on a page is a case the test suite applies to a real database on
+    every run.
+  </p>
+  <div class="grid">
+    <div class="feature">
+      <h3><a href="reference/index.html">The {{KINDS}} intent kinds</a></h3>
+      <p>One page each, in the shape of the PostgreSQL manual's per-command
+      pages: synopsis, parameters, a worked example, and what it refuses.</p>
+    </div>
+    <div class="feature">
+      <h3><a href="pg_laswell_mcp.1.html">pg_laswell_mcp(1)</a></h3>
+      <p>The authoritative reference for everything that is not a per-kind
+      option: pacing, the trust gates, the ledger, the dry run.</p>
+    </div>
+    <div class="feature">
+      <h3><a href="pg_laswell.1.html">pg_laswell(1)</a></h3>
+      <p>The deployment binary: one repository, exit codes a pipeline can
+      branch on, and no agent anywhere in the path.</p>
+    </div>
+  </div>
+</section>
+
+<footer>
+  pg_laswell {{VERSION}} — {{KINDS}} intent kinds, {{TESTS}} tests.
+  Named after Bill Laswell, who is credited as producer on records he mostly
+  kept other people from ruining.
+  <a href="https://github.com/sqlambda/pg_laswell">Source</a>.
+</footer>
+
+</main>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.esm.min.mjs';
+  const dark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+  mermaid.initialize({ startOnLoad: true, theme: dark ? 'dark' : 'neutral',
+                       flowchart: { htmlLabels: true, curve: 'basis' } });
+</script>
+</body>
+</html>

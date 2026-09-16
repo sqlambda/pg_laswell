@@ -354,6 +354,64 @@ jobs:
           path: ${{ matrix.artifact }}.${{ matrix.extension }}
           if-no-files-found: error
 
+  # The published site: the landing page, the generated reference, and both man
+  # pages as HTML. Built on every tag AND every run, so a broken template or an
+  # unfilled placeholder fails here rather than on the day of a release; only
+  # the deploy below is gated on a tag.
+  site:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - name: Install mandoc
+        run: |
+          sudo apt-get update -o DPkg::Lock::Timeout=300
+          sudo apt-get install -y --no-install-recommends mandoc
+      # The SAME mermaid the page loads from its CDN, so the check and the
+      # browser cannot disagree about whether a diagram parses. jsdom because
+      # mermaid sanitises labels through DOMPurify, which wants a DOM even when
+      # only parsing -- a stub is not enough, measured.
+      - name: Install the mermaid the page pins
+        run: |
+          VERSION=$(grep -oE 'mermaid@[0-9][0-9.]*' site/index.html | head -1 | cut -d@ -f2)
+          test -n "$VERSION" || { echo "::error::site/index.html pins no mermaid version"; exit 1; }
+          npm install --no-save --no-fund --no-audit "mermaid@${VERSION}" jsdom@22
+      - name: Generate
+        run: |
+          set -eux
+          # The counts on the landing page come from the source in this commit,
+          # so no number on it can disagree with what it ships beside. Fails on
+          # an unfilled placeholder.
+          python3 tools/gen-site.py _site
+          mandoc -T html cpp/man/pg_laswell.1     > _site/pg_laswell.1.html
+          mandoc -T html cpp/man/pg_laswell_mcp.1 > _site/pg_laswell_mcp.1.html
+          # The diagrams are the point of the landing page, so a syntax error in
+          # one is a build failure rather than an empty box on a live site.
+          python3 tools/check-mermaid.py site/index.html
+          ls -la _site
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy-site:
+    name: Publish the site
+    needs: [site, publish]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4
+
   publish:
     needs: build
     runs-on: ubuntu-latest

@@ -1,5 +1,9 @@
 # pg_laswell
 
+The site, with the reference for every intent kind:
+<https://sqlambda.github.io/pg_laswell/>
+
+
 **Intelligent migration for PostgreSQL.** It decides *how* to apply a change by
 measuring the database in front of it, and applies it without blocking the
 application any longer than it has to.
