@@ -532,7 +532,7 @@ inline json start_migration(ToolContext& ctx, const json& args) {
   // The observer for THIS job's database, not for whichever one happened to be
   // default. Started here rather than at construction so a configuration with
   // ten connections opens observer connections only to the ones it uses.
-  if (ctx.observers) ctx.observers->get(cfg)->start();
+  if (ctx.observers) ctx.observers->start_for(cfg);
   // The ceiling is process-wide, so it lives on the registry rather than on a
   // job. Re-declared on every start because a caller may name a different
   // connection, and the last word wins -- raising it wakes whoever is waiting.

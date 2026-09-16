@@ -383,15 +383,29 @@ class Observer {
 
   ~Observer() { stop(); }
 
+  // Guarded by its own mutex, not by m_: m_ is what the loop waits on, and
+  // holding it across a join would deadlock against the thread being joined.
+  //
+  // The guard is not decoration. start() is called from every startMigration,
+  // and two concurrent calls used to race on thread_ -- where the loser
+  // ASSIGNS to a joinable std::thread, which calls std::terminate, and the
+  // winner could leave two loops sharing one libpq connection. One observer
+  // per connection made that reachable: before, a single observer was started
+  // once at startup and the race had nowhere to happen.
   void start() {
+    std::lock_guard<std::mutex> lock(lifecycle_m_);
     if (thread_.joinable()) return;
-    stop_ = false;
+    {
+      std::lock_guard<std::mutex> lock2(m_);
+      stop_ = false;
+    }
     thread_ = std::thread([this] { loop(); });
   }
 
   void stop() {
+    std::lock_guard<std::mutex> lock(lifecycle_m_);
     {
-      std::lock_guard<std::mutex> lock(m_);
+      std::lock_guard<std::mutex> lock2(m_);
       stop_ = true;
     }
     cv_.notify_all();
@@ -573,6 +587,7 @@ class Observer {
   JobRegistry* registry_;
   int tick_ms_;
   std::unique_ptr<pqxx::connection> conn_;
+  mutable std::mutex lifecycle_m_;  // start/stop only; never held over a wait
   mutable std::mutex m_;
   std::condition_variable cv_;
   bool stop_ = false;
@@ -599,7 +614,11 @@ class ObserverPool {
  public:
   ObserverPool(JobRegistry* jobs) : jobs_(jobs) {}
 
-  Observer* get(const ConnConfig& cfg) {
+  // Created and started as ONE step under this lock. Handing back a
+  // not-yet-started observer for the caller to start left the start racing
+  // every other caller's, which is a race the single-observer arrangement
+  // never had.
+  Observer* start_for(const ConnConfig& cfg) {
     std::lock_guard<std::mutex> lock(m_);
     auto it = observers_.find(cfg.name);
     if (it == observers_.end()) {
@@ -608,6 +627,7 @@ class ObserverPool {
                                       cfg, jobs_, cfg.executor.observer_tick_ms))
                .first;
     }
+    it->second->start();
     return it->second.get();
   }
 
