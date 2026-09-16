@@ -36,9 +36,17 @@ const modules = process.argv[3];
 const require = createRequire(pathToFileURL(path.join(modules, 'noop.js')));
 const { JSDOM } = require('jsdom');
 const dom = new JSDOM('<!doctype html><body></body>', { pretendToBeVisual: true });
-global.window = dom.window;
-global.document = dom.window.document;
-global.navigator = dom.window.navigator;
+// window and document only. `navigator` became a real global in node 21 with
+// a getter and no setter, so assigning it throws TypeError -- on the runner,
+// which has node 22, while this machine has node 20 and never saw it. Mermaid
+// parses without it; verified rather than assumed.
+//
+// defineProperty rather than assignment for the two that are needed, so a
+// future node that makes either of them getter-only fails here at the seam
+// instead of somewhere unrecognisable.
+for (const [name, value] of [['window', dom.window], ['document', dom.window.document]]) {
+  Object.defineProperty(globalThis, name, { value, configurable: true, writable: true });
+}
 const mermaid = (await import(
   pathToFileURL(path.join(modules, 'mermaid', 'dist', 'mermaid.esm.min.mjs')).href
 )).default;
@@ -92,9 +100,20 @@ def main():
                          'locally, npm install them or set MERMAID_MODULES.'
                          % (needed, modules, version))
         print('check-mermaid: %d diagram(s) against mermaid %s' % (len(blocks), version))
-        r = subprocess.run(['node', script, src, modules])
-        if r.returncode != 0:
+        r = subprocess.run(['node', script, src, modules], capture_output=True, text=True)
+        sys.stdout.write(r.stdout)
+        sys.stderr.write(r.stderr)
+        if r.returncode == 0:
+            return
+        # A checker that could not RUN is not a broken diagram, and saying so
+        # is not pedantry: this reported "a diagram does not parse" when the
+        # real fault was node 22 refusing an assignment, which sent the reader
+        # looking at correct diagrams for the problem.
+        if '  ok   diagram' in r.stdout or '  FAIL diagram' in r.stdout:
             sys.exit('check-mermaid: a diagram does not parse')
+        sys.exit('check-mermaid: the checker itself could not run -- see the '
+                 'error above. The diagrams were never examined, so this says '
+                 'nothing about whether they are valid.')
 
 
 if __name__ == '__main__':
