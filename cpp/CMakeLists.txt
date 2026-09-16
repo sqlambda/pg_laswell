@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(pg_laswell_mcp VERSION 0.1.0 LANGUAGES CXX)
+project(pg_laswell_mcp VERSION 0.1.1 LANGUAGES CXX)
 
 # Standard bin/ and share/man/ layout, so `cmake --install` produces a tree that
 # can be dropped onto a prefix as-is: the release tarballs are staged this way,
