@@ -478,22 +478,23 @@ class MigrationRepository {
         // the problem message carries both paths instead.
         const auto prior = claimed.find(spec.id);
         if (prior != claimed.end()) {
-          // Named by SOURCE as well as by path when the two files came from
-          // different directories: across projects the useful half of the
-          // answer is whose project it was, and the paths may look alike.
-          const auto where = [&](const std::string& src, const std::string& file) {
-            return src == file || src.empty() ? file : file + " (in " + src + ")";
-          };
+          // Both PATHS, and only the paths. A source is named by its own
+          // directory until a manifest gives it another name, so annotating
+          // each path with its source repeated the prefix the path already
+          // carries -- ".../dupA/0001-init.json (in .../dupA)" -- on a message
+          // that is long enough already. When sources gain names of their own
+          // this should carry the name; adding it before then was prose no
+          // test could distinguish from its own absence, which is how it was
+          // found.
           problems.push_back(
               prior->second.digest == spec.digest
                   ? "\"" + spec.id + "\" is claimed by two files with identical "
-                    "content: " + where(prior->second.source, prior->second.path) +
-                    " and " + where(source, path) +
+                    "content: " + prior->second.path + " and " + path +
                     ". One of them is a copy; delete it."
                   : "\"" + spec.id + "\" is claimed by two DIFFERENT "
-                    "specifications: " + where(prior->second.source, prior->second.path) +
-                    " (" + prior->second.digest.substr(0, 12) + "…) and " +
-                    where(source, path) + " (" + spec.digest.substr(0, 12) +
+                    "specifications: " + prior->second.path + " (" +
+                    prior->second.digest.substr(0, 12) + "…) and " + path +
+                    " (" + spec.digest.substr(0, 12) +
                     "…). An id is what depends_on refers to and what the ledger "
                     "records, so it cannot mean two things. Rename one.");
           continue;

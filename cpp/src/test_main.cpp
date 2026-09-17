@@ -4192,9 +4192,40 @@ TEST_F(MultiSourceTest, OneIdInTwoDirectoriesIsRefusedAndNamesBoth) {
     if (t.find("0001-init") != std::string::npos) named = t;
   }
   ASSERT_FALSE(named.empty()) << s.dump(2);
-  EXPECT_NE(named.find(dir_), std::string::npos)
-      << "the refusal must name both directories: " << named;
-  EXPECT_NE(named.find(dir2_), std::string::npos) << named;
+  // The FULL paths, not the directory prefixes: a path contains its own
+  // directory, so asserting the prefix passes on text the message would carry
+  // anyway and proves nothing about naming both files.
+  EXPECT_NE(named.find(dir_ + "/0001-init.json"), std::string::npos)
+      << "the refusal must name both files: " << named;
+  EXPECT_NE(named.find(dir2_ + "/0001-init.json"), std::string::npos) << named;
+}
+
+TEST_F(MultiSourceTest, TheSameSpecCopiedIntoTwoDirectoriesSaysItIsACopy) {
+  // The other half of the collision, and the likelier accident: not two
+  // projects that chose one id, but one file copied from one project into
+  // another. Same id, same bytes, so it needs a different instruction --
+  // delete the copy, rather than rename either.
+  //
+  // It had no test until a mutation went uncaught: the collision test used two
+  // files with DIFFERENT content, so the identical-content branch was never
+  // reached by anything.
+  make_shop(cfg());
+  const auto doc = add_column_spec("0001-init", "orders", "ca");
+  write_spec_in(dir_, "0001-init.json", doc);
+  write_spec_in(dir2_, "0001-init.json", doc);
+
+  const auto s = scan_many({dir_, dir2_});
+  std::string named;
+  for (const auto& p : s["problems"]) {
+    const auto t = p.get<std::string>();
+    if (t.find("0001-init") != std::string::npos) named = t;
+  }
+  ASSERT_FALSE(named.empty()) << s.dump(2);
+  EXPECT_NE(named.find("identical content"), std::string::npos)
+      << "two copies of one file are a copy to delete, not a name to change: "
+      << named;
+  EXPECT_NE(named.find(dir_ + "/0001-init.json"), std::string::npos) << named;
+  EXPECT_NE(named.find(dir2_ + "/0001-init.json"), std::string::npos) << named;
 }
 
 TEST_F(MultiSourceTest, TheOrderTheDirectoriesAreNamedInDoesNotChangeTheAnswer) {
