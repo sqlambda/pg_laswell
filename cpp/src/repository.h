@@ -339,6 +339,15 @@ class MigrationRepository {
     std::sort(files.begin(), files.end());
 
     std::map<std::string, Spec> parsed;
+    // spec id -> the first file that claimed it. An id is the name every other
+    // spec refers to in depends_on and the name the ledger records, so two
+    // files claiming one id is not a preference to resolve but a question with
+    // two answers.
+    struct FirstSeen {
+      std::string path;
+      std::string digest;
+    };
+    std::map<std::string, FirstSeen> claimed;
 
     for (const auto& path : files) {
       RepoEntry entry;
@@ -349,6 +358,30 @@ class MigrationRepository {
         const auto spec = parse_spec(doc);
         entry.spec_id = spec.id;
         entry.digest = spec.digest;
+
+        // Last-wins was the wrong answer twice over: the loser vanished from
+        // the dependency order, and nothing said so. Harmless while one team
+        // keeps one directory; read several together and two projects that
+        // both wrote 0001-init collide, and one of them quietly stops
+        // existing. The duplicate is not listed as its own entry -- a second
+        // pending row under one id would put the id in the order twice -- so
+        // the problem message carries both paths instead.
+        const auto prior = claimed.find(spec.id);
+        if (prior != claimed.end()) {
+          problems.push_back(
+              prior->second.digest == spec.digest
+                  ? "\"" + spec.id + "\" is claimed by two files with identical "
+                    "content: " + prior->second.path + " and " + path +
+                    ". One of them is a copy; delete it."
+                  : "\"" + spec.id + "\" is claimed by two DIFFERENT "
+                    "specifications: " + prior->second.path + " (" +
+                    prior->second.digest.substr(0, 12) + "…) and " + path +
+                    " (" + spec.digest.substr(0, 12) +
+                    "…). An id is what depends_on refers to and what the ledger "
+                    "records, so it cannot mean two things. Rename one.");
+          continue;
+        }
+        claimed.emplace(spec.id, FirstSeen{path, spec.digest});
         entry.depends_on = spec.depends_on;
         entry.database = spec.target_database;
         entry.environment = spec.target_environment;
