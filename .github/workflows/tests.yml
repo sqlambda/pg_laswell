@@ -148,19 +148,6 @@ jobs:
           --health-cmd pg_isready --health-interval 5s
           --health-timeout 5s --health-retries 10
         ports: ['5432:5432']
-      # A SECOND cluster, not a second database. The grouping logic grants
-      # concurrency across databases without evidence, and the case that gets
-      # that wrong -- one database NAME on two servers -- cannot be expressed
-      # inside a single cluster, where names are unique. Same image, separate
-      # initdb, so the system_identifiers genuinely differ.
-      postgres_second:
-        image: postgres:${{ matrix.pg }}
-        env:
-          POSTGRES_PASSWORD: postgres
-        options: >-
-          --health-cmd pg_isready --health-interval 5s
-          --health-timeout 5s --health-retries 10
-        ports: ['5433:5432']
     steps:
       # The suite shells out to psql to install the ledger, and reads
       # sql/bootstrap.sql through a path baked in at compile time, so the source
@@ -178,10 +165,8 @@ jobs:
         working-directory: build
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
-          PGLASWELL_SECOND_CLUSTER_URL: postgresql://postgres:postgres@localhost:5433/postgres
           # A skip nobody notices is a test that silently stopped running.
           PGLASWELL_REQUIRE_DATABASE: '1'
-          PGLASWELL_REQUIRE_SECOND_CLUSTER: '1'
         run: |
           chmod +x pg_laswell_mcp_test   # artifacts do not preserve the mode bit
           ./pg_laswell_mcp_test
@@ -483,6 +468,61 @@ jobs:
   # beside them. `always()` with an explicit result check, not the default: a
   # needs: job is SKIPPED when a dependency fails, and a skipped required check
   # is not a failing one -- protection would let the merge through.
+  # One database NAME on two servers is two databases, and the grouping logic
+  # grants concurrency across databases with NO evidence -- so that case is the
+  # one place a wrong answer costs something. It cannot be expressed inside a
+  # single cluster, where names are unique, so it gets two.
+  #
+  # Its own job rather than a second service on all seven matrix jobs. Those run
+  # the whole suite, paced backfills included, and the executor guards itself
+  # with idle_in_transaction_session_timeout = commit_interval_ms * 3 -- putting
+  # a second database on a two-core runner is how a paced commit starts losing
+  # its connection, which is exactly what one of them then did.
+  twin_clusters:
+    name: twin clusters
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 10
+        ports: ['5432:5432']
+      # Same image, separate initdb, so the system_identifiers genuinely differ.
+      postgres_second:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 10
+        ports: ['5433:5432']
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update -o DPkg::Lock::Timeout=300
+          sudo apt-get install -y --no-install-recommends libpq5 postgresql-client
+      - uses: actions/download-artifact@v4
+        with:
+          name: test-binary-plain-gcc
+          path: build
+      - name: One name on two servers
+        working-directory: build
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+          PGLASWELL_SECOND_CLUSTER_URL: postgresql://postgres:postgres@localhost:5433/postgres
+          PGLASWELL_REQUIRE_DATABASE: '1'
+          # This job exists for this test. A skip here is the job doing nothing.
+          PGLASWELL_REQUIRE_SECOND_CLUSTER: '1'
+        run: |
+          chmod +x pg_laswell_mcp_test   # artifacts do not preserve the mode bit
+          ./pg_laswell_mcp_test --gtest_filter='TwinNamedDatabaseTest.*'
+
   ci-ok:
     name: ci-ok
     if: always()
@@ -494,6 +534,7 @@ jobs:
       - call_mode
       - replication
       - pooled
+      - twin_clusters
       - packages
     runs-on: ubuntu-latest
     timeout-minutes: 5
