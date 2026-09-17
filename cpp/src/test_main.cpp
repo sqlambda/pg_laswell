@@ -10765,6 +10765,198 @@ class TwoDatabaseTest : public RepoTest {
   std::string second_url_, ini_;
 };
 
+// Two SEPARATE CLUSTERS, whose databases share a name.
+//
+// The case the identity fix exists for, and the one no single-cluster fixture
+// can reach: within a cluster, names are unique, so "same name, different
+// database" is only expressible across servers. A fleet of shards all called
+// "app", or a staging server restored from production, is the ordinary way it
+// happens -- and under a name comparison every such pair declines the
+// shortcut, serialising migrations that cannot possibly touch each other's
+// tables. That is precisely the concurrency target.connection exists to give.
+//
+// Needs PGLASWELL_SECOND_CLUSTER_URL pointing at a DIFFERENT cluster. Locally:
+//   docker run -d --name laswell_pg2 -e POSTGRES_PASSWORD=laswell
+//     -e POSTGRES_DB=app -p 55433:5432 postgres:18
+// The fixture creates an identically named database on both, so the precondition
+// holds however the two URLs are spelled.
+class TwinNamedDatabaseTest : public RepoTest {
+ public:
+  static constexpr const char* kTwin = "laswell_twin";
+
+  void SetUp() override {
+    RepoTest::SetUp();
+    if (::testing::Test::IsSkipped()) return;
+    const char* second = std::getenv("PGLASWELL_SECOND_CLUSTER_URL");
+    if (second == nullptr || *second == '\0') {
+      // The same bargain DatabaseTest strikes, for the same reason: a skip
+      // nobody notices is a test that silently stopped running, and this one
+      // guards a grant that is made WITHOUT evidence.
+      if (std::getenv("PGLASWELL_REQUIRE_SECOND_CLUSTER") != nullptr) {
+        FAIL() << "PGLASWELL_SECOND_CLUSTER_URL is unset and "
+                  "PGLASWELL_REQUIRE_SECOND_CLUSTER=1. CI runs a second "
+                  "postgres service for this; if it has gone, restore it "
+                  "rather than dropping the variable.";
+      }
+      GTEST_SKIP() << "PGLASWELL_SECOND_CLUSTER_URL is not set: this needs a "
+                      "SECOND cluster, because one database name on two "
+                      "servers cannot be expressed inside one. Set "
+                      "PGLASWELL_REQUIRE_SECOND_CLUSTER=1 to make this a "
+                      "failure.";
+    }
+    first_twin_ = with_dbname(url_, kTwin);
+    second_twin_ = with_dbname(second, kTwin);
+
+    create_twin(url_);
+    create_twin(second);
+
+    // The whole test rests on these two facts. Asserted, not assumed: given the
+    // same cluster twice it would silently become a different test.
+    ASSERT_EQ(scalar(first_twin_, "current_database()"),
+              scalar(second_twin_, "current_database()"))
+        << "the two databases must share a name or there is nothing to prove";
+    if (scalar(first_twin_, "(SELECT system_identifier FROM pg_control_system())") ==
+        scalar(second_twin_, "(SELECT system_identifier FROM pg_control_system())")) {
+      GTEST_SKIP() << "PGLASWELL_SECOND_CLUSTER_URL names the SAME cluster as "
+                      "DATABASE_URL; two are needed.";
+    }
+
+    bootstrap_into(first_twin_);
+    bootstrap_into(second_twin_);
+
+    ini_ = dir_ + "/twins.ini";
+    {
+      std::ofstream f(ini_);
+      f << "[first]\n" << conn_section(first_twin_)
+        << "\n[other]\n" << conn_section(second_twin_);
+    }
+    ::chmod(ini_.c_str(), 0600);
+    ctx_->registry = pglaswell::Registry::from_ini(ini_, "pg-laswell/test");
+    ctx_->registry.mutable_trust() = policy_trusting_test_key();
+    server_ = std::make_unique<pglaswell::McpServer>(pglaswell::make_tools(*ctx_));
+    initialize(*server_);
+  }
+
+  void TearDown() override {
+    if (!::testing::Test::IsSkipped()) {
+      const char* second = std::getenv("PGLASWELL_SECOND_CLUSTER_URL");
+      drop_twin(url_);
+      if (second != nullptr && *second != '\0') drop_twin(second);
+    }
+    RepoTest::TearDown();
+  }
+
+  static std::string with_dbname(const std::string& url, const std::string& db) {
+    auto rest = url;
+    std::string query;
+    const auto q = rest.find('?');
+    if (q != std::string::npos) {
+      query = rest.substr(q);
+      rest = rest.substr(0, q);
+    }
+    const auto slash = rest.find('/', rest.find("://") + 3);
+    return (slash == std::string::npos ? rest : rest.substr(0, slash)) + "/" +
+           db + query;
+  }
+
+  static std::string scalar(const std::string& url, const std::string& expr) {
+    pglaswell::ConnConfig c;
+    c.name = "probe";
+    c.conninfo = url;
+    pglaswell::ReadSession r(c);
+    return r.txn().exec("SELECT (" + expr + ")::text")[0][0].as<std::string>();
+  }
+
+  static void create_twin(const std::string& url) {
+    pglaswell::ConnConfig c;
+    c.name = "admin";
+    c.conninfo = url;
+    pglaswell::WriteSession w(c);
+    w.exec_nontransactional(std::string("DROP DATABASE IF EXISTS ") + kTwin);
+    w.exec_nontransactional(std::string("CREATE DATABASE ") + kTwin);
+  }
+
+  static void drop_twin(const std::string& url) {
+    try {
+      pglaswell::ConnConfig c;
+      c.name = "admin";
+      c.conninfo = url;
+      pglaswell::WriteSession w(c);
+      w.exec_nontransactional(std::string("DROP DATABASE IF EXISTS ") + kTwin);
+    } catch (const std::exception&) {
+    }
+  }
+
+  // conn_section is TwoDatabaseTest's, unchanged: the INI shape a user writes
+  // is the one under test, here as much as there.
+  static std::string conn_section(const std::string& url) {
+    return TwoDatabaseTest::conn_section(url);
+  }
+
+  static void bootstrap_into(const std::string& url) {
+    // Roles are CLUSTER-wide, and bootstrap.sql grants to this one rather than
+    // creating it -- deliberately, since the runtime role is the operator's to
+    // define. On the first cluster it already exists, because the suite
+    // bootstrapped a database there; the second cluster has never been touched.
+    // Getting this wrong is what the second cluster is for.
+    (void)std::system(("psql -X -q -c 'CREATE ROLE laswell_runner NOLOGIN' \"" +
+                       url + "\" >/dev/null 2>&1").c_str());
+    const std::string key_b64 = pglaswell::Registry::base64_encode(test_key().pub);
+    const std::string cmd =
+        "PSQLRC=/dev/null psql -X -q -v ON_ERROR_STOP=1 "
+        "-v laswell_role=laswell_runner "
+        "-v first_key_id=" + test_key().key_id +
+        " -v first_key_b64=" + key_b64 +
+        " -v first_key_label=suite "
+        "-f " + std::string(PGLASWELL_BOOTSTRAP_SQL) + " \"" + url + "\" 2>&1";
+    // Captured, not discarded: "bootstrap failed" without psql's own words
+    // sends the reader to the wrong cluster.
+    std::string output;
+    FILE* pipe = ::popen(cmd.c_str(), "r");
+    if (pipe != nullptr) {
+      char buf[512];
+      while (::fgets(buf, sizeof(buf), pipe) != nullptr) output += buf;
+      if (::pclose(pipe) != 0) {
+        throw std::runtime_error("bootstrap.sql failed on " + url + ": " + output);
+      }
+    }
+  }
+
+  std::string first_twin_, second_twin_, ini_;
+};
+
+TEST_F(TwinNamedDatabaseTest, OneNameOnTwoServersIsTwoDatabases) {
+  // Both clusters get the same table, and both specs touch it. Under a name
+  // comparison the two databases are indistinguishable and the pair declines;
+  // under the exact identity they are plainly different and the pair is
+  // granted without needing evidence at all.
+  for (const auto& url : {first_twin_, second_twin_}) {
+    pglaswell::ConnConfig c;
+    c.name = "seed";
+    c.conninfo = url;
+    pglaswell::WriteSession w(c);
+    w.begin("pg_laswell/test/twin");
+    w.txn().exec("CREATE SCHEMA IF NOT EXISTS shop");
+    w.txn().exec("CREATE TABLE shop.orders(id bigint PRIMARY KEY)");
+    w.commit();
+  }
+
+  auto a = add_column_spec("a", "orders", "ca");
+  a["target"] = json{{"connection", "first"}};
+  auto b = add_column_spec("b", "orders", "cb");
+  b["target"] = json{{"connection", "other"}};
+  write_spec("a.json", a);
+  write_spec("b.json", b);
+
+  const auto s = scan(true);
+  ASSERT_EQ(s["order"].size(), 1u) << s.dump(2);
+  EXPECT_TRUE(s["order"][0].value("provenConcurrent", false))
+      << "two databases on two different clusters were not proven concurrent "
+         "merely because they are both called \"" << kTwin
+      << "\". A fleet of shards named alike would serialise entirely: "
+      << s.dump(2);
+}
+
 TEST_F(TwoDatabaseTest, TwoConnectionNamesForOneDatabaseAreNotIndependentByConstruction) {
   // parallel_subsets() grants concurrency across connections with no evidence
   // at all, reasoning that different databases cannot touch each other's

@@ -148,6 +148,19 @@ jobs:
           --health-cmd pg_isready --health-interval 5s
           --health-timeout 5s --health-retries 10
         ports: ['5432:5432']
+      # A SECOND cluster, not a second database. The grouping logic grants
+      # concurrency across databases without evidence, and the case that gets
+      # that wrong -- one database NAME on two servers -- cannot be expressed
+      # inside a single cluster, where names are unique. Same image, separate
+      # initdb, so the system_identifiers genuinely differ.
+      postgres_second:
+        image: postgres:${{ matrix.pg }}
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 10
+        ports: ['5433:5432']
     steps:
       # The suite shells out to psql to install the ledger, and reads
       # sql/bootstrap.sql through a path baked in at compile time, so the source
@@ -165,8 +178,10 @@ jobs:
         working-directory: build
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+          PGLASWELL_SECOND_CLUSTER_URL: postgresql://postgres:postgres@localhost:5433/postgres
           # A skip nobody notices is a test that silently stopped running.
           PGLASWELL_REQUIRE_DATABASE: '1'
+          PGLASWELL_REQUIRE_SECOND_CLUSTER: '1'
         run: |
           chmod +x pg_laswell_mcp_test   # artifacts do not preserve the mode bit
           ./pg_laswell_mcp_test
