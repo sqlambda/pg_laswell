@@ -10716,6 +10716,38 @@ TEST_F(TwoDatabaseTest, TwoConnectionNamesForOneDatabaseAreNotIndependentByConst
       << "two specifications on one database, both touching shop.orders, were "
          "proven concurrent because their connections are spelled "
          "differently: " << s.dump(2);
+
+  // And the other half, which is what stops this test passing for the wrong
+  // reason. An unreachable database reports no name either, so "declined the
+  // shortcut" alone proves nothing -- the same assertion would hold if neither
+  // connection worked at all. Point the second name at the genuinely second
+  // database and the grant must come back: different databases really cannot
+  // touch each other's tables, and that concurrency is the point of routing.
+  {
+    pglaswell::ConnConfig sc;
+    sc.name = "second";
+    sc.conninfo = second_url_;
+    make_shop(sc);
+  }
+  {
+    std::ofstream f(dir_ + "/two.ini");
+    f << "[first]\n" << conn_section(url_)
+      << "\n[alias]\n" << conn_section(second_url_);
+  }
+  ::chmod((dir_ + "/two.ini").c_str(), 0600);
+  ctx_->registry = pglaswell::Registry::from_ini(dir_ + "/two.ini",
+                                                 "pg-laswell/test");
+  ctx_->registry.mutable_trust() = policy_trusting_test_key();
+  server_ = std::make_unique<pglaswell::McpServer>(pglaswell::make_tools(*ctx_));
+  initialize(*server_);
+
+  const auto two = scan(true);
+  ASSERT_EQ(two["order"].size(), 1u) << two.dump(2);
+  EXPECT_TRUE(two["order"][0].value("provenConcurrent", false))
+      << "two specifications on two DIFFERENT databases must still be "
+         "independent by construction -- if this fails the fix has taken the "
+         "shortcut away entirely, or neither database was reachable and the "
+         "assertion above proved nothing: " << two.dump(2);
 }
 
 TEST_F(TwoDatabaseTest, ASpecificationRunsWhereItSaysAndWaitsForAnotherDatabase) {

@@ -108,6 +108,11 @@ struct RepoEntry {
   std::string hint;
   std::string applied_digest;  // set when status is kModified
   std::string connection;      // which configured connection it runs against
+  // current_database() as that connection's server reports it -- the database
+  // itself, not the name of the INI section pointing at it. Empty when the
+  // database could not be reached, which denies the shortcut below rather than
+  // guessing.
+  std::string database_identity;
   std::string database;        // target.database, as the spec declares it
   std::string environment;     // target.environment, as the spec declares it
   std::string release;         // the release tag gating it, if any
@@ -407,6 +412,7 @@ class MigrationRepository {
           continue;
         }
         const auto& view = view_for(entry.connection);
+        entry.database_identity = view.database;
         classify(entry, view.applied);
         gate(entry, view);
       } catch (const SpecError& e) {
@@ -829,16 +835,31 @@ class MigrationRepository {
       const bool complete_i = by_id.at(ready[i])->relations.complete();
       taken[i] = true;
 
-      const auto& conn_i = by_id.at(ready[i])->connection;
+      const auto& db_i = by_id.at(ready[i])->database_identity;
       for (std::size_t k = i + 1; k < ready.size(); ++k) {
         if (taken[k]) continue;
         // Different databases cannot touch each other's tables, so two
-        // specifications on different connections are independent by
+        // specifications on different databases are independent by
         // construction rather than by evidence -- the one case where this
         // grants concurrency without having to prove anything. Nothing
         // crosses a database but the dependency the author declared, and a
         // dependency puts them in different LEVELS, never this list.
-        if (by_id.at(ready[k])->connection != conn_i) {
+        //
+        // DATABASES, and it used to compare connection NAMES. Nothing checks
+        // that two names denote two databases, and a DDL role beside an
+        // application role -- or a pooled connection beside a direct one --
+        // points both at one. That collected the grant without the fact it
+        // rests on.
+        //
+        // current_database() is the right signal and is exact in the direction
+        // that matters. Two different names ARE two different databases, so
+        // granting is correct. Two equal names are either one database or two
+        // like-named ones on different clusters; the first is unsafe and the
+        // second merely loses a little concurrency, so equality declines and
+        // falls through to the evidence below. An unreachable database reports
+        // no name, and declines the same way.
+        const auto& db_k = by_id.at(ready[k])->database_identity;
+        if (!db_i.empty() && !db_k.empty() && db_k != db_i) {
           group.push_back(ready[k]);
           taken[k] = true;
           continue;
