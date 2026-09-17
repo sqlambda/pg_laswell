@@ -3065,6 +3065,12 @@ void make_shop(const pglaswell::ConnConfig& c) {
       " created_at timestamptz NOT NULL DEFAULT now())");
   w.txn().exec("INSERT INTO shop.orders(warehouse_id) SELECT (g%5)+1 FROM generate_series(1,300) g");
   w.commit();
+  // Settle reltuples, so a test that plans twice is not straddling the first
+  // autoanalyse and reading 0 rows and then 300. The digest no longer covers
+  // the STALENESS of the statistics -- see kObservedDetailKeys -- but it does
+  // still cover the estimate itself, which is right: how many rows a step
+  // expects is part of what the operator was shown.
+  w.exec_nontransactional("ANALYZE shop.warehouse, shop.orders");
 }
 }  // namespace
 
@@ -3303,6 +3309,44 @@ TEST_F(ToolTest, TheExecutedPlanIsTheOneThatWasShown) {
   ASSERT_TRUE(wait_for_status(*this, started["jobId"], [](const json& s) {
     return s.value("state", "") == "succeeded";
   })) << status_of(started["jobId"]).dump(2);
+}
+
+TEST_F(ToolTest, AnalysingTheTableDoesNotChangeThePlanDigest) {
+  // The receipt must survive a background process. Autovacuum analysing a
+  // table between planMigration and startMigration is not an event about this
+  // migration, and before this it changed the digest -- because a step's
+  // detail carried estimated_from, which is GREATEST(last_vacuum,
+  // last_autovacuum, last_analyze, last_autoanalyze): a timestamp for when
+  // some OTHER process last touched the statistics.
+  //
+  // It surfaced as the valgrind shards failing TheExecutedPlanIsTheOneThatWasShown
+  // while every fast job passed, because only there do twelve seconds separate
+  // the two calls. That test proves the property by timing, which is to say it
+  // proves it by luck; this one forces the event.
+  make_shop(cfg());
+  const auto first = payload(call("planMigration", json{{"spec", signed_spec()}}));
+  ASSERT_TRUE(first.value("ok", false)) << first.dump(2);
+
+  {
+    pglaswell::WriteSession w(cfg());
+    w.exec_nontransactional("ANALYZE shop.warehouse, shop.orders");
+  }
+
+  const auto second = payload(call("planMigration", json{{"spec", signed_spec()}}));
+  ASSERT_TRUE(second.value("ok", false)) << second.dump(2);
+  EXPECT_EQ(first.value("planDigest", "a"), second.value("planDigest", "b"))
+      << "an ANALYZE moved the plan digest, so the receipt now fails for a "
+         "reason that has nothing to do with the migration";
+
+  // And the reading itself is still SHOWN. Dropping it from the page would
+  // have passed this test and lost the operator the freshness of the estimate
+  // they are being asked to trust.
+  bool shown = false;
+  for (const auto& step : second.value("steps", json::array())) {
+    if (step.value("detail", json::object()).contains("estimated_from")) shown = true;
+  }
+  EXPECT_TRUE(shown) << "estimated_from must still be reported, just not hashed: "
+                     << second.dump(2);
 }
 
 TEST_F(ToolTest, AMigrationActuallyChangesTheDatabase) {
