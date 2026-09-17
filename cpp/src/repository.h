@@ -108,10 +108,19 @@ struct RepoEntry {
   std::string hint;
   std::string applied_digest;  // set when status is kModified
   std::string connection;      // which configured connection it runs against
-  // current_database() as that connection's server reports it -- the database
-  // itself, not the name of the INI section pointing at it. Empty when the
-  // database could not be reached, which denies the shortcut below rather than
-  // guessing.
+  // Which database this actually is, as its own server reports it -- not the
+  // name of the INI section pointing at it. Two signals, because they prove
+  // different things and only one of them is exact.
+  //
+  //   database_name      current_database(). Different names ARE different
+  //                      databases, so it proves DIFFERENCE. It cannot prove
+  //                      sameness: a fleet of shards all called "app" share it.
+  //   database_identity  system_identifier/oid. Exact both ways, and empty
+  //                      when unreadable -- unknown, never "different".
+  //
+  // Both empty when the database could not be reached, which declines the
+  // shortcut rather than guessing.
+  std::string database_name;
   std::string database_identity;
   std::string database;        // target.database, as the spec declares it
   std::string environment;     // target.environment, as the spec declares it
@@ -265,6 +274,30 @@ class RelationAnalyzer {
   ConnectionCache* cache_ = nullptr;
 };
 
+// Are these two specifications provably against DIFFERENT databases?
+//
+// Only a YES grants concurrency without evidence, so every uncertain answer
+// must be NO. The two signals prove different things:
+//
+//   identity  system_identifier/oid, exact in both directions. When both are
+//             known it is the whole answer.
+//   name      current_database(). Different names ARE different databases, so
+//             it proves difference -- but equal names do not prove sameness,
+//             because a fleet of shards called "app", or a staging server
+//             restored from production, share one name across servers.
+//
+// So the name is consulted only when the exact identity is missing, and there
+// it can answer YES but never NO. Getting that backwards is the whole bug:
+// comparing connection NAMES answered YES for two names pointing at one
+// database, which is the one answer that is never safe to be wrong about.
+inline bool provably_different_databases(const RepoEntry& a, const RepoEntry& b) {
+  if (!a.database_identity.empty() && !b.database_identity.empty()) {
+    return a.database_identity != b.database_identity;
+  }
+  return !a.database_name.empty() && !b.database_name.empty() &&
+         a.database_name != b.database_name;
+}
+
 // A directory of specs, each classified against the ledger of the database it
 // targets -- which need not be the same database for all of them.
 //
@@ -294,6 +327,7 @@ class MigrationRepository {
     bool reachable = false;
     std::string error;
     std::string database;
+    std::string database_identity;
     std::string environment;
     std::set<std::string> releases_ready;
     json applied = json::object();
@@ -308,6 +342,7 @@ class MigrationRepository {
       Ledger ledger(cfg, cache_);
       const auto st = ledger.status();
       v.database = st.database;
+      v.database_identity = st.database_identity;
       v.environment = st.environment;
       v.releases_ready = st.releases_ready;
       v.applied = applied_index(cfg);
@@ -412,7 +447,8 @@ class MigrationRepository {
           continue;
         }
         const auto& view = view_for(entry.connection);
-        entry.database_identity = view.database;
+        entry.database_name = view.database;
+        entry.database_identity = view.database_identity;
         classify(entry, view.applied);
         gate(entry, view);
       } catch (const SpecError& e) {
@@ -835,7 +871,7 @@ class MigrationRepository {
       const bool complete_i = by_id.at(ready[i])->relations.complete();
       taken[i] = true;
 
-      const auto& db_i = by_id.at(ready[i])->database_identity;
+      const auto& entry_i = *by_id.at(ready[i]);
       for (std::size_t k = i + 1; k < ready.size(); ++k) {
         if (taken[k]) continue;
         // Different databases cannot touch each other's tables, so two
@@ -851,15 +887,13 @@ class MigrationRepository {
         // points both at one. That collected the grant without the fact it
         // rests on.
         //
-        // current_database() is the right signal and is exact in the direction
-        // that matters. Two different names ARE two different databases, so
-        // granting is correct. Two equal names are either one database or two
-        // like-named ones on different clusters; the first is unsafe and the
-        // second merely loses a little concurrency, so equality declines and
-        // falls through to the evidence below. An unreachable database reports
-        // no name, and declines the same way.
-        const auto& db_k = by_id.at(ready[k])->database_identity;
-        if (!db_i.empty() && !db_k.empty() && db_k != db_i) {
+        // What counts as "different" is provably_different_databases(), which
+        // prefers the exact identity and falls back to the name only where
+        // the name can answer safely. Comparing names ALONE would be the same
+        // mistake one level down: a fleet of shards all called "app" is two
+        // dozen different databases sharing one name, and declining every one
+        // of them would cost exactly the concurrency that routing exists for.
+        if (provably_different_databases(entry_i, *by_id.at(ready[k]))) {
           group.push_back(ready[k]);
           taken[k] = true;
           continue;

@@ -3959,6 +3959,50 @@ TEST_F(RepoTest, AMissingDependencyIsReportedRatherThanIgnored) {
   EXPECT_TRUE(named) << s["problems"].dump(2);
 }
 
+TEST(Repository, DifferentDatabasesAreProvenExactlyOrNotAtAll) {
+  // The one place the scheduler grants concurrency with no evidence, so a
+  // wrong YES is the only answer that can hurt. Pinned as a table rather than
+  // against real servers because the case it exists for -- one database NAME
+  // on two different servers -- needs two clusters, and neither this fixture
+  // nor CI has a second one.
+  const auto entry = [](std::string identity, std::string name) {
+    pglaswell::RepoEntry e;
+    e.database_identity = std::move(identity);
+    e.database_name = std::move(name);
+    return e;
+  };
+  const auto differ = [](const pglaswell::RepoEntry& a,
+                         const pglaswell::RepoEntry& b) {
+    return pglaswell::provably_different_databases(a, b);
+  };
+
+  // Exact identity, both known: the whole answer, in both directions.
+  EXPECT_TRUE(differ(entry("7600827906225085002/5", "app"),
+                     entry("7600827906225085002/9", "app")))
+      << "two databases on one cluster differ however they are named";
+  EXPECT_TRUE(differ(entry("7600827906225085002/5", "app"),
+                     entry("1111111111111111111/5", "app")))
+      << "ONE NAME ON TWO SERVERS IS TWO DATABASES -- declining here would "
+         "serialise every shard of a fleet that names them all alike";
+  EXPECT_FALSE(differ(entry("7600827906225085002/5", "app"),
+                      entry("7600827906225085002/5", "app")))
+      << "one database reached twice is not two";
+
+  // No exact identity: the name proves difference and never sameness.
+  EXPECT_TRUE(differ(entry("", "shop"), entry("", "audit")))
+      << "different names are different databases";
+  EXPECT_FALSE(differ(entry("", "app"), entry("", "app")))
+      << "equal names may be one database or two; unproven is not granted";
+
+  // Mixed and missing: unknown is never "different".
+  EXPECT_FALSE(differ(entry("7600827906225085002/5", "app"), entry("", "app")))
+      << "half an exact answer is not an answer";
+  EXPECT_FALSE(differ(entry("", ""), entry("", "")))
+      << "an unreachable database proves nothing";
+  EXPECT_FALSE(differ(entry("7600827906225085002/5", "app"), entry("", "")))
+      << "an unreachable database proves nothing, even beside a known one";
+}
+
 TEST_F(RepoTest, ADependencyTheLedgerHasAppliedNeedsNoFile) {
   // The partial repository. One directory holds one project's specs and
   // depends on something that ran from a directory it does not contain -- the

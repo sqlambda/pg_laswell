@@ -54,6 +54,16 @@ struct LedgerStatus {
   // label written by whoever owns the schema does not. A spec naming a
   // database gets the check it asked for, and the message says what it proves.
   std::string database;
+  // WHICH DATABASE THIS IS, exactly, anywhere in the world: the cluster's
+  // system_identifier (written once at initdb) and the database's oid. Unlike
+  // the name it cannot collide -- a fleet of shards all called "app", or a
+  // staging server restored from production, are the ordinary way two
+  // different databases end up sharing one name.
+  //
+  // Empty when it could not be read. pg_control_system() is executable by
+  // PUBLIC by default, but an installation may revoke it, and a caller must
+  // treat the absence as "unknown" rather than as "different".
+  std::string database_identity;
   std::string environment;
   std::set<std::string> releases_ready;
   std::string error;
@@ -90,6 +100,25 @@ class Ledger {
   LedgerStatus status() {
     LedgerStatus st;
     ReadSession s(cfg_, std::nullopt, cache_, kLedgerLockTimeoutMs);
+
+    // First, because a revoked pg_control_system() raises and an aborted
+    // transaction poisons every statement after it. Asked first, the recovery
+    // is a renew and everything below runs on a clean transaction; asked in
+    // the middle, it would take the rest of the status with it.
+    try {
+      const auto id = s.txn().exec(
+          "SELECT (SELECT system_identifier FROM pg_control_system())::text"
+          " || '/' || (SELECT oid FROM pg_database"
+          "             WHERE datname = current_database())::text");
+      if (!id.empty() && !id[0][0].is_null()) {
+        st.database_identity = id[0][0].as<std::string>();
+      }
+    } catch (const pqxx::sql_error&) {
+      // Unknown, not different. The caller falls back to the database NAME,
+      // which proves difference but never sameness.
+      s.txn().abort();
+      s.renew();
+    }
 
     const auto probe = s.txn().exec(
         "SELECT to_regclass('laswell.schema_version') IS NOT NULL,"
