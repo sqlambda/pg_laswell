@@ -108,6 +108,20 @@ struct RepoEntry {
   std::string hint;
   std::string applied_digest;  // set when status is kModified
   std::string connection;      // which configured connection it runs against
+  // Which database this actually is, as its own server reports it -- not the
+  // name of the INI section pointing at it. Two signals, because they prove
+  // different things and only one of them is exact.
+  //
+  //   database_name      current_database(). Different names ARE different
+  //                      databases, so it proves DIFFERENCE. It cannot prove
+  //                      sameness: a fleet of shards all called "app" share it.
+  //   database_identity  system_identifier/oid. Exact both ways, and empty
+  //                      when unreadable -- unknown, never "different".
+  //
+  // Both empty when the database could not be reached, which declines the
+  // shortcut rather than guessing.
+  std::string database_name;
+  std::string database_identity;
   std::string database;        // target.database, as the spec declares it
   std::string environment;     // target.environment, as the spec declares it
   std::string release;         // the release tag gating it, if any
@@ -260,6 +274,30 @@ class RelationAnalyzer {
   ConnectionCache* cache_ = nullptr;
 };
 
+// Are these two specifications provably against DIFFERENT databases?
+//
+// Only a YES grants concurrency without evidence, so every uncertain answer
+// must be NO. The two signals prove different things:
+//
+//   identity  system_identifier/oid, exact in both directions. When both are
+//             known it is the whole answer.
+//   name      current_database(). Different names ARE different databases, so
+//             it proves difference -- but equal names do not prove sameness,
+//             because a fleet of shards called "app", or a staging server
+//             restored from production, share one name across servers.
+//
+// So the name is consulted only when the exact identity is missing, and there
+// it can answer YES but never NO. Getting that backwards is the whole bug:
+// comparing connection NAMES answered YES for two names pointing at one
+// database, which is the one answer that is never safe to be wrong about.
+inline bool provably_different_databases(const RepoEntry& a, const RepoEntry& b) {
+  if (!a.database_identity.empty() && !b.database_identity.empty()) {
+    return a.database_identity != b.database_identity;
+  }
+  return !a.database_name.empty() && !b.database_name.empty() &&
+         a.database_name != b.database_name;
+}
+
 // A directory of specs, each classified against the ledger of the database it
 // targets -- which need not be the same database for all of them.
 //
@@ -289,6 +327,7 @@ class MigrationRepository {
     bool reachable = false;
     std::string error;
     std::string database;
+    std::string database_identity;
     std::string environment;
     std::set<std::string> releases_ready;
     json applied = json::object();
@@ -303,6 +342,7 @@ class MigrationRepository {
       Ledger ledger(cfg, cache_);
       const auto st = ledger.status();
       v.database = st.database;
+      v.database_identity = st.database_identity;
       v.environment = st.environment;
       v.releases_ready = st.releases_ready;
       v.applied = applied_index(cfg);
@@ -339,6 +379,15 @@ class MigrationRepository {
     std::sort(files.begin(), files.end());
 
     std::map<std::string, Spec> parsed;
+    // spec id -> the first file that claimed it. An id is the name every other
+    // spec refers to in depends_on and the name the ledger records, so two
+    // files claiming one id is not a preference to resolve but a question with
+    // two answers.
+    struct FirstSeen {
+      std::string path;
+      std::string digest;
+    };
+    std::map<std::string, FirstSeen> claimed;
 
     for (const auto& path : files) {
       RepoEntry entry;
@@ -349,6 +398,30 @@ class MigrationRepository {
         const auto spec = parse_spec(doc);
         entry.spec_id = spec.id;
         entry.digest = spec.digest;
+
+        // Last-wins was the wrong answer twice over: the loser vanished from
+        // the dependency order, and nothing said so. Harmless while one team
+        // keeps one directory; read several together and two projects that
+        // both wrote 0001-init collide, and one of them quietly stops
+        // existing. The duplicate is not listed as its own entry -- a second
+        // pending row under one id would put the id in the order twice -- so
+        // the problem message carries both paths instead.
+        const auto prior = claimed.find(spec.id);
+        if (prior != claimed.end()) {
+          problems.push_back(
+              prior->second.digest == spec.digest
+                  ? "\"" + spec.id + "\" is claimed by two files with identical "
+                    "content: " + prior->second.path + " and " + path +
+                    ". One of them is a copy; delete it."
+                  : "\"" + spec.id + "\" is claimed by two DIFFERENT "
+                    "specifications: " + prior->second.path + " (" +
+                    prior->second.digest.substr(0, 12) + "…) and " + path +
+                    " (" + spec.digest.substr(0, 12) +
+                    "…). An id is what depends_on refers to and what the ledger "
+                    "records, so it cannot mean two things. Rename one.");
+          continue;
+        }
+        claimed.emplace(spec.id, FirstSeen{path, spec.digest});
         entry.depends_on = spec.depends_on;
         entry.database = spec.target_database;
         entry.environment = spec.target_environment;
@@ -374,6 +447,8 @@ class MigrationRepository {
           continue;
         }
         const auto& view = view_for(entry.connection);
+        entry.database_name = view.database;
+        entry.database_identity = view.database_identity;
         classify(entry, view.applied);
         gate(entry, view);
       } catch (const SpecError& e) {
@@ -460,6 +535,26 @@ class MigrationRepository {
     )SQL");
     if (r.empty() || r[0][0].is_null()) return json::object();
     return json::parse(r[0][0].as<std::string>());
+  }
+
+  // Has any database this listing touched recorded this spec id as applied?
+  //
+  // Every database, not one: depends_on crosses databases freely, and a
+  // dependency the repository does not contain brings no target.connection of
+  // its own to narrow the search with. The ledger that knows is the one in the
+  // database where it ran, which is exactly the set already read here.
+  //
+  // Succeeded, specifically. A dependency that is running, failed or merely
+  // recorded has not happened yet, and the caller must keep waiting or stop.
+  bool applied_somewhere(const std::string& spec_id) const {
+    for (const auto& [conn, view] : views_) {
+      (void)conn;
+      if (!view.applied.contains(spec_id)) continue;
+      if (!view.applied[spec_id].value("succeeded", json::array()).empty()) {
+        return true;
+      }
+    }
+    return false;
   }
 
   static bool contains(const json& arr, const std::string& v) {
@@ -637,14 +732,28 @@ class MigrationRepository {
       }
     }
 
-    // A dependency that names a spec the repository does not contain is a
-    // refusal, not a warning: the order cannot be honoured.
+    // A dependency the repository does not contain is not automatically a
+    // refusal. The question depends_on asks is "has that one run", and the
+    // thing that answers it is a LEDGER, not a directory listing -- so a
+    // dependency any database in this listing records as succeeded is
+    // satisfied whether or not its file is here.
+    //
+    // That distinction is what makes a partial repository possible at all. One
+    // project's directory holds one project's specs; a spec in it may depend on
+    // something that ran from a directory this deployment will never see. Read
+    // from the files, that is unanswerable and the whole run is refused. Read
+    // from the ledger, it is simply true.
+    //
+    // Unsatisfied is still a refusal, and the message now says both places
+    // that were looked in, because "I cannot find it" is only useful when it
+    // says where it looked.
     for (const auto& id : runnable) {
       for (const auto& d : by_id[id]->depends_on) {
-        if (by_id.count(d) == 0) {
-          problems.push_back("\"" + id + "\" depends on \"" + d +
-                             "\", which is not in this repository");
-        }
+        if (by_id.count(d) != 0) continue;
+        if (applied_somewhere(d)) continue;
+        problems.push_back("\"" + id + "\" depends on \"" + d +
+                           "\", which is not in this repository and which no "
+                           "database in this listing records as applied");
       }
     }
 
@@ -762,16 +871,29 @@ class MigrationRepository {
       const bool complete_i = by_id.at(ready[i])->relations.complete();
       taken[i] = true;
 
-      const auto& conn_i = by_id.at(ready[i])->connection;
+      const auto& entry_i = *by_id.at(ready[i]);
       for (std::size_t k = i + 1; k < ready.size(); ++k) {
         if (taken[k]) continue;
         // Different databases cannot touch each other's tables, so two
-        // specifications on different connections are independent by
+        // specifications on different databases are independent by
         // construction rather than by evidence -- the one case where this
         // grants concurrency without having to prove anything. Nothing
         // crosses a database but the dependency the author declared, and a
         // dependency puts them in different LEVELS, never this list.
-        if (by_id.at(ready[k])->connection != conn_i) {
+        //
+        // DATABASES, and it used to compare connection NAMES. Nothing checks
+        // that two names denote two databases, and a DDL role beside an
+        // application role -- or a pooled connection beside a direct one --
+        // points both at one. That collected the grant without the fact it
+        // rests on.
+        //
+        // What counts as "different" is provably_different_databases(), which
+        // prefers the exact identity and falls back to the name only where
+        // the name can answer safely. Comparing names ALONE would be the same
+        // mistake one level down: a fleet of shards all called "app" is two
+        // dozen different databases sharing one name, and declining every one
+        // of them would cost exactly the concurrency that routing exists for.
+        if (provably_different_databases(entry_i, *by_id.at(ready[k]))) {
           group.push_back(ready[k]);
           taken[k] = true;
           continue;

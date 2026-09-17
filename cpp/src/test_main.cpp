@@ -3065,6 +3065,12 @@ void make_shop(const pglaswell::ConnConfig& c) {
       " created_at timestamptz NOT NULL DEFAULT now())");
   w.txn().exec("INSERT INTO shop.orders(warehouse_id) SELECT (g%5)+1 FROM generate_series(1,300) g");
   w.commit();
+  // Settle reltuples, so a test that plans twice is not straddling the first
+  // autoanalyse and reading 0 rows and then 300. The digest no longer covers
+  // the STALENESS of the statistics -- see kObservedDetailKeys -- but it does
+  // still cover the estimate itself, which is right: how many rows a step
+  // expects is part of what the operator was shown.
+  w.exec_nontransactional("ANALYZE shop.warehouse, shop.orders");
 }
 }  // namespace
 
@@ -3303,6 +3309,44 @@ TEST_F(ToolTest, TheExecutedPlanIsTheOneThatWasShown) {
   ASSERT_TRUE(wait_for_status(*this, started["jobId"], [](const json& s) {
     return s.value("state", "") == "succeeded";
   })) << status_of(started["jobId"]).dump(2);
+}
+
+TEST_F(ToolTest, AnalysingTheTableDoesNotChangeThePlanDigest) {
+  // The receipt must survive a background process. Autovacuum analysing a
+  // table between planMigration and startMigration is not an event about this
+  // migration, and before this it changed the digest -- because a step's
+  // detail carried estimated_from, which is GREATEST(last_vacuum,
+  // last_autovacuum, last_analyze, last_autoanalyze): a timestamp for when
+  // some OTHER process last touched the statistics.
+  //
+  // It surfaced as the valgrind shards failing TheExecutedPlanIsTheOneThatWasShown
+  // while every fast job passed, because only there do twelve seconds separate
+  // the two calls. That test proves the property by timing, which is to say it
+  // proves it by luck; this one forces the event.
+  make_shop(cfg());
+  const auto first = payload(call("planMigration", json{{"spec", signed_spec()}}));
+  ASSERT_TRUE(first.value("ok", false)) << first.dump(2);
+
+  {
+    pglaswell::WriteSession w(cfg());
+    w.exec_nontransactional("ANALYZE shop.warehouse, shop.orders");
+  }
+
+  const auto second = payload(call("planMigration", json{{"spec", signed_spec()}}));
+  ASSERT_TRUE(second.value("ok", false)) << second.dump(2);
+  EXPECT_EQ(first.value("planDigest", "a"), second.value("planDigest", "b"))
+      << "an ANALYZE moved the plan digest, so the receipt now fails for a "
+         "reason that has nothing to do with the migration";
+
+  // And the reading itself is still SHOWN. Dropping it from the page would
+  // have passed this test and lost the operator the freshness of the estimate
+  // they are being asked to trust.
+  bool shown = false;
+  for (const auto& step : second.value("steps", json::array())) {
+    if (step.value("detail", json::object()).contains("estimated_from")) shown = true;
+  }
+  EXPECT_TRUE(shown) << "estimated_from must still be reported, just not hashed: "
+                     << second.dump(2);
 }
 
 TEST_F(ToolTest, AMigrationActuallyChangesTheDatabase) {
@@ -3957,6 +4001,104 @@ TEST_F(RepoTest, AMissingDependencyIsReportedRatherThanIgnored) {
     if (p.get<std::string>().find("nonexistent") != std::string::npos) named = true;
   }
   EXPECT_TRUE(named) << s["problems"].dump(2);
+}
+
+TEST(Repository, DifferentDatabasesAreProvenExactlyOrNotAtAll) {
+  // The one place the scheduler grants concurrency with no evidence, so a
+  // wrong YES is the only answer that can hurt. Pinned as a table rather than
+  // against real servers because the case it exists for -- one database NAME
+  // on two different servers -- needs two clusters, and neither this fixture
+  // nor CI has a second one.
+  const auto entry = [](std::string identity, std::string name) {
+    pglaswell::RepoEntry e;
+    e.database_identity = std::move(identity);
+    e.database_name = std::move(name);
+    return e;
+  };
+  const auto differ = [](const pglaswell::RepoEntry& a,
+                         const pglaswell::RepoEntry& b) {
+    return pglaswell::provably_different_databases(a, b);
+  };
+
+  // Exact identity, both known: the whole answer, in both directions.
+  EXPECT_TRUE(differ(entry("7600827906225085002/5", "app"),
+                     entry("7600827906225085002/9", "app")))
+      << "two databases on one cluster differ however they are named";
+  EXPECT_TRUE(differ(entry("7600827906225085002/5", "app"),
+                     entry("1111111111111111111/5", "app")))
+      << "ONE NAME ON TWO SERVERS IS TWO DATABASES -- declining here would "
+         "serialise every shard of a fleet that names them all alike";
+  EXPECT_FALSE(differ(entry("7600827906225085002/5", "app"),
+                      entry("7600827906225085002/5", "app")))
+      << "one database reached twice is not two";
+
+  // No exact identity: the name proves difference and never sameness.
+  EXPECT_TRUE(differ(entry("", "shop"), entry("", "audit")))
+      << "different names are different databases";
+  EXPECT_FALSE(differ(entry("", "app"), entry("", "app")))
+      << "equal names may be one database or two; unproven is not granted";
+
+  // Mixed and missing: unknown is never "different".
+  EXPECT_FALSE(differ(entry("7600827906225085002/5", "app"), entry("", "app")))
+      << "half an exact answer is not an answer";
+  EXPECT_FALSE(differ(entry("", ""), entry("", "")))
+      << "an unreachable database proves nothing";
+  EXPECT_FALSE(differ(entry("7600827906225085002/5", "app"), entry("", "")))
+      << "an unreachable database proves nothing, even beside a known one";
+}
+
+TEST_F(RepoTest, ADependencyTheLedgerHasAppliedNeedsNoFile) {
+  // The partial repository. One directory holds one project's specs and
+  // depends on something that ran from a directory it does not contain -- the
+  // file is not here and never will be. Which database it ran against is what
+  // knows whether it ran, and that database is the one being deployed to, so
+  // the question is answerable. Asking the DIRECTORY instead makes a partial
+  // repository impossible, which is the whole of what this unblocks.
+  make_shop(cfg());
+  write_spec("a.json", add_column_spec("a", "orders", "a"));
+  const auto started = payload(call("startMigration",
+      json{{"spec", json::parse(std::ifstream(dir_ + "/a.json"), nullptr, true)}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, started["jobId"], [](const json& x) {
+    return x.value("state", "") == "succeeded";
+  })) << status_of(started["jobId"]).dump(2);
+
+  // The file leaves the repository. The ledger keeps the fact that it ran.
+  std::filesystem::remove(dir_ + "/a.json");
+  write_spec("b.json", add_column_spec("b", "warehouse", "b", {"a"}));
+
+  const auto s = scan(false);
+  for (const auto& p : s["problems"]) {
+    EXPECT_EQ(p.get<std::string>().find("which is not in this repository"),
+              std::string::npos)
+        << "a dependency this database records as applied was refused for "
+           "having no file on disk: " << s["problems"].dump(2);
+  }
+  const auto* e = entry_for(s, "b");
+  ASSERT_NE(e, nullptr) << s.dump(2);
+  EXPECT_EQ(e->value("status", ""), "pending") << s.dump(2);
+}
+
+TEST_F(RepoTest, TwoFilesClaimingOneIdAreRefusedRatherThanSilentlyDropped) {
+  // Last-wins is the wrong answer twice over: the loser vanishes from the
+  // dependency order, and nothing says so. Harmless while one team keeps one
+  // directory; the moment several are read together, two projects that both
+  // wrote 0001-init collide and one of them quietly stops existing.
+  make_shop(cfg());
+  write_spec("0001-orders.json", add_column_spec("dup", "orders", "a"));
+  write_spec("0002-warehouse.json", add_column_spec("dup", "warehouse", "b"));
+
+  const auto s = scan(false);
+  std::string named;
+  for (const auto& p : s["problems"]) {
+    const auto t = p.get<std::string>();
+    if (t.find("dup") != std::string::npos) named = t;
+  }
+  ASSERT_FALSE(named.empty())
+      << "two files claimed one id and nothing said so: " << s.dump(2);
+  EXPECT_NE(named.find("0001-orders.json"), std::string::npos)
+      << "the problem must name both files, not just the survivor: " << named;
+  EXPECT_NE(named.find("0002-warehouse.json"), std::string::npos) << named;
 }
 
 TEST_F(RepoTest, ACycleIsNamedAsACycle) {
@@ -10622,6 +10764,271 @@ class TwoDatabaseTest : public RepoTest {
 
   std::string second_url_, ini_;
 };
+
+// Two SEPARATE CLUSTERS, whose databases share a name.
+//
+// The case the identity fix exists for, and the one no single-cluster fixture
+// can reach: within a cluster, names are unique, so "same name, different
+// database" is only expressible across servers. A fleet of shards all called
+// "app", or a staging server restored from production, is the ordinary way it
+// happens -- and under a name comparison every such pair declines the
+// shortcut, serialising migrations that cannot possibly touch each other's
+// tables. That is precisely the concurrency target.connection exists to give.
+//
+// Needs PGLASWELL_SECOND_CLUSTER_URL pointing at a DIFFERENT cluster. Locally:
+//   docker run -d --name laswell_pg2 -e POSTGRES_PASSWORD=laswell
+//     -e POSTGRES_DB=app -p 55433:5432 postgres:18
+// The fixture creates an identically named database on both, so the precondition
+// holds however the two URLs are spelled.
+class TwinNamedDatabaseTest : public RepoTest {
+ public:
+  static constexpr const char* kTwin = "laswell_twin";
+
+  void SetUp() override {
+    RepoTest::SetUp();
+    if (::testing::Test::IsSkipped()) return;
+    const char* second = std::getenv("PGLASWELL_SECOND_CLUSTER_URL");
+    if (second == nullptr || *second == '\0') {
+      // The same bargain DatabaseTest strikes, for the same reason: a skip
+      // nobody notices is a test that silently stopped running, and this one
+      // guards a grant that is made WITHOUT evidence.
+      if (std::getenv("PGLASWELL_REQUIRE_SECOND_CLUSTER") != nullptr) {
+        FAIL() << "PGLASWELL_SECOND_CLUSTER_URL is unset and "
+                  "PGLASWELL_REQUIRE_SECOND_CLUSTER=1. CI runs a second "
+                  "postgres service for this; if it has gone, restore it "
+                  "rather than dropping the variable.";
+      }
+      GTEST_SKIP() << "PGLASWELL_SECOND_CLUSTER_URL is not set: this needs a "
+                      "SECOND cluster, because one database name on two "
+                      "servers cannot be expressed inside one. Set "
+                      "PGLASWELL_REQUIRE_SECOND_CLUSTER=1 to make this a "
+                      "failure.";
+    }
+    first_twin_ = with_dbname(url_, kTwin);
+    second_twin_ = with_dbname(second, kTwin);
+
+    create_twin(url_);
+    create_twin(second);
+
+    // The whole test rests on these two facts. Asserted, not assumed: given the
+    // same cluster twice it would silently become a different test.
+    ASSERT_EQ(scalar(first_twin_, "current_database()"),
+              scalar(second_twin_, "current_database()"))
+        << "the two databases must share a name or there is nothing to prove";
+    if (scalar(first_twin_, "(SELECT system_identifier FROM pg_control_system())") ==
+        scalar(second_twin_, "(SELECT system_identifier FROM pg_control_system())")) {
+      GTEST_SKIP() << "PGLASWELL_SECOND_CLUSTER_URL names the SAME cluster as "
+                      "DATABASE_URL; two are needed.";
+    }
+
+    bootstrap_into(first_twin_);
+    bootstrap_into(second_twin_);
+
+    ini_ = dir_ + "/twins.ini";
+    {
+      std::ofstream f(ini_);
+      f << "[first]\n" << conn_section(first_twin_)
+        << "\n[other]\n" << conn_section(second_twin_);
+    }
+    ::chmod(ini_.c_str(), 0600);
+    ctx_->registry = pglaswell::Registry::from_ini(ini_, "pg-laswell/test");
+    ctx_->registry.mutable_trust() = policy_trusting_test_key();
+    server_ = std::make_unique<pglaswell::McpServer>(pglaswell::make_tools(*ctx_));
+    initialize(*server_);
+  }
+
+  void TearDown() override {
+    if (!::testing::Test::IsSkipped()) {
+      const char* second = std::getenv("PGLASWELL_SECOND_CLUSTER_URL");
+      drop_twin(url_);
+      if (second != nullptr && *second != '\0') drop_twin(second);
+    }
+    RepoTest::TearDown();
+  }
+
+  static std::string with_dbname(const std::string& url, const std::string& db) {
+    auto rest = url;
+    std::string query;
+    const auto q = rest.find('?');
+    if (q != std::string::npos) {
+      query = rest.substr(q);
+      rest = rest.substr(0, q);
+    }
+    const auto slash = rest.find('/', rest.find("://") + 3);
+    return (slash == std::string::npos ? rest : rest.substr(0, slash)) + "/" +
+           db + query;
+  }
+
+  static std::string scalar(const std::string& url, const std::string& expr) {
+    pglaswell::ConnConfig c;
+    c.name = "probe";
+    c.conninfo = url;
+    pglaswell::ReadSession r(c);
+    return r.txn().exec("SELECT (" + expr + ")::text")[0][0].as<std::string>();
+  }
+
+  static void create_twin(const std::string& url) {
+    pglaswell::ConnConfig c;
+    c.name = "admin";
+    c.conninfo = url;
+    pglaswell::WriteSession w(c);
+    w.exec_nontransactional(std::string("DROP DATABASE IF EXISTS ") + kTwin);
+    w.exec_nontransactional(std::string("CREATE DATABASE ") + kTwin);
+  }
+
+  static void drop_twin(const std::string& url) {
+    try {
+      pglaswell::ConnConfig c;
+      c.name = "admin";
+      c.conninfo = url;
+      pglaswell::WriteSession w(c);
+      w.exec_nontransactional(std::string("DROP DATABASE IF EXISTS ") + kTwin);
+    } catch (const std::exception&) {
+    }
+  }
+
+  // conn_section is TwoDatabaseTest's, unchanged: the INI shape a user writes
+  // is the one under test, here as much as there.
+  static std::string conn_section(const std::string& url) {
+    return TwoDatabaseTest::conn_section(url);
+  }
+
+  static void bootstrap_into(const std::string& url) {
+    // Roles are CLUSTER-wide, and bootstrap.sql grants to this one rather than
+    // creating it -- deliberately, since the runtime role is the operator's to
+    // define. On the first cluster it already exists, because the suite
+    // bootstrapped a database there; the second cluster has never been touched.
+    // Getting this wrong is what the second cluster is for.
+    (void)std::system(("psql -X -q -c 'CREATE ROLE laswell_runner NOLOGIN' \"" +
+                       url + "\" >/dev/null 2>&1").c_str());
+    const std::string key_b64 = pglaswell::Registry::base64_encode(test_key().pub);
+    const std::string cmd =
+        "PSQLRC=/dev/null psql -X -q -v ON_ERROR_STOP=1 "
+        "-v laswell_role=laswell_runner "
+        "-v first_key_id=" + test_key().key_id +
+        " -v first_key_b64=" + key_b64 +
+        " -v first_key_label=suite "
+        "-f " + std::string(PGLASWELL_BOOTSTRAP_SQL) + " \"" + url + "\" 2>&1";
+    // Captured, not discarded: "bootstrap failed" without psql's own words
+    // sends the reader to the wrong cluster.
+    std::string output;
+    FILE* pipe = ::popen(cmd.c_str(), "r");
+    if (pipe != nullptr) {
+      char buf[512];
+      while (::fgets(buf, sizeof(buf), pipe) != nullptr) output += buf;
+      if (::pclose(pipe) != 0) {
+        throw std::runtime_error("bootstrap.sql failed on " + url + ": " + output);
+      }
+    }
+  }
+
+  std::string first_twin_, second_twin_, ini_;
+};
+
+TEST_F(TwinNamedDatabaseTest, OneNameOnTwoServersIsTwoDatabases) {
+  // Both clusters get the same table, and both specs touch it. Under a name
+  // comparison the two databases are indistinguishable and the pair declines;
+  // under the exact identity they are plainly different and the pair is
+  // granted without needing evidence at all.
+  for (const auto& url : {first_twin_, second_twin_}) {
+    pglaswell::ConnConfig c;
+    c.name = "seed";
+    c.conninfo = url;
+    pglaswell::WriteSession w(c);
+    w.begin("pg_laswell/test/twin");
+    w.txn().exec("CREATE SCHEMA IF NOT EXISTS shop");
+    w.txn().exec("CREATE TABLE shop.orders(id bigint PRIMARY KEY)");
+    w.commit();
+  }
+
+  auto a = add_column_spec("a", "orders", "ca");
+  a["target"] = json{{"connection", "first"}};
+  auto b = add_column_spec("b", "orders", "cb");
+  b["target"] = json{{"connection", "other"}};
+  write_spec("a.json", a);
+  write_spec("b.json", b);
+
+  const auto s = scan(true);
+  ASSERT_EQ(s["order"].size(), 1u) << s.dump(2);
+  EXPECT_TRUE(s["order"][0].value("provenConcurrent", false))
+      << "two databases on two different clusters were not proven concurrent "
+         "merely because they are both called \"" << kTwin
+      << "\". A fleet of shards named alike would serialise entirely: "
+      << s.dump(2);
+}
+
+TEST_F(TwoDatabaseTest, TwoConnectionNamesForOneDatabaseAreNotIndependentByConstruction) {
+  // parallel_subsets() grants concurrency across connections with no evidence
+  // at all, reasoning that different databases cannot touch each other's
+  // tables. True -- but it compares connection NAMES, and nothing checks that
+  // two names denote two databases. A DDL role and an application role
+  // pointing at one database is an ordinary configuration, and it is enough to
+  // collect the grant without the fact it rests on.
+  //
+  // The advisory locks still refuse the overlap, so this is a wrong PLAN
+  // rather than a corrupted database -- the operator gets a lock refusal where
+  // a scheduling decision belonged.
+  make_shop(cfg());
+  {
+    std::ofstream f(dir_ + "/alias.ini");
+    f << "[first]\n" << conn_section(url_)
+      << "\n[alias]\n" << conn_section(url_);
+  }
+  ::chmod((dir_ + "/alias.ini").c_str(), 0600);
+  ctx_->registry = pglaswell::Registry::from_ini(dir_ + "/alias.ini",
+                                                 "pg-laswell/test");
+  ctx_->registry.mutable_trust() = policy_trusting_test_key();
+  server_ = std::make_unique<pglaswell::McpServer>(pglaswell::make_tools(*ctx_));
+  initialize(*server_);
+
+  // Both touch shop.orders. Both are pending. They differ only in which NAME
+  // for one database they were routed through.
+  auto a = add_column_spec("a", "orders", "ca");
+  a["target"] = json{{"connection", "first"}};
+  auto b = add_column_spec("b", "orders", "cb");
+  b["target"] = json{{"connection", "alias"}};
+  write_spec("a.json", a);
+  write_spec("b.json", b);
+
+  const auto s = scan(true);
+  ASSERT_EQ(s["order"].size(), 1u) << s.dump(2);
+  EXPECT_FALSE(s["order"][0].value("provenConcurrent", true))
+      << "two specifications on one database, both touching shop.orders, were "
+         "proven concurrent because their connections are spelled "
+         "differently: " << s.dump(2);
+
+  // And the other half, which is what stops this test passing for the wrong
+  // reason. An unreachable database reports no name either, so "declined the
+  // shortcut" alone proves nothing -- the same assertion would hold if neither
+  // connection worked at all. Point the second name at the genuinely second
+  // database and the grant must come back: different databases really cannot
+  // touch each other's tables, and that concurrency is the point of routing.
+  {
+    pglaswell::ConnConfig sc;
+    sc.name = "second";
+    sc.conninfo = second_url_;
+    make_shop(sc);
+  }
+  {
+    std::ofstream f(dir_ + "/two.ini");
+    f << "[first]\n" << conn_section(url_)
+      << "\n[alias]\n" << conn_section(second_url_);
+  }
+  ::chmod((dir_ + "/two.ini").c_str(), 0600);
+  ctx_->registry = pglaswell::Registry::from_ini(dir_ + "/two.ini",
+                                                 "pg-laswell/test");
+  ctx_->registry.mutable_trust() = policy_trusting_test_key();
+  server_ = std::make_unique<pglaswell::McpServer>(pglaswell::make_tools(*ctx_));
+  initialize(*server_);
+
+  const auto two = scan(true);
+  ASSERT_EQ(two["order"].size(), 1u) << two.dump(2);
+  EXPECT_TRUE(two["order"][0].value("provenConcurrent", false))
+      << "two specifications on two DIFFERENT databases must still be "
+         "independent by construction -- if this fails the fix has taken the "
+         "shortcut away entirely, or neither database was reachable and the "
+         "assertion above proved nothing: " << two.dump(2);
+}
 
 TEST_F(TwoDatabaseTest, ASpecificationRunsWhereItSaysAndWaitsForAnotherDatabase) {
   const auto table_spec = [](const std::string& id, const std::string& conn,

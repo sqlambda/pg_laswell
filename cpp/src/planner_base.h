@@ -143,9 +143,33 @@ struct Plan {
   // precisely because the answer goes stale, so hashing it asserted the one
   // thing the tool is built not to assume. The parts of the budget that do
   // reach execution reach it through a step, and steps are hashed.
+  // Readings of the server this instant, which live in a step's detail the way
+  // the budget lives at the top. Same argument, one level down: neither of
+  // these decides WHAT RUNS, and both change under the plan's feet.
+  //
+  //   estimated_from  GREATEST(last_vacuum, last_autovacuum, last_analyze,
+  //                   last_autoanalyze) -- when some OTHER process last touched
+  //                   the statistics. Pure provenance, and autovacuum
+  //                   analysing a freshly loaded table is not an event about
+  //                   this migration at all.
+  //   lock_waiters    how many sessions are queued on the relation right now.
+  //                   A number that is stale before it is printed, and the
+  //                   executor re-reads it precisely because it goes stale.
+  //
+  // Both are still SHOWN. They are worth reading and worthless to hash, which
+  // is the whole distinction the budget already drew.
+  static constexpr const char* kObservedDetailKeys[] = {"estimated_from",
+                                                        "lock_waiters"};
+
   std::string digest() const {
     json d = to_json();
     d.erase("budget");
+    if (d.contains("steps")) {
+      for (auto& step : d["steps"]) {
+        if (!step.contains("detail") || !step["detail"].is_object()) continue;
+        for (const char* key : kObservedDetailKeys) step["detail"].erase(key);
+      }
+    }
     return digest_hex(d);
   }
 
