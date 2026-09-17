@@ -1,5 +1,55 @@
 # Changes
 
+## 0.1.2
+
+Wave one of the multi-directory work, and three defects it uncovered on the
+way. 389 tests.
+
+**A dependency is satisfied by the ledger, not by the directory.** `depends_on`
+asks "has that one run", and a ledger answers it -- but the check read the
+directory listing, so a dependency whose file was absent was refused however
+plainly the database recorded it succeeded. That is what makes a partial
+repository impossible: one project's directory holds one project's specs, and a
+spec in it may depend on something that ran from a directory this deployment
+will never see. Every database in the listing is asked, because depends_on
+crosses databases and a dependency the repository lacks brings no
+target.connection of its own to narrow the search with.
+
+Not sufficient on its own, and worth saying so: the same missing file also
+trips the orphan check, which is still a refusal. Scoping that needs to know
+what the listing is SUPPOSED to contain.
+
+**Two files cannot claim one spec id.** The listing kept the last file read, so
+the loser vanished from the dependency order and nothing said so. Silence was
+the defect, not the collision -- a repository with a missing migration looked
+exactly like a healthy one.
+
+**Grouping compares databases, not the names of connections.** The one place
+concurrency is granted with no evidence, on the reasoning that different
+databases cannot touch each other's tables. Sound -- but it compared connection
+NAMES, and nothing checks that two names denote two databases. A DDL role beside
+an application role points both at one. Never corrupting: advisory locks are
+scoped per database, exactly the semantics the scheduler assumed, so the overlap
+was refused -- the operator just got a lock refusal where a scheduling decision
+belonged.
+
+The identity is now the cluster's `system_identifier` with the database's oid:
+exact in both directions and unprivileged. The first attempt compared
+`current_database()`, which is safe but blunt -- a fleet of shards all called
+"app" would have serialised entirely, losing the concurrency routing exists to
+provide. **Proved against two real clusters**, locally with docker and in CI
+with a second service container, and the skip is fatal under
+`PGLASWELL_REQUIRE_SECOND_CLUSTER` so it cannot quietly stop running.
+
+**A timestamp from autovacuum is not part of the plan.** Two plans of one spec
+seconds apart hashed differently, which surfaced as the Valgrind shards failing
+the receipt while every fast job passed. Diffing the plans found one leaf:
+`estimated_from`, which is GREATEST(last_vacuum, last_autovacuum, last_analyze,
+last_autoanalyze) -- when some OTHER process last touched the statistics.
+`lock_waiters` went with it. This is the budget argument one level down, and the
+original fix simply had not reached into step detail. Both are still SHOWN, just
+not hashed.
+
 ## 0.1.1
 
 Everything below shipped as the pre-release `v0.1.0-alpha0` or was added after
