@@ -30,7 +30,8 @@ void usage(const char* argv0) {
       "\n"
       "Usage: " << argv0 << " --repo DIR [options] [conninfo]\n"
       "\n"
-      "  --repo DIR         the directory of signed specifications\n"
+      "  --repo DIR         the directory of signed specifications; repeat it\n"
+      "                     to apply several as one repository\n"
       "  --status           report what is pending and exit; change nothing\n"
       "  --dry-run          plan every pending migration; apply nothing\n"
       "  -c, --config FILE  configuration file (or PGLASWELL_CONFIG)\n"
@@ -66,7 +67,8 @@ int main(int argc, char* argv[]) {
     if (arg == "--dry-run") { opts.dry_run = true;     continue; }
     if (arg == "--repo") {
       if (i + 1 >= argc) { std::cerr << "--repo requires a directory\n"; return 3; }
-      opts.repo = argv[++i];
+      // Repeatable: a project per directory, applied as one repository.
+      opts.repos.push_back(argv[++i]);
       continue;
     }
     if (arg == "-c" || arg == "--config") {
@@ -88,7 +90,7 @@ int main(int argc, char* argv[]) {
   if (db_url.empty()) {
     if (const char* env = std::getenv("DATABASE_URL")) db_url = env;
   }
-  if (opts.repo.empty()) {
+  if (opts.repos.empty() && opts.repo.empty()) {
     std::cerr << "--repo is required: there is nothing to apply without one\n";
     return 3;
   }

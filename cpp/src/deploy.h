@@ -58,6 +58,12 @@
 namespace pglaswell {
 
 struct DeployOptions {
+  // One entry per --repo. Several are applied as ONE repository: the union is
+  // ordered as a single graph, so depends_on crosses between projects.
+  std::vector<std::string> repos;
+  // Kept for callers that set a single directory directly, the tests among
+  // them. Folded into `repos` at the point of use rather than at assignment,
+  // so neither field has to know about the other.
   std::string repo;
   bool dry_run = false;      // plan everything, apply nothing
   bool status_only = false;  // report what is pending, change nothing
@@ -96,7 +102,10 @@ class Deployment {
   DeployResult run() {
     auto& out = *opts_.out;
 
-    const auto listing = list_migrations(ctx_, json{{"directory", opts_.repo}});
+    json dirs = json::array();
+    for (const auto& r : opts_.repos) dirs.push_back(r);
+    if (!opts_.repo.empty()) dirs.push_back(opts_.repo);
+    const auto listing = list_migrations(ctx_, json{{"directories", dirs}});
     if (listing.contains("error")) {
       out << "error: " << listing["error"].get<std::string>() << "\n";
       if (listing.contains("hint")) out << "  " << listing["hint"].get<std::string>() << "\n";

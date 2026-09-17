@@ -662,16 +662,35 @@ inline json cancel_job(ToolContext& ctx, const json& args) {
 
 // --- listMigrations --------------------------------------------------------
 inline json list_migrations(ToolContext& ctx, const json& args) {
+  // One directory or several. `directories` is the union form: a project per
+  // directory, read as one repository, which the ledger permits because it
+  // records a spec id and digest and never a file path.
+  std::vector<Source> sources;
+  if (args.contains("directories")) {
+    if (!args["directories"].is_array()) {
+      return json{{"error", "\"directories\" must be an array of paths"},
+                  {"hint", "Use \"directory\" for one, \"directories\" for several."}};
+    }
+    for (const auto& d : args["directories"]) {
+      if (!d.is_string() || d.get<std::string>().empty()) {
+        return json{{"error", "every entry in \"directories\" must be a path"},
+                    {"hint", "An empty entry names no folder, so what it was "
+                             "meant to contribute cannot be guessed."}};
+      }
+      sources.push_back(Source{d.get<std::string>(), d.get<std::string>()});
+    }
+  }
   const auto dir = args.value("directory", "");
-  if (dir.empty()) {
-    return json{{"error", "listMigrations needs a \"directory\""},
+  if (!dir.empty()) sources.push_back(Source{dir, dir});
+  if (sources.empty()) {
+    return json{{"error", "listMigrations needs a \"directory\" or \"directories\""},
                 {"hint", "Point it at the folder holding the migration specs."}};
   }
   // The caller's connection is the DEFAULT for specifications that name none;
   // each one that names its own is classified against that database instead.
   const auto& cfg = ctx.connection(args);
   MigrationRepository repo(ctx.registry, cfg.name, ctx.cache);
-  auto out = repo.scan(dir, args.value("deriveRelations", true));
+  auto out = repo.scan(sources, args.value("deriveRelations", true));
   out["connection"] = cfg.name;
   out["database"] = cfg.dbname;
   return out;
@@ -766,6 +785,14 @@ inline std::vector<ToolDef> make_tools(ToolContext& ctx) {
         json props{{"directory",
                     {{"type", "string"},
                      {"description", "folder holding the migration specs"}}},
+                   {"directories",
+                    {{"type", "array"},
+                     {"items", {{"type", "string"}}},
+                     {"description",
+                      "several such folders, read as ONE repository: a project "
+                      "per directory, with depends_on crossing between them. "
+                      "An id claimed by two directories is refused rather than "
+                      "resolved. Use instead of `directory`, or alongside it."}}},
                    {"deriveRelations",
                     {{"type", "boolean"},
                      {"description",
@@ -775,7 +802,10 @@ inline std::vector<ToolDef> make_tools(ToolContext& ctx) {
         props.update(detail::connection_property());
         return json{{"type", "object"},
                     {"properties", props},
-                    {"required", json::array({"directory"})}};
+                    // Neither alone is required; one of the two is, which a
+                    // JSON Schema `required` cannot say. The tool reports the
+                    // omission itself.
+                    {"required", json::array()}};
       },
       [] { return json{{"type", "object"}}; },
       {true, false, true, false},

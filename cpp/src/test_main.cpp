@@ -4101,6 +4101,141 @@ TEST_F(RepoTest, TwoFilesClaimingOneIdAreRefusedRatherThanSilentlyDropped) {
   EXPECT_NE(named.find("0002-warehouse.json"), std::string::npos) << named;
 }
 
+// --- several source directories, one listing -------------------------------
+//
+// A project per directory, and a deployment that reads them together. The
+// ledger makes this possible at all -- it records a spec id, digest and bytes
+// and never a file path -- so unioning directories is a listing concern and
+// not a state concern. What has to hold: the union is ordered as one graph,
+// collisions across directories are refused rather than resolved, and the
+// answer does not depend on the order the directories were named in.
+namespace {
+
+class MultiSourceTest : public RepoTest {
+ public:
+  void SetUp() override {
+    RepoTest::SetUp();
+    if (::testing::Test::IsSkipped()) return;
+    dir2_ = dir_ + "_second";
+    std::filesystem::create_directories(dir2_);
+  }
+  void TearDown() override {
+    std::error_code ec;
+    std::filesystem::remove_all(dir2_, ec);
+    RepoTest::TearDown();
+  }
+
+  void write_spec_in(const std::string& dir, const std::string& file, json doc) {
+    const auto parsed = pglaswell::parse_spec(doc);
+    doc["signatures"] = json::array({{{"key_id", test_key().key_id},
+                                      {"algorithm", "ed25519"},
+                                      {"signature", base64(sign(parsed.canonical_bytes))}}});
+    std::ofstream(dir + "/" + file) << doc.dump(2);
+  }
+
+  json scan_many(const std::vector<std::string>& dirs, bool derive = false) {
+    return payload(call("listMigrations",
+                        json{{"directories", dirs}, {"deriveRelations", derive}}));
+  }
+
+  std::string dir2_;
+};
+
+}  // namespace
+
+TEST_F(MultiSourceTest, TwoDirectoriesAreReadAsOneRepository) {
+  make_shop(cfg());
+  write_spec_in(dir_, "a.json", add_column_spec("a", "orders", "ca"));
+  write_spec_in(dir2_, "b.json", add_column_spec("b", "warehouse", "cb"));
+
+  const auto s = scan_many({dir_, dir2_});
+  EXPECT_TRUE(s.value("problems", json::array()).empty()) << s["problems"].dump(2);
+  ASSERT_EQ(s["migrations"].size(), 2u) << s.dump(2);
+  ASSERT_NE(entry_for(s, "a"), nullptr) << s.dump(2);
+  ASSERT_NE(entry_for(s, "b"), nullptr) << s.dump(2);
+  EXPECT_EQ(entry_for(s, "a")->value("status", ""), "pending");
+  EXPECT_EQ(entry_for(s, "b")->value("status", ""), "pending");
+
+  // Each entry says where it came from. Without it "which project is this"
+  // has no answer at all once more than one directory is in play.
+  EXPECT_EQ(entry_for(s, "a")->value("source", ""), dir_) << s.dump(2);
+  EXPECT_EQ(entry_for(s, "b")->value("source", ""), dir2_) << s.dump(2);
+}
+
+TEST_F(MultiSourceTest, ADependencyCrossesDirectories) {
+  // The point of the feature. b lives in another project's directory and
+  // depends on a; the union is one graph, so a goes first.
+  make_shop(cfg());
+  write_spec_in(dir_, "a.json", add_column_spec("a", "orders", "ca"));
+  write_spec_in(dir2_, "b.json", add_column_spec("b", "warehouse", "cb", {"a"}));
+
+  const auto s = scan_many({dir_, dir2_});
+  EXPECT_TRUE(s.value("problems", json::array()).empty()) << s["problems"].dump(2);
+  ASSERT_EQ(s["order"].size(), 2u)
+      << "a dependency across directories must still produce two levels: "
+      << s.dump(2);
+  EXPECT_EQ(s["order"][0]["groups"][0]["specs"][0], "a") << s.dump(2);
+  EXPECT_EQ(s["order"][1]["groups"][0]["specs"][0], "b") << s.dump(2);
+}
+
+TEST_F(MultiSourceTest, OneIdInTwoDirectoriesIsRefusedAndNamesBoth) {
+  // The collision that is theoretical in one directory and ordinary across
+  // several: two projects that both wrote 0001-init.
+  make_shop(cfg());
+  write_spec_in(dir_, "0001-init.json", add_column_spec("0001-init", "orders", "ca"));
+  write_spec_in(dir2_, "0001-init.json", add_column_spec("0001-init", "warehouse", "cb"));
+
+  const auto s = scan_many({dir_, dir2_});
+  std::string named;
+  for (const auto& p : s["problems"]) {
+    const auto t = p.get<std::string>();
+    if (t.find("0001-init") != std::string::npos) named = t;
+  }
+  ASSERT_FALSE(named.empty()) << s.dump(2);
+  EXPECT_NE(named.find(dir_), std::string::npos)
+      << "the refusal must name both directories: " << named;
+  EXPECT_NE(named.find(dir2_), std::string::npos) << named;
+}
+
+TEST_F(MultiSourceTest, TheOrderTheDirectoriesAreNamedInDoesNotChangeTheAnswer) {
+  // Two pipelines listing the same projects in a different order must get the
+  // same listing, or the output is not something a golden file or a reviewer
+  // can compare.
+  make_shop(cfg());
+  write_spec_in(dir_, "a.json", add_column_spec("a", "orders", "ca"));
+  write_spec_in(dir2_, "b.json", add_column_spec("b", "warehouse", "cb"));
+
+  auto forward = scan_many({dir_, dir2_});
+  auto backward = scan_many({dir2_, dir_});
+  EXPECT_EQ(forward["migrations"], backward["migrations"])
+      << "forward: " << forward["migrations"].dump(2)
+      << "\nbackward: " << backward["migrations"].dump(2);
+}
+
+TEST_F(MultiSourceTest, TheSameDirectoryTwiceIsRefusedAsAConfigurationMistake) {
+  // Every id would collide with itself. Reported as what it is -- one
+  // directory named twice -- rather than as a repository full of duplicates.
+  make_shop(cfg());
+  write_spec_in(dir_, "a.json", add_column_spec("a", "orders", "ca"));
+
+  const auto s = scan_many({dir_, dir_});
+  bool named = false;
+  for (const auto& p : s["problems"]) {
+    if (p.get<std::string>().find("twice") != std::string::npos) named = true;
+  }
+  EXPECT_TRUE(named) << "one directory listed twice should say so: " << s.dump(2);
+}
+
+TEST_F(MultiSourceTest, AMissingDirectoryNamesWhichOne) {
+  make_shop(cfg());
+  write_spec_in(dir_, "a.json", add_column_spec("a", "orders", "ca"));
+
+  const auto s = scan_many({dir_, dir_ + "_nope"});
+  const auto text = s.value("error", "") + s.value("problems", json::array()).dump();
+  EXPECT_NE(text.find("_nope"), std::string::npos)
+      << "the message must say WHICH directory is missing: " << s.dump(2);
+}
+
 TEST_F(RepoTest, ACycleIsNamedAsACycle) {
   make_shop(cfg());
   write_spec("a.json", add_column_spec("a", "orders", "a", {"b"}));
