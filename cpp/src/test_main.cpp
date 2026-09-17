@@ -3959,6 +3959,60 @@ TEST_F(RepoTest, AMissingDependencyIsReportedRatherThanIgnored) {
   EXPECT_TRUE(named) << s["problems"].dump(2);
 }
 
+TEST_F(RepoTest, ADependencyTheLedgerHasAppliedNeedsNoFile) {
+  // The partial repository. One directory holds one project's specs and
+  // depends on something that ran from a directory it does not contain -- the
+  // file is not here and never will be. Which database it ran against is what
+  // knows whether it ran, and that database is the one being deployed to, so
+  // the question is answerable. Asking the DIRECTORY instead makes a partial
+  // repository impossible, which is the whole of what this unblocks.
+  make_shop(cfg());
+  write_spec("a.json", add_column_spec("a", "orders", "a"));
+  const auto started = payload(call("startMigration",
+      json{{"spec", json::parse(std::ifstream(dir_ + "/a.json"), nullptr, true)}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, started["jobId"], [](const json& x) {
+    return x.value("state", "") == "succeeded";
+  })) << status_of(started["jobId"]).dump(2);
+
+  // The file leaves the repository. The ledger keeps the fact that it ran.
+  std::filesystem::remove(dir_ + "/a.json");
+  write_spec("b.json", add_column_spec("b", "warehouse", "b", {"a"}));
+
+  const auto s = scan(false);
+  for (const auto& p : s["problems"]) {
+    EXPECT_EQ(p.get<std::string>().find("which is not in this repository"),
+              std::string::npos)
+        << "a dependency this database records as applied was refused for "
+           "having no file on disk: " << s["problems"].dump(2);
+  }
+  const auto* e = entry_for(s, "b");
+  ASSERT_NE(e, nullptr) << s.dump(2);
+  EXPECT_EQ(e->value("status", ""), "pending") << s.dump(2);
+}
+
+TEST_F(RepoTest, TwoFilesClaimingOneIdAreRefusedRatherThanSilentlyDropped) {
+  // Last-wins is the wrong answer twice over: the loser vanishes from the
+  // dependency order, and nothing says so. Harmless while one team keeps one
+  // directory; the moment several are read together, two projects that both
+  // wrote 0001-init collide and one of them quietly stops existing.
+  make_shop(cfg());
+  write_spec("0001-orders.json", add_column_spec("dup", "orders", "a"));
+  write_spec("0002-warehouse.json", add_column_spec("dup", "warehouse", "b"));
+
+  const auto s = scan(false);
+  std::string named;
+  for (const auto& p : s["problems"]) {
+    const auto t = p.get<std::string>();
+    if (t.find("dup") != std::string::npos) named = t;
+  }
+  ASSERT_FALSE(named.empty())
+      << "two files claimed one id and nothing said so: " << s.dump(2);
+  EXPECT_NE(named.find("0001-orders.json"), std::string::npos)
+      << "the problem must name both files, not just the survivor: " << named;
+  EXPECT_NE(named.find("0002-warehouse.json"), std::string::npos) << named;
+}
+
 TEST_F(RepoTest, ACycleIsNamedAsACycle) {
   make_shop(cfg());
   write_spec("a.json", add_column_spec("a", "orders", "a", {"b"}));
@@ -10622,6 +10676,47 @@ class TwoDatabaseTest : public RepoTest {
 
   std::string second_url_, ini_;
 };
+
+TEST_F(TwoDatabaseTest, TwoConnectionNamesForOneDatabaseAreNotIndependentByConstruction) {
+  // parallel_subsets() grants concurrency across connections with no evidence
+  // at all, reasoning that different databases cannot touch each other's
+  // tables. True -- but it compares connection NAMES, and nothing checks that
+  // two names denote two databases. A DDL role and an application role
+  // pointing at one database is an ordinary configuration, and it is enough to
+  // collect the grant without the fact it rests on.
+  //
+  // The advisory locks still refuse the overlap, so this is a wrong PLAN
+  // rather than a corrupted database -- the operator gets a lock refusal where
+  // a scheduling decision belonged.
+  make_shop(cfg());
+  {
+    std::ofstream f(dir_ + "/alias.ini");
+    f << "[first]\n" << conn_section(url_)
+      << "\n[alias]\n" << conn_section(url_);
+  }
+  ::chmod((dir_ + "/alias.ini").c_str(), 0600);
+  ctx_->registry = pglaswell::Registry::from_ini(dir_ + "/alias.ini",
+                                                 "pg-laswell/test");
+  ctx_->registry.mutable_trust() = policy_trusting_test_key();
+  server_ = std::make_unique<pglaswell::McpServer>(pglaswell::make_tools(*ctx_));
+  initialize(*server_);
+
+  // Both touch shop.orders. Both are pending. They differ only in which NAME
+  // for one database they were routed through.
+  auto a = add_column_spec("a", "orders", "ca");
+  a["target"] = json{{"connection", "first"}};
+  auto b = add_column_spec("b", "orders", "cb");
+  b["target"] = json{{"connection", "alias"}};
+  write_spec("a.json", a);
+  write_spec("b.json", b);
+
+  const auto s = scan(true);
+  ASSERT_EQ(s["order"].size(), 1u) << s.dump(2);
+  EXPECT_FALSE(s["order"][0].value("provenConcurrent", true))
+      << "two specifications on one database, both touching shop.orders, were "
+         "proven concurrent because their connections are spelled "
+         "differently: " << s.dump(2);
+}
 
 TEST_F(TwoDatabaseTest, ASpecificationRunsWhereItSaysAndWaitsForAnotherDatabase) {
   const auto table_spec = [](const std::string& id, const std::string& conn,

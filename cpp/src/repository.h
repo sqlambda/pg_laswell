@@ -462,6 +462,26 @@ class MigrationRepository {
     return json::parse(r[0][0].as<std::string>());
   }
 
+  // Has any database this listing touched recorded this spec id as applied?
+  //
+  // Every database, not one: depends_on crosses databases freely, and a
+  // dependency the repository does not contain brings no target.connection of
+  // its own to narrow the search with. The ledger that knows is the one in the
+  // database where it ran, which is exactly the set already read here.
+  //
+  // Succeeded, specifically. A dependency that is running, failed or merely
+  // recorded has not happened yet, and the caller must keep waiting or stop.
+  bool applied_somewhere(const std::string& spec_id) const {
+    for (const auto& [conn, view] : views_) {
+      (void)conn;
+      if (!view.applied.contains(spec_id)) continue;
+      if (!view.applied[spec_id].value("succeeded", json::array()).empty()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   static bool contains(const json& arr, const std::string& v) {
     for (const auto& x : arr) {
       if (x.get<std::string>() == v) return true;
@@ -637,14 +657,28 @@ class MigrationRepository {
       }
     }
 
-    // A dependency that names a spec the repository does not contain is a
-    // refusal, not a warning: the order cannot be honoured.
+    // A dependency the repository does not contain is not automatically a
+    // refusal. The question depends_on asks is "has that one run", and the
+    // thing that answers it is a LEDGER, not a directory listing -- so a
+    // dependency any database in this listing records as succeeded is
+    // satisfied whether or not its file is here.
+    //
+    // That distinction is what makes a partial repository possible at all. One
+    // project's directory holds one project's specs; a spec in it may depend on
+    // something that ran from a directory this deployment will never see. Read
+    // from the files, that is unanswerable and the whole run is refused. Read
+    // from the ledger, it is simply true.
+    //
+    // Unsatisfied is still a refusal, and the message now says both places
+    // that were looked in, because "I cannot find it" is only useful when it
+    // says where it looked.
     for (const auto& id : runnable) {
       for (const auto& d : by_id[id]->depends_on) {
-        if (by_id.count(d) == 0) {
-          problems.push_back("\"" + id + "\" depends on \"" + d +
-                             "\", which is not in this repository");
-        }
+        if (by_id.count(d) != 0) continue;
+        if (applied_somewhere(d)) continue;
+        problems.push_back("\"" + id + "\" depends on \"" + d +
+                           "\", which is not in this repository and which no "
+                           "database in this listing records as applied");
       }
     }
 
