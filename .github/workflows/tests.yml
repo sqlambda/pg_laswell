@@ -558,58 +558,28 @@ jobs:
 
   # The worked examples, which until now nothing but a person ever ran.
   #
-  # They earn a job because they have already found three things the 416-test
+  # They earn a job because they have already found FOUR things the 416-test
   # suite did not: an empty directory passing silently against a populated
-  # ledger, a summary line saying "databases" while counting connections, and a
-  # helper sending stderr to /dev/null so a hard failure became an empty log.
-  # They find those because they drive the BINARY end to end, against real
-  # clusters, in the arrangements the landing page sells -- and the page now
-  # links to them from its first screen, so a directory that has stopped
-  # working is worse than no example at all.
+  # ledger, a summary line saying "databases" while counting connections, a
+  # helper sending stderr to /dev/null so a hard failure became an empty log,
+  # and an example that had stopped demonstrating its own point. They find those
+  # because they drive the BINARY end to end, against real clusters, in the
+  # arrangements the landing page sells -- and the page links to them from its
+  # first screen, so a directory that has stopped working is worse than none.
   #
-  # Three services rather than docker compose, because lib.sh already takes the
-  # ports from the environment. The one thing compose gives that services do not
-  # is name resolution between containers, which exactly one example needs: the
-  # subscriber dials the publisher, so PUBLISHER_HOST names the service instead.
+  # docker compose, NOT service containers, and the reason is worth keeping.
+  # Service containers looked cheaper: lib.sh already takes its ports from the
+  # environment. But a service container cannot be given a custom command, and
+  # the replication example needs wal_level=logical -- which ALTER SYSTEM cannot
+  # deliver because it takes a restart, and a service container cannot be
+  # restarted from the job. Tried it; got `wal_level=replica` three times and a
+  # failure. compose sets it in the file, which is also the one definition of
+  # the topology a developer already runs.
   examples:
     name: examples
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    services:
-      alpha:
-        image: postgres:latest
-        env:
-          POSTGRES_PASSWORD: laswell
-          POSTGRES_DB: app
-          # Same reason compose sets it: pg_laswell refuses a password in a
-          # subscription's connection string, because the ledger records what
-          # ran and a redacted entry would no longer be what ran.
-          POSTGRES_HOST_AUTH_METHOD: trust
-        options: >-
-          --health-cmd "pg_isready -U postgres -d app" --health-interval 3s
-          --health-timeout 3s --health-retries 20
-        ports: ['55432:5432']
-      beta:
-        image: postgres:latest
-        env:
-          POSTGRES_PASSWORD: laswell
-          POSTGRES_DB: app
-          POSTGRES_HOST_AUTH_METHOD: trust
-        options: >-
-          --health-cmd "pg_isready -U postgres -d app" --health-interval 3s
-          --health-timeout 3s --health-retries 20
-        ports: ['55433:5432']
-      gamma:
-        image: postgres:latest
-        env:
-          POSTGRES_PASSWORD: laswell
-          POSTGRES_DB: app
-          POSTGRES_HOST_AUTH_METHOD: trust
-        options: >-
-          --health-cmd "pg_isready -U postgres -d app" --health-interval 3s
-          --health-timeout 3s --health-retries 20
-        ports: ['55434:5432']
     steps:
       - uses: actions/checkout@v4
       - name: Install runtime dependencies
@@ -622,34 +592,44 @@ jobs:
         with:
           name: test-binary-plain-gcc
           path: build
-      - name: wal_level=logical, which the replication example needs
-        env:
-          PGPASSWORD: laswell
+      - name: Start the three clusters
         run: |
-          for port in 55432 55433 55434; do
-            psql -h 127.0.0.1 -p $port -U postgres -d app -q -c \
-              "ALTER SYSTEM SET wal_level = 'logical'" \
-              -c "ALTER SYSTEM SET max_replication_slots = 8" \
-              -c "ALTER SYSTEM SET max_wal_senders = 8"
+          docker compose -f examples/docker/compose.yml up -d
+          for i in $(seq 1 60); do
+            ok=0
+            for c in laswell_alpha laswell_beta laswell_gamma; do
+              docker exec "$c" pg_isready -U postgres -d app -q 2>/dev/null && ok=$((ok+1))
+            done
+            [ "$ok" = 3 ] && break
+            sleep 2
           done
-          # A restart is the only way wal_level takes effect, and a service
-          # container cannot be restarted from here -- so the containers are
-          # started with it instead. Asserted rather than assumed:
+          # Asserted, not assumed: this is the setting the replication example
+          # needs and the one a service container could not provide.
           for port in 55432 55433 55434; do
-            got=$(psql -h 127.0.0.1 -p $port -U postgres -d app -t -A -c "SHOW wal_level")
-            echo "port $port wal_level=$got"
+            got=$(PGPASSWORD=laswell psql -h 127.0.0.1 -p $port -U postgres -d app -t -A -c "SHOW wal_level")
+            echo "127.0.0.1:$port wal_level=$got"
+            [ "$got" = "logical" ] || { echo "::error::wal_level is $got on $port"; exit 1; }
           done
       - name: Every example
         env:
           PG_LASWELL: ${{ github.workspace }}/build/pg_laswell
           PG_LASWELL_MCP: ${{ github.workspace }}/build/pg_laswell_mcp
-          PGPASSWORD: laswell
-          # The subscriber dials the publisher by service name here, not by the
-          # container name compose would give it.
+          # compose resolves container names, so the subscriber dials `alpha`
+          # exactly as it does on a developer's machine.
           PUBLISHER_HOST: alpha
         run: |
           chmod +x build/pg_laswell build/pg_laswell_mcp
           ./examples/docker/run-all.sh
+      - name: The logs of anything that failed
+        if: failure()
+        run: |
+          for f in examples/docker/.*.log; do
+            [ -e "$f" ] || continue
+            echo "::group::$f"; cat "$f"; echo "::endgroup::"
+          done
+      - name: Stop the clusters
+        if: always()
+        run: docker compose -f examples/docker/compose.yml down -v
 
   ci-ok:
     name: ci-ok

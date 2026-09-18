@@ -84,7 +84,16 @@ omitting it costs scope and never safety.
   that had stopped being caught.
 - The deployment summary said "across N databases" while counting connections.
 
-### Ten runnable examples
+### A landing page that names every concept
+
+The page now lists every idea the tool has -- thirty terms in six layers, each
+with what it ACTUALLY is rather than a gloss, because `target` does four
+unrelated jobs and saying so once beats four paragraphs elsewhere -- and then
+twelve ways people arrange it, each with a diagram, a numbered sequence, and a
+link to a directory you can run. It states the dry-run limit below rather than
+leaving a reader to discover it.
+
+### Ten runnable examples, and CI runs them
 
 `examples/docker/` starts three `postgres:latest` containers and demonstrates
 each arrangement: the baseline, a CI gate, release tags, environments, two roles
@@ -92,6 +101,11 @@ on one database, a DBA repository the application never sees, adopting a
 database nobody scripted, rolling a baseline forward, a sharded fleet, and a
 publisher with a subscriber. Three clusters because two of those cannot be shown
 inside one.
+
+They run in CI, and `run-all.sh` checks each one still prints the line that IS
+its demonstration -- because an example that runs without failing is not the
+same as one that still shows anything, and exactly that had already happened to
+one of the ten.
 
 ### Known limit
 
