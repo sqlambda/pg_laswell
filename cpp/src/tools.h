@@ -680,6 +680,15 @@ inline json list_migrations(ToolContext& ctx, const json& args) {
       sources.push_back(Source{d.get<std::string>(), d.get<std::string>()});
     }
   }
+  bool complete = false;
+  const auto manifest_path = args.value("manifest", "");
+  if (!manifest_path.empty()) {
+    Manifest m;
+    const auto bad = parse_manifest(manifest_path, m);
+    if (!bad.is_null()) return bad;
+    for (auto& src : m.sources) sources.push_back(std::move(src));
+    complete = m.complete;
+  }
   const auto dir = args.value("directory", "");
   if (!dir.empty()) sources.push_back(Source{dir, dir});
   if (sources.empty()) {
@@ -690,7 +699,8 @@ inline json list_migrations(ToolContext& ctx, const json& args) {
   // each one that names its own is classified against that database instead.
   const auto& cfg = ctx.connection(args);
   MigrationRepository repo(ctx.registry, cfg.name, ctx.cache);
-  auto out = repo.scan(sources, args.value("deriveRelations", true));
+  auto out = repo.scan(sources, args.value("deriveRelations", true), complete);
+  if (complete) out["complete"] = true;
   out["connection"] = cfg.name;
   out["database"] = cfg.dbname;
   return out;
@@ -793,6 +803,14 @@ inline std::vector<ToolDef> make_tools(ToolContext& ctx) {
                       "per directory, with depends_on crossing between them. "
                       "An id claimed by two directories is refused rather than "
                       "resolved. Use instead of `directory`, or alongside it."}}},
+                   {"manifest",
+                    {{"type", "string"},
+                     {"description",
+                      "path to a manifest naming the sources this deployment "
+                      "is made of. Its `complete: true` asserts they are ALL "
+                      "of it, which puts the drift check back to full "
+                      "strength: every migration the ledger records must be "
+                      "described by a file here, in any epoch."}}},
                    {"deriveRelations",
                     {{"type", "boolean"},
                      {"description",

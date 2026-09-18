@@ -4101,6 +4101,270 @@ TEST_F(RepoTest, TwoFilesClaimingOneIdAreRefusedRatherThanSilentlyDropped) {
   EXPECT_NE(named.find("0002-warehouse.json"), std::string::npos) << named;
 }
 
+// --- epochs -----------------------------------------------------------------
+//
+// A lineage of tracked history, and the thing that lets a deployment answer
+// for PART of a database. The drift check -- "applied here, and no file
+// describes it" -- is unanswerable for a deliberately partial repository;
+// scoped by epoch it becomes answerable again.
+namespace {
+
+class EpochTest : public RepoTest {
+ public:
+  void open_epoch(const std::string& name, const std::string& note = "test") {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/epoch");
+    pglaswell::pqxx_exec(w.txn(),
+        "INSERT INTO laswell.epoch(name, note) VALUES ($1, $2)"
+        " ON CONFLICT (name) DO NOTHING",
+        pqxx::params{name, note});
+    w.commit();
+  }
+  void retire_epoch(const std::string& name) {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/epoch-retire");
+    pglaswell::pqxx_exec(w.txn(),
+        "UPDATE laswell.epoch SET retired_at = now(), retired_by = current_user"
+        " WHERE name = $1", pqxx::params{name});
+    w.commit();
+  }
+  static json in_epoch(json doc, const std::string& epoch) {
+    doc["target"] = json{{"epoch", epoch}};
+    return doc;
+  }
+  void apply_now(const std::string& file) {
+    const auto started = payload(call("startMigration",
+        json{{"spec", json::parse(std::ifstream(dir_ + "/" + file), nullptr, true)}}));
+    ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+    ASSERT_TRUE(wait_for_status(*this, started["jobId"], [](const json& x) {
+      return x.value("state", "") == "succeeded";
+    })) << status_of(started["jobId"]).dump(2);
+  }
+};
+
+}  // namespace
+
+TEST_F(EpochTest, AFreshLedgerIsVersionThreeWithADefaultEpoch) {
+  pglaswell::Ledger ledger(cfg());
+  const auto st = ledger.status();
+  EXPECT_EQ(st.version, 3);
+  EXPECT_TRUE(st.usable) << st.error;
+  EXPECT_EQ(st.epochs_live.count("default"), 1u)
+      << "everything unnamed belongs to 'default', so it must always exist";
+  EXPECT_TRUE(st.epochs_retired.empty());
+}
+
+TEST_F(EpochTest, ASpecificationNamingNoEpochBelongsToDefault) {
+  make_shop(cfg());
+  write_spec("a.json", add_column_spec("a", "orders", "ca"));
+  apply_now("a.json");
+
+  pglaswell::ReadSession r(cfg());
+  const auto rows = r.txn().exec(
+      "SELECT epoch FROM laswell.migration WHERE spec_id = 'a'");
+  ASSERT_EQ(rows.size(), 1u);
+  EXPECT_EQ(rows[0][0].as<std::string>(), "default");
+}
+
+TEST_F(EpochTest, TheSameBytesMayRunInTwoEpochs) {
+  // The reason UNIQUE (epoch, spec_digest) replaces a global unique on the
+  // digest. Retiring a lineage and replaying the same specifications into a
+  // new one is the ordinary case, and a global unique made it a constraint
+  // violation instead.
+  make_shop(cfg());
+  open_epoch("second");
+  const auto doc = add_column_spec("same", "orders", "ca");
+
+  write_spec("first.json", in_epoch(doc, "default"));
+  apply_now("first.json");
+
+  // Byte-identical but for the epoch, which is inside the signature.
+  write_spec("second.json", in_epoch(doc, "second"));
+  const auto started = payload(call("startMigration",
+      json{{"spec", json::parse(std::ifstream(dir_ + "/second.json"), nullptr, true)}}));
+  EXPECT_TRUE(started.value("accepted", false))
+      << "the same specification in a second lineage must be recordable: "
+      << started.dump(2);
+
+  pglaswell::ReadSession r(cfg());
+  EXPECT_EQ(r.txn().exec(
+      "SELECT count(*) FROM laswell.migration WHERE spec_id = 'same'")[0][0].as<int>(), 2);
+}
+
+TEST_F(EpochTest, AnIdIsStillUniqueWithinOneListingWhateverTheEpoch) {
+  // Epochs do NOT license reusing an id inside one deployment, and it would be
+  // easy to assume they do. depends_on names an id and nothing else, so two
+  // specifications answering to one id in a single listing leave every
+  // dependency on it ambiguous -- whatever epochs they sit in. The ledger now
+  // records (epoch, id), which is what lets a lineage be replayed later; the
+  // LISTING still needs one answer per name.
+  make_shop(cfg());
+  open_epoch("other");
+  write_spec("a.json", in_epoch(add_column_spec("0001-init", "orders", "ca"), "default"));
+  write_spec("b.json", in_epoch(add_column_spec("0001-init", "warehouse", "cb"), "other"));
+
+  const auto s = scan(false);
+  bool refused = false;
+  for (const auto& p : s["problems"]) {
+    if (p.get<std::string>().find("0001-init") != std::string::npos) refused = true;
+  }
+  EXPECT_TRUE(refused)
+      << "one id claimed twice in one listing is ambiguous however the epochs "
+         "differ: " << s.dump(2);
+}
+
+TEST_F(EpochTest, ReplayingASpecIntoANewEpochIsPendingNotApplied) {
+  // What keying the applied index by epoch actually buys, and the case the
+  // roadmap named: retire a lineage, open another, replay the same
+  // specifications into it.
+  //
+  // The ledger then holds that id twice. Looked up by id alone it would find
+  // the retired lineage's row -- whose digest differs, because the epoch is
+  // inside the signature -- and report a migration that has never run here as
+  // edited after being applied. A false drift alarm on a correct replay.
+  make_shop(cfg());
+  open_epoch("old");
+  write_spec("x.json", in_epoch(add_column_spec("x", "orders", "ca"), "old"));
+  apply_now("x.json");
+  retire_epoch("old");
+
+  open_epoch("fresh");
+  std::filesystem::remove(dir_ + "/x.json");
+  write_spec("x.json", in_epoch(add_column_spec("x", "orders", "ca"), "fresh"));
+
+  const auto s = scan(false);
+  const auto* e = entry_for(s, "x");
+  ASSERT_NE(e, nullptr) << s.dump(2);
+  EXPECT_EQ(e->value("status", ""), "pending")
+      << "a replay into a new lineage has not run there: " << s.dump(2);
+
+  pglaswell::ReadSession r(cfg());
+  EXPECT_EQ(r.txn().exec(
+      "SELECT count(*) FROM laswell.migration WHERE spec_id = 'x'")[0][0].as<int>(), 1)
+      << "only the retired lineage's row exists until the replay is applied";
+}
+
+TEST_F(EpochTest, AnEpochThisDatabaseHasNotOpenedHolds) {
+  make_shop(cfg());
+  write_spec("a.json", in_epoch(add_column_spec("a", "orders", "ca"), "unopened"));
+
+  const auto s = scan(false);
+  const auto* e = entry_for(s, "a");
+  ASSERT_NE(e, nullptr) << s.dump(2);
+  EXPECT_EQ(e->value("status", ""), "held_for_epoch") << s.dump(2);
+  EXPECT_NE(e->value("hint", "").find("INSERT INTO laswell.epoch"),
+            std::string::npos)
+      << "the hint must say how to open it: " << e->dump(2);
+}
+
+TEST_F(EpochTest, ARetiredEpochIsNotApplied) {
+  make_shop(cfg());
+  open_epoch("old");
+  retire_epoch("old");
+  write_spec("a.json", in_epoch(add_column_spec("a", "orders", "ca"), "old"));
+
+  const auto s = scan(false);
+  const auto* e = entry_for(s, "a");
+  ASSERT_NE(e, nullptr) << s.dump(2);
+  EXPECT_EQ(e->value("status", ""), "retired_epoch") << s.dump(2);
+}
+
+TEST_F(EpochTest, TheDriftCheckAnswersOnlyForTheEpochsOnDisk) {
+  // THE PAYOFF. A partial repository: this deployment carries one lineage and
+  // says nothing about the other, where unscoped it called every one of the
+  // other's migrations a deleted file and refused the whole run.
+  make_shop(cfg());
+  open_epoch("theirs");
+  write_spec("theirs.json", in_epoch(add_column_spec("theirs-0001", "warehouse", "cb"), "theirs"));
+  apply_now("theirs.json");
+  std::filesystem::remove(dir_ + "/theirs.json");
+
+  write_spec("ours.json", in_epoch(add_column_spec("ours-0001", "orders", "ca"), "default"));
+
+  const auto s = scan(false);
+  for (const auto& p : s["problems"]) {
+    EXPECT_EQ(p.get<std::string>().find("theirs-0001"), std::string::npos)
+        << "another lineage's migration is not this deployment's drift: "
+        << s["problems"].dump(2);
+  }
+  EXPECT_TRUE(s["problems"].empty()) << s["problems"].dump(2);
+}
+
+TEST_F(EpochTest, DriftInsideAClaimedEpochIsStillCaught) {
+  // The other side of the same scoping, and the one that would make it
+  // worthless if it were wrong: within a lineage this deployment DOES claim,
+  // a missing file is still drift.
+  make_shop(cfg());
+  write_spec("a.json", add_column_spec("a", "orders", "ca"));
+  apply_now("a.json");
+  std::filesystem::remove(dir_ + "/a.json");
+  write_spec("b.json", add_column_spec("b", "warehouse", "cb"));
+
+  const auto s = scan(false);
+  bool named = false;
+  for (const auto& p : s["problems"]) {
+    if (p.get<std::string>().find("\"a\" as applied") != std::string::npos) named = true;
+  }
+  EXPECT_TRUE(named) << "drift in an epoch this repository claims must still "
+                        "be caught: " << s.dump(2);
+}
+
+TEST_F(EpochTest, ARetiredLineageIsNotHeldToAccountForItsMissingFiles) {
+  // A mutation found this: with the retirement skip removed, nothing failed.
+  // RetirementDoesNotUnsayThatAMigrationRan deletes the retired lineage's only
+  // file, so its epoch is not claimed by anything on disk and the scoping
+  // check skips it first -- the retirement skip never runs, and removing it
+  // changes nothing.
+  //
+  // So the case that needs the skip is a retired lineage still PRESENT on
+  // disk, with part of it missing. Claimed, therefore in scope; retired,
+  // therefore not something to answer for. A lineage abandoned deliberately is
+  // not drift, and reporting it would leave an operator unable to stop
+  // tracking anything without first deleting every file.
+  make_shop(cfg());
+  open_epoch("old");
+  write_spec("one.json", in_epoch(add_column_spec("old-0001", "orders", "ca"), "old"));
+  write_spec("two.json", in_epoch(add_column_spec("old-0002", "warehouse", "cb"), "old"));
+  apply_now("one.json");
+  apply_now("two.json");
+  retire_epoch("old");
+
+  // One file stays, so the epoch IS claimed. The other goes.
+  std::filesystem::remove(dir_ + "/two.json");
+
+  const auto s = scan(false);
+  for (const auto& p : s["problems"]) {
+    EXPECT_EQ(p.get<std::string>().find("old-0002"), std::string::npos)
+        << "a retired lineage is not held to account for its missing files: "
+        << s["problems"].dump(2);
+  }
+  EXPECT_TRUE(s["problems"].empty()) << s["problems"].dump(2);
+}
+
+TEST_F(EpochTest, RetirementDoesNotUnsayThatAMigrationRan) {
+  // Rule 2, and the rule that makes retirement safe. A retired lineage stops
+  // being TRACKED; its migrations remain applied, so a specification in a live
+  // epoch may still depend on one. Get this backwards and such a dependency
+  // blocks forever.
+  make_shop(cfg());
+  open_epoch("old");
+  write_spec("old.json", in_epoch(add_column_spec("old-0001", "orders", "ca"), "old"));
+  apply_now("old.json");
+  retire_epoch("old");
+  std::filesystem::remove(dir_ + "/old.json");
+
+  write_spec("new.json", in_epoch(
+      add_column_spec("new-0001", "warehouse", "cb", {"old-0001"}), "default"));
+
+  const auto s = scan(false);
+  EXPECT_TRUE(s["problems"].empty())
+      << "a dependency on a retired lineage's migration still ran: "
+      << s["problems"].dump(2);
+  const auto* e = entry_for(s, "new-0001");
+  ASSERT_NE(e, nullptr) << s.dump(2);
+  EXPECT_EQ(e->value("status", ""), "pending") << s.dump(2);
+}
+
 // --- several source directories, one listing -------------------------------
 //
 // A project per directory, and a deployment that reads them together. The
@@ -4265,6 +4529,169 @@ TEST_F(MultiSourceTest, AMissingDirectoryNamesWhichOne) {
   const auto text = s.value("error", "") + s.value("problems", json::array()).dump();
   EXPECT_NE(text.find("_nope"), std::string::npos)
       << "the message must say WHICH directory is missing: " << s.dump(2);
+}
+
+// --- the manifest -----------------------------------------------------------
+//
+// A main repository: which sources make up a deployment, and whether they are
+// ALL of it. `complete` is an assertion no directory can make about itself,
+// and it is what puts the drift check back to the strength epochs scoped away.
+namespace {
+
+class ManifestTest : public MultiSourceTest {
+ public:
+  std::string write_manifest(bool complete,
+                             std::vector<std::pair<std::string, std::string>> srcs) {
+    json doc{{"laswell_manifest_version", 1}, {"complete", complete}};
+    doc["sources"] = json::array();
+    for (const auto& [name, dir] : srcs) {
+      doc["sources"].push_back(json{{"name", name}, {"directory", dir}});
+    }
+    const auto path = dir_ + "/../manifest_" + std::to_string(::getpid()) + ".json";
+    std::ofstream(path) << doc.dump(2);
+    written_.push_back(path);
+    return path;
+  }
+  void TearDown() override {
+    for (const auto& f : written_) { std::error_code ec; std::filesystem::remove(f, ec); }
+    MultiSourceTest::TearDown();
+  }
+  json scan_manifest(const std::string& path) {
+    return payload(call("listMigrations",
+                        json{{"manifest", path}, {"deriveRelations", false}}));
+  }
+  std::vector<std::string> written_;
+};
+
+}  // namespace
+
+TEST_F(ManifestTest, AManifestNamesTheSourcesAndTheyAreRead) {
+  make_shop(cfg());
+  write_spec_in(dir_, "a.json", add_column_spec("a", "orders", "ca"));
+  write_spec_in(dir2_, "b.json", add_column_spec("b", "warehouse", "cb"));
+
+  const auto s = scan_manifest(write_manifest(false, {{"shop", dir_}, {"audit", dir2_}}));
+  EXPECT_TRUE(s.value("problems", json::array()).empty()) << s["problems"].dump(2);
+  ASSERT_EQ(s["migrations"].size(), 2u) << s.dump(2);
+  // The NAME, not the directory. This is what a manifest adds over --repo, and
+  // the reason the collision message can now say whose project a file is.
+  EXPECT_EQ(entry_for(s, "a")->value("source", ""), "shop") << s.dump(2);
+  EXPECT_EQ(entry_for(s, "b")->value("source", ""), "audit") << s.dump(2);
+}
+
+TEST_F(ManifestTest, AnIncompleteManifestAnswersOnlyForTheEpochsItBrought) {
+  // Without `complete`, a manifest is just a tidier way to name sources: the
+  // epoch scoping still applies, and another lineage's migrations are none of
+  // this deployment's business.
+  make_shop(cfg());
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/epoch");
+    w.txn().exec("INSERT INTO laswell.epoch(name, note) VALUES ('theirs','t')"
+                 " ON CONFLICT (name) DO NOTHING");
+    w.commit();
+  }
+  auto theirs = add_column_spec("theirs-0001", "warehouse", "cb");
+  theirs["target"] = json{{"epoch", "theirs"}};
+  write_spec_in(dir_, "theirs.json", theirs);
+  const auto started = payload(call("startMigration",
+      json{{"spec", json::parse(std::ifstream(dir_ + "/theirs.json"), nullptr, true)}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, started["jobId"], [](const json& x) {
+    return x.value("state", "") == "succeeded";
+  })) << status_of(started["jobId"]).dump(2);
+  std::filesystem::remove(dir_ + "/theirs.json");
+
+  write_spec_in(dir_, "ours.json", add_column_spec("ours-0001", "orders", "ca"));
+
+  const auto s = scan_manifest(write_manifest(false, {{"ours", dir_}}));
+  EXPECT_TRUE(s["problems"].empty())
+      << "an incomplete manifest answers only for what it brought: "
+      << s["problems"].dump(2);
+}
+
+TEST_F(ManifestTest, ACompleteManifestAnswersForEveryEpoch) {
+  // THE POINT OF F2. The same database and the same missing file as above, and
+  // this time the deployment asserts it is the whole story -- so the migration
+  // it cannot account for is drift again, exactly as it was before epochs
+  // existed. `complete` only ever WIDENS the check.
+  make_shop(cfg());
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/epoch");
+    w.txn().exec("INSERT INTO laswell.epoch(name, note) VALUES ('theirs','t')"
+                 " ON CONFLICT (name) DO NOTHING");
+    w.commit();
+  }
+  auto theirs = add_column_spec("theirs-0001", "warehouse", "cb");
+  theirs["target"] = json{{"epoch", "theirs"}};
+  write_spec_in(dir_, "theirs.json", theirs);
+  const auto started = payload(call("startMigration",
+      json{{"spec", json::parse(std::ifstream(dir_ + "/theirs.json"), nullptr, true)}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, started["jobId"], [](const json& x) {
+    return x.value("state", "") == "succeeded";
+  })) << status_of(started["jobId"]).dump(2);
+  std::filesystem::remove(dir_ + "/theirs.json");
+
+  write_spec_in(dir_, "ours.json", add_column_spec("ours-0001", "orders", "ca"));
+
+  const auto s = scan_manifest(write_manifest(true, {{"ours", dir_}}));
+  bool named = false;
+  for (const auto& p : s["problems"]) {
+    if (p.get<std::string>().find("theirs-0001") != std::string::npos) named = true;
+  }
+  EXPECT_TRUE(named)
+      << "a complete manifest answers for every epoch, so this IS drift: "
+      << s.dump(2);
+  EXPECT_TRUE(s.value("complete", false)) << s.dump(2);
+}
+
+TEST_F(ManifestTest, AManifestThatDoesNotParseIsRefusedRatherThanGuessedAt) {
+  make_shop(cfg());
+  const auto path = dir_ + "/broken.json";
+  std::ofstream(path) << "{ not json";
+  const auto s = payload(call("listMigrations", json{{"manifest", path}}));
+  EXPECT_NE(s.value("error", "").find("does not parse"), std::string::npos)
+      << s.dump(2);
+}
+
+TEST_F(ManifestTest, AnUnknownManifestVersionIsRefused) {
+  // Read as far as it goes, a newer manifest could name sources this binary
+  // silently ignores -- a deployment quietly missing a project.
+  make_shop(cfg());
+  const auto path = dir_ + "/future.json";
+  std::ofstream(path) << R"({"laswell_manifest_version": 2, "sources": []})";
+  const auto s = payload(call("listMigrations", json{{"manifest", path}}));
+  EXPECT_NE(s.value("error", "").find("laswell_manifest_version"),
+            std::string::npos) << s.dump(2);
+}
+
+TEST_F(ManifestTest, TwoSourcesMayNotShareAName) {
+  make_shop(cfg());
+  const auto path = write_manifest(false, {{"same", dir_}, {"same", dir2_}});
+  const auto s = scan_manifest(path);
+  EXPECT_NE(s.value("error", "").find("both named"), std::string::npos)
+      << s.dump(2);
+}
+
+TEST_F(ManifestTest, ARelativeDirectoryIsResolvedAgainstTheManifest) {
+  // A manifest checked out anywhere must name the same folders, so relative
+  // paths follow the manifest and not the process's working directory.
+  make_shop(cfg());
+  write_spec_in(dir_, "a.json", add_column_spec("a", "orders", "ca"));
+  const auto leaf = std::filesystem::path(dir_).filename().string();
+  const auto path = dir_ + "/../rel_manifest.json";
+  std::ofstream(path) << json{{"laswell_manifest_version", 1},
+                              {"sources", json::array({json{{"name", "shop"},
+                                                            {"directory", leaf}}})}}
+                             .dump(2);
+  written_.push_back(path);
+
+  const auto s = scan_manifest(path);
+  EXPECT_TRUE(s.value("problems", json::array()).empty()) << s.dump(2);
+  ASSERT_EQ(s["migrations"].size(), 1u) << s.dump(2);
+  EXPECT_EQ(entry_for(s, "a")->value("source", ""), "shop") << s.dump(2);
 }
 
 TEST_F(RepoTest, ACycleIsNamedAsACycle) {

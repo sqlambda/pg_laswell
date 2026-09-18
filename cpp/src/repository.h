@@ -75,6 +75,14 @@ enum class RepoStatus {
   kWrongEnvironment,
   kWrongDatabase,
   kHeldForRelease,
+  // The lineage this specification names has not been opened here. Waiting,
+  // not wrong -- the same shape as a release nobody has approved, and for the
+  // same reason: opening an epoch narrows the drift check, so it is the
+  // schema owner's decision and not the deploying role's.
+  kHeldForEpoch,
+  // The lineage was retired. Not waiting for anything: it was abandoned
+  // deliberately, and a specification in it is not going to be applied here.
+  kRetiredEpoch,
   // The specification names a connection this configuration does not define.
   // A repository problem rather than a gate: every other status answers "should
   // this run here", and this one says the question could not be asked.
@@ -92,6 +100,8 @@ inline const char* to_string(RepoStatus s) {
     case RepoStatus::kWrongEnvironment: return "wrong_environment";
     case RepoStatus::kWrongDatabase: return "wrong_database";
     case RepoStatus::kHeldForRelease: return "held_for_release";
+    case RepoStatus::kHeldForEpoch: return "held_for_epoch";
+    case RepoStatus::kRetiredEpoch: return "retired_epoch";
     case RepoStatus::kUnknownConnection: return "unknown_connection";
   }
   return "unknown";
@@ -129,6 +139,7 @@ struct RepoEntry {
   std::string database;        // target.database, as the spec declares it
   std::string environment;     // target.environment, as the spec declares it
   std::string release;         // the release tag gating it, if any
+  std::string epoch;           // the lineage it belongs to; "default" if unnamed
 };
 
 // Derives what a spec actually touches.
@@ -289,6 +300,88 @@ struct Source {
   std::string dir;
 };
 
+// A main repository: which sources make up this deployment, and whether they
+// are ALL of it.
+//
+// `complete` is the whole point, and it is an assertion no directory can make
+// about itself. An epoch lets a partial deployment answer only for the
+// lineages it brought; a complete manifest says there is nothing else to
+// answer for, which puts the drift check back to full strength -- every
+// migration this database records must be described by a file here.
+//
+// So the two are complementary rather than alternatives. Deploying one project
+// alone, the epoch is the scope. Deploying the main repository, the manifest
+// says the scope is everything.
+//
+// Directories are resolved against the MANIFEST'S OWN directory, so a manifest
+// checked out anywhere still names the same folders.
+struct Manifest {
+  std::vector<Source> sources;
+  bool complete = false;
+};
+
+// Returns an error object, or null when the manifest parsed.
+inline json parse_manifest(const std::string& path, Manifest& out) {
+  namespace fs = std::filesystem;
+  std::ifstream in(path);
+  if (!in) {
+    return json{{"error", "cannot read manifest: " + path},
+                {"hint", "Point --manifest at a JSON file listing the sources "
+                         "this deployment is made of."}};
+  }
+  json doc;
+  try {
+    doc = json::parse(in);
+  } catch (const std::exception& e) {
+    return json{{"error", std::string("manifest does not parse: ") + e.what()},
+                {"hint", "A manifest decides which migrations run; one that "
+                         "cannot be read is not a deployment to guess at."}};
+  }
+  if (!doc.is_object()) {
+    return json{{"error", "the manifest must be an object"}, {"hint", ""}};
+  }
+  const auto version = doc.value("laswell_manifest_version", 0);
+  if (version != 1) {
+    return json{{"error", "unsupported laswell_manifest_version: " +
+                              std::to_string(version)},
+                {"hint", "This binary reads version 1. A manifest from a newer "
+                         "release may name sources in ways it would silently "
+                         "ignore, which is why an unknown version is refused "
+                         "rather than read as far as it goes."}};
+  }
+  if (!doc.contains("sources") || !doc["sources"].is_array() ||
+      doc["sources"].empty()) {
+    return json{{"error", "the manifest lists no sources"},
+                {"hint", "Add \"sources\": [{\"name\": \"...\", "
+                         "\"directory\": \"...\"}]."}};
+  }
+  const auto base = fs::path(path).parent_path();
+  std::set<std::string> names;
+  for (const auto& src : doc["sources"]) {
+    if (!src.is_object()) {
+      return json{{"error", "every source must be an object"}, {"hint", ""}};
+    }
+    const auto dir = src.value("directory", "");
+    if (dir.empty()) {
+      return json{{"error", "every source needs a \"directory\""}, {"hint", ""}};
+    }
+    // The name is what messages call it. Defaulting it to the directory keeps
+    // a manifest that bothers with neither readable.
+    const auto name = src.value("name", dir);
+    if (!names.insert(name).second) {
+      return json{{"error", "two sources are both named \"" + name + "\""},
+                  {"hint", "A name is how a problem message says which project "
+                           "a file came from, so it cannot mean two of them."}};
+    }
+    const auto resolved = fs::path(dir).is_absolute()
+                              ? fs::path(dir)
+                              : base / fs::path(dir);
+    out.sources.push_back(Source{name, resolved.lexically_normal().string()});
+  }
+  out.complete = doc.value("complete", false);
+  return json(nullptr);
+}
+
 // Are these two specifications provably against DIFFERENT databases?
 //
 // Only a YES grants concurrency without evidence, so every uncertain answer
@@ -345,6 +438,11 @@ class MigrationRepository {
     std::string database_identity;
     std::string environment;
     std::set<std::string> releases_ready;
+    std::set<std::string> epochs_live;
+    std::set<std::string> epochs_retired;
+    // epoch -> spec_id -> state. Keyed by epoch as well as id, because two
+    // lineages may each hold a "0001-init" and they are not the same
+    // migration; a flat index fused them into one entry.
     json applied = json::object();
   };
 
@@ -360,6 +458,8 @@ class MigrationRepository {
       v.database_identity = st.database_identity;
       v.environment = st.environment;
       v.releases_ready = st.releases_ready;
+      v.epochs_live = st.epochs_live;
+      v.epochs_retired = st.epochs_retired;
       v.applied = applied_index(cfg);
       v.reachable = true;
     } catch (const std::exception& e) {
@@ -379,6 +479,14 @@ class MigrationRepository {
   }
 
   json scan(const std::vector<Source>& sources, bool derive_relations) {
+    return scan(sources, derive_relations, false);
+  }
+
+  // `complete` is the manifest's assertion that these sources are the WHOLE
+  // story for this database. It only ever widens the drift check, never
+  // narrows it, so getting it wrong by omission costs nothing but scope.
+  json scan(const std::vector<Source>& sources, bool derive_relations,
+            bool complete) {
     namespace fs = std::filesystem;
     std::vector<RepoEntry> entries;
     std::vector<std::string> problems;
@@ -504,6 +612,8 @@ class MigrationRepository {
         entry.database = spec.target_database;
         entry.environment = spec.target_environment;
         entry.release = spec.release;
+        entry.epoch = spec.target_epoch.empty() ? std::string("default")
+                                                : spec.target_epoch;
         // Routed before it is classified, because WHICH ledger answers "has
         // this been applied" is the first question, not a detail of the
         // answer.
@@ -568,17 +678,45 @@ class MigrationRepository {
     // is where an unrouted specification would go, so its ledger is part of
     // this repository's story whether or not a file currently points there.
     if (registry_->has(default_connection_)) (void)view_for(default_connection_);
+    // Scoped to the lineages this deployment BROUGHT, which is the whole point
+    // of an epoch and what finally makes a partial repository possible.
+    //
+    // Unscoped, the check asked the impossible of a repository that is
+    // deliberately partial: every migration another project applied looked
+    // like a deleted file. Scoped, it asks something answerable -- for the
+    // epochs on disk here, is anything missing -- and says nothing at all
+    // about lineages this deployment never claimed to describe.
+    //
+    // A retired epoch is out of scope even when its specs ARE on disk: the
+    // lineage was abandoned on purpose, so nothing in it is expected to be
+    // accounted for. That is retirement narrowing the drift check and nothing
+    // else; applied_somewhere() still sees those rows.
     std::set<std::string> on_disk;
+    std::set<std::string> epochs_claimed;
     for (const auto& e : entries) {
-      if (!e.spec_id.empty()) on_disk.insert(e.spec_id);
+      if (e.spec_id.empty()) continue;
+      on_disk.insert(e.epoch + "\x1f" + e.spec_id);
+      epochs_claimed.insert(e.epoch);
     }
     for (const auto& [conn, view] : views_) {
-      for (auto it = view.applied.begin(); it != view.applied.end(); ++it) {
-        if (on_disk.count(it.key()) == 0) {
+      for (auto ep = view.applied.begin(); ep != view.applied.end(); ++ep) {
+        const auto& epoch = ep.key();
+        // A complete manifest answers for every lineage, claimed or not:
+        // that is what it asserts, and it is the only thing that can put the
+        // check back to the strength it had before epochs scoped it.
+        if (!complete && epochs_claimed.count(epoch) == 0) continue;
+        if (view.epochs_retired.count(epoch) != 0) continue;
+        for (auto it = ep.value().begin(); it != ep.value().end(); ++it) {
+          if (on_disk.count(epoch + "\x1f" + it.key()) != 0) continue;
           problems.push_back(
               "the ledger of \"" + conn + "\" records \"" + it.key() +
-              "\" as applied, and no file in the repository has that id. It "
-              "was applied from somewhere else, or the file was deleted.");
+              "\" as applied in epoch \"" + epoch +
+              "\", and no file in this repository has that id in that epoch. "
+              "It was applied from somewhere else, or the file was deleted." +
+              (complete && epochs_claimed.count(epoch) == 0
+                   ? std::string(" This manifest declares itself complete, so "
+                                 "it answers for that epoch too.")
+                   : std::string()));
         }
       }
     }
@@ -596,8 +734,9 @@ class MigrationRepository {
     if (probe.empty() || !probe[0][0].as<bool>()) return json::object();
 
     const auto r = s.txn().exec(R"SQL(
-      SELECT COALESCE(JSONB_OBJECT_AGG(spec_id, entry), '{}'::jsonb) FROM (
-        SELECT m.spec_id,
+      SELECT COALESCE(JSONB_OBJECT_AGG(epoch, by_id), '{}'::jsonb) FROM (
+        SELECT epoch, JSONB_OBJECT_AGG(spec_id, entry) AS by_id FROM (
+        SELECT m.epoch, m.spec_id,
                JSONB_BUILD_OBJECT(
                  'digests', JSONB_AGG(DISTINCT m.spec_digest),
                  'succeeded', COALESCE(JSONB_AGG(DISTINCT m.spec_digest)
@@ -609,7 +748,8 @@ class MigrationRepository {
                ) AS entry
           FROM laswell.migration m
           LEFT JOIN laswell.job j ON j.migration_id = m.migration_id
-         GROUP BY m.spec_id) AS s
+         GROUP BY m.epoch, m.spec_id) AS s
+         GROUP BY epoch) AS e
     )SQL");
     if (r.empty() || r[0][0].is_null()) return json::object();
     return json::parse(r[0][0].as<std::string>());
@@ -627,9 +767,15 @@ class MigrationRepository {
   bool applied_somewhere(const std::string& spec_id) const {
     for (const auto& [conn, view] : views_) {
       (void)conn;
-      if (!view.applied.contains(spec_id)) continue;
-      if (!view.applied[spec_id].value("succeeded", json::array()).empty()) {
-        return true;
+      // Every epoch, retired ones included. Retirement stops a lineage being
+      // TRACKED; it does not unsay that its migrations ran, and a
+      // specification in a live epoch may depend on one of them. Getting this
+      // backwards would block such a dependency forever.
+      for (auto ep = view.applied.begin(); ep != view.applied.end(); ++ep) {
+        if (!ep.value().contains(spec_id)) continue;
+        if (!ep.value()[spec_id].value("succeeded", json::array()).empty()) {
+          return true;
+        }
       }
     }
     return false;
@@ -643,11 +789,14 @@ class MigrationRepository {
   }
 
   void classify(RepoEntry& e, const json& applied) {
-    if (!applied.contains(e.spec_id)) {
+    // Inside its OWN lineage. Another epoch's "0001-init" is a different
+    // migration that happens to share a name, and treating it as this one
+    // would report a pending migration as already applied.
+    if (!applied.contains(e.epoch) || !applied[e.epoch].contains(e.spec_id)) {
       e.status = RepoStatus::kPending;
       return;
     }
-    const auto& a = applied[e.spec_id];
+    const auto& a = applied[e.epoch][e.spec_id];
     if (contains(a.value("running", json::array()), e.digest)) {
       e.status = RepoStatus::kInProgress;
       return;
@@ -742,6 +891,34 @@ class MigrationRepository {
                  "to this one.";
         return;
       }
+    }
+
+    // Before the release gate: a release approved inside a lineage nobody
+    // opened is not a thing to reason about.
+    if (view.epochs_retired.count(e.epoch) != 0) {
+      e.status = RepoStatus::kRetiredEpoch;
+      e.error = "\"" + e.spec_id + "\" belongs to epoch \"" + e.epoch +
+                "\", which this database retired";
+      e.hint =
+          "Nothing is wrong: that lineage was abandoned deliberately, and what "
+          "it already applied stays applied. To track this change, put it in a "
+          "live epoch. To revive the lineage, as the owner of the laswell "
+          "schema: UPDATE laswell.epoch SET retired_at = NULL, "
+          "retired_by = NULL WHERE name = " + quote_sql_literal(e.epoch) + ";";
+      return;
+    }
+    if (!e.epoch.empty() && view.epochs_live.count(e.epoch) == 0 &&
+        !view.epochs_live.empty()) {
+      e.status = RepoStatus::kHeldForEpoch;
+      e.error = "\"" + e.spec_id + "\" belongs to epoch \"" + e.epoch +
+                "\", which this database has not opened";
+      e.hint =
+          "Open it as the owner of the laswell schema: INSERT INTO "
+          "laswell.epoch(name, note) VALUES (" + quote_sql_literal(e.epoch) +
+          ", '...'); An epoch scopes the check that catches drift, so opening "
+          "one is a decision the deploying role must not be able to make for "
+          "itself.";
+      return;
     }
 
     if (!e.release.empty() && view.releases_ready.count(e.release) == 0) {

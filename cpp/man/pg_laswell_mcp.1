@@ -192,6 +192,44 @@ resolved.
 The ledger records a specification's id, digest and bytes and never a file
 path, which is what makes the union a listing concern rather than a state one.
 .Pp
+.Cm manifest
+names a JSON file listing those sources instead, and gives each a NAME that
+problem messages use in place of its directory.
+Its
+.Cm complete
+asserts the sources are ALL of this database's story, which widens the drift
+check from the epochs on disk to every epoch the ledger knows.
+.Sh EPOCHS
+A lineage of tracked history, and what lets a deployment answer for PART of a
+database.
+A specification names one in
+.Cm target.epoch ,
+inside the signature; naming none puts it in
+.Cm default ,
+where a ledger upgraded from version 2 also keeps its whole history.
+.Pp
+The drift check \(em this database records a migration applied that no file
+here describes \(em is unanswerable for a repository that is deliberately
+partial, and scoped by epoch it becomes answerable again: a deployment answers
+for the epochs it brought and says nothing about the others.
+.Pp
+Epochs are opened by whoever owns the laswell schema and never by the migrating
+role, for the sharpest version of the reason environment and release are:
+opening one NARROWS the check that catches drift, so a role that could open its
+own could excuse its own.
+A specification naming an epoch this database has not opened is
+.Cm held_for_epoch ,
+waiting on a decision that is not the deploying role's to make.
+.Pp
+Retiring an epoch stops a lineage being tracked without unsaying that it ran.
+Its migrations stay applied, so a specification in a live epoch may still
+depend on one of them; what changes is that the lineage is no longer held to
+account for its files, and a specification in it is
+.Cm retired_epoch
+rather than pending.
+Retirement is per database: deleting a retired lineage's files is safe only
+once every database has retired it.
+.Pp
 Statuses are
 .Cm pending ,
 .Cm applied ,

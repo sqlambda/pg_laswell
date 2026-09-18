@@ -523,6 +523,39 @@ jobs:
           chmod +x pg_laswell_mcp_test   # artifacts do not preserve the mode bit
           ./pg_laswell_mcp_test --gtest_filter='TwinNamedDatabaseTest.*'
 
+  # The ledger schema upgrade, against the PREVIOUS release's own bootstrap
+  # rather than a copy of its DDL. A fixture that has to be kept in step with a
+  # file in the same repository is a fixture that will quietly stop standing
+  # for it, and the one thing this has to prove is that a ledger written by the
+  # previous release upgrades without losing history.
+  #
+  # fetch-depth: 0 because the script reads that script out of git.
+  ledger_upgrade:
+    name: ledger upgrade
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 10
+        ports: ['5432:5432']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update -o DPkg::Lock::Timeout=300
+          sudo apt-get install -y --no-install-recommends postgresql-client
+      - name: A version 2 ledger upgrades to version 3
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+        run: sh cpp/test/upgrade-tests.sh
+
   ci-ok:
     name: ci-ok
     if: always()
@@ -535,6 +568,7 @@ jobs:
       - replication
       - pooled
       - twin_clusters
+      - ledger_upgrade
       - packages
     runs-on: ubuntu-latest
     timeout-minutes: 5
