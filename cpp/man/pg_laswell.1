@@ -7,6 +7,7 @@
 .Sh SYNOPSIS
 .Nm
 .Fl -repo Ar directory
+.Op Fl -repo Ar directory ...
 .Op Fl -status | Fl -dry-run
 .Op Fl c Ar file
 .Op Ar conninfo
@@ -52,6 +53,17 @@ Advisory locks refuse an unsafe overlap whatever anybody decided.
 .It Fl -repo Ar directory
 The directory of signed specifications.
 Required; there is nothing to apply without one.
+.Pp
+Repeatable.
+Several directories are applied as ONE repository: the union is ordered as a
+single graph, so
+.Cm depends_on
+crosses freely between projects, and a specification id claimed by two of them
+is refused rather than resolved.
+This works because the ledger records a specification's id, digest and bytes and
+never a file path, so which directory a migration was read from changes nothing
+about whether it has been applied.
+The order the directories are named in does not affect the listing.
 .It Fl -status
 Report what is pending, held, or for another environment, and exit.
 Changes nothing.

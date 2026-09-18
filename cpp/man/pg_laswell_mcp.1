@@ -174,10 +174,23 @@ Asks a running migration to stop.
 Cooperative: it stops at the next batch boundary after committing what it has
 done, and the committed cursor lets a later job resume rather than start over.
 .Sh THE REPOSITORY
-A directory of signed specifications, classified against one database's ledger.
+One or more directories of signed specifications, classified against one
+database's ledger.
 Note that pending is always relative to a target database: the ledger is per
 database, so the same directory is at a different point on staging than on
 production.
+.Pp
+.Ic listMigrations
+takes
+.Cm directory
+for one and
+.Cm directories
+for several, which are read as ONE repository: a project per directory, with
+.Cm depends_on
+crossing between them, and an id claimed by two of them refused rather than
+resolved.
+The ledger records a specification's id, digest and bytes and never a file
+path, which is what makes the union a listing concern rather than a state one.
 .Pp
 Statuses are
 .Cm pending ,

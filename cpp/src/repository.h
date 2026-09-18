@@ -99,6 +99,10 @@ inline const char* to_string(RepoStatus s) {
 
 struct RepoEntry {
   std::string path;
+  // Which source directory this file came from. With one directory it is
+  // redundant with `path`; with several it is the only thing that answers
+  // "which project is this", and it is what problem messages name.
+  std::string source;
   std::string spec_id;
   std::string digest;
   RepoStatus status = RepoStatus::kPending;
@@ -274,6 +278,17 @@ class RelationAnalyzer {
   ConnectionCache* cache_ = nullptr;
 };
 
+// One directory of specifications, and the name messages call it by.
+//
+// A repository is a UNION of these. The ledger is what makes that possible:
+// it records a spec id, digest and bytes, and never a file path, so which
+// directory a spec was read from is a listing concern and not a state concern.
+// Nothing about a union changes what "applied" means.
+struct Source {
+  std::string name;
+  std::string dir;
+};
+
 // Are these two specifications provably against DIFFERENT databases?
 //
 // Only a YES grants concurrency without evidence, so every uncertain answer
@@ -358,25 +373,78 @@ class MigrationRepository {
 
  public:
 
+  // One directory, which is every caller that predates the union.
   json scan(const std::string& dir, bool derive_relations) {
+    return scan(std::vector<Source>{Source{dir, dir}}, derive_relations);
+  }
+
+  json scan(const std::vector<Source>& sources, bool derive_relations) {
     namespace fs = std::filesystem;
     std::vector<RepoEntry> entries;
     std::vector<std::string> problems;
 
-    if (!fs::exists(dir) || !fs::is_directory(dir)) {
-      return json{{"error", "not a directory: " + dir},
+    if (sources.empty()) {
+      return json{{"error", "no source directory given"},
                   {"hint", "Point `directory` at the folder holding the "
-                           "migration specs."}};
+                           "migration specs, or `directories` at several."}};
     }
 
-    // Sorted, so the answer is stable regardless of filesystem order.
-    std::vector<std::string> files;
-    for (const auto& e : fs::directory_iterator(dir)) {
-      if (e.is_regular_file() && e.path().extension() == ".json") {
-        files.push_back(e.path().string());
+    // Canonical order, so two pipelines naming the same projects in a
+    // different order get the same listing. Nothing about EXECUTION order
+    // depends on this -- that comes from depends_on and from relations -- but
+    // a listing whose shape depends on argument order is not something a
+    // golden file or a reviewer can compare.
+    auto ordered = sources;
+    std::sort(ordered.begin(), ordered.end(), [](const Source& a, const Source& b) {
+      return a.name == b.name ? a.dir < b.dir : a.name < b.name;
+    });
+
+    // One directory named twice would collide every id in it with itself, and
+    // would be reported as a repository full of duplicates rather than as the
+    // configuration mistake it is. Compared canonically, so ./specs and specs/
+    // are the same answer.
+    std::map<std::string, std::string> seen_dirs;
+    std::vector<Source> unique;
+    for (const auto& src : ordered) {
+      if (!fs::exists(src.dir) || !fs::is_directory(src.dir)) {
+        if (ordered.size() == 1) {
+          return json{{"error", "not a directory: " + src.dir},
+                      {"hint", "Point `directory` at the folder holding the "
+                               "migration specs."}};
+        }
+        problems.push_back("not a directory: " + src.dir +
+                           ". Every source must exist, or the listing is "
+                           "missing migrations without knowing it.");
+        continue;
       }
+      std::error_code ec;
+      auto key = fs::weakly_canonical(src.dir, ec).string();
+      if (ec) key = src.dir;
+      const auto prior = seen_dirs.find(key);
+      if (prior != seen_dirs.end()) {
+        problems.push_back("the directory " + src.dir +
+                           " is listed twice (as \"" + prior->second +
+                           "\" and \"" + src.name +
+                           "\"), so every id in it would collide with itself");
+        continue;
+      }
+      seen_dirs.emplace(key, src.name);
+      unique.push_back(src);
     }
-    std::sort(files.begin(), files.end());
+
+    // Sorted within each source, so the answer is stable regardless of
+    // filesystem order; grouped by source, so it is stable across them too.
+    std::vector<std::pair<std::string, std::string>> files;  // source name, path
+    for (const auto& src : unique) {
+      std::vector<std::string> in_source;
+      for (const auto& e : fs::directory_iterator(src.dir)) {
+        if (e.is_regular_file() && e.path().extension() == ".json") {
+          in_source.push_back(e.path().string());
+        }
+      }
+      std::sort(in_source.begin(), in_source.end());
+      for (auto& f : in_source) files.emplace_back(src.name, std::move(f));
+    }
 
     std::map<std::string, Spec> parsed;
     // spec id -> the first file that claimed it. An id is the name every other
@@ -386,12 +454,14 @@ class MigrationRepository {
     struct FirstSeen {
       std::string path;
       std::string digest;
+      std::string source;
     };
     std::map<std::string, FirstSeen> claimed;
 
-    for (const auto& path : files) {
+    for (const auto& [source, path] : files) {
       RepoEntry entry;
       entry.path = path;
+      entry.source = source;
       try {
         std::ifstream in(path);
         const auto doc = json::parse(in);
@@ -408,6 +478,14 @@ class MigrationRepository {
         // the problem message carries both paths instead.
         const auto prior = claimed.find(spec.id);
         if (prior != claimed.end()) {
+          // Both PATHS, and only the paths. A source is named by its own
+          // directory until a manifest gives it another name, so annotating
+          // each path with its source repeated the prefix the path already
+          // carries -- ".../dupA/0001-init.json (in .../dupA)" -- on a message
+          // that is long enough already. When sources gain names of their own
+          // this should carry the name; adding it before then was prose no
+          // test could distinguish from its own absence, which is how it was
+          // found.
           problems.push_back(
               prior->second.digest == spec.digest
                   ? "\"" + spec.id + "\" is claimed by two files with identical "
@@ -421,7 +499,7 @@ class MigrationRepository {
                     "records, so it cannot mean two things. Rename one.");
           continue;
         }
-        claimed.emplace(spec.id, FirstSeen{path, spec.digest});
+        claimed.emplace(spec.id, FirstSeen{path, spec.digest, source});
         entry.depends_on = spec.depends_on;
         entry.database = spec.target_database;
         entry.environment = spec.target_environment;
@@ -818,6 +896,7 @@ class MigrationRepository {
     json list = json::array();
     for (const auto& e : entries) {
       json j{{"path", e.path},
+             {"source", e.source},
              {"specId", e.spec_id},
              {"digest", e.digest},
              {"status", to_string(e.status)},
