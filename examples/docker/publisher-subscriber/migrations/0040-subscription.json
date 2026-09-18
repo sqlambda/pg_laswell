@@ -14,17 +14,10 @@
     {
       "kind": "create_subscription",
       "name": "archive_from_store",
-      "connection": "host=alpha port=5432 dbname=store user=postgres",
+      "connection": "host=__PUBLISHER_HOST__ port=5432 dbname=store user=postgres",
       "publications": [
         "store_events"
       ]
-    }
-  ],
-  "signatures": [
-    {
-      "key_id": "ed25519:213d2cf5f366de3a",
-      "algorithm": "ed25519",
-      "signature": "E7RR8p/dDd4ltwBBNQ+wZoihleHWPWXi/uTFOV5MJDZHD5Q7FIM8BMCAKwx/W0F6ntJZQQMj9T9ZjJtiOD3hCw=="
     }
   ]
 }

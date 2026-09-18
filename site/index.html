@@ -37,6 +37,10 @@
     font: 17px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
     padding-inline: 20px;
   }
+  .hero-try {
+    margin: 1rem 0 0; font-size: .95rem; color: var(--muted); max-width: 60ch;
+  }
+  .hero-try code { font-size: .88em; }
   main { max-width: 64rem; margin: 0 auto; padding-block: 3.5rem 3rem; }
   a { color: var(--accent); }
   code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .9em; }
@@ -115,24 +119,54 @@
     .terms > dd { border-top: 0; padding-top: 0; }
   }
   /* Ways to use it. */
-  .uses { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(23rem, 1fr)); }
-  .use pre.mermaid {
-    margin: 0; padding: .6rem; background: var(--code-bg); border-radius: 6px;
-    border: 0; text-align: center; overflow-x: auto;
+  /* One arrangement per row: the diagram wants width, and a squeezed diagram
+     is worse than no diagram. Text beside it at wide widths, under it when
+     there is not room for both. */
+  .arrangements { display: flex; flex-direction: column; gap: 1.25rem; }
+  .arr {
+    display: grid; grid-template-columns: minmax(0, 1.05fr) minmax(0, .95fr);
+    gap: 1.5rem; align-items: center;
+    border: 1px solid var(--rule); border-radius: 10px;
+    padding: 1.25rem 1.4rem; background: var(--panel);
   }
-  .use pre.mermaid svg { max-width: 100%; height: auto; }
-  .use {
-    border: 1px solid var(--rule); border-radius: 8px; padding: 1rem 1.1rem;
-    background: var(--panel); display: flex; flex-direction: column; gap: .45rem;
+  .arr.is-new { border-color: var(--accent); }
+  .arr-figure {
+    background: var(--code-bg); border-radius: 8px; padding: 1rem;
+    display: flex; align-items: center; justify-content: center; min-height: 11rem;
   }
-  .use h3 { margin: 0; font-size: 1rem; }
-  .use p { margin: 0; color: var(--muted); font-size: .93rem; }
-  .use .how { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-              font-size: .82rem; color: var(--accent); }
-  .use.new { border-color: var(--accent); }
-  .use .tag { align-self: flex-start; font-size: .68rem; letter-spacing: .08em;
-              text-transform: uppercase; font-weight: 700; color: var(--accent);
-              background: var(--accent-soft); border-radius: 3px; padding: .1rem .4rem; }
+  .arr-figure pre.mermaid { margin: 0; border: 0; background: none; padding: 0; width: 100%; }
+  /* Mermaid writes its own max-width on the svg, which is what kept these
+     postage-stamp sized inside the old card grid. */
+  .arr-figure pre.mermaid svg { width: 100% !important; max-width: none !important; height: auto; }
+  .arr-body { display: flex; flex-direction: column; gap: .6rem; }
+  .arr-body h3 { margin: 0; font-size: 1.15rem; }
+  .arr-lede { margin: 0; font-size: 1rem; }
+  .seq {
+    margin: 0; padding-left: 1.3rem; display: flex; flex-direction: column; gap: .35rem;
+    color: var(--muted); font-size: .94rem;
+  }
+  .seq li::marker { color: var(--accent); font-variant-numeric: tabular-nums; }
+  .arr .how {
+    margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: .82rem; color: var(--accent);
+  }
+  .try {
+    align-self: flex-start; font-size: .88rem; text-decoration: none;
+    border: 1px solid var(--accent); color: var(--accent);
+    background: var(--accent-soft); border-radius: 6px; padding: .3rem .6rem;
+  }
+  .try code { background: none; font-size: .95em; }
+  .try:hover { text-decoration: underline; }
+  .try-none { margin: 0; font-size: .85rem; color: var(--muted); }
+  .arr .tag {
+    align-self: flex-start; font-size: .68rem; letter-spacing: .08em;
+    text-transform: uppercase; font-weight: 700; color: var(--accent);
+    background: var(--accent-soft); border-radius: 3px; padding: .1rem .4rem;
+  }
+  @media (max-width: 54rem) {
+    .arr { grid-template-columns: 1fr; }
+    .arr-figure { order: -1; min-height: 0; }
+  }
 </style>
 </head>
 <body>
@@ -160,8 +194,15 @@
   </p>
   <div class="cta">
     <a class="btn primary" href="https://github.com/sqlambda/pg_laswell/releases">Download {{VERSION}}</a>
-    <a class="btn" href="reference/index.html">Browse the {{KINDS}} intent kinds</a>
+    <a class="btn" href="#uses">See it arranged ten ways</a>
+    <a class="btn" href="https://github.com/sqlambda/pg_laswell/tree/main/examples/docker">Run the examples</a>
   </div>
+  <p class="hero-try">
+    Every arrangement below is a directory you can run:
+    <code>docker compose -f examples/docker/compose.yml up -d</code> and then
+    <code>./examples/docker/run-all.sh</code>. Three PostgreSQL containers,
+    because two of the arrangements cannot be shown inside one.
+  </p>
 </div>
 
 <div class="stats">
@@ -577,168 +618,305 @@ flowchart LR
     between them.
   </p>
 
-  <div class="uses">
-    <div class="use">
-      <h3>One cluster, one repository</h3>
-      <pre class="mermaid">
+  <div class="arrangements">
+    <article class="arr">
+      <div class="arr-figure">
+        <pre class="mermaid">
 flowchart LR
   R[/"migrations/"/] --> L["pg_laswell"]
-  L --> D[("app")]
-  D -.-> LED["laswell ledger"]
-      </pre>
-      <p>The baseline. A folder of signed specifications, a ledger in the target database, and a pipeline that applies what is pending.</p>
-      <p class="how">pg_laswell --repo ./migrations</p>
-    </div>
+  L -->|"what is pending?"| D[("app")]
+  L -->|"plan, then apply"| D
+  D --> LED[("laswell ledger")]
+        </pre>
+      </div>
+      <div class="arr-body">
+        <h3>One cluster, one repository</h3>
+        <p class="arr-lede">The baseline. Everything else here is this with one thing added.</p>
+        <ol class="seq">
+          <li>A folder of signed specifications, and a ledger in the target database.</li>
+          <li>pg_laswell reads the folder, asks the ledger what has already run, and orders what has not.</li>
+          <li>Each pending change is planned against the live catalog, then applied.</li>
+          <li>The ledger records the exact bytes that were verified — not the file, the bytes.</li>
+        </ol>
+        <p class="how">pg_laswell --repo ./migrations</p>
+        <a class="try" href="https://github.com/sqlambda/pg_laswell/tree/main/examples/docker/single-cluster">Run it: <code>examples/docker/single-cluster/run.sh</code></a>
+      </div>
+    </article>
 
-    <div class="use">
-      <h3>Publisher and subscriber</h3>
-      <pre class="mermaid">
+    <article class="arr">
+      <div class="arr-figure">
+        <pre class="mermaid">
 flowchart LR
   R[/"migrations/"/] --> L["pg_laswell"]
   L -->|"connection: store"| S[("store")]
-  L -->|"connection: audit"| A[("audit")]
+  L -->|"connection: archive"| A[("archive")]
   S --> P{{"PUBLICATION"}}
-  P -->|"depends_on"| C{{"SUBSCRIPTION"}}
+  P -->|"depends_on holds<br/>until store's ledger<br/>records it"| C{{"SUBSCRIPTION"}}
   C --> A
-      </pre>
-      <p>One repository, several databases. A specification names the connection it runs against; a dependency crosses databases, so the subscription waits for the publication that feeds it.</p>
-      <p class="how">target.connection + depends_on</p>
-    </div>
+        </pre>
+      </div>
+      <div class="arr-body">
+        <h3>Publisher and subscriber</h3>
+        <p class="arr-lede">One repository, two databases, and a dependency that crosses between them.</p>
+        <ol class="seq">
+          <li>The events table is created on the store; the same shape on the archive.</li>
+          <li>A publication is created on the store — it depends on that table.</li>
+          <li>The subscription runs on the ARCHIVE and depends on the publication, which lives in a database the archive cannot see.</li>
+          <li>pg_laswell holds it until the STORE's own ledger records that publication, because that is where the answer lives.</li>
+        </ol>
+        <p class="how">target.connection + depends_on</p>
+        <a class="try" href="https://github.com/sqlambda/pg_laswell/tree/main/examples/docker/publisher-subscriber">Run it: <code>examples/docker/publisher-subscriber/run.sh</code></a>
+      </div>
+    </article>
 
-    <div class="use new">
-      <span class="tag">new</span>
-      <h3>A DBA repository the application never sees</h3>
-      <pre class="mermaid">
+    <article class="arr is-new">
+      <div class="arr-figure">
+        <pre class="mermaid">
 flowchart TB
-  APP[/"app/"/] --> AD["app deploy"]
-  DBA[/"dba/"/] --> MD["DBA deploy"]
-  APP -.-> MF["manifest\ncomplete: true"]
+  APP[/"app/"/] --> AD["app deploy<br/>answers for: app"]
+  DBA[/"dba/"/] --> MD["DBA deploy<br/>answers for: everything"]
+  APP -.->|"also listed in"| MF[/"manifest<br/>complete: true"/]
   MF --> MD
-  AD -->|"epoch: app"| DB[("one database")]
-  MD -->|"both epochs"| DB
-      </pre>
-      <p>The application team deploys its own directory and answers only for its own lineage. The DBA's manifest lists both and declares itself complete, so it answers for the whole database. Neither refuses the other's absence.</p>
-      <p class="how">epoch per team + manifest complete: true</p>
-    </div>
+  AD -->|"epoch: app"| DB[("one database,<br/>two lineages")]
+  MD --> DB
+        </pre>
+      </div>
+      <div class="arr-body">
+        <span class="tag">new</span>
+        <h3>A DBA repository the application never sees</h3>
+        <p class="arr-lede">Two teams, one database, and neither refused for the other's absence.</p>
+        <ol class="seq">
+          <li>Each team's directory declares its own epoch — a lineage of tracked history.</li>
+          <li>The application deploys only its own directory, and answers only for its own lineage.</li>
+          <li>A migration the DBA applied is NOT reported as a deleted file: it is not the application's lineage to account for.</li>
+          <li>Inside its OWN lineage a missing file is still drift, and still fails the build.</li>
+          <li>The DBA's manifest lists both and declares itself complete, so it answers for the whole database — and catches what the application cannot.</li>
+        </ol>
+        <p class="how">epoch per team + manifest complete: true</p>
+        <a class="try" href="https://github.com/sqlambda/pg_laswell/tree/main/examples/docker/dba-and-app">Run it: <code>examples/docker/dba-and-app/run.sh</code></a>
+      </div>
+    </article>
 
-    <div class="use">
-      <h3>A release tag as the trigger</h3>
-      <pre class="mermaid">
+    <article class="arr">
+      <div class="arr-figure">
+        <pre class="mermaid">
 flowchart LR
-  S[/"spec\nrelease: 2026.09"/] --> G{"tag ready\nhere?"}
-  G -->|"no"| H["held"]
+  S[/"spec<br/>release: 2026.09"/] --> G{"is that tag<br/>ready here?"}
+  G -->|"no"| H["held<br/>(not an error)"]
+  OWN["schema owner"] -->|"approves, with<br/>who and when"| G
   G -->|"yes"| AP["applied"]
-  OWN["schema owner"] -->|"approves"| G
-      </pre>
-      <p>Specifications carry a tag and wait. Approving it is a privileged statement in the target database, recorded with who and when. The tag is inside the signature, so it cannot be retargeted on the way to production.</p>
-      <p class="how">release + laswell.release</p>
-    </div>
+        </pre>
+      </div>
+      <div class="arr-body">
+        <h3>A release tag as the trigger</h3>
+        <p class="arr-lede">The change is written, signed and waiting. Approval happens somewhere else.</p>
+        <ol class="seq">
+          <li>A specification carries a release tag, inside its signature.</li>
+          <li>Nobody has approved that tag in this database, so it is held — and a deployment that skips it has still succeeded.</li>
+          <li>Someone with the privilege approves the tag, which records who and when.</li>
+          <li>The next run applies it. The file never changed.</li>
+        </ol>
+        <p class="how">release + laswell.release</p>
+        <a class="try" href="https://github.com/sqlambda/pg_laswell/tree/main/examples/docker/release-tag">Run it: <code>examples/docker/release-tag/run.sh</code></a>
+      </div>
+    </article>
 
-    <div class="use new">
-      <span class="tag">new</span>
-      <h3>A large estate, decoupled</h3>
-      <pre class="mermaid">
+    <article class="arr is-new">
+      <div class="arr-figure">
+        <pre class="mermaid">
 flowchart LR
   T1[/"team one"/] -->|"epoch: one"| DB[("shared database")]
   T2[/"team two"/] -->|"epoch: two"| DB
   T3[/"team three"/] -->|"epoch: three"| DB
-      </pre>
-      <p>Epochs do not make a migration run faster. What they remove is coupling: a project's pipeline no longer needs every other project's files checked out to avoid being refused for drift it knows nothing about.</p>
-      <p class="how">target.epoch</p>
-    </div>
+  DB -.->|"answers for all"| M[/"manifest"/]
+        </pre>
+      </div>
+      <div class="arr-body">
+        <span class="tag">new</span>
+        <h3>A large estate, decoupled</h3>
+        <p class="arr-lede">Epochs do not make a migration run faster. What they remove is coupling.</p>
+        <ol class="seq">
+          <li>Each team owns a lineage and a directory.</li>
+          <li>A team's pipeline checks out its own directory and nothing else.</li>
+          <li>Before epochs, that pipeline was refused for drift it knew nothing about — every other team's migrations looked like deleted files.</li>
+          <li>Now each answers for its own, and the coordinating deployment answers for all.</li>
+        </ol>
+        <p class="how">target.epoch</p>
+        <p class="try-none">No directory of its own — see <a href="https://github.com/sqlambda/pg_laswell/tree/main/examples/docker">the examples</a> for why.</p>
+      </div>
+    </article>
 
-    <div class="use">
-      <h3>A sharded fleet</h3>
-      <pre class="mermaid">
+    <article class="arr">
+      <div class="arr-figure">
+        <pre class="mermaid">
 flowchart LR
   R[/"migrations/"/] --> L["pg_laswell"]
-  L --> S1[("app @ shard-1")]
-  L --> S2[("app @ shard-2")]
-  L --> S3[("app @ shard-3")]
-      </pre>
-      <p>Twenty databases all called app on twenty servers. They are proven independent by the cluster's own identifier rather than by name, so they migrate concurrently — no evidence needed, because different databases cannot touch each other's tables.</p>
-      <p class="how">one connection per shard</p>
-    </div>
+  L --> S1[("app<br/>sysid 7686…401")]
+  L --> S2[("app<br/>sysid 7686…995")]
+  L --> S3[("app<br/>sysid 7686…459")]
+        </pre>
+      </div>
+      <div class="arr-body">
+        <h3>A sharded fleet</h3>
+        <p class="arr-lede">Twenty databases called app on twenty servers, migrating at once.</p>
+        <ol class="seq">
+          <li>One change, addressed to each shard by connection.</li>
+          <li>Every shard's database is called app, so comparing names proves nothing.</li>
+          <li>Identity is the cluster's own system_identifier with the database's oid — exact, and unprivileged to read.</li>
+          <li>Different databases cannot touch each other's tables, so they run concurrently with no evidence required. This is the one place concurrency is granted for free.</li>
+        </ol>
+        <p class="how">one connection per shard</p>
+        <a class="try" href="https://github.com/sqlambda/pg_laswell/tree/main/examples/docker/sharded-fleet">Run it: <code>examples/docker/sharded-fleet/run.sh</code></a>
+      </div>
+    </article>
 
-    <div class="use new">
-      <span class="tag">new</span>
-      <h3>Adopting a database nobody scripted</h3>
-      <pre class="mermaid">
+    <article class="arr is-new">
+      <div class="arr-figure">
+        <pre class="mermaid">
 flowchart LR
-  OLD["ten years\nof unknown DDL"] --> E{{"epoch opened\nhere"}}
+  OLD["ten years of<br/>unknown DDL"] --> E{{"epoch opened here<br/>by the schema owner"}}
   E --> N1["change"]
   N1 --> N2["change"]
   N2 --> N3["tracked from now on"]
-      </pre>
-      <p>You have the database and not its history. An epoch records that tracking deliberately starts here — auditable, rather than an empty ledger that cannot be told apart from one nobody has ever used.</p>
-      <p class="how">open an epoch, track forward</p>
-    </div>
+        </pre>
+      </div>
+      <div class="arr-body">
+        <span class="tag">new</span>
+        <h3>Adopting a database nobody scripted</h3>
+        <p class="arr-lede">You have the database. You do not have its history.</p>
+        <ol class="seq">
+          <li>Ten years of hand-applied DDL, and no file describes any of it.</li>
+          <li>An empty ledger cannot be told apart from a database nobody has ever run the tool against.</li>
+          <li>Opening an epoch records the difference: tracking deliberately begins here, by whom, and that what came before is deliberately unknown.</li>
+          <li>From then on the tool answers for that lineage and makes no claim about the ten years.</li>
+        </ol>
+        <p class="how">open an epoch, track forward</p>
+        <a class="try" href="https://github.com/sqlambda/pg_laswell/tree/main/examples/docker/adopting-a-database">Run it: <code>examples/docker/adopting-a-database/run.sh</code></a>
+      </div>
+    </article>
 
-    <div class="use new">
-      <span class="tag">new</span>
-      <h3>Rolling the baseline forward</h3>
-      <pre class="mermaid">
+    <article class="arr is-new">
+      <div class="arr-figure">
+        <pre class="mermaid">
 flowchart LR
-  B1["base backup"] --> EA["epoch A"]
-  EA --> B2["new base backup"]
+  B1["base backup<br/>June"] --> EA["epoch A"]
+  EA --> B2["base backup<br/>September"]
   B2 -->|"retire A"| EB["epoch B"]
-  EA -.->|"still applied"| EB
-      </pre>
-      <p>One lineage holds every change since the last base backup. A new backup is taken, that lineage is retired, and the next one begins. Retiring stops tracking without unsaying that anything ran.</p>
-      <p class="how">retire, never delete</p>
-    </div>
+  EA -.->|"still applied,<br/>still dependable"| EB
+        </pre>
+      </div>
+      <div class="arr-body">
+        <span class="tag">new</span>
+        <h3>Rolling the baseline forward</h3>
+        <p class="arr-lede">A new base backup already contains the changes, so the lineage holding them has nothing left to track.</p>
+        <ol class="seq">
+          <li>One lineage holds every change since the last base backup.</li>
+          <li>A new backup is taken. It already contains all of them.</li>
+          <li>That lineage is RETIRED — not deleted. Its migrations stay applied.</li>
+          <li>Its files can now be deleted, and the drift check does not object.</li>
+          <li>A change in the new lineage may still depend on one of them, and it still resolves.</li>
+        </ol>
+        <p class="how">retire, never delete</p>
+        <a class="try" href="https://github.com/sqlambda/pg_laswell/tree/main/examples/docker/rolling-baseline">Run it: <code>examples/docker/rolling-baseline/run.sh</code></a>
+      </div>
+    </article>
 
-    <div class="use">
-      <h3>Promotion through environments</h3>
-      <pre class="mermaid">
+    <article class="arr">
+      <div class="arr-figure">
+        <pre class="mermaid">
 flowchart LR
   R[/"migrations/"/] --> D[("dev")]
   R --> S[("staging")]
   R --> P[("production")]
-  P -.->|"says what it IS"| LBL["laswell.environment"]
-      </pre>
-      <p>One repository, three environments. Each database says what it is, and a specification declaring an environment is applied only where the two agree. A database name proves less — a dump restored elsewhere keeps it.</p>
-      <p class="how">target.environment</p>
-    </div>
+  P -.->|"says what it is"| LBL[("laswell.environment")]
+        </pre>
+      </div>
+      <div class="arr-body">
+        <h3>Promotion through environments</h3>
+        <p class="arr-lede">One repository, three environments, and no file that differs between them.</p>
+        <ol class="seq">
+          <li>Each database says what it IS, in a table only the schema owner can write.</li>
+          <li>A specification naming an environment is applied only where the two agree.</li>
+          <li>The declaration is inside the signature, so it cannot be edited on the way to production.</li>
+          <li>A database NAME would prove less: a dump restored elsewhere keeps its name.</li>
+        </ol>
+        <p class="how">target.environment</p>
+        <a class="try" href="https://github.com/sqlambda/pg_laswell/tree/main/examples/docker/environments">Run it: <code>examples/docker/environments/run.sh</code></a>
+      </div>
+    </article>
 
-    <div class="use">
-      <h3>A gate that deploys nothing</h3>
-      <pre class="mermaid">
+    <article class="arr">
+      <div class="arr-figure">
+        <pre class="mermaid">
 flowchart LR
   CI["CI job"] --> ST["--status"]
   ST --> Z{"exit code"}
-  Z -->|"0"| OK["clean"]
-  Z -->|"2"| DR["drift: fail the build"]
-      </pre>
-      <p>Report what is pending and change nothing, with exit codes a pipeline can branch on. Drift fails the build before anything reaches a database.</p>
-      <p class="how">pg_laswell --repo ./migrations --status</p>
-    </div>
+  Z -->|"0"| OK["agree"]
+  Z -->|"2"| DR["drift:<br/>fail the build"]
+  Z -->|"3"| CF["configuration"]
+        </pre>
+      </div>
+      <div class="arr-body">
+        <h3>A gate that deploys nothing</h3>
+        <p class="arr-lede">A pipeline step that changes nothing and can still fail the build.</p>
+        <ol class="seq">
+          <li>Report what is pending and exit. Nothing is applied.</li>
+          <li>Exit 0: the database and the files agree.</li>
+          <li>Exit 2: they do not — a specification was edited after it was applied, or one the ledger records has no file here.</li>
+          <li>Exit 3 is a configuration problem, kept separate so a pipeline can tell a broken setup from a broken repository.</li>
+        </ol>
+        <p class="how">pg_laswell --repo ./migrations --status</p>
+        <a class="try" href="https://github.com/sqlambda/pg_laswell/tree/main/examples/docker/ci-gate">Run it: <code>examples/docker/ci-gate/run.sh</code></a>
+      </div>
+    </article>
 
-    <div class="use">
-      <h3>An agent writes, a person approves</h3>
-      <pre class="mermaid">
+    <article class="arr">
+      <div class="arr-figure">
+        <pre class="mermaid">
 flowchart LR
-  AG["agent"] --> M["pg_laswell_mcp"]
-  M --> SP[/"spec"/]
-  SP --> HU["person signs"]
-  HU --> L["pg_laswell"]
+  AG["agent"] --> M["pg_laswell_mcp<br/>plan, argue, revise"]
+  M --> SP[/"canonical bytes"/]
+  SP --> HU["a person signs"]
+  HU --> L["pg_laswell<br/>no agent"]
   L --> DB[("database")]
-      </pre>
-      <p>The MCP server is for authoring: plan it, argue with the reasoning, revise. Signing is the human act. The deploying binary has no agent anywhere in its path.</p>
-      <p class="how">pg_laswell_mcp to author, pg_laswell to deploy</p>
-    </div>
+        </pre>
+      </div>
+      <div class="arr-body">
+        <h3>An agent writes, a person approves</h3>
+        <p class="arr-lede">The tool verifies signatures and never creates them. That split is the design, not an inconvenience.</p>
+        <ol class="seq">
+          <li>An agent plans a change through the MCP server, reads the warnings, and argues with the reasoning.</li>
+          <li>The specification's canonical bytes come out of the tool; the signature is made outside it.</li>
+          <li>A person signs. That is the approval, and it is the only step a machine cannot do alone.</li>
+          <li>The deploying binary has no agent anywhere in its path — an agent could only ever choose LESS than the tool already permits.</li>
+        </ol>
+        <p class="how">pg_laswell_mcp to author, pg_laswell to deploy</p>
+        <p class="try-none">No directory of its own — see <a href="https://github.com/sqlambda/pg_laswell/tree/main/examples/docker">the examples</a> for why.</p>
+      </div>
+    </article>
 
-    <div class="use">
-      <h3>Two roles on one database</h3>
-      <pre class="mermaid">
+    <article class="arr">
+      <div class="arr-figure">
+        <pre class="mermaid">
 flowchart LR
   C1["connection: ddl"] --> DB[("app")]
   C2["connection: reader"] --> DB
-  DB -.->|"one system_identifier"| ID{{"same database"}}
-      </pre>
-      <p>A role that owns the DDL beside the one the application uses. Ordinary, and worth naming because it is the case a scheduler comparing connection names gets wrong.</p>
-      <p class="how">two connections, one identity</p>
-    </div>
+  DB -.-> ID{{"one system_identifier<br/>one oid<br/>= one database"}}
+        </pre>
+      </div>
+      <div class="arr-body">
+        <h3>Two roles on one database</h3>
+        <p class="arr-lede">Ordinary, and worth naming because it is the case a scheduler gets wrong.</p>
+        <ol class="seq">
+          <li>A role that owns the DDL, beside the one the application uses.</li>
+          <li>Two connection names, two entries in the configuration.</li>
+          <li>A scheduler deciding independence by NAME would run their migrations at once, claiming proof it does not have.</li>
+          <li>They resolve to one system_identifier and one database oid, so the overlap is found and the two are serialised.</li>
+        </ol>
+        <p class="how">two connections, one identity</p>
+        <a class="try" href="https://github.com/sqlambda/pg_laswell/tree/main/examples/docker/two-roles">Run it: <code>examples/docker/two-roles/run.sh</code></a>
+      </div>
+    </article>
   </div>
 </section>
 
