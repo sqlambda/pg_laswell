@@ -1,0 +1,46 @@
+{
+  "laswell_spec_version": 1,
+  "id": "dba-0001-retention",
+  "description": "Operational bookkeeping the application does not know about.",
+  "rationale": "The DBA's own lineage. The application team never checks this out.",
+  "target": {
+    "epoch": "dba"
+  },
+  "intents": [
+    {
+      "kind": "create_schema",
+      "schema": "ops",
+      "comment": "Operational objects owned by the DBA."
+    },
+    {
+      "kind": "create_table",
+      "schema": "ops",
+      "table": "retention_policy",
+      "comment": "How long each table's rows are kept.",
+      "primary_key": [
+        "relname"
+      ],
+      "columns": [
+        {
+          "name": "relname",
+          "type": "text",
+          "nullable": false,
+          "comment": "Qualified table name."
+        },
+        {
+          "name": "keep_days",
+          "type": "integer",
+          "nullable": false,
+          "comment": "Retention window."
+        }
+      ]
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:a820397c00133376",
+      "algorithm": "ed25519",
+      "signature": "n7oW1/J2qiyyQZI+GljcBnkMokOSUR/3NMu9NNor5VC8iWmxSyYuMMD7mGEHcXf3UVcPz4coSzN13UWowletCg=="
+    }
+  ]
+}

@@ -1,0 +1,37 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0001-orders",
+  "description": "The orders table (edited after it was applied).",
+  "intents": [
+    {
+      "kind": "create_table",
+      "schema": "public",
+      "table": "orders",
+      "comment": "Customer orders.",
+      "primary_key": [
+        "id"
+      ],
+      "columns": [
+        {
+          "name": "id",
+          "type": "bigint",
+          "nullable": false,
+          "comment": "Surrogate key."
+        },
+        {
+          "name": "status",
+          "type": "text",
+          "nullable": false,
+          "comment": "Lifecycle state."
+        }
+      ]
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:607c7d91c6909ec7",
+      "algorithm": "ed25519",
+      "signature": "op5m0KZZKr71fZUyBZG8loasNYzyXtgaAvHOpPWRggD9VqYZeo8LemKhk8fD0Zx58VB88FXAizbzl3Kuf4BkBg=="
+    }
+  ]
+}

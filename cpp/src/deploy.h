@@ -65,6 +65,8 @@ struct DeployOptions {
   // them. Folded into `repos` at the point of use rather than at assignment,
   // so neither field has to know about the other.
   std::string repo;
+  // A manifest naming the sources, and saying whether they are all of them.
+  std::string manifest;
   bool dry_run = false;      // plan everything, apply nothing
   bool status_only = false;  // report what is pending, change nothing
   int poll_ms = 500;
@@ -105,7 +107,9 @@ class Deployment {
     json dirs = json::array();
     for (const auto& r : opts_.repos) dirs.push_back(r);
     if (!opts_.repo.empty()) dirs.push_back(opts_.repo);
-    const auto listing = list_migrations(ctx_, json{{"directories", dirs}});
+    json listing_args{{"directories", dirs}};
+    if (!opts_.manifest.empty()) listing_args["manifest"] = opts_.manifest;
+    const auto listing = list_migrations(ctx_, listing_args);
     if (listing.contains("error")) {
       out << "error: " << listing["error"].get<std::string>() << "\n";
       if (listing.contains("hint")) out << "  " << listing["hint"].get<std::string>() << "\n";
@@ -129,7 +133,8 @@ class Deployment {
       by_id[m.value("specId", "")] = m;
       const auto status = m.value("status", "");
       if (status == "pending") ++pending;
-      if (status == "held_for_release") ++held;
+      if (status == "held_for_release" || status == "held_for_epoch") ++held;
+      if (status == "retired_epoch") ++elsewhere;
       if (status == "wrong_environment" || status == "wrong_database") ++elsewhere;
     }
 
@@ -141,7 +146,8 @@ class Deployment {
     // a broken one, and a pipeline would learn to ignore the code.
     for (const auto& m : listing.value("migrations", json::array())) {
       const auto status = m.value("status", "");
-      if (status == "held_for_release" || status == "wrong_environment" ||
+      if (status == "held_for_release" || status == "held_for_epoch" ||
+          status == "retired_epoch" || status == "wrong_environment" ||
           status == "wrong_database") {
         out << "  " << m.value("specId", "") << ": " << status;
         if (m.contains("error")) {
@@ -192,7 +198,12 @@ class Deployment {
       }
     }
     if (connections.size() > 1) {
-      out << "  across " << connections.size() << " databases:";
+      // CONNECTIONS, which is what this set counts. Two of them may name one
+      // database -- a role that owns the DDL beside the one the application
+      // uses -- and calling that "2 databases" asserts the very thing the
+      // grouping had to stop assuming.
+      out << "  across " << connections.size() << " connection"
+          << (connections.size() == 1 ? "" : "s") << ":";
       for (const auto& c : connections) out << " " << c;
       out << "\n";
     }

@@ -1,0 +1,87 @@
+# Three PostgreSQL clusters, which is every topology the examples need.
+#
+# Three rather than one because two of the arrangements cannot be shown inside a
+# single cluster at all: logical replication needs a publisher and a subscriber,
+# and "one database NAME on two servers" -- a sharded fleet where every shard is
+# called `app` -- is not expressible where names are unique. A second database
+# would prove neither.
+#
+# `latest` is deliberate. These exist to be run against whatever PostgreSQL is
+# current, and pg_laswell targets 18 while supporting back to 15; an example
+# pinned to the version its author had stops being evidence about the version
+# you have. The examples print the server version they found.
+#
+#   docker compose -f examples/docker/compose.yml up -d
+#   docker compose -f examples/docker/compose.yml down -v
+services:
+  alpha:
+    image: postgres:latest
+    container_name: laswell_alpha
+    environment:
+      POSTGRES_PASSWORD: laswell
+      POSTGRES_DB: app
+      # Trust on the compose network, because a subscriber has to dial the
+      # publisher by container name and pg_laswell REFUSES a password in a
+      # subscription's connection string -- the ledger records what ran, and a
+      # redacted entry would no longer be what ran. On a throwaway container
+      # that is the honest way to say "these three can reach each other"; a real
+      # deployment uses ~/.pgpass or a connection service file.
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports: ['55432:5432']
+    command:
+      # wal_level=logical on all three, so any of them can publish. Cheap on an
+      # example and it saves a restart mid-demonstration.
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=8
+      - -c
+      - max_wal_senders=8
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d app']
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  beta:
+    image: postgres:latest
+    container_name: laswell_beta
+    environment:
+      POSTGRES_PASSWORD: laswell
+      POSTGRES_DB: app
+      # Trust on the compose network, because a subscriber has to dial the
+      # publisher by container name and pg_laswell REFUSES a password in a
+      # subscription's connection string -- the ledger records what ran, and a
+      # redacted entry would no longer be what ran. On a throwaway container
+      # that is the honest way to say "these three can reach each other"; a real
+      # deployment uses ~/.pgpass or a connection service file.
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports: ['55433:5432']
+    command: [postgres, -c, wal_level=logical, -c, max_replication_slots=8, -c, max_wal_senders=8]
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d app']
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  gamma:
+    image: postgres:latest
+    container_name: laswell_gamma
+    environment:
+      POSTGRES_PASSWORD: laswell
+      POSTGRES_DB: app
+      # Trust on the compose network, because a subscriber has to dial the
+      # publisher by container name and pg_laswell REFUSES a password in a
+      # subscription's connection string -- the ledger records what ran, and a
+      # redacted entry would no longer be what ran. On a throwaway container
+      # that is the honest way to say "these three can reach each other"; a real
+      # deployment uses ~/.pgpass or a connection service file.
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports: ['55434:5432']
+    command: [postgres, -c, wal_level=logical, -c, max_replication_slots=8, -c, max_wal_senders=8]
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d app']
+      interval: 3s
+      timeout: 3s
+      retries: 20

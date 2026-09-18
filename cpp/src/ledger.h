@@ -36,7 +36,7 @@ namespace pglaswell {
 // release tag must refuse a ledger that has no table to read the tag out of,
 // because "no row" and "no table" mean opposite things -- the first holds the
 // migration and the second would silently let every gated migration through.
-inline constexpr int kLedgerSchemaVersion = 2;
+inline constexpr int kLedgerSchemaVersion = 3;
 
 struct LedgerStatus {
   bool installed = false;
@@ -66,6 +66,12 @@ struct LedgerStatus {
   std::string database_identity;
   std::string environment;
   std::set<std::string> releases_ready;
+  // Every epoch this database has opened, and whether it is still live. A
+  // specification naming one that is absent is HELD -- the same shape as an
+  // unapproved release -- and one naming a retired lineage is not applied at
+  // all, because that lineage has been abandoned deliberately.
+  std::set<std::string> epochs_live;
+  std::set<std::string> epochs_retired;
   std::string error;
   std::string hint;
 
@@ -77,7 +83,9 @@ struct LedgerStatus {
            {"trustedKeyIds", trusted_key_ids},
            {"database", database},
            {"environment", environment},
-           {"releasesReady", releases_ready}};
+           {"releasesReady", releases_ready},
+           {"epochsLive", epochs_live},
+           {"epochsRetired", epochs_retired}};
     if (!error.empty()) j["error"] = error;
     if (!hint.empty()) j["hint"] = hint;
     return j;
@@ -152,9 +160,13 @@ class Ledger {
         -- exceptions here then reported the gated specs as belonging to an
         -- unlabelled database, which is a different and untrue thing.
         'hasEnvironment', to_regclass('laswell.environment') IS NOT NULL,
-        'hasRelease', to_regclass('laswell.release') IS NOT NULL)
+        'hasRelease', to_regclass('laswell.release') IS NOT NULL,
+        -- Asked the same way and for the same reason: a version 2 ledger has
+        -- no epoch table, and naming it in a FROM would kill the whole query
+        -- at parse time rather than answer false.
+        'hasEpoch', to_regclass('laswell.epoch') IS NOT NULL)
     )SQL");
-    bool has_environment = false, has_release = false;
+    bool has_environment = false, has_release = false, has_epoch = false;
     if (!r.empty() && !r[0][0].is_null()) {
       const auto j = json::parse(r[0][0].as<std::string>());
       st.version = j.value("version", 0);
@@ -164,12 +176,26 @@ class Ledger {
       }
       has_environment = j.value("hasEnvironment", false);
       has_release = j.value("hasRelease", false);
+      has_epoch = j.value("hasEpoch", false);
     }
 
     // A second statement, because only now is it known to be parseable. Keyed
     // on the tables existing rather than on the version number, so a ledger
     // caught halfway through an upgrade answers for whichever half is there
     // instead of failing on the other.
+    if (has_epoch) {
+      const auto e = s.txn().exec(
+          "SELECT COALESCE(JSONB_OBJECT_AGG(name, retired_at IS NOT NULL),"
+          "                '{}'::jsonb) FROM laswell.epoch");
+      if (!e.empty() && !e[0][0].is_null()) {
+        const auto j = json::parse(e[0][0].as<std::string>());
+        for (auto it = j.begin(); it != j.end(); ++it) {
+          (it.value().get<bool>() ? st.epochs_retired : st.epochs_live)
+              .insert(it.key());
+        }
+      }
+    }
+
     if (has_environment || has_release) {
       const auto g = s.txn().exec(
           "SELECT JSONB_BUILD_OBJECT('environment'," +
@@ -307,14 +333,23 @@ class Ledger {
     const auto r = pqxx_exec(
         w.txn(),
         "INSERT INTO laswell.migration"
-        "  (spec_id, spec_digest, canonical_bytes, signer_key_id, signature)"
-        "  VALUES ($1, $2, convert_to($3, 'UTF8'), $4, decode($5, 'base64'))"
-        "  ON CONFLICT (spec_digest) DO UPDATE SET spec_id = EXCLUDED.spec_id"
+        "  (spec_id, spec_digest, epoch, canonical_bytes, signer_key_id,"
+        "   signature)"
+        "  VALUES ($1, $2, $3, convert_to($4, 'UTF8'), $5,"
+        "          decode($6, 'base64'))"
+        // Per EPOCH, matching the constraint: the same bytes in two lineages
+        // of one database are two rows, which is what replaying a retired
+        // lineage into a new one produces.
+        "  ON CONFLICT (epoch, spec_digest)"
+        "    DO UPDATE SET spec_id = EXCLUDED.spec_id"
         "  RETURNING migration_id",
         // convert_to(..., 'UTF8') rather than any bytea quoting: RFC 8785
         // mandates UTF-8 output, so the canonical bytes ARE a UTF-8 string and
         // there is nothing to escape. One fewer encoding to get wrong.
-        pqxx::params{spec.id, spec.digest, spec.canonical_bytes, signer_key_id,
+        pqxx::params{spec.id, spec.digest,
+                     spec.target_epoch.empty() ? std::string("default")
+                                               : spec.target_epoch,
+                     spec.canonical_bytes, signer_key_id,
                      spec.signatures[0].value("signature", "")});
     const auto id = r[0][0].as<long long>();
     w.commit();

@@ -326,6 +326,20 @@ struct Spec {
   // anywhere, and one with no release tag is not held. Both defaults are
   // backwards compatible with every specification written before this existed.
   std::string target_environment;
+  // WHICH LINEAGE OF TRACKED HISTORY this belongs to, and the thing that lets
+  // a deployment answer for part of a database instead of all of it.
+  //
+  // The drift check -- "this database records a migration applied that no file
+  // here describes" -- is unanswerable for a repository that is deliberately
+  // partial. Scoped by epoch it becomes answerable again: a deployment answers
+  // for the epochs it brought and says nothing about the others.
+  //
+  // Inside the signature, like target_environment and for the same reason: an
+  // epoch an operator could edit on the way to production is not a boundary,
+  // it is a comment. Empty means "default", where everything unnamed belongs
+  // and where a ledger upgraded from version 2 keeps its whole history, so
+  // nothing written before epochs existed has to be reconsidered.
+  std::string target_epoch;
   std::string release;
   int min_server_version = 0;
   // Business ordering, which no amount of measurement can derive. Relation
@@ -2480,7 +2494,8 @@ inline Spec parse_spec(const json& doc) {
     }
     detail::reject_unknown_keys(
         doc["target"],
-        {"connection", "database", "environment", "min_server_version"},
+        {"connection", "database", "environment", "epoch",
+         "min_server_version"},
         "target");
     if (doc["target"].contains("connection")) {
       s.target_connection =
@@ -2490,6 +2505,9 @@ inline Spec parse_spec(const json& doc) {
     if (doc["target"].contains("environment")) {
       s.target_environment = detail::require_string(doc["target"], "environment",
                                                     "target");
+    }
+    if (doc["target"].contains("epoch")) {
+      s.target_epoch = detail::require_string(doc["target"], "epoch", "target");
     }
     if (doc["target"].contains("min_server_version")) {
       if (!doc["target"]["min_server_version"].is_number_integer()) {

@@ -1,0 +1,37 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0001-orders",
+  "description": "The orders table.",
+  "intents": [
+    {
+      "kind": "create_table",
+      "schema": "public",
+      "table": "orders",
+      "comment": "Customer orders.",
+      "primary_key": [
+        "id"
+      ],
+      "columns": [
+        {
+          "name": "id",
+          "type": "bigint",
+          "nullable": false,
+          "comment": "Surrogate key."
+        },
+        {
+          "name": "status",
+          "type": "text",
+          "nullable": false,
+          "comment": "Lifecycle state."
+        }
+      ]
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:e1314de58653cc2b",
+      "algorithm": "ed25519",
+      "signature": "bqfVGQkiGnZMxg/PEY/KYfoKm75QZWaGyMQgPGNQQjO8UESsJMXzlH0/NfcMmKUaMuNytivIXkAe/8AhogkJCw=="
+    }
+  ]
+}

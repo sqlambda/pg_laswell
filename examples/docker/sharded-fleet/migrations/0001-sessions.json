@@ -1,0 +1,12 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0001-sessions",
+  "description": "The sessions table, on every shard.",
+  "rationale": "A template. run.sh writes one copy per shard into .build/, each naming its own connection, because a shard's specification is the same change addressed to a different database.",
+  "intents": [
+    { "kind": "create_table", "schema": "public", "table": "sessions",
+      "comment": "One row per active session.",
+      "primary_key": ["id"],
+      "columns": [
+        { "name": "id", "type": "bigint", "nullable": false, "comment": "Surrogate key." },
+        { "name": "opened_at", "type": "timestamptz", "nullable": false, "comment": "When it began." } ] } ] }

@@ -1,0 +1,30 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0040-subscription",
+  "description": "Consume the store's events into the archive.",
+  "rationale": "The dependency that crosses databases. It runs on archive and cannot be applied until 0030 is applied on store -- pg_laswell holds it until STORE'S OWN ledger records that publication, because that is where the answer lives.",
+  "target": {
+    "connection": "archive"
+  },
+  "depends_on": [
+    "0020-events-on-archive",
+    "0030-publication"
+  ],
+  "intents": [
+    {
+      "kind": "create_subscription",
+      "name": "archive_from_store",
+      "connection": "host=alpha port=5432 dbname=store user=postgres",
+      "publications": [
+        "store_events"
+      ]
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:213d2cf5f366de3a",
+      "algorithm": "ed25519",
+      "signature": "E7RR8p/dDd4ltwBBNQ+wZoihleHWPWXi/uTFOV5MJDZHD5Q7FIM8BMCAKwx/W0F6ntJZQQMj9T9ZjJtiOD3hCw=="
+    }
+  ]
+}

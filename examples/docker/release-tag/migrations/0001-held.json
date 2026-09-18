@@ -1,0 +1,25 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0001-add-loyalty-tier",
+  "description": "Adds the loyalty tier column the 2026.09 release needs.",
+  "rationale": "Carries a release tag, so it waits until this database approves that release.",
+  "release": "2026.09",
+  "intents": [
+    {
+      "kind": "add_column",
+      "schema": "public",
+      "table": "customers",
+      "column": "loyalty_tier",
+      "type": "text",
+      "nullable": true,
+      "comment": "bronze, silver or gold."
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:d5c0a80a13983bda",
+      "algorithm": "ed25519",
+      "signature": "Yf2CCr0GlAq9iaREXNEJNSuclBMoh81c1c9rOUxYYkTNe1b9ogz+bKdBJ9NcoJdoywuQHNfPgFl8BQtVNfIJDA=="
+    }
+  ]
+}

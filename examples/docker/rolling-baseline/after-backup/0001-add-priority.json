@@ -1,0 +1,30 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0001-add-priority",
+  "description": "The first change after the new base backup.",
+  "rationale": "A new lineage. The old one is retired, not deleted: its migrations are still applied, and this one may depend on them.",
+  "target": {
+    "epoch": "since-2026-09"
+  },
+  "depends_on": [
+    "0001-add-channel"
+  ],
+  "intents": [
+    {
+      "kind": "add_column",
+      "schema": "public",
+      "table": "orders",
+      "column": "priority",
+      "type": "integer",
+      "nullable": true,
+      "comment": "Fulfilment priority."
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:18f6055a98506fd8",
+      "algorithm": "ed25519",
+      "signature": "S2mFoV3L4O37LzRDlsqCn4cPuB6Xc+O2G7LR4dXr4OFI7+FbwuBLnuf7qP+mguEY2x7NTXUvjT4TLGZwTIEmCQ=="
+    }
+  ]
+}

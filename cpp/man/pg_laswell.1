@@ -64,6 +64,26 @@ This works because the ledger records a specification's id, digest and bytes and
 never a file path, so which directory a migration was read from changes nothing
 about whether it has been applied.
 The order the directories are named in does not affect the listing.
+.It Fl -manifest Ar file
+A manifest naming the sources this deployment is made of, as JSON:
+.Bd -literal -offset indent
+{ "laswell_manifest_version": 1,
+  "complete": true,
+  "sources": [ { "name": "shop",  "directory": "db/shop" },
+               { "name": "audit", "directory": "db/audit" } ] }
+.Ed
+.Pp
+Directories are resolved against the manifest's own folder, so a manifest
+checked out anywhere names the same sources.
+.Pp
+.Cm complete
+is the part that matters and is an assertion no directory can make about
+itself: it says these sources are ALL of this database's story.
+An epoch lets a partial deployment answer only for the lineages it brought;
+a complete manifest says there is nothing else to answer for, which puts the
+drift check back to full strength \(em every migration the ledger records must
+be described by a file here, in any epoch.
+It only ever widens the check, so omitting it costs scope and never safety.
 .It Fl -status
 Report what is pending, held, or for another environment, and exit.
 Changes nothing.

@@ -1,0 +1,30 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0002-production-only",
+  "description": "A production-only change, declared inside the signature.",
+  "rationale": "An environment an operator can edit on the way to production is a comment, not a constraint.",
+  "target": {
+    "environment": "production"
+  },
+  "intents": [
+    {
+      "kind": "create_index",
+      "schema": "public",
+      "table": "orders",
+      "name": "orders_channel_idx",
+      "columns": [
+        "channel"
+      ],
+      "unique": false,
+      "method": "btree",
+      "comment": "Only worth its maintenance cost on production volumes."
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:f87feb3271e399ed",
+      "algorithm": "ed25519",
+      "signature": "yX6CWevZqYmKmDjf8f22g9RXI8eMpYkShQKtkZOEW818NayuiqOfLgz3t0IwCrmD708inPvDhWhQKOSdK1DzBw=="
+    }
+  ]
+}

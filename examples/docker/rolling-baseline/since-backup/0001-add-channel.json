@@ -1,0 +1,26 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0001-add-channel",
+  "description": "Records which channel an order arrived through.",
+  "target": {
+    "epoch": "since-2026-06"
+  },
+  "intents": [
+    {
+      "kind": "add_column",
+      "schema": "public",
+      "table": "orders",
+      "column": "channel",
+      "type": "text",
+      "nullable": true,
+      "comment": "web, phone or partner."
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:18f6055a98506fd8",
+      "algorithm": "ed25519",
+      "signature": "bfd0nqFBclhuZD/0wyZJqerpt16+2WqarHl7PWMosLK/TKt4czKpr6E6XHcep6iovXFFNdCrPxjMhsCInWIgBw=="
+    }
+  ]
+}

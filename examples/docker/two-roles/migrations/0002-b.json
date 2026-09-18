@@ -1,0 +1,26 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0002-orders-channel",
+  "description": "A channel column on the SAME table, routed through a different connection name.",
+  "target": {
+    "connection": "alias"
+  },
+  "intents": [
+    {
+      "kind": "add_column",
+      "schema": "public",
+      "table": "orders",
+      "column": "channel",
+      "type": "text",
+      "nullable": true,
+      "comment": "web or phone."
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:cce26f28d967e425",
+      "algorithm": "ed25519",
+      "signature": "l9DPWKcVeBLEufRxpOJTq7ZrdhH8Z4K9XS253SHCM/SvjKLYIhqyqo/19//J9VN0EznomJP8mr3k1Jbr0iOvCA=="
+    }
+  ]
+}

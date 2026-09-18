@@ -32,6 +32,10 @@ void usage(const char* argv0) {
       "\n"
       "  --repo DIR         the directory of signed specifications; repeat it\n"
       "                     to apply several as one repository\n"
+      "  --manifest FILE    a manifest naming the sources this deployment is\n"
+      "                     made of; `complete: true` in it asserts they are\n"
+      "                     ALL of it, so the drift check answers for every\n"
+      "                     epoch rather than only the ones on disk\n"
       "  --status           report what is pending and exit; change nothing\n"
       "  --dry-run          plan every pending migration; apply nothing\n"
       "  -c, --config FILE  configuration file (or PGLASWELL_CONFIG)\n"
@@ -71,6 +75,11 @@ int main(int argc, char* argv[]) {
       opts.repos.push_back(argv[++i]);
       continue;
     }
+    if (arg == "--manifest") {
+      if (i + 1 >= argc) { std::cerr << "--manifest requires a file\n"; return 3; }
+      opts.manifest = argv[++i];
+      continue;
+    }
     if (arg == "-c" || arg == "--config") {
       if (i + 1 >= argc) { std::cerr << arg << " requires a file argument\n"; return 3; }
       config_path = argv[++i];
@@ -90,7 +99,7 @@ int main(int argc, char* argv[]) {
   if (db_url.empty()) {
     if (const char* env = std::getenv("DATABASE_URL")) db_url = env;
   }
-  if (opts.repos.empty() && opts.repo.empty()) {
+  if (opts.repos.empty() && opts.repo.empty() && opts.manifest.empty()) {
     std::cerr << "--repo is required: there is nothing to apply without one\n";
     return 3;
   }

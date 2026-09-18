@@ -1,0 +1,29 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0002-status-index",
+  "description": "Index the column the list endpoint filters on.",
+  "depends_on": [
+    "0001-orders"
+  ],
+  "intents": [
+    {
+      "kind": "create_index",
+      "schema": "public",
+      "table": "orders",
+      "name": "orders_status_idx",
+      "columns": [
+        "status"
+      ],
+      "unique": false,
+      "method": "btree",
+      "comment": "Orders list endpoint."
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:e1314de58653cc2b",
+      "algorithm": "ed25519",
+      "signature": "I/ha+BTD/DXwuvF0O/rj3O4+W0LTsuotEDKG7/DbOrpTFj7FYDTzd0ptAnKnPUm0ShEwnrW/zead43QfrXWKCg=="
+    }
+  ]
+}

@@ -90,6 +90,49 @@
   table.kinds th, table.kinds td { text-align: left; padding: .5rem .6rem; border-bottom: 1px solid var(--rule); }
   table.kinds th { color: var(--muted); font-size: .78rem; text-transform: uppercase; letter-spacing: .05em; }
   footer { border-top: 1px solid var(--rule); padding-top: 1.4rem; color: var(--muted); font-size: .88rem; }
+  /* The concept ledger: a term, what it actually is, and nothing else. */
+  .concepts { display: grid; gap: 0; border: 1px solid var(--rule); border-radius: 8px;
+              overflow: hidden; background: var(--panel); }
+  .layer { border-top: 1px solid var(--rule); }
+  .layer:first-child { border-top: 0; }
+  .layer > h3 {
+    margin: 0; padding: .7rem 1rem; font-size: .78rem; letter-spacing: .09em;
+    text-transform: uppercase; color: var(--muted); background: var(--code-bg);
+    font-weight: 600;
+  }
+  .terms { display: grid; grid-template-columns: minmax(9rem, 14rem) 1fr; }
+  .terms > dt {
+    padding: .7rem 1rem; border-top: 1px solid var(--rule); font-weight: 600;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .92rem;
+  }
+  .terms > dd {
+    padding: .7rem 1rem; border-top: 1px solid var(--rule); margin: 0;
+    color: var(--muted); font-size: .95rem;
+  }
+  .terms > dt:first-of-type, .terms > dt:first-of-type + dd { border-top: 0; }
+  @media (max-width: 42rem) {
+    .terms { grid-template-columns: 1fr; }
+    .terms > dd { border-top: 0; padding-top: 0; }
+  }
+  /* Ways to use it. */
+  .uses { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(23rem, 1fr)); }
+  .use pre.mermaid {
+    margin: 0; padding: .6rem; background: var(--code-bg); border-radius: 6px;
+    border: 0; text-align: center; overflow-x: auto;
+  }
+  .use pre.mermaid svg { max-width: 100%; height: auto; }
+  .use {
+    border: 1px solid var(--rule); border-radius: 8px; padding: 1rem 1.1rem;
+    background: var(--panel); display: flex; flex-direction: column; gap: .45rem;
+  }
+  .use h3 { margin: 0; font-size: 1rem; }
+  .use p { margin: 0; color: var(--muted); font-size: .93rem; }
+  .use .how { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+              font-size: .82rem; color: var(--accent); }
+  .use.new { border-color: var(--accent); }
+  .use .tag { align-self: flex-start; font-size: .68rem; letter-spacing: .08em;
+              text-transform: uppercase; font-weight: 700; color: var(--accent);
+              background: var(--accent-soft); border-radius: 3px; padding: .1rem .4rem; }
 </style>
 </head>
 <body>
@@ -98,6 +141,8 @@
 <nav class="top">
   <a class="brand" href="#">pg_laswell</a>
   <div class="links">
+    <a href="#concepts">Concepts</a>
+    <a href="#uses">Ways to use it</a>
     <a href="reference/index.html">Reference</a>
     <a href="pg_laswell.1.html">pg_laswell(1)</a>
     <a href="pg_laswell_mcp.1.html">pg_laswell_mcp(1)</a>
@@ -338,6 +383,363 @@ flowchart LR
     the ledger records what ran, and a redacted ledger entry would no longer be
     what ran. Name a service instead.
   </p>
+</section>
+
+<section id="concepts">
+  <h2>Every idea the tool has, in one place</h2>
+  <p class="lede">
+    pg_laswell has a small vocabulary and uses each word for exactly one thing.
+    Most confusion about migration tools comes from words that mean four things
+    at once, so here is each of them and what it actually is.
+  </p>
+
+  <div class="concepts">
+    <div class="layer">
+      <h3>What you write</h3>
+      <dl class="terms">
+        <dt>specification</dt>
+        <dd>A signed JSON document: an id, a description, the reasoning, a
+            target, and the changes it asks for. Nothing else in the file is
+            signed, which is what lets an optional key be added later without
+            invalidating anything already written.</dd>
+        <dt>intent</dt>
+        <dd>A declared outcome, never SQL. <b>{{KINDS}} kinds</b>, from
+            <code>create_table</code> to <code>merge_rows</code> to
+            <code>attach_partition</code>. You say what should be true; the
+            planner decides how, from what it measures.</dd>
+        <dt>digest</dt>
+        <dd>SHA-256 over the canonical bytes (RFC 8785). The short form is what
+            a human quotes in a ticket.</dd>
+        <dt>signature</dt>
+        <dd>Detached Ed25519. A key id is the content address of the key
+            itself, so an id can never be reassigned to different bytes.</dd>
+        <dt>depends_on</dt>
+        <dd>Ordering that no measurement can derive, because it is business
+            sequence rather than a fact about the schema. It crosses databases
+            and directories, and it is satisfied by the <b>ledger</b> — if the
+            database says it ran, the file need not be present.</dd>
+        <dt>target</dt>
+        <dd>Four different jobs people usually conflate.
+            <code>connection</code> <b>routes</b>; <code>database</code> and
+            <code>environment</code> <b>guard</b>; <code>epoch</code>
+            <b>scopes</b>; <code>min_server_version</code> <b>refuses</b>. All
+            inside the signature, so none can be edited on the way to
+            production.</dd>
+        <dt>release</dt>
+        <dd>A tag a specification carries and a database approves. Until
+            somebody with the privilege to do it says that tag is ready
+            <em>here</em>, everything carrying it waits.</dd>
+      </dl>
+    </div>
+
+    <div class="layer">
+      <h3>Where specifications live</h3>
+      <dl class="terms">
+        <dt>source</dt>
+        <dd>One directory of specifications. Usually one project's.</dd>
+        <dt>repository</dt>
+        <dd>The union of the sources a deployment names. Ordered as a single
+            graph, so a dependency crosses freely between them — and an id
+            claimed by two of them is refused rather than resolved, because
+            <code>depends_on</code> names an id and nothing else.</dd>
+        <dt>manifest</dt>
+        <dd>A file naming those sources, giving each a name that messages use
+            in place of its path. Its <code>complete</code> flag is an
+            assertion no single directory can make about itself: these are
+            <em>all</em> of this database's story.</dd>
+        <dt>status</dt>
+        <dd>What a listing says about each specification: pending, applied,
+            in&nbsp;progress, failed, modified&nbsp;after&nbsp;apply, or one of
+            the not-for-here answers — wrong database, wrong environment, held
+            for a release, held for an epoch, retired epoch. None of the last
+            five is an error.</dd>
+        <dt>problem</dt>
+        <dd>A fault of the <em>repository</em> rather than of any one
+            migration: drift, a file that will not parse, a dependency nothing
+            can satisfy. One is enough to stop the whole run, because what is
+            unknown includes where the unreadable file sat in the order.</dd>
+      </dl>
+    </div>
+
+    <div class="layer">
+      <h3>What the database holds</h3>
+      <dl class="terms">
+        <dt>ledger</dt>
+        <dd>A schema in the target database, versioned, that records what ran.
+            It never stores a file path — which is exactly why several
+            directories can be read as one repository, and why a spec's
+            identity survives being moved.</dd>
+        <dt>trust root</dt>
+        <dd>The table of signing keys this database accepts. It is a foreign
+            key, not a code path: an untrusted signer cannot create a row at
+            all. A permissive client config cannot talk a database into
+            anything.</dd>
+        <dt>environment</dt>
+        <dd>One row, enforced by the primary key. Two rows would make “which
+            environment is this” a question with two answers, and every gate
+            downstream would have to pick.</dd>
+        <dt>epoch</dt>
+        <dd>A lineage of tracked history. It is what lets a deployment answer
+            for <em>part</em> of a database — see below. Opened by whoever owns
+            the schema, never by the deploying role, because opening one
+            narrows a safety check.</dd>
+        <dt>job &amp; step</dt>
+        <dd>One attempt to apply one migration, and every statement it ran. The
+            plan is stored <em>as it was shown</em>, not regenerated
+            afterwards.</dd>
+        <dt>cursor</dt>
+        <dd>Where a paced backfill got to. Committed with the batch, so a job
+            that dies resumes instead of starting over.</dd>
+      </dl>
+    </div>
+
+    <div class="layer">
+      <h3>What the planner produces</h3>
+      <dl class="terms">
+        <dt>observation</dt>
+        <dd>What was measured before deciding: table sizes, the catalog, who is
+            waiting on a lock, how much connection headroom the server has.
+            Every decision names the reading behind it.</dd>
+        <dt>plan</dt>
+        <dd>Ordered steps, each with the SQL, the reason, the lock it takes and
+            the settings it needs — plus warnings, conflicts, and
+            prerequisites.</dd>
+        <dt>plan digest</dt>
+        <dd>How “what ran is what you were shown” becomes checkable rather than
+            promised. Readings that change under the plan's feet, like when
+            autovacuum last touched the statistics, are shown but deliberately
+            not hashed.</dd>
+        <dt>prerequisite</dt>
+        <dd>Work the tool will not do for you, named with where to do it and
+            how to check it is done. A half-filled one is worse than none.</dd>
+        <dt>dry run</dt>
+        <dd>Every pending plan tried against the real schema in a transaction
+            that is rolled back. <b>Per specification, and that is a real
+            limit:</b> one that needs a table an earlier <em>pending</em>
+            specification creates cannot be planned yet, and says so. A
+            repository-wide dry run is not possible — paced batches commit by
+            design, and an index built concurrently cannot run in a transaction
+            at all.</dd>
+      </dl>
+    </div>
+
+    <div class="layer">
+      <h3>How it runs</h3>
+      <dl class="terms">
+        <dt>pacing</dt>
+        <dd>Work in batches that commit when the database asks: a lock waiter
+            appears, an interval elapses, or a batch cap is reached. Measured
+            on 300 000 rows under contention: 48 of 63 commits fired on a
+            waiter, zero on the interval, in the same wall time as an
+            uncontended run.</dd>
+        <dt>observer</dt>
+        <dd>A separate connection counting who is blocked — <em>transitively</em>,
+            because a direct-blocker count saw 1 where the real blast radius was
+            6. It throttles, pauses, and can cancel the statement.</dd>
+        <dt>advisory lock</dt>
+        <dd>One per specification and one per table it touches. The last word on
+            safety: an overlap the grouping wrongly permitted is refused here,
+            so a wrong call is refused rather than corrupting.</dd>
+        <dt>budget &amp; gates</dt>
+        <dd>How many jobs and operations may run at once, derived from the
+            server's own capacity rather than guessed.</dd>
+      </dl>
+    </div>
+
+    <div class="layer">
+      <h3>How it decides what is safe</h3>
+      <dl class="terms">
+        <dt>relations touched</dt>
+        <dd>Three sources: what each intent names, what PostgreSQL itself
+            resolves in the rendered SQL, and foreign keys in both directions.
+            Triggers are <em>named, never resolved</em> — a function body is
+            opaque, so a target carrying one is reported rather than silently
+            treated as understood.</dd>
+        <dt>concurrency</dt>
+        <dd>Levels and groups. The asymmetry is the whole design: a
+            <em>conflict</em> is decidable, <em>independence</em> is not. So
+            incomplete evidence denies concurrency and hands you the
+            decision.</dd>
+        <dt>drift</dt>
+        <dd>Two kinds. A specification edited after it was applied — the
+            database no longer matches the file claiming to describe it. And a
+            migration applied here that no file describes.</dd>
+      </dl>
+    </div>
+  </div>
+</section>
+
+<section id="uses">
+  <h2>Ways people actually run it</h2>
+  <p class="lede">
+    The same binary and the same ledger, arranged differently. Each of these is
+    a configuration, not a mode — there is no flag that switches pg_laswell
+    between them.
+  </p>
+
+  <div class="uses">
+    <div class="use">
+      <h3>One cluster, one repository</h3>
+      <pre class="mermaid">
+flowchart LR
+  R[/"migrations/"/] --> L["pg_laswell"]
+  L --> D[("app")]
+  D -.-> LED["laswell ledger"]
+      </pre>
+      <p>The baseline. A folder of signed specifications, a ledger in the target database, and a pipeline that applies what is pending.</p>
+      <p class="how">pg_laswell --repo ./migrations</p>
+    </div>
+
+    <div class="use">
+      <h3>Publisher and subscriber</h3>
+      <pre class="mermaid">
+flowchart LR
+  R[/"migrations/"/] --> L["pg_laswell"]
+  L -->|"connection: store"| S[("store")]
+  L -->|"connection: audit"| A[("audit")]
+  S --> P{{"PUBLICATION"}}
+  P -->|"depends_on"| C{{"SUBSCRIPTION"}}
+  C --> A
+      </pre>
+      <p>One repository, several databases. A specification names the connection it runs against; a dependency crosses databases, so the subscription waits for the publication that feeds it.</p>
+      <p class="how">target.connection + depends_on</p>
+    </div>
+
+    <div class="use new">
+      <span class="tag">new</span>
+      <h3>A DBA repository the application never sees</h3>
+      <pre class="mermaid">
+flowchart TB
+  APP[/"app/"/] --> AD["app deploy"]
+  DBA[/"dba/"/] --> MD["DBA deploy"]
+  APP -.-> MF["manifest\ncomplete: true"]
+  MF --> MD
+  AD -->|"epoch: app"| DB[("one database")]
+  MD -->|"both epochs"| DB
+      </pre>
+      <p>The application team deploys its own directory and answers only for its own lineage. The DBA's manifest lists both and declares itself complete, so it answers for the whole database. Neither refuses the other's absence.</p>
+      <p class="how">epoch per team + manifest complete: true</p>
+    </div>
+
+    <div class="use">
+      <h3>A release tag as the trigger</h3>
+      <pre class="mermaid">
+flowchart LR
+  S[/"spec\nrelease: 2026.09"/] --> G{"tag ready\nhere?"}
+  G -->|"no"| H["held"]
+  G -->|"yes"| AP["applied"]
+  OWN["schema owner"] -->|"approves"| G
+      </pre>
+      <p>Specifications carry a tag and wait. Approving it is a privileged statement in the target database, recorded with who and when. The tag is inside the signature, so it cannot be retargeted on the way to production.</p>
+      <p class="how">release + laswell.release</p>
+    </div>
+
+    <div class="use new">
+      <span class="tag">new</span>
+      <h3>A large estate, decoupled</h3>
+      <pre class="mermaid">
+flowchart LR
+  T1[/"team one"/] -->|"epoch: one"| DB[("shared database")]
+  T2[/"team two"/] -->|"epoch: two"| DB
+  T3[/"team three"/] -->|"epoch: three"| DB
+      </pre>
+      <p>Epochs do not make a migration run faster. What they remove is coupling: a project's pipeline no longer needs every other project's files checked out to avoid being refused for drift it knows nothing about.</p>
+      <p class="how">target.epoch</p>
+    </div>
+
+    <div class="use">
+      <h3>A sharded fleet</h3>
+      <pre class="mermaid">
+flowchart LR
+  R[/"migrations/"/] --> L["pg_laswell"]
+  L --> S1[("app @ shard-1")]
+  L --> S2[("app @ shard-2")]
+  L --> S3[("app @ shard-3")]
+      </pre>
+      <p>Twenty databases all called app on twenty servers. They are proven independent by the cluster's own identifier rather than by name, so they migrate concurrently — no evidence needed, because different databases cannot touch each other's tables.</p>
+      <p class="how">one connection per shard</p>
+    </div>
+
+    <div class="use new">
+      <span class="tag">new</span>
+      <h3>Adopting a database nobody scripted</h3>
+      <pre class="mermaid">
+flowchart LR
+  OLD["ten years\nof unknown DDL"] --> E{{"epoch opened\nhere"}}
+  E --> N1["change"]
+  N1 --> N2["change"]
+  N2 --> N3["tracked from now on"]
+      </pre>
+      <p>You have the database and not its history. An epoch records that tracking deliberately starts here — auditable, rather than an empty ledger that cannot be told apart from one nobody has ever used.</p>
+      <p class="how">open an epoch, track forward</p>
+    </div>
+
+    <div class="use new">
+      <span class="tag">new</span>
+      <h3>Rolling the baseline forward</h3>
+      <pre class="mermaid">
+flowchart LR
+  B1["base backup"] --> EA["epoch A"]
+  EA --> B2["new base backup"]
+  B2 -->|"retire A"| EB["epoch B"]
+  EA -.->|"still applied"| EB
+      </pre>
+      <p>One lineage holds every change since the last base backup. A new backup is taken, that lineage is retired, and the next one begins. Retiring stops tracking without unsaying that anything ran.</p>
+      <p class="how">retire, never delete</p>
+    </div>
+
+    <div class="use">
+      <h3>Promotion through environments</h3>
+      <pre class="mermaid">
+flowchart LR
+  R[/"migrations/"/] --> D[("dev")]
+  R --> S[("staging")]
+  R --> P[("production")]
+  P -.->|"says what it IS"| LBL["laswell.environment"]
+      </pre>
+      <p>One repository, three environments. Each database says what it is, and a specification declaring an environment is applied only where the two agree. A database name proves less — a dump restored elsewhere keeps it.</p>
+      <p class="how">target.environment</p>
+    </div>
+
+    <div class="use">
+      <h3>A gate that deploys nothing</h3>
+      <pre class="mermaid">
+flowchart LR
+  CI["CI job"] --> ST["--status"]
+  ST --> Z{"exit code"}
+  Z -->|"0"| OK["clean"]
+  Z -->|"2"| DR["drift: fail the build"]
+      </pre>
+      <p>Report what is pending and change nothing, with exit codes a pipeline can branch on. Drift fails the build before anything reaches a database.</p>
+      <p class="how">pg_laswell --repo ./migrations --status</p>
+    </div>
+
+    <div class="use">
+      <h3>An agent writes, a person approves</h3>
+      <pre class="mermaid">
+flowchart LR
+  AG["agent"] --> M["pg_laswell_mcp"]
+  M --> SP[/"spec"/]
+  SP --> HU["person signs"]
+  HU --> L["pg_laswell"]
+  L --> DB[("database")]
+      </pre>
+      <p>The MCP server is for authoring: plan it, argue with the reasoning, revise. Signing is the human act. The deploying binary has no agent anywhere in its path.</p>
+      <p class="how">pg_laswell_mcp to author, pg_laswell to deploy</p>
+    </div>
+
+    <div class="use">
+      <h3>Two roles on one database</h3>
+      <pre class="mermaid">
+flowchart LR
+  C1["connection: ddl"] --> DB[("app")]
+  C2["connection: reader"] --> DB
+  DB -.->|"one system_identifier"| ID{{"same database"}}
+      </pre>
+      <p>A role that owns the DDL beside the one the application uses. Ordinary, and worth naming because it is the case a scheduler comparing connection names gets wrong.</p>
+      <p class="how">two connections, one identity</p>
+    </div>
+  </div>
 </section>
 
 <section id="docs">
