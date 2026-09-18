@@ -586,11 +586,14 @@ jobs:
         run: |
           sudo apt-get update -o DPkg::Lock::Timeout=300
           sudo apt-get install -y --no-install-recommends libpq5 postgresql-client openssl
-      # Both binaries: the examples sign with pg_laswell_mcp and apply with
-      # pg_laswell, which is the split the tool exists to keep.
+      # tools-plain, NOT test-binary-*: the examples need the two SHIPPED
+      # binaries, because they sign with pg_laswell_mcp and apply with
+      # pg_laswell, and that split is the thing the tool exists to keep. The
+      # test artifact carries pg_laswell_mcp_test and neither of them, which is
+      # how this job first failed on `chmod: cannot access build/pg_laswell`.
       - uses: actions/download-artifact@v4
         with:
-          name: test-binary-plain-gcc
+          name: tools-plain
           path: build
       - name: Start the three clusters
         run: |
