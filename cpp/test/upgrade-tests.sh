@@ -47,17 +47,50 @@ install_with() {
 
 scalar() { psql -X -t -A -c "$1" "$TARGET"; }
 
-# The previous release's script. HEAD~ is not used: this runs on a branch whose
-# HEAD may already carry the new schema, and origin/main is what "the version
-# before this change" means.
-PREV=$(git -C "$HERE" rev-parse --verify --quiet origin/main || git -C "$HERE" rev-parse --verify main)
-git -C "$HERE" show "$PREV:sql/bootstrap.sql" > "$WORK/previous.sql"
+# A bootstrap from an OLDER SCHEMA, which is the only thing this can upgrade
+# from. Finding it is the part that was wrong the first time.
+#
+# The first version used origin/main, and that was a self-reference: it was
+# correct while the schema change sat on a branch and became wrong the instant
+# that branch merged, because main was then the NEW schema. The test was
+# guaranteed to break on its own merge, and did, on the very next pull request.
+#
+# "Previous" means the newest RELEASE that installs a lower version than this
+# tree does -- read out of each tag's own script rather than assumed, so this
+# keeps working across every future bump without being edited.
+version_of() { grep -oE 'installs version [0-9]+' "$1" | grep -oE '[0-9]+$' | head -1; }
 
-echo "installing the previous ledger from $PREV"
+CURRENT=$(version_of "$HERE/sql/bootstrap.sql")
+[ -n "$CURRENT" ] || { echo "cannot read the version this tree installs"; exit 1; }
+
+PREV=""
+for tag in $(git -C "$HERE" tag --sort=-v:refname); do
+  git -C "$HERE" show "$tag:sql/bootstrap.sql" > "$WORK/candidate.sql" 2>/dev/null || continue
+  v=$(version_of "$WORK/candidate.sql")
+  [ -n "$v" ] || continue
+  if [ "$v" -lt "$CURRENT" ]; then
+    PREV=$tag
+    mv "$WORK/candidate.sql" "$WORK/previous.sql"
+    PREV_VERSION=$v
+    break
+  fi
+done
+
+if [ -z "$PREV" ]; then
+  # Not a failure: the first release after a bump has no older release to
+  # upgrade from, and neither does a repository with no tags. Saying so beats
+  # a green tick that checked nothing.
+  echo "SKIP: no release installs a schema older than $CURRENT, so there is"
+  echo "      nothing to upgrade from yet."
+  exit 0
+fi
+
+echo "installing the previous ledger from $PREV (schema $PREV_VERSION)"
 install_with "$WORK/previous.sql"
 
 BEFORE=$(scalar "SELECT max(version) FROM laswell.schema_version")
-[ "$BEFORE" = "2" ] || { echo "expected the previous script to install 2, got $BEFORE"; exit 1; }
+[ "$BEFORE" = "$PREV_VERSION" ] || {
+  echo "expected $PREV to install $PREV_VERSION, got $BEFORE"; exit 1; }
 
 psql -X -q -v ON_ERROR_STOP=1 -c \
   "INSERT INTO laswell.migration(spec_id, spec_digest, canonical_bytes, signer_key_id, signature)
@@ -68,7 +101,7 @@ echo "upgrading"
 install_with "$HERE/sql/bootstrap.sql"
 
 AFTER=$(scalar "SELECT max(version) FROM laswell.schema_version")
-[ "$AFTER" = "3" ] || { echo "expected version 3 after upgrade, got $AFTER"; exit 1; }
+[ "$AFTER" = "$CURRENT" ] || { echo "expected version $CURRENT after upgrade, got $AFTER"; exit 1; }
 
 ROWS=$(scalar "SELECT count(*) FROM laswell.migration")
 [ "$ROWS" = "2" ] || { echo "history was lost: expected 2 rows, got $ROWS"; exit 1; }
@@ -100,8 +133,8 @@ fi
 echo "re-running the new script must change nothing"
 install_with "$HERE/sql/bootstrap.sql"
 AGAIN=$(scalar "SELECT max(version) FROM laswell.schema_version")
-[ "$AGAIN" = "3" ] || { echo "re-run moved the version to $AGAIN"; exit 1; }
+[ "$AGAIN" = "$CURRENT" ] || { echo "re-run moved the version to $AGAIN"; exit 1; }
 STILL=$(scalar "SELECT count(*) FROM laswell.migration")
 [ "$STILL" = "3" ] || { echo "re-run changed the history: $STILL rows"; exit 1; }
 
-echo "ledger upgrade 2 -> 3: ok"
+echo "ledger upgrade $PREV_VERSION -> $CURRENT: ok (from $PREV)"
