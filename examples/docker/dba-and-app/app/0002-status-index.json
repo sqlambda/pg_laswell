@@ -1,0 +1,33 @@
+{
+  "laswell_spec_version": 1,
+  "id": "app-0002-status-index",
+  "description": "Index the status column the orders list endpoint filters on.",
+  "rationale": "Built concurrently, so the application keeps writing.",
+  "target": {
+    "epoch": "app"
+  },
+  "depends_on": [
+    "app-0001-orders"
+  ],
+  "intents": [
+    {
+      "kind": "create_index",
+      "schema": "public",
+      "table": "orders",
+      "name": "orders_status_idx",
+      "columns": [
+        "status"
+      ],
+      "unique": false,
+      "method": "btree",
+      "comment": "Tenant-free lookup for the orders list endpoint."
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:a820397c00133376",
+      "algorithm": "ed25519",
+      "signature": "uYGySTdKHtfhrlA9L0SeL5i8GdK4KOu5t9JXS4xXtQJ89YByA4eA9VVs4+0qBL4cYgMbwz91NZRzv4uaTJNOCA=="
+    }
+  ]
+}

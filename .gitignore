@@ -7,6 +7,12 @@ cpp/dist/
 # The generated site: 84 pages that tools/gen-site.py rebuilds from source.
 /_site/
 
+# tools/check-mermaid.py needs mermaid and jsdom resolvable. CI installs them
+# with --no-save; installing them here to check a diagram before pushing should
+# not put node_modules in the tree.
+/node_modules/
+/package-lock.json
+
 # Editors and noise
 __pycache__/
 *.pyc

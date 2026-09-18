@@ -1,0 +1,41 @@
+{
+  "laswell_spec_version": 1,
+  "id": "app-0001-orders",
+  "description": "The orders table the application reads and writes.",
+  "rationale": "Owned by the application team. The DBA never edits this file.",
+  "target": {
+    "epoch": "app"
+  },
+  "intents": [
+    {
+      "kind": "create_table",
+      "schema": "public",
+      "table": "orders",
+      "comment": "Customer orders.",
+      "primary_key": [
+        "id"
+      ],
+      "columns": [
+        {
+          "name": "id",
+          "type": "bigint",
+          "nullable": false,
+          "comment": "Surrogate key."
+        },
+        {
+          "name": "status",
+          "type": "text",
+          "nullable": false,
+          "comment": "Lifecycle state."
+        }
+      ]
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:a820397c00133376",
+      "algorithm": "ed25519",
+      "signature": "9vx2+YaNKY/GtA3oD8yEZg8Y4A10jyRlX8xWpPQrw+2Bw5by2vST/5U74/x9n+/6sqyeRdpfMud3RB749RJnDQ=="
+    }
+  ]
+}

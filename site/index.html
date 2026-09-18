@@ -115,7 +115,12 @@
     .terms > dd { border-top: 0; padding-top: 0; }
   }
   /* Ways to use it. */
-  .uses { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr)); }
+  .uses { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(23rem, 1fr)); }
+  .use pre.mermaid {
+    margin: 0; padding: .6rem; background: var(--code-bg); border-radius: 6px;
+    border: 0; text-align: center; overflow-x: auto;
+  }
+  .use pre.mermaid svg { max-width: 100%; height: auto; }
   .use {
     border: 1px solid var(--rule); border-radius: 8px; padding: 1rem 1.1rem;
     background: var(--panel); display: flex; flex-direction: column; gap: .45rem;
@@ -575,107 +580,163 @@ flowchart LR
   <div class="uses">
     <div class="use">
       <h3>One cluster, one repository</h3>
-      <p>The baseline. A folder of signed specifications, a ledger in the target
-      database, and a pipeline that applies what is pending.</p>
+      <pre class="mermaid">
+flowchart LR
+  R[/"migrations/"/] --> L["pg_laswell"]
+  L --> D[("app")]
+  D -.-> LED["laswell ledger"]
+      </pre>
+      <p>The baseline. A folder of signed specifications, a ledger in the target database, and a pipeline that applies what is pending.</p>
       <p class="how">pg_laswell --repo ./migrations</p>
     </div>
 
     <div class="use">
       <h3>Publisher and subscriber</h3>
-      <p>One repository, several databases. A specification names the connection
-      it runs against; a dependency crosses databases, so the subscription waits
-      for the publication that feeds it. Neither database can see the other's
-      tables, and neither has to.</p>
+      <pre class="mermaid">
+flowchart LR
+  R[/"migrations/"/] --> L["pg_laswell"]
+  L -->|"connection: store"| S[("store")]
+  L -->|"connection: audit"| A[("audit")]
+  S --> P{{"PUBLICATION"}}
+  P -->|"depends_on"| C{{"SUBSCRIPTION"}}
+  C --> A
+      </pre>
+      <p>One repository, several databases. A specification names the connection it runs against; a dependency crosses databases, so the subscription waits for the publication that feeds it.</p>
       <p class="how">target.connection + depends_on</p>
     </div>
 
     <div class="use new">
       <span class="tag">new</span>
       <h3>A DBA repository the application never sees</h3>
-      <p>The application team deploys its own directory and answers only for its
-      own lineage. The DBA's manifest lists both — theirs and the
-      application's — and declares itself complete, so it answers for the whole
-      database. Neither refuses the other's absence.</p>
+      <pre class="mermaid">
+flowchart TB
+  APP[/"app/"/] --> AD["app deploy"]
+  DBA[/"dba/"/] --> MD["DBA deploy"]
+  APP -.-> MF["manifest\ncomplete: true"]
+  MF --> MD
+  AD -->|"epoch: app"| DB[("one database")]
+  MD -->|"both epochs"| DB
+      </pre>
+      <p>The application team deploys its own directory and answers only for its own lineage. The DBA's manifest lists both and declares itself complete, so it answers for the whole database. Neither refuses the other's absence.</p>
       <p class="how">epoch per team + manifest complete: true</p>
     </div>
 
     <div class="use">
       <h3>A release tag as the trigger</h3>
-      <p>Specifications carry a tag and wait. Approving it is a privileged
-      statement in the target database, recorded with who and when — an
-      authorisation act, not a technical one. The tag is inside the signature,
-      so it cannot be retargeted on the way to production.</p>
+      <pre class="mermaid">
+flowchart LR
+  S[/"spec\nrelease: 2026.09"/] --> G{"tag ready\nhere?"}
+  G -->|"no"| H["held"]
+  G -->|"yes"| AP["applied"]
+  OWN["schema owner"] -->|"approves"| G
+      </pre>
+      <p>Specifications carry a tag and wait. Approving it is a privileged statement in the target database, recorded with who and when. The tag is inside the signature, so it cannot be retargeted on the way to production.</p>
       <p class="how">release + laswell.release</p>
     </div>
 
     <div class="use new">
       <span class="tag">new</span>
       <h3>A large estate, decoupled</h3>
-      <p>Epochs do not make a migration run faster. What they remove is
-      coupling: a project's pipeline no longer needs every other project's files
-      checked out to avoid being refused for drift it knows nothing about.</p>
+      <pre class="mermaid">
+flowchart LR
+  T1[/"team one"/] -->|"epoch: one"| DB[("shared database")]
+  T2[/"team two"/] -->|"epoch: two"| DB
+  T3[/"team three"/] -->|"epoch: three"| DB
+      </pre>
+      <p>Epochs do not make a migration run faster. What they remove is coupling: a project's pipeline no longer needs every other project's files checked out to avoid being refused for drift it knows nothing about.</p>
       <p class="how">target.epoch</p>
     </div>
 
     <div class="use">
       <h3>A sharded fleet</h3>
-      <p>Twenty databases all called <code>app</code> on twenty servers. They
-      are proven independent by the cluster's own identifier rather than by
-      name, so they migrate concurrently — with no evidence needed, because
-      different databases cannot touch each other's tables.</p>
+      <pre class="mermaid">
+flowchart LR
+  R[/"migrations/"/] --> L["pg_laswell"]
+  L --> S1[("app @ shard-1")]
+  L --> S2[("app @ shard-2")]
+  L --> S3[("app @ shard-3")]
+      </pre>
+      <p>Twenty databases all called app on twenty servers. They are proven independent by the cluster's own identifier rather than by name, so they migrate concurrently — no evidence needed, because different databases cannot touch each other's tables.</p>
       <p class="how">one connection per shard</p>
     </div>
 
     <div class="use new">
       <span class="tag">new</span>
       <h3>Adopting a database nobody scripted</h3>
-      <p>You have the database and not its history. An epoch records that
-      tracking deliberately starts here — auditable, rather than an empty ledger
-      that cannot be told apart from one nobody has ever used.</p>
+      <pre class="mermaid">
+flowchart LR
+  OLD["ten years\nof unknown DDL"] --> E{{"epoch opened\nhere"}}
+  E --> N1["change"]
+  N1 --> N2["change"]
+  N2 --> N3["tracked from now on"]
+      </pre>
+      <p>You have the database and not its history. An epoch records that tracking deliberately starts here — auditable, rather than an empty ledger that cannot be told apart from one nobody has ever used.</p>
       <p class="how">open an epoch, track forward</p>
     </div>
 
     <div class="use new">
       <span class="tag">new</span>
       <h3>Rolling the baseline forward</h3>
-      <p>One lineage holds every change since the last base backup. A new backup
-      is taken, that lineage is retired, and the next one begins. Retiring stops
-      tracking without unsaying that anything ran, so a later change may still
-      depend on one of its migrations.</p>
+      <pre class="mermaid">
+flowchart LR
+  B1["base backup"] --> EA["epoch A"]
+  EA --> B2["new base backup"]
+  B2 -->|"retire A"| EB["epoch B"]
+  EA -.->|"still applied"| EB
+      </pre>
+      <p>One lineage holds every change since the last base backup. A new backup is taken, that lineage is retired, and the next one begins. Retiring stops tracking without unsaying that anything ran.</p>
       <p class="how">retire, never delete</p>
     </div>
 
     <div class="use">
       <h3>Promotion through environments</h3>
-      <p>One repository, three environments. Each database says what it is, and
-      a specification declaring an environment is applied only where the two
-      agree. A database name proves less — a dump restored elsewhere keeps
-      it.</p>
+      <pre class="mermaid">
+flowchart LR
+  R[/"migrations/"/] --> D[("dev")]
+  R --> S[("staging")]
+  R --> P[("production")]
+  P -.->|"says what it IS"| LBL["laswell.environment"]
+      </pre>
+      <p>One repository, three environments. Each database says what it is, and a specification declaring an environment is applied only where the two agree. A database name proves less — a dump restored elsewhere keeps it.</p>
       <p class="how">target.environment</p>
     </div>
 
     <div class="use">
       <h3>A gate that deploys nothing</h3>
-      <p>Report what is pending and change nothing, with exit codes a pipeline
-      can branch on: clean, refused, a repository problem, a configuration
-      problem. Drift fails the build before anything reaches a database.</p>
+      <pre class="mermaid">
+flowchart LR
+  CI["CI job"] --> ST["--status"]
+  ST --> Z{"exit code"}
+  Z -->|"0"| OK["clean"]
+  Z -->|"2"| DR["drift: fail the build"]
+      </pre>
+      <p>Report what is pending and change nothing, with exit codes a pipeline can branch on. Drift fails the build before anything reaches a database.</p>
       <p class="how">pg_laswell --repo ./migrations --status</p>
     </div>
 
     <div class="use">
       <h3>An agent writes, a person approves</h3>
-      <p>The MCP server is for authoring: plan it, argue with the reasoning,
-      revise. Signing is the human act. The deploying binary has no agent
-      anywhere in its path — it was never load-bearing for safety, because an
-      agent could only ever choose less than the tool already permits.</p>
+      <pre class="mermaid">
+flowchart LR
+  AG["agent"] --> M["pg_laswell_mcp"]
+  M --> SP[/"spec"/]
+  SP --> HU["person signs"]
+  HU --> L["pg_laswell"]
+  L --> DB[("database")]
+      </pre>
+      <p>The MCP server is for authoring: plan it, argue with the reasoning, revise. Signing is the human act. The deploying binary has no agent anywhere in its path.</p>
       <p class="how">pg_laswell_mcp to author, pg_laswell to deploy</p>
     </div>
 
     <div class="use">
       <h3>Two roles on one database</h3>
-      <p>A role that owns the DDL beside the one the application uses. Ordinary,
-      and worth naming because it is the case a scheduler comparing connection
-      <em>names</em> gets wrong.</p>
+      <pre class="mermaid">
+flowchart LR
+  C1["connection: ddl"] --> DB[("app")]
+  C2["connection: reader"] --> DB
+  DB -.->|"one system_identifier"| ID{{"same database"}}
+      </pre>
+      <p>A role that owns the DDL beside the one the application uses. Ordinary, and worth naming because it is the case a scheduler comparing connection names gets wrong.</p>
       <p class="how">two connections, one identity</p>
     </div>
   </div>

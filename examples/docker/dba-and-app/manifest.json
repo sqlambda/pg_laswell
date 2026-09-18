@@ -1,0 +1,8 @@
+{
+  "laswell_manifest_version": 1,
+  "complete": true,
+  "sources": [
+    { "name": "app", "directory": "app" },
+    { "name": "dba", "directory": "dba" }
+  ]
+}
