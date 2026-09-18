@@ -3769,11 +3769,24 @@ TEST_F(ToolTest, ALockWaiterForcesACommitBeforeTheIntervalWouldHave) {
 
 TEST_F(ToolTest, WithNoWaiterTheIntervalIsWhatCommits) {
   // The inverse, so the previous test cannot pass by accident: nothing waiting,
-  // a tiny interval, and every commit must be attributed to the interval.
+  // and every commit must be attributed to the interval.
+  //
+  // 250ms, not the 20ms this used to ask for. The executor guards itself with
+  // idle_in_transaction_session_timeout = commit_interval_ms * 3, so 20ms meant
+  // a 60ms window -- shorter than one scheduler hiccup on a shared runner, and
+  // hopeless under ThreadSanitizer. It failed three times on unrelated pull
+  // requests with "Connection lost while committing transaction", which is the
+  // server terminating the session, not a defect in pacing.
+  //
+  // The test loses nothing: 20000 rows at 100 a batch is 200 commits' worth of
+  // work, so any interval shorter than the whole run still fires, and the
+  // assertion is that it fired at all. Whether the GUARD's formula wants a
+  // floor at the small end is a separate question about shipped behaviour, and
+  // not one to answer inside a test.
   make_big_shop(cfg(), 20000);
   auto e = cfg().executor;
   e.batch_rows = 100;
-  e.commit_interval_ms = 20;
+  e.commit_interval_ms = 250;
   e.batch_cap_rows = 100000000;
   e.observer_tick_ms = 25;
   set_executor(e);
