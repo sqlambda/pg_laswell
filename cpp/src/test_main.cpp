@@ -11742,8 +11742,12 @@ TEST_F(TwoDatabaseTest, DeployAppliesEachSpecificationInItsOwnDatabase) {
   const auto result = run.run();
   const auto text = out.str();
   EXPECT_EQ(result, pglaswell::DeployResult::kOk) << text;
-  EXPECT_NE(text.find("across 2 databases"), std::string::npos)
-      << "a run that reaches two servers should say so: " << text;
+  // CONNECTIONS, which is what that line counts. Here the two really are two
+  // databases, so the old wording happened to be true -- but it was true by
+  // coincidence, and on a configuration where two connection names point at one
+  // database it said something the grouping had to stop assuming.
+  EXPECT_NE(text.find("across 2 connections"), std::string::npos)
+      << "a run that reaches two connections should say so: " << text;
 
   // The tables landed in the right databases, and NOT in the wrong ones.
   const auto has_table = [&](const std::string& url, const std::string& t) {
