@@ -27,7 +27,16 @@ kid=$(install_ledger "$BETA_PORT" archive "$here/keys" repl)
 # which is why compose.yml sets POSTGRES_HOST_AUTH_METHOD=trust: pg_laswell
 # refuses a password in a subscription's connection string, because the ledger
 # records what ran and a redacted entry would no longer be what ran.
-sign_dir "$here/migrations" "$here/keys/repl.key.pem" "$kid"
+# The subscriber dials the publisher by NAME, and what that name is depends on
+# who started the containers: compose resolves `alpha`, GitHub Actions service
+# containers resolve the service's own label. Substituted into a build directory
+# rather than hardcoded, so the example runs in both.
+build=$here/.build
+rm -rf "$build"; mkdir -p "$build"
+for f in "$here/migrations"/*.json; do
+  sed "s/__PUBLISHER_HOST__/${PUBLISHER_HOST:-alpha}/" "$f" > "$build/$(basename "$f")"
+done
+sign_dir "$build" "$here/keys/repl.key.pem" "$kid"
 
 cat > "$here/repl.ini" <<INI
 [store]
@@ -47,10 +56,10 @@ INI
 chmod 600 "$here/repl.ini"
 
 say "1. The order, derived from depends_on across two databases"
-run "$PG_LASWELL" --config "$here/repl.ini" --repo "$here/migrations" --status
+run "$PG_LASWELL" --config "$here/repl.ini" --repo "$build" --status
 
 say "2. Apply"
-run "$PG_LASWELL" --config "$here/repl.ini" --repo "$here/migrations"
+run "$PG_LASWELL" --config "$here/repl.ini" --repo "$build"
 
 say "3. Write on the store"
 psql -X -q -v ON_ERROR_STOP=1 -c \

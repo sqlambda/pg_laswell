@@ -556,6 +556,84 @@ jobs:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
         run: sh cpp/test/upgrade-tests.sh
 
+  # The worked examples, which until now nothing but a person ever ran.
+  #
+  # They earn a job because they have already found FOUR things the 416-test
+  # suite did not: an empty directory passing silently against a populated
+  # ledger, a summary line saying "databases" while counting connections, a
+  # helper sending stderr to /dev/null so a hard failure became an empty log,
+  # and an example that had stopped demonstrating its own point. They find those
+  # because they drive the BINARY end to end, against real clusters, in the
+  # arrangements the landing page sells -- and the page links to them from its
+  # first screen, so a directory that has stopped working is worse than none.
+  #
+  # docker compose, NOT service containers, and the reason is worth keeping.
+  # Service containers looked cheaper: lib.sh already takes its ports from the
+  # environment. But a service container cannot be given a custom command, and
+  # the replication example needs wal_level=logical -- which ALTER SYSTEM cannot
+  # deliver because it takes a restart, and a service container cannot be
+  # restarted from the job. Tried it; got `wal_level=replica` three times and a
+  # failure. compose sets it in the file, which is also the one definition of
+  # the topology a developer already runs.
+  examples:
+    name: examples
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update -o DPkg::Lock::Timeout=300
+          sudo apt-get install -y --no-install-recommends libpq5 postgresql-client openssl
+      # tools-plain, NOT test-binary-*: the examples need the two SHIPPED
+      # binaries, because they sign with pg_laswell_mcp and apply with
+      # pg_laswell, and that split is the thing the tool exists to keep. The
+      # test artifact carries pg_laswell_mcp_test and neither of them, which is
+      # how this job first failed on `chmod: cannot access build/pg_laswell`.
+      - uses: actions/download-artifact@v4
+        with:
+          name: tools-plain
+          path: build
+      - name: Start the three clusters
+        run: |
+          docker compose -f examples/docker/compose.yml up -d
+          for i in $(seq 1 60); do
+            ok=0
+            for c in laswell_alpha laswell_beta laswell_gamma; do
+              docker exec "$c" pg_isready -U postgres -d app -q 2>/dev/null && ok=$((ok+1))
+            done
+            [ "$ok" = 3 ] && break
+            sleep 2
+          done
+          # Asserted, not assumed: this is the setting the replication example
+          # needs and the one a service container could not provide.
+          for port in 55432 55433 55434; do
+            got=$(PGPASSWORD=laswell psql -h 127.0.0.1 -p $port -U postgres -d app -t -A -c "SHOW wal_level")
+            echo "127.0.0.1:$port wal_level=$got"
+            [ "$got" = "logical" ] || { echo "::error::wal_level is $got on $port"; exit 1; }
+          done
+      - name: Every example
+        env:
+          PG_LASWELL: ${{ github.workspace }}/build/pg_laswell
+          PG_LASWELL_MCP: ${{ github.workspace }}/build/pg_laswell_mcp
+          # compose resolves container names, so the subscriber dials `alpha`
+          # exactly as it does on a developer's machine.
+          PUBLISHER_HOST: alpha
+        run: |
+          chmod +x build/pg_laswell build/pg_laswell_mcp
+          ./examples/docker/run-all.sh
+      - name: The logs of anything that failed
+        if: failure()
+        run: |
+          for f in examples/docker/.*.log; do
+            [ -e "$f" ] || continue
+            echo "::group::$f"; cat "$f"; echo "::endgroup::"
+          done
+      - name: Stop the clusters
+        if: always()
+        run: docker compose -f examples/docker/compose.yml down -v
+
   ci-ok:
     name: ci-ok
     if: always()
@@ -569,6 +647,7 @@ jobs:
       - pooled
       - twin_clusters
       - ledger_upgrade
+      - examples
       - packages
     runs-on: ubuntu-latest
     timeout-minutes: 5
