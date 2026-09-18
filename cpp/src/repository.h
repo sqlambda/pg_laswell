@@ -706,7 +706,13 @@ class MigrationRepository {
         // check back to the strength it had before epochs scoped it.
         if (!complete && epochs_claimed.count(epoch) == 0) continue;
         if (view.epochs_retired.count(epoch) != 0) continue;
-        for (auto it = ep.value().begin(); it != ep.value().end(); ++it) {
+        // Bound once, not called twice. An iterator's value() does return a
+        // reference so nothing dangles here, but no-dangling-items.sh is a
+        // regex and is blunt on purpose -- this bug shape has appeared five
+        // times in this project. A guard worth trusting is one with no
+        // exceptions carved into it, and binding is the clearer code anyway.
+        const auto& ids = ep.value();
+        for (auto it = ids.begin(); it != ids.end(); ++it) {
           if (on_disk.count(epoch + "\x1f" + it.key()) != 0) continue;
           problems.push_back(
               "the ledger of \"" + conn + "\" records \"" + it.key() +
