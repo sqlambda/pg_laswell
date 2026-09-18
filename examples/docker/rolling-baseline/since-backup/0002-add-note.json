@@ -1,0 +1,29 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0002-add-note",
+  "description": "A free-text note on an order.",
+  "target": {
+    "epoch": "since-2026-06"
+  },
+  "depends_on": [
+    "0001-add-channel"
+  ],
+  "intents": [
+    {
+      "kind": "add_column",
+      "schema": "public",
+      "table": "orders",
+      "column": "note",
+      "type": "text",
+      "nullable": true,
+      "comment": "Operator note."
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:18f6055a98506fd8",
+      "algorithm": "ed25519",
+      "signature": "DsK22akkCGW7EC2dyH/i5PpJoV1nsxNXVleRF5ARSru60h1nx2mur8pqq9An6VHZNxE/qsJeS5PgYQmlRKmJBQ=="
+    }
+  ]
+}

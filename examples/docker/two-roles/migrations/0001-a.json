@@ -1,0 +1,26 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0001-orders-note",
+  "description": "A note column on orders.",
+  "target": {
+    "connection": "ddl"
+  },
+  "intents": [
+    {
+      "kind": "add_column",
+      "schema": "public",
+      "table": "orders",
+      "column": "note",
+      "type": "text",
+      "nullable": true,
+      "comment": "Operator note."
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:cce26f28d967e425",
+      "algorithm": "ed25519",
+      "signature": "DetIETY8Jt2XjexIH0QcrOJiVMNgKitPzx77+gnDcRK2Z5UevrRtwmx/mUAoTKupg0RlOjACHHJfk6thF3S1AQ=="
+    }
+  ]
+}

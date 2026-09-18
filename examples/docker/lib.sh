@@ -44,7 +44,12 @@ wait_for() {  # wait_for <port>
 server_version() { psql -X -t -A -c 'SHOW server_version' "$(url "$1" "${2:-app}")"; }
 
 recreate_db() {  # recreate_db <port> <dbname>
-  psql -X -q -c "DROP DATABASE IF EXISTS \"$2\" WITH (FORCE)" "$(url "$1")" >/dev/null 2>&1
+  # stdout dropped, stderr KEPT. An earlier version sent both to /dev/null to
+  # hide the "does not exist, skipping" notice, and a real failure -- DROP
+  # DATABASE refusing while a replication slot was still held -- became silence
+  # plus an empty log. The notice is worth filtering; the error is not.
+  psql -X -q -c "DROP DATABASE IF EXISTS \"$2\" WITH (FORCE)" "$(url "$1")" 2>&1 >/dev/null \
+    | grep -v 'does not exist, skipping' >&2 || true
   psql -X -q -c "CREATE DATABASE \"$2\"" "$(url "$1")" >/dev/null
 }
 

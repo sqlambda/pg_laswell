@@ -4309,6 +4309,42 @@ TEST_F(EpochTest, DriftInsideAClaimedEpochIsStillCaught) {
                         "be caught: " << s.dump(2);
 }
 
+TEST_F(EpochTest, ARepositoryDescribingNothingIsNotAgreementWithEverything) {
+  // Found by a worked example rather than by a test, which is why the example
+  // was worth building. Scoping the drift check by epoch has a degenerate end:
+  // a listing that claims NO epoch answers for nothing, so an empty directory
+  // passed silently against a database full of history.
+  //
+  // That is the wrong way round. Someone deleting the whole migrations
+  // directory, or pointing a deployment at the wrong path, are the two most
+  // catastrophic things that can be wrong here -- and before epochs scoped this
+  // check, both were caught loudly as every applied migration at once.
+  make_shop(cfg());
+  write_spec("a.json", add_column_spec("a", "orders", "ca"));
+  apply_now("a.json");
+  std::filesystem::remove(dir_ + "/a.json");
+
+  const auto s = scan(false);
+  bool named = false;
+  for (const auto& p : s["problems"]) {
+    if (p.get<std::string>().find("describes no migrations at all") !=
+        std::string::npos) {
+      named = true;
+    }
+  }
+  EXPECT_TRUE(named)
+      << "an empty repository against a populated ledger must say so: "
+      << s.dump(2);
+}
+
+TEST_F(EpochTest, AnEmptyRepositoryAgainstAnEmptyLedgerIsFine) {
+  // The other half, or the fix would refuse every first run: with nothing
+  // applied there is nothing to disagree about.
+  make_shop(cfg());
+  const auto s = scan(false);
+  EXPECT_TRUE(s["problems"].empty()) << s["problems"].dump(2);
+}
+
 TEST_F(EpochTest, ARetiredLineageIsNotHeldToAccountForItsMissingFiles) {
   // A mutation found this: with the retirement skip removed, nothing failed.
   // RetirementDoesNotUnsayThatAMigrationRan deletes the retired lineage's only

@@ -20,6 +20,13 @@ services:
     environment:
       POSTGRES_PASSWORD: laswell
       POSTGRES_DB: app
+      # Trust on the compose network, because a subscriber has to dial the
+      # publisher by container name and pg_laswell REFUSES a password in a
+      # subscription's connection string -- the ledger records what ran, and a
+      # redacted entry would no longer be what ran. On a throwaway container
+      # that is the honest way to say "these three can reach each other"; a real
+      # deployment uses ~/.pgpass or a connection service file.
+      POSTGRES_HOST_AUTH_METHOD: trust
     ports: ['55432:5432']
     command:
       # wal_level=logical on all three, so any of them can publish. Cheap on an
@@ -43,6 +50,13 @@ services:
     environment:
       POSTGRES_PASSWORD: laswell
       POSTGRES_DB: app
+      # Trust on the compose network, because a subscriber has to dial the
+      # publisher by container name and pg_laswell REFUSES a password in a
+      # subscription's connection string -- the ledger records what ran, and a
+      # redacted entry would no longer be what ran. On a throwaway container
+      # that is the honest way to say "these three can reach each other"; a real
+      # deployment uses ~/.pgpass or a connection service file.
+      POSTGRES_HOST_AUTH_METHOD: trust
     ports: ['55433:5432']
     command: [postgres, -c, wal_level=logical, -c, max_replication_slots=8, -c, max_wal_senders=8]
     healthcheck:
@@ -57,6 +71,13 @@ services:
     environment:
       POSTGRES_PASSWORD: laswell
       POSTGRES_DB: app
+      # Trust on the compose network, because a subscriber has to dial the
+      # publisher by container name and pg_laswell REFUSES a password in a
+      # subscription's connection string -- the ledger records what ran, and a
+      # redacted entry would no longer be what ran. On a throwaway container
+      # that is the honest way to say "these three can reach each other"; a real
+      # deployment uses ~/.pgpass or a connection service file.
+      POSTGRES_HOST_AUTH_METHOD: trust
     ports: ['55434:5432']
     command: [postgres, -c, wal_level=logical, -c, max_replication_slots=8, -c, max_wal_senders=8]
     healthcheck:

@@ -198,7 +198,12 @@ class Deployment {
       }
     }
     if (connections.size() > 1) {
-      out << "  across " << connections.size() << " databases:";
+      // CONNECTIONS, which is what this set counts. Two of them may name one
+      // database -- a role that owns the DDL beside the one the application
+      // uses -- and calling that "2 databases" asserts the very thing the
+      // grouping had to stop assuming.
+      out << "  across " << connections.size() << " connection"
+          << (connections.size() == 1 ? "" : "s") << ":";
       for (const auto& c : connections) out << " " << c;
       out << "\n";
     }

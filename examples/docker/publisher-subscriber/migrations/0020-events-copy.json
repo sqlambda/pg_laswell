@@ -1,0 +1,40 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0020-events-on-archive",
+  "description": "The same shape on the archive, which will receive the rows.",
+  "target": {
+    "connection": "archive"
+  },
+  "intents": [
+    {
+      "kind": "create_table",
+      "schema": "public",
+      "table": "events",
+      "comment": "Events replicated from the store.",
+      "primary_key": [
+        "id"
+      ],
+      "columns": [
+        {
+          "name": "id",
+          "type": "bigint",
+          "nullable": false,
+          "comment": "Surrogate key."
+        },
+        {
+          "name": "payload",
+          "type": "text",
+          "nullable": false,
+          "comment": "What happened."
+        }
+      ]
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:213d2cf5f366de3a",
+      "algorithm": "ed25519",
+      "signature": "fQEAOV5zRBFVFY4dUGan/ZchOP744p/5Tjw5fmLcaD25PHgGJcXiMVbOV9W5WvlgeaU9F5Pv5YegwOFEhB29BQ=="
+    }
+  ]
+}

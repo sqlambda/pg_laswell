@@ -698,6 +698,34 @@ class MigrationRepository {
       on_disk.insert(e.epoch + "\x1f" + e.spec_id);
       epochs_claimed.insert(e.epoch);
     }
+    // Claiming NO epoch at all is the one case scoping gets wrong on its own.
+    //
+    // "Answer for the epochs you brought" is the right rule and this is its
+    // degenerate end: bring nothing and you answer for nothing, so a repository
+    // with no specifications in it passes silently against a database full of
+    // history. That is precisely backwards -- someone deleted the whole
+    // directory, or pointed the deployment at the wrong path, and those are the
+    // two most catastrophic things that can be wrong. Before epochs scoped this
+    // check they were caught, loudly, as every applied migration at once.
+    //
+    // Not a narrowing of the scoping: it says nothing about WHICH epochs a
+    // listing answers for, only that a listing describing nothing cannot be
+    // taken as agreeing with everything.
+    if (on_disk.empty()) {
+      for (const auto& [conn, view] : views_) {
+        if (view.applied.empty()) continue;
+        std::size_t recorded = 0;
+        for (auto ep = view.applied.begin(); ep != view.applied.end(); ++ep) {
+          recorded += ep.value().size();
+        }
+        problems.push_back(
+            "this repository describes no migrations at all, and the ledger of "
+            "\"" + conn + "\" records " + std::to_string(recorded) +
+            ". Nothing can be checked against nothing: either the path is "
+            "wrong, or every specification was deleted.");
+      }
+    }
+
     for (const auto& [conn, view] : views_) {
       for (auto ep = view.applied.begin(); ep != view.applied.end(); ++ep) {
         const auto& epoch = ep.key();

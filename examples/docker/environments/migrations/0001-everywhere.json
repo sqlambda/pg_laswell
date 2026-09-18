@@ -1,0 +1,23 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0001-everywhere",
+  "description": "Applies to every environment: no target.environment at all.",
+  "intents": [
+    {
+      "kind": "add_column",
+      "schema": "public",
+      "table": "orders",
+      "column": "channel",
+      "type": "text",
+      "nullable": true,
+      "comment": "web or phone."
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:f87feb3271e399ed",
+      "algorithm": "ed25519",
+      "signature": "Y9V0BnM2CGVLB/VfcoSJUKbHNDEn7Jj8hyC+ytWKUdLPku90U/K3gC1exH9J+1e1ocxokwENG02ldiD14SeiDw=="
+    }
+  ]
+}

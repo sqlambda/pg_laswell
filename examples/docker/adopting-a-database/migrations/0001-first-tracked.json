@@ -1,0 +1,27 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0001-first-tracked-change",
+  "description": "The first change anyone recorded against this database.",
+  "rationale": "Everything before this was applied by hand over ten years. The epoch says so, on the record, instead of leaving an empty ledger that cannot be told apart from an unused one.",
+  "target": {
+    "epoch": "adopted-2026-09"
+  },
+  "intents": [
+    {
+      "kind": "add_column",
+      "schema": "public",
+      "table": "customers",
+      "column": "region",
+      "type": "text",
+      "nullable": true,
+      "comment": "Added under the first tracked epoch."
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:d0da17584103b1e1",
+      "algorithm": "ed25519",
+      "signature": "4Kd7N/XlJNwoxyUZtyDVuBIi0DRyWv+2HfcUxUOacz8ucJLXInQtRWq+3c7mAnqe3G0UspGCMPtIMUxP60YgAQ=="
+    }
+  ]
+}
