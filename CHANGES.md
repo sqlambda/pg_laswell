@@ -2,8 +2,105 @@
 
 ## 0.1.2
 
-Wave one of the multi-directory work, and three defects it uncovered on the
-way. 389 tests.
+The multi-directory work, end to end: a repository may be several directories, a
+specification belongs to a lineage, and a manifest can say whether those
+directories are all of a database's story. 416 tests, and **the ledger schema
+moves to version 3** -- run the bootstrap script shipped with this binary.
+
+### A repository may be several directories
+
+A project per directory, read as one repository. The ledger is what permits it:
+it records a specification's id, digest, canonical bytes and signature, and
+never a file path, so which directory a migration came from is a listing concern
+and not a state concern. Ordering needed nothing new -- the scheduler only ever
+saw ids, relations and connections.
+
+`--repo` is repeatable; `listMigrations` takes `directories`. Three things a
+union makes newly possible to get wrong are refused rather than resolved: an id
+claimed by two directories, one directory named twice, and a missing directory
+(which now says which one). Sources are put in canonical order first, so the
+order they are named in cannot change the listing.
+
+### Epochs, and the partial repository
+
+A specification belongs to a lineage, named in `target.epoch` and inside the
+signature; naming none puts it in `default`, where a ledger upgraded from
+version 2 keeps its whole history.
+
+The check that catches drift -- this database records a migration applied that
+no file here describes -- is unanswerable for a repository that is deliberately
+partial. Scoped by epoch it becomes answerable: a deployment answers for the
+lineages it brought and says nothing about the others. **That is what finally
+makes a DBA repository and an application repository coexist without either
+refusing the other's absence.**
+
+`spec_digest` was globally unique, so the same bytes could never run in two
+lineages of one database -- which is exactly what replaying a retired lineage
+into a new one does. `UNIQUE (epoch, spec_digest)` replaces it, and the applied
+index is keyed by epoch too: without that, a correct replay was reported as
+edited-after-apply, a false drift alarm.
+
+Epochs are opened by whoever owns the schema and never by the migrating role,
+for the sharpest version of the reason environment and release are: opening one
+NARROWS the check that catches drift, so a role that could open one could excuse
+its own. Retiring a lineage stops tracking it without unsaying that it ran --
+its migrations stay applied, so a live specification may still depend on one of
+them, and its files can be deleted without objection.
+
+### A manifest, and what `complete` asserts
+
+A file naming the sources a deployment is made of, giving each a name that
+messages use in place of its path, with directories resolved against the
+manifest's own folder. Its `complete: true` is an assertion no single directory
+can make about itself: these are ALL of this database's story, which widens the
+drift check back to every epoch the ledger knows. It only ever widens, so
+omitting it costs scope and never safety.
+
+### Defects fixed
+
+- **A dependency is satisfied by the ledger, not the directory.** `depends_on`
+  asks "has that one run", and a ledger answers it -- but the check read the
+  directory, so a dependency whose file was absent was refused however plainly
+  the database recorded it succeeded.
+- **Two files may not claim one spec id.** The listing kept the last file read,
+  so the loser vanished from the dependency order and nothing said so. Silence
+  was the defect, not the collision.
+- **Grouping compares databases, not the names of connections.** The one place
+  concurrency is granted without evidence compared connection NAMES, and nothing
+  checked that two names denote two databases. Never corrupting -- advisory
+  locks are scoped per database, exactly the semantics the scheduler assumed, so
+  the overlap was refused -- but the plan was wrong. Identity is now the
+  cluster's `system_identifier` with the database's oid, exact in both
+  directions: a fleet of shards all called `app` still migrates concurrently,
+  where comparing `current_database()` would have serialised every one of them.
+- **A timestamp from autovacuum is not part of the plan.** `estimated_from` --
+  when some other process last touched the statistics -- was inside
+  `planDigest`, so autovacuum moved the receipt. `lock_waiters` went with it.
+  Both are still shown, just not hashed.
+- **A repository describing nothing is not agreement with everything.** Found by
+  a worked example: scoping the drift check by epoch let an EMPTY directory pass
+  silently against a database full of history. The two most catastrophic things
+  that can be wrong -- the directory deleted, or the wrong path -- were the two
+  that had stopped being caught.
+- The deployment summary said "across N databases" while counting connections.
+
+### Ten runnable examples
+
+`examples/docker/` starts three `postgres:latest` containers and demonstrates
+each arrangement: the baseline, a CI gate, release tags, environments, two roles
+on one database, a DBA repository the application never sees, adopting a
+database nobody scripted, rolling a baseline forward, a sharded fleet, and a
+publisher with a subscriber. Three clusters because two of those cannot be shown
+inside one.
+
+### Known limit
+
+`--dry-run` is per specification. One that needs a table an earlier PENDING
+specification creates cannot be planned yet, and says so. A repository-wide dry
+run is not merely unimplemented: paced batches commit by design and an index
+built concurrently cannot run in a transaction at all.
+
+### Wave one, as published in v0.1.2-alpha1
 
 **A dependency is satisfied by the ledger, not by the directory.** `depends_on`
 asks "has that one run", and a ledger answers it -- but the check read the
