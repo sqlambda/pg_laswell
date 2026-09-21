@@ -12043,4 +12043,37 @@ TEST(Conformance, CoversEveryIntentKind) {
 // helpers above, and here rather than in a separate binary because a module's
 // planner is not a separate program -- it is compiled into this one, and a
 // second binary would be a second thing to remember to run.
+
+// The naming rule, enforced rather than documented: every kind a module
+// declares must carry its module's name. A kind called "distribute_table"
+// looks like something pg_laswell does; "citus_distribute_table" says which
+// module implements it, so the refusal on a PostgreSQL-only build is
+// predictable rather than surprising -- and two modules cannot collide.
+//
+// Derived from the module list rather than hardcoded, so it keeps holding for
+// modules that do not exist yet.
+TEST(Modules, EveryModuleKindCarriesItsModulesName) {
+  const auto modules = pglaswell::Plan::modules();
+  if (modules.empty()) GTEST_SKIP() << "no modules compiled in";
+
+  std::set<std::string> declared;
+#define PGLASWELL_KIND(spec_name, enum_id, parse_fn, plan_fn) \
+  declared.insert(#spec_name);
+#include "modules/enabled_kinds.inc"
+#undef PGLASWELL_KIND
+
+  for (const auto& kind : declared) {
+    bool prefixed = false;
+    for (const auto& m : modules) {
+      const auto prefix = m.get<std::string>() + "_";
+      if (kind.rfind(prefix, 0) == 0) prefixed = true;
+    }
+    EXPECT_TRUE(prefixed)
+        << "\"" << kind << "\" is declared by a module but does not begin with "
+        << "that module's name. A reader of a specification could not tell "
+        << "which binary can run it, and two modules could collide over the "
+        << "name.";
+  }
+}
+
 #include "modules/enabled_planner_tests.h"

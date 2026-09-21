@@ -802,6 +802,7 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
 // planner_purity_check.cpp fails the build if pqxx reaches here, and that check
 // covers modules/*/plan.h too. Nothing will fail the build if a module sneaks
 // in a non-determinism, so that part is discipline.
+#include "modules/enabled_guard_headers.h"
 #include "modules/enabled_planners.h"
 
 // The partitioned-index recipe. Emitted as separate steps because each
@@ -5047,10 +5048,31 @@ inline Plan plan_migration(const Spec& spec, const Observations& obs,
   // Beside that check deliberately: both say "this database is not one a
   // migration should be applied to right now", and both are cheaper to answer
   // than anything downstream.
-#define PGLASWELL_PLAN_GUARD(...) { __VA_ARGS__ }
+  // REFUSAL-ONLY BY CONSTRUCTION, not by asking nicely. The first version was a
+  // raw block with `plan` in lexical scope, and an audit proved what that
+  // permits: a guard pushing a warning compiled clean, so a guard could have
+  // fabricated a step. That is the forbidden shape -- a module altering what
+  // core emits -- available by accident.
+  //
+  // A module now provides a FUNCTION, and core calls it with (spec, obs) and a
+  // refuse callback. `plan` is not passed, so a guard cannot reach it: the only
+  // thing it can do is say no, and say why.
+  {
+    std::vector<std::string> refusals;
+    // maybe_unused because a PostgreSQL-only build has no guard to call it, and
+    // -Werror=unused-but-set-variable is not wrong to notice that.
+    [[maybe_unused]] const auto refuse = [&refusals](std::string why) {
+      refusals.push_back(std::move(why));
+    };
+#define PGLASWELL_PLAN_GUARD(guard_fn) guard_fn(spec, obs, refuse);
 #include "modules/enabled_guards.h"
 #undef PGLASWELL_PLAN_GUARD
-  if (!plan.ok) return plan;
+    if (!refusals.empty()) {
+      plan.ok = false;
+      for (auto& r : refusals) plan.conflicts.push_back(std::move(r));
+      return plan;
+    }
+  }
 
   int ordinal = 0;
   int group = 1;

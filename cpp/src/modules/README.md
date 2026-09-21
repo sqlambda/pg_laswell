@@ -101,6 +101,44 @@ a signed specification should see named rather than discover in a plan. And when
 a table is local today and distributed tomorrow, the kind becomes wrong, which
 is exactly when a refusal beats a silent change of strategy.
 
+### What is ENFORCED, and what is only asked (audited 2026-09-21)
+
+The rule above was written after the seams were built, so the hooks were audited
+against it by PROBE rather than by reading. Results, because "I believe it
+complies" is weaker than "I tried to break it":
+
+| hook | probe | outcome |
+|------|-------|---------|
+| `OBJECT_KEY` naming a kind core already cases | `error: duplicate case value` | **compiler enforces** |
+| `OBJECT_KEY` naming a core kind core leaves to `default:` | compiled clean | **HOLE** |
+| `CONFLICT_KEYS` naming such a kind | same shape | **HOLE** |
+| `PROJECT` writing to `projected.tables` | reachable | **HOLE** |
+| `PLAN_GUARD` pushing a warning | compiled clean | **was a hole, now closed** |
+| `TOPOLOGY` merge | counts only ever raised | compliant |
+| `OBSERVE` | writes only `extensions[<module>]` | compliant |
+
+**Closed:** the plan guard is a FUNCTION taking `(spec, obs, refuse)`, not a
+block. `plan` is not passed, so a guard cannot reach it -- verified: a guard
+touching it now fails with *'plan' was not declared in this scope*. It can say
+no and say why, and nothing else.
+
+**Closed:** the naming rule is a test (`Modules.EveryModuleKindCarriesItsModulesName`)
+derived from the enabled module list, so it holds for modules that do not exist
+yet.
+
+**Open, and honestly so:** `OBJECT_KEY`, `CONFLICT_KEYS` and `PROJECT` are keyed
+by enum id, and a module naming a CORE kind that core does not already case
+compiles. The compiler catches the common case and not the residue. Nothing in
+the Citus module does this -- `PROJECT` writes only `extensions["citus"]`, and
+both key hooks name only `citus_*` kinds -- but that is discipline, not
+mechanism.
+
+Closing it wants the same treatment the guard got: functions taking only what
+they may touch, rather than blocks inheriting a scope. `PROJECT` should receive
+`json& mine` (its own extension slot) instead of `projected`. That is the next
+piece of work on this seam and it is recorded here rather than in a comment
+nobody reads.
+
 ### Naming: every module kind carries its module's name
 
 `citus_distribute_table`, not `distribute_table`. Three reasons, and the first

@@ -1,8 +1,15 @@
 #pragma once
-// Plan-level guards for a Citus cluster: conditions of the TOPOLOGY, which no
+// Plan-level refusals for a Citus cluster: conditions of the TOPOLOGY, which no
 // per-kind planner can own because they are true of every kind at once.
+//
+// A FUNCTION, not a block, and it receives (spec, obs, refuse) -- deliberately
+// NOT the plan. A guard can say no and say why; it cannot reach what core
+// emits. An audit found the earlier block form compiled happily while pushing
+// a warning, which is the forbidden shape available by accident.
+template <typename Refuse>
+inline void citus_plan_refusals(const Spec& spec, const Observations& obs,
+                                const Refuse& refuse) {
 
-PGLASWELL_PLAN_GUARD(
   const auto& citus = obs.extension("citus");
   if (!citus.empty()) {
     const auto settings = citus.value("settings", json::object());
@@ -56,8 +63,7 @@ PGLASWELL_PLAN_GUARD(
       if (!tables.contains(qualified)) continue;  // local table: unaffected
       const auto method = tables[qualified].value("partmethod", "");
       if (method == "n") continue;  // reference table: single placement per node
-      plan.ok = false;
-      plan.conflicts.push_back(
+      refuse(
           "\"" + in.kind_name + "\" on " + qualified +
           " is a paced walk, and " + qualified +
           " is distributed. The walk takes each batch with FOR UPDATE so the "
@@ -70,8 +76,7 @@ PGLASWELL_PLAN_GUARD(
     }
 
     if (propagation == "off" || propagation == "false") {
-      plan.ok = false;
-      plan.conflicts.push_back(
+      refuse(
           "citus.enable_ddl_propagation is off, so DDL would run on the "
           "coordinator and not on the workers. The coordinator's catalog and "
           "the workers' would diverge, and every reading pg_laswell takes -- "
@@ -81,4 +86,5 @@ PGLASWELL_PLAN_GUARD(
           "SYSTEM, if it is off by default here).");
     }
   }
-)
+
+}
