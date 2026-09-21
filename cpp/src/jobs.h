@@ -394,6 +394,13 @@ class Observer {
   Observer(ConnConfig cfg, JobRegistry* registry, int tick_ms)
       : cfg_(std::move(cfg)), registry_(registry), tick_ms_(tick_ms) {}
 
+  // Which topology's reading applies, decided once. Empty means plain
+  // PostgreSQL, where the local reading is the whole truth.
+  std::string topology_;
+  bool topology_probed_ = false;
+  const char* topology_any_sql_ = nullptr;
+  const char* topology_observer_sql_ = nullptr;
+
   ~Observer() { stop(); }
 
   // Guarded by its own mutex, not by m_: m_ is what the loop waits on, and
@@ -452,9 +459,36 @@ class Observer {
       pqxx::work txn(*conn_);
       txn.exec("SET TRANSACTION READ ONLY");
 
+      // Does a module's topology-wide reading apply here? Asked ONCE per
+      // connection rather than per tick: the answer is a property of the
+      // cluster, and a tick runs every few hundred milliseconds.
+      //
+      // This is the substitutive seam, and it is safe precisely because waiter
+      // counts are already outside planDigest (kObservedDetailKeys): changing
+      // HOW a reading is taken cannot change what a plan says it will do.
+      if (!topology_probed_) {
+        topology_probed_ = true;
+#define PGLASWELL_TOPOLOGY(module_name, applies_sql, any_sql, observer_sql) \
+        do {                                                                \
+          const auto a = txn.exec(applies_sql);                             \
+          if (a.empty() || !a[0][0].as<bool>()) break;                      \
+          topology_ = module_name;                                          \
+          topology_any_sql_ = any_sql;                                      \
+          topology_observer_sql_ = observer_sql;                            \
+        } while (false);
+#include "modules/enabled_topologies.h"
+#undef PGLASWELL_TOPOLOGY
+      }
+
       const auto any = txn.exec(detail::kAnyWaitersSql);
-      const bool anyone_waiting =
-          !any.empty() && any[0][0].as<long long>() > 0;
+      bool anyone_waiting = !any.empty() && any[0][0].as<long long>() > 0;
+      // A waiter on another node is invisible to the local reading, so tier 1
+      // has to ask the cluster too or the whole observer short-circuits on a
+      // coordinator that is quiet while every worker queues.
+      if (!anyone_waiting && topology_any_sql_ != nullptr) {
+        const auto far = txn.exec(topology_any_sql_);
+        anyone_waiting = !far.empty() && far[0][0].as<long long>() > 0;
+      }
       if (!anyone_waiting) {
         for (const auto& j : live) clear_contention(*j);
         txn.commit();
@@ -469,6 +503,26 @@ class Observer {
       array += "}";
 
       const auto r = pqxx_exec(txn, detail::kObserverSql, pqxx::params{array});
+      // The cluster's counts, merged into the local ones by taking the larger.
+      // Merged rather than replaced, and this is the honest part: the
+      // distributed graph carries no waitstart, so a worker-side wait has no
+      // measurable age. Timings stay with the local reading and a
+      // cluster-only wait reports its age as ABSENT -- because 0 would read as
+      // "nobody has been waiting long" and would quietly disable the
+      // max_waiter_wait_ms breaker, which is the false reassurance this whole
+      // change exists to remove.
+      json cluster = json::object();
+      if (topology_observer_sql_ != nullptr) {
+        try {
+          const auto cr = pqxx_exec(txn, topology_observer_sql_, pqxx::params{array});
+          if (!cr.empty() && !cr[0][0].is_null()) {
+            cluster = json::parse(cr[0][0].as<std::string>());
+          }
+        } catch (const pqxx::sql_error&) {
+          // A cluster reading that cannot be taken must not silently become
+          // "no waiters". Left empty, and the local reading still applies.
+        }
+      }
       json by_pid = json::object();
       if (!r.empty() && !r[0][0].is_null()) {
         by_pid = json::parse(r[0][0].as<std::string>());
@@ -477,11 +531,30 @@ class Observer {
 
       for (const auto& j : live) {
         const auto key = std::to_string(j->pacing.worker_pid.load());
-        if (!by_pid.contains(key)) {
+        json reading = by_pid.contains(key) ? by_pid[key] : json::object();
+        // The larger of the two counts wins. A worker-side pile-up the
+        // coordinator cannot see is the case this exists for, and taking the
+        // max means a cluster reading can only ever raise the count -- never
+        // hide a local waiter the distributed view does not model.
+        if (cluster.contains(key)) {
+          const auto& c = cluster[key];
+          reading["direct"] =
+              std::max(reading.value("direct", 0LL), c.value("direct", 0LL));
+          reading["transitive"] = std::max(reading.value("transitive", 0LL),
+                                           c.value("transitive", 0LL));
+          if (c.contains("blockingWaiterNode") &&
+              !c["blockingWaiterNode"].is_null()) {
+            reading["blockingWaiterNode"] = c["blockingWaiterNode"];
+          }
+          reading["topology"] = topology_;
+        }
+        if (reading.empty() ||
+            (reading.value("direct", 0LL) == 0 &&
+             reading.value("transitive", 0LL) == 0)) {
           clear_contention(*j);
           continue;
         }
-        apply(*j, by_pid[key]);
+        apply(*j, reading);
       }
     } catch (const std::exception&) {
       // A failed observation is not a failed migration. The worker keeps its

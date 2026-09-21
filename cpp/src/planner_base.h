@@ -279,6 +279,33 @@ inline json compute_budget(const Observations& obs, const ExecutorConfig& cfg) {
          {"appStatementTimeoutMs", cfg.app_statement_timeout_ms},
          {"safetyPercent", cfg.safety_percent}};
 
+  // A distributed topology makes this arithmetic wrong in a direction that
+  // matters: the coordinator's headroom is not the cluster's. One coordinator
+  // session fans out to every worker, up to the adaptive pool size EACH, so the
+  // real ceiling is a worker's max_connections divided by that fan-out -- and
+  // the coordinator cannot see a worker's max_connections at all.
+  //
+  // Stated rather than computed, which is the whole rule this file is written
+  // under: a number that looks derived and is not is worse than an admission.
+  // The budget is outside planDigest, so saying this changes no receipt.
+  const auto& citus = obs.extension("citus");
+  if (!citus.empty()) {
+    const int workers = citus.value("worker_count", 0);
+    const auto pool = citus.value("settings", json::object())
+                          .value("max_adaptive_executor_pool_size", "");
+    b["topology"] = "citus";
+    b["workerCount"] = workers;
+    b["workerFanOutPerSession"] = pool.empty() ? json() : json(pool);
+    b["caveatTopology"] =
+        "This headroom is the COORDINATOR's. On Citus one session opens up to "
+        "citus.max_adaptive_executor_pool_size connections to each of " +
+        std::to_string(workers) +
+        " workers, so the binding limit is a worker's own max_connections "
+        "divided by that fan-out -- and a worker's max_connections is not "
+        "readable from here. Treat the number below as an upper bound on what "
+        "the coordinator will allow, not on what the cluster will survive.";
+  }
+
   if (cfg.app_pool_size > 0) {
     b["effectiveHeadroom"] = std::min(server_headroom, cfg.app_pool_size);
     b["headroomSource"] = "app_pool_size";
