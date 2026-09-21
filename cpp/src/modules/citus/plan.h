@@ -184,16 +184,56 @@ inline void plan_distribute_table(const Intent& in, const Observations& obs,
   // concurrently: auto is where the planner earns its keep. The same shape as
   // create_index deciding whether a build may be concurrent: measure, decide,
   // and SAY WHICH READING DECIDED.
+  // Does this Citus HAVE the concurrent call? Read from pg_proc rather than
+  // inferred from a version number: the presence of a function is a fact, and a
+  // minimum version is a recollection. Without this, a Citus too old to have it
+  // gets SQL it cannot parse -- which is the one failure mode the version gate
+  // on merge_rows exists to prevent for core.
+  const auto calls = citus.value("calls", json::object());
+  const bool has_concurrent =
+      calls.value("create_distributed_table_concurrently", false);
+
   const auto when = in.body.value("concurrently", "auto");
   const long long rows = t.value("reltuples", 0LL);
   bool concurrent = false;
   std::string decided_by;
+  if (when == "always" && !has_concurrent) {
+    // Asked for explicitly and not available: a refusal, not a silent
+    // downgrade. Someone who wrote "always" was making a decision about a
+    // table too big to lock, and quietly locking it anyway is the worst
+    // available answer.
+    step.action = Action::kConflict;
+    step.why = "concurrently: always was asked for, and this Citus has no "
+               "create_distributed_table_concurrently";
+    plan.conflicts.push_back(
+        step.why + " (citus " + citus.value("version", "?") +
+        "). The concurrent form was added in a later Citus; this one can only "
+        "distribute under an exclusive lock. Upgrade Citus, or write "
+        "concurrently: never to say the lock is acceptable for this table.");
+    return;
+  }
   if (when == "always") {
     concurrent = true;
     decided_by = "concurrently: always, overriding the row count";
   } else if (when == "never") {
     concurrent = false;
     decided_by = "concurrently: never, overriding the row count";
+  } else if (!has_concurrent) {
+    // auto, and the call is not there. The blocking form is the only path, and
+    // the plan says WHY rather than looking like it weighed the row count and
+    // chose this.
+    concurrent = false;
+    decided_by = "this Citus (" + citus.value("version", "?") +
+                 ") has no create_distributed_table_concurrently, so the "
+                 "blocking form is the only path -- the " +
+                 std::to_string(rows) + " estimated rows did not decide it";
+    if (rows > kCitusConcurrentRowThreshold) {
+      plan.warnings.push_back(
+          "At " + std::to_string(rows) +
+          " estimated rows this would have taken the concurrent path if Citus "
+          "had it. Writes are blocked for the whole copy instead. Consider "
+          "upgrading Citus before running this against a live system.");
+    }
   } else {
     concurrent = rows > kCitusConcurrentRowThreshold;
     decided_by = std::to_string(rows) + " estimated rows, " +

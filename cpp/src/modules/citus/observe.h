@@ -71,6 +71,25 @@ SELECT JSONB_BUILD_OBJECT(
        JOIN pg_proc pr ON pr.oid = o.objid
        JOIN pg_namespace n ON n.oid = pr.pronamespace
       WHERE o.classid = 'pg_proc'::regclass), '[]'::jsonb),
+  -- WHICH CALLS THIS CITUS ACTUALLY HAS, which is a fact rather than a version
+  -- comparison. CITUS.md suggests gating on citus_version() against a
+  -- remembered minimum -- believed 11.1 for the concurrent form -- but a
+  -- remembered minimum is exactly the kind of number this project refuses to
+  -- state: it cannot be derived, only recalled, and it is wrong the moment a
+  -- distribution backports or a fork diverges.
+  --
+  -- pg_proc answers directly. A plan that says "this Citus has no
+  -- create_distributed_table_concurrently" is reporting a reading; one that
+  -- says "Citus 11.0 is too old" is reporting a belief.
+  'calls', COALESCE((
+     SELECT JSONB_OBJECT_AGG(p.proname, true)
+       FROM pg_proc p
+      WHERE p.proname IN ('create_distributed_table_concurrently',
+                          'alter_distributed_table',
+                          'citus_rebalance_start',
+                          'citus_split_shard_by_split_points',
+                          'citus_add_local_table_to_metadata',
+                          'undistribute_table')), '{}'::jsonb),
   -- Settings the plan must STATE rather than inherit. A plan that inherits a
   -- session setting is not a function of the spec plus observations.
   'settings', JSONB_BUILD_OBJECT(

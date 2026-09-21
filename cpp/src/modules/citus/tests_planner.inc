@@ -8,11 +8,14 @@ namespace {
 
 // A Citus reading, shaped exactly as observe.h produces it.
 json citus_obs(json tables = json::object(), int workers = 2,
-               const char* propagation = "on") {
+               const char* propagation = "on", bool concurrent_call = true) {
+  json calls = json::object();
+  if (concurrent_call) calls["create_distributed_table_concurrently"] = true;
   return json{{"version", "13.2-1"},
               {"worker_count", workers},
               {"tables", std::move(tables)},
               {"distributed_functions", json::array()},
+              {"calls", calls},
               {"settings", json{{"enable_ddl_propagation", propagation},
                                 {"max_adaptive_executor_pool_size", "16"}}}};
 }
@@ -230,4 +233,48 @@ TEST(CitusPlanner, TheModuleSetIsRecordedAndIsNotHashed) {
   json d = p.to_json();
   EXPECT_TRUE(d.contains("modules"));
   EXPECT_EQ(p.digest(), p.digest());
+}
+
+TEST(CitusPlanner, WithoutTheConcurrentCallTheBlockingPathSaysWhyItWasForced) {
+  // Gated on the FUNCTION EXISTING, not on a version comparison: presence is a
+  // reading, a minimum version is a recollection. Without this an older Citus
+  // gets SQL it cannot parse, which is the failure the merge_rows/PG17 gate
+  // exists to prevent for core.
+  const auto obs = citus_observations(
+      citus_obs(json::object(), 2, "on", /*concurrent_call=*/false),
+      json{{"public.accounts", table_with_pk({"id"}, 5000000)}});
+  const auto p = plan_citus(json{{"kind", "distribute_table"},
+                                 {"schema", "public"}, {"table", "accounts"},
+                                 {"distribution_column", "id"}}, obs);
+  ASSERT_TRUE(p.ok) << (p.conflicts.empty() ? "" : p.conflicts[0]);
+  EXPECT_FALSE(p.steps[0].detail.value("concurrent", true));
+  EXPECT_EQ(p.steps[0].sql[0].find("_concurrently"), std::string::npos);
+  // And it must not read as though the row count chose the blocking path: five
+  // million rows would have chosen the other one.
+  EXPECT_NE(p.steps[0].why.find("has no create_distributed_table_concurrently"),
+            std::string::npos) << p.steps[0].why;
+  EXPECT_NE(p.steps[0].why.find("did not decide it"), std::string::npos);
+  bool warned = false;
+  for (const auto& w : p.warnings) {
+    if (w.find("would have taken the concurrent path") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned) << "a table big enough to want the concurrent path must "
+                         "be told it is not getting it";
+}
+
+TEST(CitusPlanner, AskingForConcurrentlyAlwaysWithoutTheCallIsRefused) {
+  // Not silently downgraded. Someone who wrote "always" decided the table is
+  // too big to lock; locking it anyway is the worst available answer.
+  const auto obs = citus_observations(
+      citus_obs(json::object(), 2, "on", /*concurrent_call=*/false),
+      json{{"public.accounts", table_with_pk({"id"}, 5000000)}});
+  const auto p = plan_citus(json{{"kind", "distribute_table"},
+                                 {"schema", "public"}, {"table", "accounts"},
+                                 {"distribution_column", "id"},
+                                 {"concurrently", "always"}}, obs);
+  EXPECT_FALSE(p.ok);
+  EXPECT_TRUE(conflicts_mention(p, "has no create_distributed_table_concurrently"))
+      << (p.conflicts.empty() ? "none" : p.conflicts[0]);
+  EXPECT_TRUE(conflicts_mention(p, "concurrently: never"))
+      << "the refusal must say what the author can write instead";
 }
