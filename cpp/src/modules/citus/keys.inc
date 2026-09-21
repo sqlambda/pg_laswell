@@ -4,10 +4,10 @@
 // defines expanded. The other is a no-op there.
 
 #ifdef PGLASWELL_OBJECT_KEY
-// distribute_function plans against a FUNCTION, not a relation. A kind missing
+// citus_distribute_function plans against a FUNCTION, not a relation. A kind missing
 // from object_key_for reads back as absent -- which is what cost a whole batch
 // of ALTER kinds before the pairing test existed.
-PGLASWELL_OBJECT_KEY(kDistributeFunction, "function:" + schema + "." + name)
+PGLASWELL_OBJECT_KEY(kCitusDistributeFunction, "function:" + schema + "." + name)
 #endif
 
 #ifdef PGLASWELL_CONFLICT_KEYS
@@ -20,13 +20,13 @@ PGLASWELL_OBJECT_KEY(kDistributeFunction, "function:" + schema + "." + name)
 // When a spec colocates with nothing the edge is absent rather than empty --
 // and the repository denies concurrency on incomplete evidence, which is the
 // answer that keeps this safe either way.
-PGLASWELL_CONFLICT_KEYS(kDistributeTable, {
+PGLASWELL_CONFLICT_KEYS(kCitusDistributeTable, {
   const auto with = in.body.value("colocate_with", "");
   if (!with.empty() && with != "none" && with != "default") {
     add("colocation:" + with);
   }
 })
-PGLASWELL_CONFLICT_KEYS(kDistributeFunction, {
+PGLASWELL_CONFLICT_KEYS(kCitusDistributeFunction, {
   const auto with = in.body.value("colocate_with", "");
   if (!with.empty() && with != "none" && with != "default") {
     add("colocation:" + with);

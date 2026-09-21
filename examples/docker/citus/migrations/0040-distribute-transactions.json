@@ -9,7 +9,7 @@
   ],
   "intents": [
     {
-      "kind": "distribute_table",
+      "kind": "citus_distribute_table",
       "schema": "public",
       "table": "account_transactions",
       "distribution_column": "account_id",
@@ -21,7 +21,7 @@
     {
       "key_id": "ed25519:c6a0b46e75c99c34",
       "algorithm": "ed25519",
-      "signature": "MsLJg5rgy9rFgEqNqChtFZ4mnr/YWM0S7+TfXt05DSo3/cvgqRfZ7LtFOK+jmqQURZoWlvfG65OmaM+CN9MqCA=="
+      "signature": "tW1uCBAeeJ3qWe/XcF/h3DMECR4IHtcQ5GS088ByBAEbfFlSSNtVOP0j85iE04yOYf595FGY/IjajEDO2jGXCA=="
     }
   ]
 }

@@ -9,7 +9,7 @@
 // Projected entries carry projected_by_step, the same marker core uses, so a
 // reader of the plan can tell a reading from a prediction.
 
-PGLASWELL_PROJECT(kDistributeTable, {
+PGLASWELL_PROJECT(kCitusDistributeTable, {
   projected.extensions["citus"]["tables"][qualified] = json{
       {"partmethod", "h"},
       {"distribution_column", in.body.value("distribution_column", "")},
@@ -17,7 +17,7 @@ PGLASWELL_PROJECT(kDistributeTable, {
       {"projected_by_step", step.ordinal}};
 })
 
-PGLASWELL_PROJECT(kCreateReferenceTable, {
+PGLASWELL_PROJECT(kCitusCreateReferenceTable, {
   projected.extensions["citus"]["tables"][qualified] = json{
       {"partmethod", "n"},
       {"distribution_column", ""},
@@ -25,7 +25,7 @@ PGLASWELL_PROJECT(kCreateReferenceTable, {
       {"projected_by_step", step.ordinal}};
 })
 
-// distribute_function never reaches this switch at runtime: it has an object
+// citus_distribute_function never reaches this switch at runtime: it has an object
 // key ("function:schema.name"), so the object branch above returns first. The
 // case exists because -Wswitch demands every enum value be named, and that is
 // the guarantee being paid for -- the compiler cannot know which branch runs,
@@ -33,4 +33,4 @@ PGLASWELL_PROJECT(kCreateReferenceTable, {
 //
 // Nothing to project: a specification distributing the same function twice is
 // a duplicate for the author to fix, not a state a later step reads.
-PGLASWELL_PROJECT(kDistributeFunction, )
+PGLASWELL_PROJECT(kCitusDistributeFunction, )

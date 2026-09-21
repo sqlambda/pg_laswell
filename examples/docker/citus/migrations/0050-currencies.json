@@ -27,7 +27,7 @@
       ]
     },
     {
-      "kind": "create_reference_table",
+      "kind": "citus_create_reference_table",
       "schema": "public",
       "table": "currencies",
       "comment": "Joined from every shard, so replicated everywhere."
@@ -37,7 +37,7 @@
     {
       "key_id": "ed25519:c6a0b46e75c99c34",
       "algorithm": "ed25519",
-      "signature": "jxzwO8BkD7W9Rn5FE5/wXLoZde/Y8H58pzPcrp2TE/00HMbwxJ+NUTPryQwf/Z3RzBulg/DTAAxWQ4za2o4eAQ=="
+      "signature": "ao/bdFsucmBM8dWHCZdIQYDyY39J2dx8oN+2W7RPST35p7rQX9zOX+FXjyeRuUWHS8A2J6cIUNYbq/9lZ+dTCw=="
     }
   ]
 }

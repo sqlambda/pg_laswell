@@ -80,7 +80,7 @@ TEST(CitusPlanner, ASmallTableTakesTheBlockingPathAndSaysWhichReadingDecided) {
   // sides of it or it is a guess wearing a constant's name.
   const auto obs = citus_observations(
       citus_obs(), json{{"public.accounts", table_with_pk({"id"}, 500)}});
-  const auto p = plan_citus(json{{"kind", "distribute_table"},
+  const auto p = plan_citus(json{{"kind", "citus_distribute_table"},
                                  {"schema", "public"}, {"table", "accounts"},
                                  {"distribution_column", "id"}}, obs);
   ASSERT_TRUE(p.ok) << p.conflicts.size();
@@ -96,7 +96,7 @@ TEST(CitusPlanner, ASmallTableTakesTheBlockingPathAndSaysWhichReadingDecided) {
 TEST(CitusPlanner, ALargeTableTakesTheConcurrentPathAndCannotBeInATransaction) {
   const auto obs = citus_observations(
       citus_obs(), json{{"public.accounts", table_with_pk({"id"}, 5000000)}});
-  const auto p = plan_citus(json{{"kind", "distribute_table"},
+  const auto p = plan_citus(json{{"kind", "citus_distribute_table"},
                                  {"schema", "public"}, {"table", "accounts"},
                                  {"distribution_column", "id"}}, obs);
   ASSERT_TRUE(p.ok);
@@ -114,7 +114,7 @@ TEST(CitusPlanner, ALargeTableTakesTheConcurrentPathAndCannotBeInATransaction) {
 TEST(CitusPlanner, ConcurrentlyNeverOverridesTheReadingAndSaysSo) {
   const auto obs = citus_observations(
       citus_obs(), json{{"public.accounts", table_with_pk({"id"}, 5000000)}});
-  const auto p = plan_citus(json{{"kind", "distribute_table"},
+  const auto p = plan_citus(json{{"kind", "citus_distribute_table"},
                                  {"schema", "public"}, {"table", "accounts"},
                                  {"distribution_column", "id"},
                                  {"concurrently", "never"}}, obs);
@@ -133,7 +133,7 @@ TEST(CitusPlanner, AKeyWithoutTheDistributionColumnIsRefusedBeforeAnythingRuns) 
   auto t = table_with_pk({"tenant_id"});
   t["columns"]["id"] = json{{"type", "integer"}};
   const auto obs = citus_observations(citus_obs(), json{{"public.accounts", t}});
-  const auto p = plan_citus(json{{"kind", "distribute_table"},
+  const auto p = plan_citus(json{{"kind", "citus_distribute_table"},
                                  {"schema", "public"}, {"table", "accounts"},
                                  {"distribution_column", "id"}}, obs);
   EXPECT_FALSE(p.ok);
@@ -152,7 +152,7 @@ TEST(CitusPlanner, ACompoundKeyThatDoesIncludeItIsAccepted) {
       citus_obs(),
       json{{"public.account_transactions",
             table_with_pk({"account_id", "reference"})}});
-  const auto p = plan_citus(json{{"kind", "distribute_table"},
+  const auto p = plan_citus(json{{"kind", "citus_distribute_table"},
                                  {"schema", "public"},
                                  {"table", "account_transactions"},
                                  {"distribution_column", "account_id"}}, obs);
@@ -162,7 +162,7 @@ TEST(CitusPlanner, ACompoundKeyThatDoesIncludeItIsAccepted) {
 TEST(CitusPlanner, ColocatingWithSomethingNotDistributedIsRefused) {
   const auto obs = citus_observations(
       citus_obs(), json{{"public.orders", table_with_pk({"id"})}});
-  const auto p = plan_citus(json{{"kind", "distribute_table"},
+  const auto p = plan_citus(json{{"kind", "citus_distribute_table"},
                                  {"schema", "public"}, {"table", "orders"},
                                  {"distribution_column", "id"},
                                  {"colocate_with", "public.accounts"}}, obs);
@@ -177,7 +177,7 @@ TEST(CitusPlanner, RedistributingOnADifferentColumnNamesTheRightKind) {
                       json{{"partmethod", "h"},
                            {"distribution_column", "tenant_id"}}}}),
       json{{"public.accounts", table_with_pk({"id"})}});
-  const auto p = plan_citus(json{{"kind", "distribute_table"},
+  const auto p = plan_citus(json{{"kind", "citus_distribute_table"},
                                  {"schema", "public"}, {"table", "accounts"},
                                  {"distribution_column", "id"}}, obs);
   EXPECT_FALSE(p.ok);
@@ -191,7 +191,7 @@ TEST(CitusPlanner, WithoutTheExtensionItRefusesAndAsksForThePrerequisite) {
   // Observations::extension() is shaped to express.
   const auto obs = citus_observations(
       json(nullptr), json{{"public.accounts", table_with_pk({"id"})}});
-  const auto p = plan_citus(json{{"kind", "distribute_table"},
+  const auto p = plan_citus(json{{"kind", "citus_distribute_table"},
                                  {"schema", "public"}, {"table", "accounts"},
                                  {"distribution_column", "id"}}, obs);
   EXPECT_FALSE(p.ok);
@@ -254,7 +254,7 @@ TEST(CitusPlanner, WithoutTheConcurrentCallTheBlockingPathSaysWhyItWasForced) {
   const auto obs = citus_observations(
       citus_obs(json::object(), 2, "on", /*concurrent_call=*/false),
       json{{"public.accounts", table_with_pk({"id"}, 5000000)}});
-  const auto p = plan_citus(json{{"kind", "distribute_table"},
+  const auto p = plan_citus(json{{"kind", "citus_distribute_table"},
                                  {"schema", "public"}, {"table", "accounts"},
                                  {"distribution_column", "id"}}, obs);
   ASSERT_TRUE(p.ok) << (p.conflicts.empty() ? "" : p.conflicts[0]);
@@ -279,7 +279,7 @@ TEST(CitusPlanner, AskingForConcurrentlyAlwaysWithoutTheCallIsRefused) {
   const auto obs = citus_observations(
       citus_obs(json::object(), 2, "on", /*concurrent_call=*/false),
       json{{"public.accounts", table_with_pk({"id"}, 5000000)}});
-  const auto p = plan_citus(json{{"kind", "distribute_table"},
+  const auto p = plan_citus(json{{"kind", "citus_distribute_table"},
                                  {"schema", "public"}, {"table", "accounts"},
                                  {"distribution_column", "id"},
                                  {"concurrently", "always"}}, obs);

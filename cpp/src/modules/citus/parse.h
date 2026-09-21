@@ -29,7 +29,7 @@ inline void citus_check_colocate_with(const Intent& in, const std::string& at) {
   }
 }
 
-inline void parse_distribute_table(Intent& in) {
+inline void parse_citus_distribute_table(Intent& in) {
   const auto at = "intents[" + std::to_string(in.ordinal) + "]";
   detail::reject_unknown_keys(
       in.body,
@@ -80,7 +80,7 @@ inline void parse_distribute_table(Intent& in) {
   }
 }
 
-inline void parse_create_reference_table(Intent& in) {
+inline void parse_citus_create_reference_table(Intent& in) {
   const auto at = "intents[" + std::to_string(in.ordinal) + "]";
   detail::reject_unknown_keys(in.body, {"kind", "schema", "table", "comment"}, at);
   detail::require_identifier(detail::require_string(in.body, "schema", at),
@@ -89,7 +89,7 @@ inline void parse_create_reference_table(Intent& in) {
                              "table", in.ordinal);
 }
 
-inline void parse_distribute_function(Intent& in) {
+inline void parse_citus_distribute_function(Intent& in) {
   const auto at = "intents[" + std::to_string(in.ordinal) + "]";
   detail::reject_unknown_keys(
       in.body,

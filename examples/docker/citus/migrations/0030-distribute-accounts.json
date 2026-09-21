@@ -8,7 +8,7 @@
   ],
   "intents": [
     {
-      "kind": "distribute_table",
+      "kind": "citus_distribute_table",
       "schema": "public",
       "table": "accounts",
       "distribution_column": "id",
@@ -19,7 +19,7 @@
     {
       "key_id": "ed25519:c6a0b46e75c99c34",
       "algorithm": "ed25519",
-      "signature": "EDQG5wJ2IGQfIqKfiHmpjCkwj3j+swKfxv3g2BVrCxbN5UOlvp/IPb2XJzi0Ufyih8yLPxH43qufIXM8jLk5BQ=="
+      "signature": "/nJTM6kS2rzQ9xLwZYegyZ79vIV5K+8tlpVjgyeTKqu6ynfduxxy1jZJ3MNGH1ttlAs7aAngxW/wyLISO2bPAw=="
     }
   ]
 }

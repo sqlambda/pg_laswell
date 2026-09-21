@@ -92,7 +92,7 @@ inline bool citus_unique_keys_include(const json& t, const std::string& column,
   return true;
 }
 
-inline void plan_distribute_table(const Intent& in, const Observations& obs,
+inline void plan_citus_distribute_table(const Intent& in, const Observations& obs,
                                   const ExecutorConfig& cfg, Plan& plan,
                                   std::vector<Step>& out) {
   (void)cfg;
@@ -128,7 +128,7 @@ inline void plan_distribute_table(const Intent& in, const Observations& obs,
       plan.conflicts.push_back(
           step.why +
           ". Changing the distribution column of a distributed table is "
-          "alter_distributed_table, not distribute_table -- it moves every row, "
+          "alter_distributed_table, not citus_distribute_table -- it moves every row, "
           "where this kind only creates the distribution.");
     }
     return;
@@ -296,7 +296,7 @@ inline void plan_distribute_table(const Intent& in, const Observations& obs,
   }
 }
 
-inline void plan_create_reference_table(const Intent& in, const Observations& obs,
+inline void plan_citus_create_reference_table(const Intent& in, const Observations& obs,
                                         const ExecutorConfig& cfg, Plan& plan,
                                         std::vector<Step>& out) {
   (void)cfg;
@@ -332,6 +332,11 @@ inline void plan_create_reference_table(const Intent& in, const Observations& ob
               " (the whole table is copied to every node)";
   step.why = "a reference table is replicated in full to every node, so reads "
              "join against it locally and writes are two-phase";
+  // create_reference_table, NOT citus_create_reference_table. The KIND carries
+  // the module's prefix; the Citus FUNCTION does not, and a rename that swept
+  // through emitted SQL as well as kind names produced
+  // "function citus_create_reference_table(unknown) does not exist" -- caught
+  // by the dry run, which is what it is for.
   step.sql.push_back("SELECT create_reference_table(" +
                      detail::quote_literal(qualified) + ");");
   plan.warnings.push_back(
@@ -340,7 +345,7 @@ inline void plan_create_reference_table(const Intent& in, const Observations& ob
       "small, rarely-written lookups; a busy one is a cluster-wide bottleneck.");
 }
 
-inline void plan_distribute_function(const Intent& in, const Observations& obs,
+inline void plan_citus_distribute_function(const Intent& in, const Observations& obs,
                                      const ExecutorConfig& cfg, Plan& plan,
                                      std::vector<Step>& out) {
   (void)cfg;
