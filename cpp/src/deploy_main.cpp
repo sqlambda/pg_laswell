@@ -64,7 +64,7 @@ int main(int argc, char* argv[]) {
     const std::string arg = argv[i];
     if (arg == "-h" || arg == "--help") { usage(argv[0]); return 0; }
     if (arg == "-V" || arg == "--version") {
-      std::cout << "pg_laswell " PGLASWELL_VERSION "\n";
+      std::cout << "pg_laswell " PGLASWELL_VERSION "\n" << pglaswell::module_banner();
       return 0;
     }
     if (arg == "--status")  { opts.status_only = true; continue; }

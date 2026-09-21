@@ -33,6 +33,22 @@
 
 namespace pglaswell {
 
+// The module set a binary was BUILT with, as a line for --version, or empty.
+//
+// A vendor module is a compile-time choice, which means two binaries with the
+// same version string can accept different kinds. Without this, the only way to
+// tell them apart is to feed one a spec and see whether it refuses -- and the
+// likeliest place to do that is a cluster. Printed only when non-empty, so a
+// stock PostgreSQL-only build says exactly what it has always said.
+inline std::string module_banner() {
+#ifdef PGLASWELL_MODULE_SET
+  const std::string set = PGLASWELL_MODULE_SET;
+  if (!set.empty()) return "modules: " + set + "\n";
+#endif
+  return {};
+}
+
+
 // Everything a tool needs to answer. Held by the server and handed to each
 // invocation, so a tool body reaches for its dependencies rather than
 // constructing them.

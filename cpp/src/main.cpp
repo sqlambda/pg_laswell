@@ -85,7 +85,7 @@ int main(int argc, char* argv[]) {
       return 0;
     }
     if (arg == "-V" || arg == "--version") {
-      std::cout << PGLASWELL_VERSION << "\n";
+      std::cout << PGLASWELL_VERSION << "\n" << pglaswell::module_banner();
       return 0;
     }
     if (arg == "--call") {
