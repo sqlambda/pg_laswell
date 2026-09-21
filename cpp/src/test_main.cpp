@@ -911,7 +911,7 @@ TEST(Spec, KnownKindsAreExactlyTheImplementedKinds) {
   // "s.f()", and the )" in that closes a default-delimited raw string early --
   // producing a "missing terminating \" character" error pointing at a line
   // several below the real cause.
-  const json bodies = json::parse(R"JSON({
+  json bodies = json::parse(R"JSON({
     "add_column":   {"kind":"add_column","schema":"s","table":"t","column":"c",
                      "type":"text","nullable":true,"comment":"c"},
     "backfill":     {"kind":"backfill","schema":"s","table":"t","key":"id",
@@ -1065,6 +1065,13 @@ TEST(Spec, KnownKindsAreExactlyTheImplementedKinds) {
     "copy_rows": {"kind":"copy_rows","schema":"s","table":"t",
                   "columns":["id","a"],"values":[[1,"x"]]}
   })JSON");
+  // A module's kinds have to prove the same thing: listed AND implemented.
+  // Merged in rather than written above, because the names do not exist at all
+  // in a PostgreSQL-only build.
+#define PGLASWELL_KIND_BODY(name, body_json) \
+  bodies[name] = json::parse(body_json);
+#include "modules/enabled_kind_bodies.h"
+#undef PGLASWELL_KIND_BODY
   for (const auto& [name, kind] : pglaswell::intent_kinds()) {
     (void)kind;
     ASSERT_TRUE(bodies.contains(name))
@@ -12028,3 +12035,12 @@ TEST(Conformance, CoversEveryIntentKind) {
   }
 }
 
+
+// Vendor module planner tests, generated from the enabled module list. Empty
+// for a PostgreSQL-only build.
+//
+// They live here rather than in the module because they need gtest and the
+// helpers above, and here rather than in a separate binary because a module's
+// planner is not a separate program -- it is compiled into this one, and a
+// second binary would be a second thing to remember to run.
+#include "modules/enabled_planner_tests.h"

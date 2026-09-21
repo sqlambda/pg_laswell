@@ -123,6 +123,7 @@ struct Plan {
                 {"warnings", warnings},
                 {"conflicts", conflicts},
                 {"prerequisites", prerequisites},
+                {"modules", modules()},
                 {"budget", budget}};
   }
 
@@ -161,9 +162,40 @@ struct Plan {
   static constexpr const char* kObservedDetailKeys[] = {"estimated_from",
                                                         "lock_waiters"};
 
+  // Which vendor modules the binary that produced this plan was built with.
+  // "" is a PostgreSQL-only build.
+  //
+  // RECORDED, so `laswell.job.plan` says which capabilities applied a
+  // migration -- otherwise "what ran" is under-specified in the one place this
+  // project treats as authoritative.
+  //
+  // NOT HASHED, and the reason is specific rather than convenient: for a
+  // specification this binary can plan at all, the module set does not change
+  // a single statement. One it cannot plan is refused outright, because an
+  // unknown kind is a fatal refusal of the whole file -- so the module set can
+  // never silently alter a plan, only decide whether there is one. Hashing it
+  // would instead change every existing digest and make two builds disagree
+  // about specs they both handle identically.
+  static json modules() {
+#ifdef PGLASWELL_MODULE_SET
+    const std::string set = PGLASWELL_MODULE_SET;
+#else
+    const std::string set;
+#endif
+    json out = json::array();
+    std::string cur;
+    for (const char c : set) {
+      if (c == ',') { if (!cur.empty()) out.push_back(cur); cur.clear(); }
+      else cur += c;
+    }
+    if (!cur.empty()) out.push_back(cur);
+    return out;
+  }
+
   std::string digest() const {
     json d = to_json();
     d.erase("budget");
+    d.erase("modules");
     if (d.contains("steps")) {
       for (auto& step : d["steps"]) {
         if (!step.contains("detail") || !step["detail"].is_object()) continue;

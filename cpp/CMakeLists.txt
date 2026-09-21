@@ -54,6 +54,7 @@ set(PGLASWELL_LIBS
 #   cmake -S cpp -B cpp/build -DPGLASWELL_MODULES=citus
 # --------------------------------------------------------------------------
 set(PGLASWELL_MODULES "" CACHE STRING "Vendor modules to compile in, e.g. citus")
+set(_mod_names "")
 
 set(_gen_dir ${CMAKE_CURRENT_BINARY_DIR}/generated/modules)
 file(MAKE_DIRECTORY ${_gen_dir})
@@ -66,6 +67,9 @@ set(_obs_head  "// Generated from PGLASWELL_MODULES. Do not edit.\n")
 set(_proj_inc  "// Generated from PGLASWELL_MODULES. Do not edit.\n")
 set(_test_inc  "// Generated from PGLASWELL_MODULES. Do not edit.\n")
 set(_topo_inc  "// Generated from PGLASWELL_MODULES. Do not edit.\n")
+set(_guard_inc "// Generated from PGLASWELL_MODULES. Do not edit.\n")
+set(_ptest_inc "// Generated from PGLASWELL_MODULES. Do not edit.\n")
+set(_body_inc  "// Generated from PGLASWELL_MODULES. Do not edit.\n")
 foreach(_mod IN LISTS PGLASWELL_MODULES)
     if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/modules/${_mod}/kinds.inc)
         message(FATAL_ERROR
@@ -90,13 +94,22 @@ foreach(_mod IN LISTS PGLASWELL_MODULES)
     endif()
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/modules/${_mod}/tests.inc)
         string(APPEND _test_inc "#include \"modules/${_mod}/tests.inc\"\n")
+        string(APPEND _body_inc "#include \"modules/${_mod}/tests.inc\"\n")
     endif()
     # observer.h is optional: a module whose vendor does not change where
     # contention is visible does not need one.
+    # guard.h is optional: a module with no topology-wide precondition needs none.
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/modules/${_mod}/tests_planner.inc)
+        string(APPEND _ptest_inc "#include \"modules/${_mod}/tests_planner.inc\"\n")
+    endif()
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/modules/${_mod}/guard.h)
+        string(APPEND _guard_inc "#include \"modules/${_mod}/guard.h\"\n")
+    endif()
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/modules/${_mod}/observer.h)
         string(APPEND _topo_inc
             "PGLASWELL_TOPOLOGY(\"${_mod}\", k${_mod}ObserverAppliesSql, k${_mod}AnyWaitersSql, k${_mod}ObserverSql)\n")
     endif()
+    list(APPEND _mod_names "${_mod}")
     message(STATUS "pg_laswell module: ${_mod}")
 endforeach()
 # Written through configure_file's copy_if_different semantics, so an unchanged
@@ -107,6 +120,12 @@ file(WRITE ${_gen_dir}/enabled_observer_headers.h.tmp "${_obs_head}")
 configure_file(${_gen_dir}/enabled_observer_headers.h.tmp ${_gen_dir}/enabled_observer_headers.h COPYONLY)
 file(WRITE ${_gen_dir}/enabled_observers.h.tmp "${_obs_inc}")
 configure_file(${_gen_dir}/enabled_observers.h.tmp ${_gen_dir}/enabled_observers.h COPYONLY)
+file(WRITE ${_gen_dir}/enabled_kind_bodies.h.tmp "${_body_inc}")
+configure_file(${_gen_dir}/enabled_kind_bodies.h.tmp ${_gen_dir}/enabled_kind_bodies.h COPYONLY)
+file(WRITE ${_gen_dir}/enabled_planner_tests.h.tmp "${_ptest_inc}")
+configure_file(${_gen_dir}/enabled_planner_tests.h.tmp ${_gen_dir}/enabled_planner_tests.h COPYONLY)
+file(WRITE ${_gen_dir}/enabled_guards.h.tmp "${_guard_inc}")
+configure_file(${_gen_dir}/enabled_guards.h.tmp ${_gen_dir}/enabled_guards.h COPYONLY)
 file(WRITE ${_gen_dir}/enabled_topologies.h.tmp "${_topo_inc}")
 configure_file(${_gen_dir}/enabled_topologies.h.tmp ${_gen_dir}/enabled_topologies.h COPYONLY)
 file(WRITE ${_gen_dir}/enabled_tests.inc.tmp "${_test_inc}")
@@ -122,6 +141,10 @@ configure_file(${_gen_dir}/enabled_modules.h.tmp ${_gen_dir}/enabled_modules.h C
 
 add_executable(pg_laswell src/deploy_main.cpp)
 add_executable(pg_laswell_mcp src/main.cpp)
+string(JOIN "," _mod_list ${_mod_names})
+# The applying binary's module set, so a plan can record which capabilities
+# produced it. "" means PostgreSQL-only.
+add_compile_definitions(PGLASWELL_MODULE_SET="${_mod_list}")
 target_compile_definitions(pg_laswell_mcp PRIVATE PGLASWELL_VERSION="${PROJECT_VERSION}")
 target_compile_definitions(pg_laswell PRIVATE PGLASWELL_VERSION="${PROJECT_VERSION}")
 target_link_libraries(pg_laswell_mcp PRIVATE ${PGLASWELL_LIBS})

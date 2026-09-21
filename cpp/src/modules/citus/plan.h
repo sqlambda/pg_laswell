@@ -115,7 +115,11 @@ inline void plan_distribute_table(const Intent& in, const Observations& obs,
     step.action = Action::kSatisfied;
     step.why = qualified + " is already distributed on " +
                (current.empty() ? std::string("an unread column") : current);
-    if (!current.empty() && current.find(column) == std::string::npos) {
+    // EQUALITY, not a substring search. The first version used find(), and a
+    // planner test caught what that means: "tenant_id" CONTAINS "id", so
+    // redistributing a table from tenant_id onto id read as "already
+    // distributed on that column" and was silently accepted as satisfied.
+    if (!current.empty() && current != column) {
       // Distributing again is not how the column changes, and Citus would
       // refuse it. Naming the right kind beats a message about the wrong one.
       step.action = Action::kConflict;

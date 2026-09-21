@@ -5039,6 +5039,19 @@ inline Plan plan_migration(const Spec& spec, const Observations& obs,
     return plan;
   }
 
+  // A module's plan-level guard: a condition of the TOPOLOGY rather than of any
+  // one intent, and therefore one no per-kind planner can own. It runs before
+  // any step is planned and may refuse the whole plan, the same shape as the
+  // standby check above.
+  //
+  // Beside that check deliberately: both say "this database is not one a
+  // migration should be applied to right now", and both are cheaper to answer
+  // than anything downstream.
+#define PGLASWELL_PLAN_GUARD(...) { __VA_ARGS__ }
+#include "modules/enabled_guards.h"
+#undef PGLASWELL_PLAN_GUARD
+  if (!plan.ok) return plan;
+
   int ordinal = 0;
   int group = 1;
   TxnClass previous = TxnClass::kRequired;

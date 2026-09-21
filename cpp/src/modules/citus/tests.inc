@@ -26,3 +26,18 @@ PGLASWELL_DEFERRED_CASE("create_reference_table",
 PGLASWELL_DEFERRED_CASE("distribute_function",
     "needs a Citus cluster and a distributed table to colocate against")
 #endif
+
+#ifdef PGLASWELL_KIND_BODY
+// One representative body per kind, for the governing invariant's own test:
+// a kind that is KNOWN must be IMPLEMENTED, and a body that parses and plans is
+// what proves the second half. A kind listed here with no planner would fail
+// the same test.
+PGLASWELL_KIND_BODY("distribute_table",
+  R"({"kind":"distribute_table","schema":"s","table":"t",
+      "distribution_column":"id"})")
+PGLASWELL_KIND_BODY("create_reference_table",
+  R"({"kind":"create_reference_table","schema":"s","table":"t"})")
+PGLASWELL_KIND_BODY("distribute_function",
+  R"({"kind":"distribute_function","schema":"s","name":"f",
+      "arguments":"integer"})")
+#endif
