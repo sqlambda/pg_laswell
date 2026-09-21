@@ -189,6 +189,23 @@ install(TARGETS pg_laswell pg_laswell_mcp RUNTIME DESTINATION ${CMAKE_INSTALL_BI
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/man/pg_laswell.1
               ${CMAKE_CURRENT_SOURCE_DIR}/man/pg_laswell_mcp.1
         DESTINATION ${CMAKE_INSTALL_MANDIR}/man1)
+# A module's page ships only with a binary that HAS the module, for the same
+# reason --version names the set: a page documenting citus_distribute_table
+# installed beside a binary that refuses it sends a reader to write a
+# specification that cannot run. Section 7, because it describes a vocabulary
+# rather than a command.
+foreach(_mod IN LISTS PGLASWELL_MODULES)
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/man/pg_laswell_${_mod}.7)
+        install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/man/pg_laswell_${_mod}.7
+                DESTINATION ${CMAKE_INSTALL_MANDIR}/man7)
+    else()
+        message(FATAL_ERROR
+            "module '${_mod}' is enabled but man/pg_laswell_${_mod}.7 does not "
+            "exist. A module's kinds are absent from a stock build, so they "
+            "cannot be documented in the core page -- they need a page of "
+            "their own. tools/check-manual.py enforces the same rule.")
+    endif()
+endforeach()
 # The bootstrap script ships alongside the binary because the binary must never
 # run it: if pg_laswell created laswell.trusted_key its role would own it, and
 # an owner can INSERT, so the migrating role could grant itself trust.
@@ -221,13 +238,30 @@ if(BUILD_TESTING)
     # any machine without PostgreSQL's own man pages installed.
     find_program(MANDOC_EXECUTABLE mandoc)
     if(MANDOC_EXECUTABLE)
+        set(_man_pages
+            ${CMAKE_CURRENT_SOURCE_DIR}/man/pg_laswell.1
+            ${CMAKE_CURRENT_SOURCE_DIR}/man/pg_laswell_mcp.1)
+        # Every module page, enabled or not: the pages are checked in, so they
+        # are lintable whatever this build carries.
+        file(GLOB _mod_man ${CMAKE_CURRENT_SOURCE_DIR}/man/pg_laswell_*.7)
+        list(APPEND _man_pages ${_mod_man})
         add_test(NAME manpage_lint
-                 COMMAND ${MANDOC_EXECUTABLE} -Tlint -Wwarning
-                         ${CMAKE_CURRENT_SOURCE_DIR}/man/pg_laswell.1
-                         ${CMAKE_CURRENT_SOURCE_DIR}/man/pg_laswell_mcp.1)
+                 COMMAND ${MANDOC_EXECUTABLE} -Tlint -Wwarning ${_man_pages})
     else()
         message(STATUS "mandoc not found: skipping the manpage_lint test")
     endif()
+    # The man pages are hand-written, so they can drift from the kinds the
+    # source implements -- and had: the core list named 46 of 83, and no page
+    # mentioned a module. Linting proves the mdoc parses, not that it is true.
+    find_program(PYTHON3_EXECUTABLE NAMES python3 python)
+    if(PYTHON3_EXECUTABLE)
+        add_test(NAME manpage_kinds
+                 COMMAND ${PYTHON3_EXECUTABLE}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/../tools/check-manual.py)
+    else()
+        message(STATUS "python3 not found: skipping the manpage_kinds test")
+    endif()
+
     # The --call contract, at the process level. The exit code is the whole
     # point of that mode and gtest cannot see it: the suite observes return
     # values, not process status. Runs without a database too, covering the

@@ -503,53 +503,113 @@ so a direct call cannot route around the listing.
 The set of kinds a binary knows is exactly the set it implements: there is no
 recognised-but-unsupported kind, and an unknown one refuses the whole
 specification rather than skipping a step.
-This build implements
+Core implements the kinds below.
+A vendor's kinds come from a build-time module and are documented separately:
+see
+.Sx MODULES .
+.\" BEGIN CORE KIND LIST -- checked by tools/check-manual.py against
+.\" intent_kinds() in cpp/src/spec.h. Do not edit by hand without re-running it.
+.Bl -tag -width "Schemas and extensions" -compact
+.It Columns
 .Cm add_column ,
-.Cm backfill ,
+.Cm drop_column ,
+.Cm alter_column_type ,
+.Cm alter_column_default ,
+.Cm set_not_null ,
+.Cm drop_not_null ,
+.Cm drop_expression ,
+.Cm set_identity ,
+.Cm set_column_options ,
+.Cm rename_column .
+.It Indexes
 .Cm create_index ,
 .Cm drop_index ,
-.Cm set_not_null ,
+.Cm cluster_on .
+.It Constraints
+.Cm add_primary_key ,
+.Cm add_unique_constraint ,
 .Cm add_foreign_key ,
 .Cm add_check_constraint ,
 .Cm drop_constraint ,
-.Cm alter_column_type ,
-.Cm drop_column ,
-.Cm replace_view ,
-.Cm add_unique_constraint ,
-.Cm add_primary_key ,
-.Cm attach_partition ,
-.Cm detach_partition ,
-.Cm rename_table ,
-.Cm rename_column ,
-.Cm rename_constraint ,
+.Cm rename_constraint .
+.It Tables
 .Cm create_table ,
+.Cm create_table_as ,
 .Cm drop_table ,
+.Cm rename_table ,
+.Cm set_table_options ,
+.Cm set_tablespace ,
+.Cm set_access_method ,
+.Cm set_logged ,
+.Cm set_replica_identity ,
+.Cm attach_partition ,
+.Cm detach_partition .
+.It Data
+.Cm insert_rows ,
+.Cm update_rows ,
 .Cm delete_rows ,
-.Cm set_row_security ,
-.Cm create_policy ,
-.Cm drop_policy ,
-.Cm set_trigger_state ,
-.Cm grant ,
-.Cm revoke ,
+.Cm merge_rows ,
+.Cm copy_rows ,
+.Cm backfill .
+.It Views
+.Cm replace_view ,
+.Cm drop_view ,
+.Cm alter_view ,
+.Cm create_materialized_view .
+.It Schemas and extensions
 .Cm create_schema ,
+.Cm alter_schema ,
 .Cm drop_schema ,
 .Cm create_extension ,
-.Cm drop_extension ,
+.Cm alter_extension ,
+.Cm drop_extension .
+.It Types
 .Cm create_type ,
 .Cm drop_type ,
 .Cm add_enum_value ,
+.Cm alter_domain .
+.It Routines
 .Cm create_function ,
+.Cm alter_function ,
 .Cm drop_function ,
 .Cm create_trigger ,
 .Cm drop_trigger ,
+.Cm set_trigger_state ,
+.Cm create_rule ,
+.Cm drop_rule .
+.It Sequences
 .Cm create_sequence ,
-.Cm drop_sequence ,
-.Cm drop_view ,
-.Cm insert_rows ,
-.Cm update_rows ,
-.Cm merge_rows
-and
-.Cm copy_rows .
+.Cm alter_sequence ,
+.Cm drop_sequence .
+.It Statistics
+.Cm create_statistics ,
+.Cm drop_statistics .
+.It Replication
+.Cm create_publication ,
+.Cm alter_publication ,
+.Cm drop_publication ,
+.Cm create_subscription ,
+.Cm alter_subscription ,
+.Cm drop_subscription .
+.It Privileges
+.Cm grant ,
+.Cm revoke ,
+.Cm alter_default_privileges ,
+.Cm set_row_security ,
+.Cm create_policy ,
+.Cm alter_policy ,
+.Cm drop_policy ,
+.Cm security_label ,
+.Cm set_owner .
+.It Any object
+.Cm create_object ,
+.Cm alter_object ,
+.Cm drop_object ,
+.Cm set_comment .
+.It Foreign data
+.Cm import_foreign_schema .
+.El
+.\" END CORE KIND LIST
 .Pp
 An intent that creates an object must carry a
 .Va comment ,
@@ -1469,6 +1529,68 @@ to a wider precision at the same scale, and a widened timestamp precision --
 and assumes a rewrite otherwise, because reporting one that does not happen
 costs a cautious plan while missing one is an unplanned outage under
 .Va AccessExclusiveLock .
+.Sh MODULES
+The core binary speaks PostgreSQL and nothing else.
+Support for a vendor's extensions -- distribution, sharding, anything whose
+behaviour is not PostgreSQL's -- is a
+.Em build-time module ,
+so that a deployment which does not run that vendor carries none of its code and
+none of its assumptions.
+.Pp
+Modules are chosen when the binary is configured:
+.Bd -literal -offset indent
+cmake -S cpp -B build -DPGLASWELL_MODULES=citus
+.Ed
+.Pp
+.Fl -version
+names the set a binary was built with, and says nothing when it was built with
+none:
+.Bd -literal -offset indent
+$ pg_laswell_mcp --version
+0.1.2
+modules: citus
+.Ed
+.Pp
+This matters because two binaries with the same version string accept different
+kinds.
+A binary built without a module does not recognise that module's kinds, and an
+unrecognised kind refuses the whole specification -- the same rule as any other
+unknown kind, not a special case for modules.
+So a specification naming
+.Cm citus_distribute_table
+is refused outright by a stock build, rather than skipped or approximated.
+.Pp
+The module set is
+.Em not
+hashed into
+.Va planDigest .
+For a specification a binary can plan at all, the module set does not change a
+single statement; one it cannot plan is refused outright.
+Hashing it would change every existing digest and make two builds disagree about
+specifications they handle identically.
+.Pp
+A module may add kinds, may add readings of its own, and may refuse -- including
+refusing a
+.Em core
+kind whose plan would be wrong on that vendor's topology.
+What it may not do is change the SQL core emits for a core kind.
+That boundary is enforced by the build rather than asked for in review; see
+.Pa cpp/src/modules/README.md
+in the source.
+.Pp
+Every kind a module adds carries the module's name as its prefix, so
+.Cm citus_distribute_table
+rather than
+.Cm distribute_table :
+a specification says which vendor it needs, and two vendors cannot collide on a
+kind name.
+.Ss Available modules
+.Bl -tag -width Ds
+.It Cm citus
+Citus: distributed tables, reference tables and distributed functions, plus
+refusals for a distributed topology.
+.Xr pg_laswell_citus 7
+.El
 .Sh PREREQUISITES
 Some migrations need something done that this program cannot do, often on a
 machine it is not connected to: a replication slot on the publisher, a package
@@ -1877,8 +1999,10 @@ pg_laswell_mcp --call planMigration --args @spec-args.json \e
 .Ed
 .Sh SEE ALSO
 .Xr openssl 1 ,
+.Xr pg_laswell 1 ,
 .Xr pg_licht_mcp 1 ,
-.Xr psql 1
+.Xr psql 1 ,
+.Xr pg_laswell_citus 7
 .Sh STANDARDS
 Model Context Protocol, revisions 2024-11-05 through 2025-11-25, over stdio
 using JSON-RPC 2.0.

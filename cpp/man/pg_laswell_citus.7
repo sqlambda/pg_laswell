@@ -1,0 +1,315 @@
+.Dd September 21, 2026
+.Dt PG_LASWELL_CITUS 7
+.Os
+.Sh NAME
+.Nm pg_laswell_citus
+.Nd Citus support in pg_laswell: intent kinds, readings and refusals
+.Sh DESCRIPTION
+Citus support is a
+.Em build-time module .
+The core binary speaks PostgreSQL and nothing else; a binary that carries this
+module additionally knows the kinds below, takes an extra reading of the
+cluster's topology, and refuses several things a stock build would accept and
+then fail to execute.
+.Pp
+This page describes a binary built with the module.
+To tell whether you have one:
+.Bd -literal -offset indent
+$ pg_laswell_mcp --version
+0.1.2
+modules: citus
+.Ed
+.Pp
+A binary with no
+.Li modules
+line does not recognise any kind on this page, and will refuse a specification
+that names one -- the whole specification, not the one intent, which is the same
+rule that governs any unknown kind.
+Build one with:
+.Bd -literal -offset indent
+cmake -S cpp -B build -DPGLASWELL_MODULES=citus
+.Ed
+.Pp
+Every kind here is prefixed
+.Cm citus_ ,
+so a specification says which vendor it needs and two vendors cannot collide on
+a name.
+The
+.Em MODULES
+section of
+.Xr pg_laswell_mcp 1
+gives the rules a module works under, and what it is forbidden to do.
+.Sh INTENT KINDS
+.\" BEGIN CITUS KIND LIST -- checked by tools/check-manual.py against
+.\" cpp/src/modules/citus/kinds.inc.
+.Ss Cm citus_distribute_table
+Hash-distribute a table across the cluster's worker nodes.
+.Pp
+Required:
+.Va schema ,
+.Va table ,
+.Va distribution_column ,
+.Va comment .
+Optional:
+.Va shard_method ,
+.Va colocate_with ,
+.Va shard_count ,
+.Va concurrently .
+.Bl -tag -width Ds
+.It Va distribution_column
+The column whose hash picks the shard.
+.Em Every
+unique constraint and primary key on the table must include it: Citus cannot
+enforce uniqueness across shards without it, so it refuses the distribution
+rather than the constraint.
+An intent whose table has a key not covering this column is refused, naming the
+key and the columns it does cover.
+.It Va shard_method
+.Cm hash
+(the default),
+.Cm append
+or
+.Cm range .
+Hash is the only form Citus recommends for new work; the other two are legacy.
+.It Va colocate_with
+.Qq schema.table ,
+or one of Citus's own words
+.Cm none
+and
+.Cm default .
+An unqualified name is refused as ambiguous with those sentinels, so a table
+genuinely called
+.Li none
+is written
+.Qq public.none .
+Colocating requires the named table to be distributed already -- in an earlier
+intent of the same specification, which is accounted for, or an earlier
+specification ordered by
+.Va depends_on .
+.It Va shard_count
+A positive integer.
+Mutually exclusive with a real
+.Va colocate_with :
+joining a colocation group adopts that group's shard count, so naming both asks
+for two different numbers.
+Refused at parse time rather than half-applied at execution.
+.It Va concurrently
+.Cm auto
+(the default),
+.Cm always
+or
+.Cm never .
+Under
+.Cm auto
+the planner chooses from the table's estimated size and records which reading
+decided.
+.Cm always
+requires
+.Fn create_distributed_table_concurrently ,
+which needs a replica identity -- a table with no primary key cannot use it --
+and is refused, not silently downgraded, on a Citus too old to have it.
+Someone who wrote
+.Cm always
+was making a decision about a table too big to lock, and quietly locking it
+anyway is the worst available answer.
+.El
+.Ss Cm citus_create_reference_table
+Replicate a table in full to every node, so reads join against it locally.
+.Pp
+Required:
+.Va schema ,
+.Va table ,
+.Va comment .
+No other keys are accepted.
+.Pp
+Always warns: every write to a reference table becomes a two-phase commit across
+all nodes.
+Reference tables are for small, rarely written lookups; a busy one is a
+cluster-wide bottleneck.
+.Ss Cm citus_distribute_function
+Route calls of a function to the node holding the relevant shard, or replicate
+its definition to every node.
+.Pp
+Required:
+.Va schema ,
+.Va name ,
+.Va arguments ,
+.Va comment .
+Optional:
+.Va distribution_argument ,
+.Va colocate_with ,
+.Va force_delegation .
+.Bl -tag -width Ds
+.It Va arguments
+The argument type list that identifies the overload, as PostgreSQL writes it.
+.It Va distribution_argument Ns / Ns Va colocate_with
+These travel together and either both appear or neither does.
+The argument says which parameter routes the call; the colocation target says
+which table's shards it routes to.
+One without the other cannot be acted on, and is refused.
+.It Va force_delegation
+Boolean.
+.El
+.Pp
+With neither colocation key, the function is replicated to every node rather
+than routed, and the plan warns: every node gets a copy of the definition, and a
+later
+.Ic CREATE OR REPLACE
+has to be propagated too or the copies diverge.
+.Pp
+The function must already exist; create it in an earlier specification and order
+the two with
+.Va depends_on .
+.\" END CITUS KIND LIST
+.Sh READINGS
+With the module built in, every plan against a database where the
+.Li citus
+extension is installed carries an extra reading under
+.Va extensions.citus :
+the extension version, the worker count, which distributed tables exist with
+their distribution column and colocation group, which functions are distributed,
+whether this Citus has
+.Fn create_distributed_table_concurrently ,
+and the values of
+.Va citus.enable_ddl_propagation
+and
+.Va citus.max_adaptive_executor_pool_size .
+.Pp
+An absent reading is not a zero reading.
+A database with no Citus installed produces no
+.Va extensions.citus
+at all, and every kind on this page is refused there with that as the reason,
+rather than planned against defaults.
+.Pp
+Contention is read differently too.
+On a coordinator,
+.Va pg_locks
+shows the coordinator's own waits and not a worker's, so a shard-level wait is
+invisible where a single-node reading would find it.
+Where the module applies, waiters come from
+.Va citus_lock_waits
+and activity from
+.Va citus_stat_activity ,
+which see the whole cluster.
+.Sh REFUSALS
+These are the reason the module exists: each is a Citus error that would
+otherwise surface at execution, partway through a migration, on a cluster, with
+earlier work already committed.
+All of them are derivable from the readings above beforehand.
+.Ss Topology-wide
+.Bl -tag -width Ds
+.It Va citus.enable_ddl_propagation Li is off
+Refused for
+.Em every
+kind, core kinds included -- a plain
+.Cm create_table
+on a Citus cluster is propagated DDL too.
+With propagation off, DDL runs on the coordinator and not on the workers, and
+the two catalogs diverge
+.Em silently :
+every reading pg_laswell takes, including the check that catches drift, is taken
+on the coordinator.
+The ledger would record the migration as fully applied, the coordinator would
+agree, and the shards would not have it.
+A warning would be a false reassurance; refusing is recoverable in one
+statement.
+.It A paced walk against a distributed table
+.Cm backfill ,
+.Cm update_rows ,
+.Cm delete_rows
+and
+.Cm merge_rows
+pace themselves by taking each batch
+.Ic FOR UPDATE ,
+which is what stops a keyset cursor selecting the same rows twice.
+Citus rejects that on a multi-shard query:
+.Bd -literal -offset indent
+ERROR: could not run distributed query with FOR UPDATE/SHARE commands
+.Ed
+.Pp
+So this does not merely perform badly -- it does not run at all, and without the
+refusal it would be accepted here and fail partway through.
+Reference tables are exempt: one placement per node is not a multi-shard query.
+Local tables on a Citus cluster are unaffected.
+.Pp
+Liftable, and intended to be: confining a batch to one shard makes
+.Ic FOR UPDATE
+legal again.
+Until then this is the honest answer.
+.El
+.Ss Per kind
+.Bl -bullet -compact
+.It
+The
+.Li citus
+extension is not installed in this database.
+.It
+A unique constraint or primary key does not include the distribution column.
+.It
+The distribution column does not exist on the table.
+.It
+.Va colocate_with
+names a table this database does not record as distributed.
+.It
+.Va concurrently : Cm always
+was asked for and this Citus has no concurrent form.
+.It
+.Va concurrently : Cm always
+on a table with no replica identity.
+.It
+A function named for distribution does not exist.
+.It
+.Va shard_count
+together with a real
+.Va colocate_with ,
+or
+.Va distribution_argument
+without
+.Va colocate_with .
+.El
+.Sh EXAMPLES
+Distribute a parent, then colocate a child with it, in one specification.
+The second intent is planned against the state the first will have produced, so
+it does not need a separate deployment:
+.Bd -literal -offset indent
+{
+  "laswell_spec_version": 1,
+  "id": "0030-distribute",
+  "description": "Distribute accounts and colocate its ledger.",
+  "intents": [
+    { "kind": "citus_distribute_table",
+      "schema": "public", "table": "accounts",
+      "distribution_column": "id",
+      "comment": "Hash distributed on id." },
+    { "kind": "citus_distribute_table",
+      "schema": "public", "table": "account_transactions",
+      "distribution_column": "account_id",
+      "colocate_with": "public.accounts",
+      "comment": "Colocated with accounts." }
+  ]
+}
+.Ed
+.Pp
+A runnable three-node cluster and the specifications above are in
+.Pa examples/docker/citus
+in the source.
+.Sh SEE ALSO
+.Xr pg_laswell 1 ,
+.Xr pg_laswell_mcp 1
+.Pp
+.Xr pg_laswell_mcp 1
+is the authoritative reference for the specification format, pacing, trust and
+the ledger; this page covers only what the Citus module adds.
+.Sh AUTHORS
+.An Daniel Cristian Cruz
+.Sh CAVEATS
+The module set is not hashed into
+.Va planDigest .
+For a specification a binary can plan at all the module set does not change a
+single statement, and one it cannot plan is refused outright -- so hashing it
+would change every existing digest while protecting nothing.
+.Pp
+Distributing a table is not reversible by re-running a specification.
+Retiring one means
+.Fn undistribute_table
+by hand, which is outside what a signed specification describes.
