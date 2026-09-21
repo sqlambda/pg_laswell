@@ -1,0 +1,35 @@
+// Citus's contributions to object_key_for() and conflict_keys().
+//
+// Included twice, once inside each switch, with only the macro that switch
+// defines expanded. The other is a no-op there.
+
+#ifdef PGLASWELL_OBJECT_KEY
+// distribute_function plans against a FUNCTION, not a relation. A kind missing
+// from object_key_for reads back as absent -- which is what cost a whole batch
+// of ALTER kinds before the pairing test existed.
+PGLASWELL_OBJECT_KEY(kDistributeFunction, "function:" + schema + "." + name)
+#endif
+
+#ifdef PGLASWELL_CONFLICT_KEYS
+// The edge single-node PostgreSQL has no equivalent of: colocation. Two tables
+// in one colocation group affect each other even though they share no name,
+// because distributing into a group, or rebalancing it, moves shards for every
+// member. Keyed on the GROUP the spec names, since the group id itself is a
+// catalog fact the parser cannot see.
+//
+// When a spec colocates with nothing the edge is absent rather than empty --
+// and the repository denies concurrency on incomplete evidence, which is the
+// answer that keeps this safe either way.
+PGLASWELL_CONFLICT_KEYS(kDistributeTable, {
+  const auto with = in.body.value("colocate_with", "");
+  if (!with.empty() && with != "none" && with != "default") {
+    add("colocation:" + with);
+  }
+})
+PGLASWELL_CONFLICT_KEYS(kDistributeFunction, {
+  const auto with = in.body.value("colocate_with", "");
+  if (!with.empty() && with != "none" && with != "default") {
+    add("colocation:" + with);
+  }
+})
+#endif

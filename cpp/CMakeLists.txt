@@ -45,12 +45,84 @@ set(PGLASWELL_LIBS
 # release pipeline, where there is nobody to ask. deploy.h explains why there is
 # nothing to ask: pacing is measured, ordering is declared in the signed spec,
 # and the repository's concurrency grouping is already the conservative one.
+# --------------------------------------------------------------------------
+# Vendor modules. Empty by default: the core binary is PostgreSQL-only, because
+# a kind that is compiled in and fails on every server without some extension is
+# within touching distance of the "recognized but unsupported" state spec.h
+# opens by forbidding. See src/modules/README.md.
+#
+#   cmake -S cpp -B cpp/build -DPGLASWELL_MODULES=citus
+# --------------------------------------------------------------------------
+set(PGLASWELL_MODULES "" CACHE STRING "Vendor modules to compile in, e.g. citus")
+
+set(_gen_dir ${CMAKE_CURRENT_BINARY_DIR}/generated/modules)
+file(MAKE_DIRECTORY ${_gen_dir})
+set(_kinds_inc "// Generated from PGLASWELL_MODULES. Do not edit.\n")
+set(_heads_inc "// Generated from PGLASWELL_MODULES. Do not edit.\n")
+set(_keys_inc  "// Generated from PGLASWELL_MODULES. Do not edit.\n")
+set(_plan_inc  "// Generated from PGLASWELL_MODULES. Do not edit.\n")
+set(_obs_inc   "// Generated from PGLASWELL_MODULES. Do not edit.\n")
+set(_obs_head  "// Generated from PGLASWELL_MODULES. Do not edit.\n")
+set(_proj_inc  "// Generated from PGLASWELL_MODULES. Do not edit.\n")
+set(_test_inc  "// Generated from PGLASWELL_MODULES. Do not edit.\n")
+foreach(_mod IN LISTS PGLASWELL_MODULES)
+    if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/modules/${_mod}/kinds.inc)
+        message(FATAL_ERROR
+            "PGLASWELL_MODULES names '${_mod}', but src/modules/${_mod}/kinds.inc "
+            "does not exist. A misspelled module must not silently produce a "
+            "binary missing the kinds someone asked for.")
+    endif()
+    string(APPEND _kinds_inc "#include \"modules/${_mod}/kinds.inc\"\n")
+    string(APPEND _heads_inc "#include \"modules/${_mod}/module.h\"\n")
+    string(APPEND _plan_inc "#include \"modules/${_mod}/plan.h\"\n")
+    string(APPEND _obs_inc  "PGLASWELL_OBSERVE(\"${_mod}\", k${_mod}PresentSql, k${_mod}ObservationSql)\n")
+    string(APPEND _obs_head "#include \"modules/${_mod}/observe.h\"\n")
+    # keys.inc is optional: a module whose kinds plan against relations only,
+    # and add no conflict edge, does not need one.
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/modules/${_mod}/keys.inc)
+        string(APPEND _keys_inc "#include \"modules/${_mod}/keys.inc\"\n")
+    endif()
+    # project.inc is optional too: a kind whose effect no LATER step in the same
+    # plan can observe does not need to project anything.
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/modules/${_mod}/project.inc)
+        string(APPEND _proj_inc "#include \"modules/${_mod}/project.inc\"\n")
+    endif()
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/modules/${_mod}/tests.inc)
+        string(APPEND _test_inc "#include \"modules/${_mod}/tests.inc\"\n")
+    endif()
+    message(STATUS "pg_laswell module: ${_mod}")
+endforeach()
+# Written through configure_file's copy_if_different semantics, so an unchanged
+# module list does not force a rebuild of every translation unit.
+file(WRITE ${_gen_dir}/enabled_planners.h.tmp "${_plan_inc}")
+configure_file(${_gen_dir}/enabled_planners.h.tmp ${_gen_dir}/enabled_planners.h COPYONLY)
+file(WRITE ${_gen_dir}/enabled_observer_headers.h.tmp "${_obs_head}")
+configure_file(${_gen_dir}/enabled_observer_headers.h.tmp ${_gen_dir}/enabled_observer_headers.h COPYONLY)
+file(WRITE ${_gen_dir}/enabled_observers.h.tmp "${_obs_inc}")
+configure_file(${_gen_dir}/enabled_observers.h.tmp ${_gen_dir}/enabled_observers.h COPYONLY)
+file(WRITE ${_gen_dir}/enabled_tests.inc.tmp "${_test_inc}")
+configure_file(${_gen_dir}/enabled_tests.inc.tmp ${_gen_dir}/enabled_tests.inc COPYONLY)
+file(WRITE ${_gen_dir}/enabled_project.inc.tmp "${_proj_inc}")
+configure_file(${_gen_dir}/enabled_project.inc.tmp ${_gen_dir}/enabled_project.inc COPYONLY)
+file(WRITE ${_gen_dir}/enabled_keys.inc.tmp "${_keys_inc}")
+configure_file(${_gen_dir}/enabled_keys.inc.tmp ${_gen_dir}/enabled_keys.inc COPYONLY)
+file(WRITE ${_gen_dir}/enabled_kinds.inc.tmp "${_kinds_inc}")
+file(WRITE ${_gen_dir}/enabled_modules.h.tmp "${_heads_inc}")
+configure_file(${_gen_dir}/enabled_kinds.inc.tmp ${_gen_dir}/enabled_kinds.inc COPYONLY)
+configure_file(${_gen_dir}/enabled_modules.h.tmp ${_gen_dir}/enabled_modules.h COPYONLY)
+
 add_executable(pg_laswell src/deploy_main.cpp)
 add_executable(pg_laswell_mcp src/main.cpp)
 target_compile_definitions(pg_laswell_mcp PRIVATE PGLASWELL_VERSION="${PROJECT_VERSION}")
 target_compile_definitions(pg_laswell PRIVATE PGLASWELL_VERSION="${PROJECT_VERSION}")
 target_link_libraries(pg_laswell_mcp PRIVATE ${PGLASWELL_LIBS})
 target_link_libraries(pg_laswell PRIVATE ${PGLASWELL_LIBS})
+# The generated module includes sit beside src/ on the include path, so core
+# says #include "modules/enabled_kinds.inc" and never learns where it came from.
+foreach(_t pg_laswell pg_laswell_mcp)
+    target_include_directories(${_t} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR}/generated)
+endforeach()
 pglaswell_harden(pg_laswell_mcp)
 pglaswell_apply_sanitizers(pg_laswell_mcp)
 
@@ -73,6 +145,8 @@ if(BUILD_TESTING)
     enable_testing()
     find_package(GTest REQUIRED)
     add_executable(pg_laswell_mcp_test src/test_main.cpp src/planner_purity_check.cpp)
+    target_include_directories(pg_laswell_mcp_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR}/generated)
     target_compile_definitions(pg_laswell_mcp_test PRIVATE
         PGLASWELL_VERSION="${PROJECT_VERSION}"
         # The shipped bootstrap script, so a test runs the file that actually
@@ -121,7 +195,8 @@ if(BUILD_TESTING)
     # headers only -- no libpq, no database -- which is what makes the golden
     # output deterministic and is itself a check that planner.h stays pure.
     add_executable(render_plan ${CMAKE_CURRENT_SOURCE_DIR}/test/render_plan.cpp)
-    target_include_directories(render_plan PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_include_directories(render_plan PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR}/generated)
     target_link_libraries(render_plan PRIVATE nlohmann_json::nlohmann_json
                                               OpenSSL::Crypto)
     target_compile_definitions(render_plan PRIVATE PGLASWELL_VERSION="${PROJECT_VERSION}")

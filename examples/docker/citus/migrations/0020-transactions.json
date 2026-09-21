@@ -1,0 +1,48 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0020-transactions",
+  "description": "Account transactions, keyed (account_id, reference).",
+  "rationale": "The compound key exists precisely to include account_id, the distribution column. This is the shape pgshard's banking variant already uses.",
+  "depends_on": [
+    "0010-accounts"
+  ],
+  "intents": [
+    {
+      "kind": "create_table",
+      "schema": "public",
+      "table": "account_transactions",
+      "comment": "Ledger of account movements.",
+      "primary_key": [
+        "account_id",
+        "reference"
+      ],
+      "columns": [
+        {
+          "name": "account_id",
+          "type": "integer",
+          "nullable": false,
+          "comment": "Owning account, and the distribution column."
+        },
+        {
+          "name": "reference",
+          "type": "text",
+          "nullable": false,
+          "comment": "Idempotency reference."
+        },
+        {
+          "name": "amount",
+          "type": "numeric",
+          "nullable": false,
+          "comment": "Signed movement."
+        }
+      ]
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:c6a0b46e75c99c34",
+      "algorithm": "ed25519",
+      "signature": "aVEwiiLNHY2gAWNCA892HWRQR0B8QOJAIU+uHYho5fkgY+mb7/9FG3x8SVODTBdhzNauiIA+XvfIOQXWk/1GCg=="
+    }
+  ]
+}

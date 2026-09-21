@@ -1,0 +1,38 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0010-accounts",
+  "description": "The accounts table, keyed so it can be distributed on id.",
+  "rationale": "The primary key includes the distribution column, which Citus requires: uniqueness cannot be enforced across shards without it.",
+  "intents": [
+    {
+      "kind": "create_table",
+      "schema": "public",
+      "table": "accounts",
+      "comment": "Customer accounts.",
+      "primary_key": [
+        "id"
+      ],
+      "columns": [
+        {
+          "name": "id",
+          "type": "integer",
+          "nullable": false,
+          "comment": "Account id, and the distribution column."
+        },
+        {
+          "name": "balance",
+          "type": "numeric",
+          "nullable": false,
+          "comment": "Current balance."
+        }
+      ]
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:c6a0b46e75c99c34",
+      "algorithm": "ed25519",
+      "signature": "lOAJ5GKA8xa491v4FGIAhzNEyfDTMvTo4VFTUX6jTMqtOCEAJ+Ed5MUTDzXYEPwd9UK297yrNq1VJL+iemWhBQ=="
+    }
+  ]
+}

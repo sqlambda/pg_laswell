@@ -1,0 +1,43 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0050-currencies",
+  "description": "A small lookup, replicated to every node.",
+  "intents": [
+    {
+      "kind": "create_table",
+      "schema": "public",
+      "table": "currencies",
+      "comment": "Currency codes.",
+      "primary_key": [
+        "code"
+      ],
+      "columns": [
+        {
+          "name": "code",
+          "type": "text",
+          "nullable": false,
+          "comment": "ISO code."
+        },
+        {
+          "name": "scale",
+          "type": "integer",
+          "nullable": false,
+          "comment": "Minor units."
+        }
+      ]
+    },
+    {
+      "kind": "create_reference_table",
+      "schema": "public",
+      "table": "currencies",
+      "comment": "Joined from every shard, so replicated everywhere."
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:c6a0b46e75c99c34",
+      "algorithm": "ed25519",
+      "signature": "jxzwO8BkD7W9Rn5FE5/wXLoZde/Y8H58pzPcrp2TE/00HMbwxJ+NUTPryQwf/Z3RzBulg/DTAAxWQ4za2o4eAQ=="
+    }
+  ]
+}

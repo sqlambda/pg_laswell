@@ -1,0 +1,57 @@
+# A Citus cluster: one coordinator, two workers.
+#
+# Two workers, not one. A single worker cannot show shard placement, cannot show
+# that a reference table is replicated to EVERY node, and cannot be rebalanced --
+# so a one-worker cluster would prove the SQL parses and nothing else.
+#
+# Separate from ../compose.yml because this needs the Citus image rather than
+# plain postgres, and because an example that requires a vendor extension should
+# not be started by someone running the PostgreSQL-only examples.
+#
+#   docker compose -f examples/docker/citus/compose.yml up -d
+#   ./examples/docker/citus/run.sh
+#   docker compose -f examples/docker/citus/compose.yml down -v
+services:
+  coordinator:
+    image: citusdata/citus:13
+    container_name: laswell_citus_coordinator
+    environment:
+      POSTGRES_PASSWORD: laswell
+      POSTGRES_DB: app
+      # The workers have to reach the coordinator and each other by name, and
+      # pg_laswell refuses a password inside a connection string it will record.
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports: ['55440:5432']
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d app']
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  worker1:
+    image: citusdata/citus:13
+    container_name: laswell_citus_worker1
+    environment:
+      POSTGRES_PASSWORD: laswell
+      POSTGRES_DB: app
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports: ['55441:5432']
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d app']
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  worker2:
+    image: citusdata/citus:13
+    container_name: laswell_citus_worker2
+    environment:
+      POSTGRES_PASSWORD: laswell
+      POSTGRES_DB: app
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports: ['55442:5432']
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d app']
+      interval: 3s
+      timeout: 3s
+      retries: 30

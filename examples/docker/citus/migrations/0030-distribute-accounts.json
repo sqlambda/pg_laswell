@@ -1,0 +1,25 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0030-distribute-accounts",
+  "description": "Distribute accounts on id.",
+  "rationale": "Small table, so the planner should choose the blocking form and say which reading decided.",
+  "depends_on": [
+    "0010-accounts"
+  ],
+  "intents": [
+    {
+      "kind": "distribute_table",
+      "schema": "public",
+      "table": "accounts",
+      "distribution_column": "id",
+      "comment": "Hash distributed on id."
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:c6a0b46e75c99c34",
+      "algorithm": "ed25519",
+      "signature": "EDQG5wJ2IGQfIqKfiHmpjCkwj3j+swKfxv3g2BVrCxbN5UOlvp/IPb2XJzi0Ufyih8yLPxH43qufIXM8jLk5BQ=="
+    }
+  ]
+}

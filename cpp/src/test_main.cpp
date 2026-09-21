@@ -7310,6 +7310,9 @@ TEST(Spec, EveryKindThatPlansAgainstAnObjectHasAnObjectKey) {
   // The list is explicit rather than inferred from the name, so adding a kind
   // means deciding whether it belongs here.
   const std::set<std::string> needs_object = {
+#define PGLASWELL_NEEDS_OBJECT(kind) kind,
+#include "modules/enabled_tests.inc"
+#undef PGLASWELL_NEEDS_OBJECT
       "create_schema", "drop_schema", "alter_schema",
       "create_extension", "drop_extension", "alter_extension",
       "create_type", "drop_type", "add_enum_value", "alter_domain",
@@ -11992,6 +11995,12 @@ TEST(Conformance, CoversEveryIntentKind) {
     (void)why;
     covered.insert(k);
   }
+  // A vendor module's kinds cannot be proved against a plain PostgreSQL either,
+  // and defer with the same discipline: a reason, not an omission.
+  for (const auto& [k, why] : conformance::deferred_by_modules()) {
+    (void)why;
+    covered.insert(k);
+  }
 
   std::set<std::string> missing;
   for (const auto& [name, kind] : pglaswell::intent_kinds()) {
@@ -12003,13 +12012,19 @@ TEST(Conformance, CoversEveryIntentKind) {
   EXPECT_TRUE(missing.empty())
       << "these intent kinds are never executed against a database: " << list
       << ".\nAdd a case to conformance.inc, or a reason to "
-         "deferred_to_two_clusters() if it genuinely needs a second cluster.";
+         "deferred_to_two_clusters() if it genuinely needs a second cluster, "
+         "or to a module's tests.inc if it needs that vendor's cluster.";
 
-  // And the deferral list must not rot: a kind listed there must still exist.
+  // And the deferral lists must not rot: a kind listed there must still exist.
   for (const auto& [k, why] : conformance::deferred_to_two_clusters()) {
     (void)why;
     EXPECT_EQ(pglaswell::intent_kinds().count(k), 1u)
         << k << " is deferred but is no longer an intent kind";
+  }
+  for (const auto& [k, why] : conformance::deferred_by_modules()) {
+    (void)why;
+    EXPECT_EQ(pglaswell::intent_kinds().count(k), 1u)
+        << k << " is deferred by a module but is no longer an intent kind";
   }
 }
 

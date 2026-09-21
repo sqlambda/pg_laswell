@@ -275,6 +275,17 @@ SELECT COALESCE(
                        'column', (SELECT a.attname FROM pg_attribute a
                                    WHERE a.attrelid = t.oid
                                      AND a.attnum = k.conkey[1]),
+                       -- Every column, in key order. `column` above is only
+                       -- conkey[1], which is enough for a single-column
+                       -- constraint and silently wrong for a compound one: a
+                       -- caller asking "does this key cover X" got the first
+                       -- column and nothing else.
+                       'columns', COALESCE((
+                          SELECT JSONB_AGG(a.attname ORDER BY x.ord)
+                            FROM UNNEST(k.conkey) WITH ORDINALITY AS x(attnum, ord)
+                            JOIN pg_attribute a
+                              ON a.attrelid = t.oid AND a.attnum = x.attnum),
+                          '[]'::jsonb),
                        'depended_on_by', COALESCE((
                           SELECT JSONB_AGG(d.conname || ' on ' ||
                                            d.conrelid::regclass::text)
@@ -510,6 +521,10 @@ inline bool is_lock_not_available(const pqxx::sql_error& e) {
   return std::string(e.sqlstate()) == "55P03";
 }
 
+// Vendor module observation queries, at namespace scope so the class below can
+// name them. Empty when no module is enabled.
+#include "modules/enabled_observer_headers.h"
+
 class Catalog {
  public:
   explicit Catalog(const ConnConfig& cfg, ConnectionCache* cache = nullptr)
@@ -551,6 +566,28 @@ class Catalog {
     }
   }
 
+  // Vendor extension readings. Each enabled module contributes a block here,
+  // and each one is gated on its extension actually being installed -- so the
+  // key is ABSENT when the extension is not there, never an empty object.
+  //
+  // A planner that cannot tell "not installed" from "installed and reporting
+  // nothing" refuses the wrong things in both directions, which is why this
+  // costs a probe query per module rather than a COALESCE.
+  void observe_extensions(ReadSession& s, Observations& obs) {
+#define PGLASWELL_OBSERVE(module_name, present_sql, observation_sql)         \
+    do {                                                                      \
+      const auto probe = s.txn().exec(present_sql);                           \
+      if (probe.empty() || !probe[0][0].as<bool>()) break;                    \
+      const auto r = s.txn().exec(observation_sql);                           \
+      if (!r.empty() && !r[0][0].is_null()) {                                 \
+        obs.extensions[module_name] = json::parse(r[0][0].as<std::string>()); \
+      }                                                                       \
+    } while (false);
+#include "modules/enabled_observers.h"
+#undef PGLASWELL_OBSERVE
+    (void)s; (void)obs;
+  }
+
   Observations observe(const std::vector<std::string>& schemas,
                        const std::vector<std::string>& tables,
                        const std::vector<std::string>& object_keys = {}) {
@@ -567,6 +604,7 @@ class Catalog {
     }
     obs.gathered_at = obs.server.value("now", json());
     observe_objects(s, obs, object_keys);
+    observe_extensions(s, obs);
 
     for (std::size_t i = 0; i < schemas.size(); ++i) {
       const auto qualified = schemas[i] + "." + tables[i];

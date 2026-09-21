@@ -33,6 +33,17 @@ struct Case {
 
 // Kinds that cannot be proved against a single database, with the reason.
 // Each is covered by cpp/test/replication-tests.sh, which builds two clusters.
+// Kinds an enabled vendor module defers, with the same discipline: a reason,
+// not an omission. Empty when no module is enabled.
+inline const std::map<std::string, const char*>& deferred_by_modules() {
+  static const std::map<std::string, const char*> kDeferred = {
+#define PGLASWELL_DEFERRED_CASE(kind, reason) {kind, reason},
+#include "modules/enabled_tests.inc"
+#undef PGLASWELL_DEFERRED_CASE
+  };
+  return kDeferred;
+}
+
 inline const std::map<std::string, const char*>& deferred_to_two_clusters() {
   static const std::map<std::string, const char*> kDeferred = {
       {"create_subscription", "needs a publisher to connect to"},

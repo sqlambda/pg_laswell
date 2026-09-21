@@ -60,10 +60,22 @@ enum class IntentKind { kAddColumn, kBackfill, kCreateIndex, kDropIndex,
                         kCreateObject, kDropObject, kAlterObject,
                         kCreateTableAs, kImportForeignSchema, kSecurityLabel,
                         kAlterDefaultPrivileges,
-                        kInsertRows, kUpdateRows, kMergeRows, kCopyRows };
+                        kInsertRows, kUpdateRows, kMergeRows, kCopyRows,
+// Vendor module kinds. Generated from the enabled module list, so core names no
+// vendor -- and the enum is still CLOSED at compile time, which is what keeps
+// every switch over it exhaustive under -Wswitch -Werror. A runtime registry
+// would have traded that compiler guarantee for a test.
+#define PGLASWELL_KIND(spec_name, enum_id, parse_fn, plan_fn) enum_id,
+#include "modules/enabled_kinds.inc"
+#undef PGLASWELL_KIND
+};
 
 inline const std::map<std::string, IntentKind>& intent_kinds() {
   static const std::map<std::string, IntentKind> kKinds = {
+#define PGLASWELL_KIND(spec_name, enum_id, parse_fn, plan_fn) \
+      {#spec_name, IntentKind::enum_id},
+#include "modules/enabled_kinds.inc"
+#undef PGLASWELL_KIND
       {"add_column", IntentKind::kAddColumn},
       {"backfill", IntentKind::kBackfill},
       {"create_index", IntentKind::kCreateIndex},
@@ -195,6 +207,12 @@ inline std::string object_key_for(const Intent& in) {
     case IntentKind::kCreateSequence:
     case IntentKind::kDropSequence:
     case IntentKind::kAlterSequence:   return "sequence:" + schema + "." + name;
+// A module's kinds that plan against a non-relation object say so here. The
+// comment above records what a kind missing from this switch cost: it read back
+// as absent, for a whole batch of kinds, found only end-to-end.
+#define PGLASWELL_OBJECT_KEY(enum_id, expr) case IntentKind::enum_id: return expr;
+#include "modules/enabled_keys.inc"
+#undef PGLASWELL_OBJECT_KEY
     default:                           return {};
   }
 }
@@ -229,6 +247,15 @@ inline std::vector<std::string> conflict_keys(const Intent& in) {
   // between two intents naming the same thing -- a column of a type against a
   // drop of that type, a trigger against the function it calls.
   switch (in.kind) {
+// A module's extra conflict edges. Citus adds one single-node PostgreSQL has
+// no equivalent of: two tables in the same colocation group conflict for
+// alter_distributed_table and a rebalance, though they share no name.
+// Variadic for the same reason PGLASWELL_PROJECT is: the block is C++ and its
+// commas are not the preprocessor's to split on.
+#define PGLASWELL_CONFLICT_KEYS(enum_id, ...) \
+    case IntentKind::enum_id: { __VA_ARGS__ return keys; }
+#include "modules/enabled_keys.inc"
+#undef PGLASWELL_CONFLICT_KEYS
     case IntentKind::kAddColumn:
     case IntentKind::kAlterColumnType: {
       // A column's type may be a user-defined one in any schema. Unqualified
@@ -2419,6 +2446,12 @@ inline void parse_drop_constraint(Intent& in) {
 
 // Parses and validates a spec document. Throws SpecError, whose hint names the
 // exact thing to change.
+// Vendor modules, included here and not at the top: a module's parser is
+// written against core's own helpers -- reject_unknown_keys, require_string,
+// the Intent shape -- and those have to exist first. Generated, and empty when
+// no module is enabled, so core never names a vendor.
+#include "modules/enabled_modules.h"
+
 inline Spec parse_spec(const json& doc) {
   if (!doc.is_object()) {
     detail::fail("the spec is not a JSON object", "A spec is a single object.");
@@ -2547,6 +2580,10 @@ inline Spec parse_spec(const json& doc) {
     in.ordinal = ordinal;
     in.body = body;
     switch (in.kind) {
+#define PGLASWELL_KIND(spec_name, enum_id, parse_fn, plan_fn) \
+      case IntentKind::enum_id: parse_fn(in); break;
+#include "modules/enabled_kinds.inc"
+#undef PGLASWELL_KIND
       case IntentKind::kAddColumn:   parse_add_column(in);   break;
       case IntentKind::kBackfill:    parse_backfill(in);     break;
       case IntentKind::kCreateIndex: parse_create_index(in); break;

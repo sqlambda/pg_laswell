@@ -206,6 +206,17 @@ inline void project(const Intent& in, const Step& step, Observations& projected)
   if (!projected.tables.contains(qualified)) return;
 
   switch (in.kind) {
+// A module's kinds project too, or a later step in the SAME plan reads the
+// database as it was rather than as the earlier step will have left it --
+// which is how a function colocated with a table distributed two steps above
+// would have been refused for colocating with something "not distributed".
+// Variadic because the block is ordinary C++ and contains commas at brace
+// depth the preprocessor does not see -- a json{...} initialiser split into
+// nine "arguments" the first time this was written.
+#define PGLASWELL_PROJECT(enum_id, ...) \
+    case IntentKind::enum_id: { __VA_ARGS__ return; }
+#include "modules/enabled_project.inc"
+#undef PGLASWELL_PROJECT
     case IntentKind::kAddColumn:
       projected.tables[qualified]["columns"][in.body.value("column", "")] =
           json{{"type", in.body.value("type", "")},
@@ -786,6 +797,12 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
   (void)cfg;
 }
 
+
+// Vendor module planners. PURE, like everything else in this file:
+// planner_purity_check.cpp fails the build if pqxx reaches here, and that check
+// covers modules/*/plan.h too. Nothing will fail the build if a module sneaks
+// in a non-determinism, so that part is discipline.
+#include "modules/enabled_planners.h"
 
 // The partitioned-index recipe. Emitted as separate steps because each
 // concurrent build must run outside a transaction block, and they run one at a
@@ -5053,6 +5070,13 @@ inline Plan plan_migration(const Spec& spec, const Observations& obs,
     // scan anyway and the two-step recipe buys nothing.
     std::vector<Step> emitted;
     switch (in.kind) {
+// Vendor module kinds. One uniform signature, so the generated arm is the same
+// shape for every module -- and the enum being closed means -Wswitch still
+// fails the build if a module adds a kind and forgets its planner.
+#define PGLASWELL_KIND(spec_name, enum_id, parse_fn, plan_fn) \
+      case IntentKind::enum_id: plan_fn(in, projected, cfg, plan, emitted); break;
+#include "modules/enabled_kinds.inc"
+#undef PGLASWELL_KIND
       case IntentKind::kAddColumn:   plan_add_column(in, projected, plan, emitted); break;
       case IntentKind::kCreateIndex: plan_create_index(in, projected, cfg, plan, emitted); break;
       case IntentKind::kBackfill:    plan_backfill(in, projected, cfg, plan, emitted); break;
