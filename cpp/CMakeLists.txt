@@ -65,6 +65,7 @@ set(_plan_inc  "// Generated from PGLASWELL_MODULES. Do not edit.\n")
 set(_obs_inc   "// Generated from PGLASWELL_MODULES. Do not edit.\n")
 set(_obs_head  "// Generated from PGLASWELL_MODULES. Do not edit.\n")
 set(_proj_inc  "// Generated from PGLASWELL_MODULES. Do not edit.\n")
+set(_proj_head "// Generated from PGLASWELL_MODULES. Do not edit.\n")
 set(_test_inc  "// Generated from PGLASWELL_MODULES. Do not edit.\n")
 set(_topo_inc  "// Generated from PGLASWELL_MODULES. Do not edit.\n")
 set(_guard_inc "// Generated from PGLASWELL_MODULES. Do not edit.\n")
@@ -90,8 +91,24 @@ foreach(_mod IN LISTS PGLASWELL_MODULES)
     endif()
     # project.inc is optional too: a kind whose effect no LATER step in the same
     # plan can observe does not need to project anything.
+    #
+    # PGLASWELL_MODULE_SLOT is defined HERE rather than by the module, so that
+    # the extension slot a projection writes is not the module's to choose. The
+    # macro in planner.h uses it to hand the function its own subtree and
+    # nothing else; a module cannot name "core" or another module's slot,
+    # because it never spells the name at all.
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/modules/${_mod}/project.inc)
+        if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/modules/${_mod}/project.h)
+            message(FATAL_ERROR
+                "src/modules/${_mod}/project.inc exists but project.h does not. "
+                "The arms in project.inc name functions, and the functions live "
+                "in project.h -- said here rather than as a missing-header error "
+                "several hundred lines into planner.h.")
+        endif()
+        string(APPEND _proj_inc "#define PGLASWELL_MODULE_SLOT \"${_mod}\"\n")
         string(APPEND _proj_inc "#include \"modules/${_mod}/project.inc\"\n")
+        string(APPEND _proj_inc "#undef PGLASWELL_MODULE_SLOT\n")
+        string(APPEND _proj_head "#include \"modules/${_mod}/project.h\"\n")
     endif()
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/modules/${_mod}/tests.inc)
         string(APPEND _test_inc "#include \"modules/${_mod}/tests.inc\"\n")
@@ -136,6 +153,8 @@ file(WRITE ${_gen_dir}/enabled_tests.inc.tmp "${_test_inc}")
 configure_file(${_gen_dir}/enabled_tests.inc.tmp ${_gen_dir}/enabled_tests.inc COPYONLY)
 file(WRITE ${_gen_dir}/enabled_project.inc.tmp "${_proj_inc}")
 configure_file(${_gen_dir}/enabled_project.inc.tmp ${_gen_dir}/enabled_project.inc COPYONLY)
+file(WRITE ${_gen_dir}/enabled_project_headers.h.tmp "${_proj_head}")
+configure_file(${_gen_dir}/enabled_project_headers.h.tmp ${_gen_dir}/enabled_project_headers.h COPYONLY)
 file(WRITE ${_gen_dir}/enabled_keys.inc.tmp "${_keys_inc}")
 configure_file(${_gen_dir}/enabled_keys.inc.tmp ${_gen_dir}/enabled_keys.inc COPYONLY)
 file(WRITE ${_gen_dir}/enabled_kinds.inc.tmp "${_kinds_inc}")

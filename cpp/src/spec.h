@@ -70,6 +70,27 @@ enum class IntentKind { kAddColumn, kBackfill, kCreateIndex, kDropIndex,
 #undef PGLASWELL_KIND
 };
 
+// Did a MODULE declare this kind, or is it core's?
+//
+// constexpr so the hooks below can static_assert on it. An audit found that
+// object_key_for and conflict_keys would happily accept a module naming a CORE
+// kind -- the compiler caught only the kinds core already cased, and said
+// nothing about the ones core leaves to `default:`. A module answering for
+// kAddColumn would have changed how a core kind plans, which is the forbidden
+// shape.
+//
+// Generated from the same list the enum arms come from, so it cannot drift from
+// what a module actually declared.
+constexpr bool is_module_kind(IntentKind k) {
+  switch (k) {
+#define PGLASWELL_KIND(spec_name, enum_id, parse_fn, plan_fn) \
+    case IntentKind::enum_id: return true;
+#include "modules/enabled_kinds.inc"
+#undef PGLASWELL_KIND
+    default: return false;
+  }
+}
+
 inline const std::map<std::string, IntentKind>& intent_kinds() {
   static const std::map<std::string, IntentKind> kKinds = {
 #define PGLASWELL_KIND(spec_name, enum_id, parse_fn, plan_fn) \
@@ -210,7 +231,12 @@ inline std::string object_key_for(const Intent& in) {
 // A module's kinds that plan against a non-relation object say so here. The
 // comment above records what a kind missing from this switch cost: it read back
 // as absent, for a whole batch of kinds, found only end-to-end.
-#define PGLASWELL_OBJECT_KEY(enum_id, expr) case IntentKind::enum_id: return expr;
+#define PGLASWELL_OBJECT_KEY(enum_id, expr)                                     \
+    case IntentKind::enum_id:                                                   \
+      static_assert(is_module_kind(IntentKind::enum_id),                        \
+                    "a module may only answer for kinds IT declared; naming a " \
+                    "core kind here would change how a core kind plans");       \
+      return expr;
 #include "modules/enabled_keys.inc"
 #undef PGLASWELL_OBJECT_KEY
     default:                           return {};
@@ -252,8 +278,13 @@ inline std::vector<std::string> conflict_keys(const Intent& in) {
 // alter_distributed_table and a rebalance, though they share no name.
 // Variadic for the same reason PGLASWELL_PROJECT is: the block is C++ and its
 // commas are not the preprocessor's to split on.
-#define PGLASWELL_CONFLICT_KEYS(enum_id, ...) \
-    case IntentKind::enum_id: { __VA_ARGS__ return keys; }
+#define PGLASWELL_CONFLICT_KEYS(enum_id, ...)                                    \
+    case IntentKind::enum_id: {                                                  \
+      static_assert(is_module_kind(IntentKind::enum_id),                         \
+                    "a module may only answer for kinds IT declared; adding an " \
+                    "edge for a core kind would change how a core kind is "      \
+                    "grouped");                                                  \
+      __VA_ARGS__ return keys; }
 #include "modules/enabled_keys.inc"
 #undef PGLASWELL_CONFLICT_KEYS
     case IntentKind::kAddColumn:

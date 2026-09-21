@@ -54,6 +54,15 @@ pglaswell::Observations citus_observations(json citus, json tables) {
   return obs;
 }
 
+// Several intents in one specification, in the order written: the case
+// projection exists for.
+json citus_spec_many(json intents) {
+  return json{{"laswell_spec_version", 1},
+              {"id", "citus-test"},
+              {"description", "a citus planner test"},
+              {"intents", std::move(intents)}};
+}
+
 json citus_spec(json intent) {
   return json{{"laswell_spec_version", 1},
               {"id", "citus-test"},
@@ -63,6 +72,12 @@ json citus_spec(json intent) {
 
 pglaswell::Plan plan_citus(const json& intent, const pglaswell::Observations& obs) {
   const auto spec = pglaswell::parse_spec(citus_spec(intent));
+  return pglaswell::plan_migration(spec, obs, pglaswell::ExecutorConfig{});
+}
+
+pglaswell::Plan plan_citus_many(const json& intents,
+                               const pglaswell::Observations& obs) {
+  const auto spec = pglaswell::parse_spec(citus_spec_many(intents));
   return pglaswell::plan_migration(spec, obs, pglaswell::ExecutorConfig{});
 }
 
@@ -338,4 +353,52 @@ TEST(CitusPlanner, PacedDmlOnAReferenceTableIsAllowed) {
                                  {"where", "balance IS NULL"},
                                  {"verify_remaining", "balance IS NULL"}}, obs);
   EXPECT_TRUE(p.ok) << (p.conflicts.empty() ? "" : p.conflicts[0]);
+}
+
+TEST(CitusPlanner, ALaterIntentColocatesWithWhatAnEarlierOneWillHaveDistributed) {
+  // Projection, end to end, in the arrangement it was written for: distribute
+  // accounts, then hang account_transactions off it, in ONE specification
+  // against a database where neither is distributed yet.
+  //
+  // This is also the only thing that proves the projection lands where the
+  // planner reads it back. The module writes its own subtree of
+  // Observations::extensions and the slot name is chosen by the build, not by
+  // the module -- so if the two ever disagree, nothing would warn, the second
+  // intent would simply be refused for colocating with something "this
+  // database does not record as distributed", and the plan would look like an
+  // author's mistake rather than a wiring one.
+  const auto obs = citus_observations(
+      citus_obs(), json{{"public.accounts", table_with_pk({"id"}, 500)},
+                        {"public.account_transactions",
+                         table_with_pk({"account_id", "reference"}, 500)}});
+  const auto p = plan_citus_many(
+      json::array({json{{"kind", "citus_distribute_table"},
+                        {"schema", "public"},
+                        {"table", "accounts"},
+                        {"distribution_column", "id"}},
+                   json{{"kind", "citus_distribute_table"},
+                        {"schema", "public"},
+                        {"table", "account_transactions"},
+                        {"distribution_column", "account_id"},
+                        {"colocate_with", "public.accounts"}}}),
+      obs);
+  ASSERT_TRUE(p.ok) << (p.conflicts.empty() ? "" : p.conflicts[0]);
+  ASSERT_EQ(p.steps.size(), 2u);
+  EXPECT_EQ(p.steps[1].detail.value("colocate_with", ""), "public.accounts");
+}
+
+TEST(CitusPlanner, WithoutTheEarlierIntentTheSameColocationIsRefused) {
+  // The other side of it. Without this, the test above passes just as happily
+  // against a planner that never refuses a colocation at all.
+  const auto obs = citus_observations(
+      citus_obs(), json{{"public.account_transactions",
+                         table_with_pk({"account_id", "reference"}, 500)}});
+  const auto p = plan_citus(json{{"kind", "citus_distribute_table"},
+                                 {"schema", "public"},
+                                 {"table", "account_transactions"},
+                                 {"distribution_column", "account_id"},
+                                 {"colocate_with", "public.accounts"}},
+                            obs);
+  EXPECT_FALSE(p.ok);
+  EXPECT_TRUE(conflicts_mention(p, "does not record as distributed"));
 }

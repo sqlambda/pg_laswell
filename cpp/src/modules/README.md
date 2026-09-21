@@ -104,40 +104,52 @@ is exactly when a refusal beats a silent change of strategy.
 ### What is ENFORCED, and what is only asked (audited 2026-09-21)
 
 The rule above was written after the seams were built, so the hooks were audited
-against it by PROBE rather than by reading. Results, because "I believe it
-complies" is weaker than "I tried to break it":
+against it by PROBE rather than by reading, and the holes it found were closed
+the same way -- then probed again. Results, because "I believe it complies" is
+weaker than "I tried to break it":
 
 | hook | probe | outcome |
 |------|-------|---------|
 | `OBJECT_KEY` naming a kind core already cases | `error: duplicate case value` | **compiler enforces** |
-| `OBJECT_KEY` naming a core kind core leaves to `default:` | compiled clean | **HOLE** |
-| `CONFLICT_KEYS` naming such a kind | same shape | **HOLE** |
-| `PROJECT` writing to `projected.tables` | reachable | **HOLE** |
-| `PLAN_GUARD` pushing a warning | compiled clean | **was a hole, now closed** |
+| `OBJECT_KEY` naming a core kind core leaves to `default:` | `static assertion failed: a module may only answer for kinds IT declared` | **was a hole, now closed** |
+| `CONFLICT_KEYS` naming such a kind | same assertion | **was a hole, now closed** |
+| `PROJECT` writing to `projected.tables` | `error: 'projected' was not declared in this scope` | **was a hole, now closed** |
+| `PROJECT` naming a core kind | `static assertion failed: a module may only project for kinds IT declared` | **was a hole, now closed** |
+| `PLAN_GUARD` pushing a warning | `error: 'plan' was not declared in this scope` | **was a hole, now closed** |
 | `TOPOLOGY` merge | counts only ever raised | compliant |
 | `OBSERVE` | writes only `extensions[<module>]` | compliant |
 
-**Closed:** the plan guard is a FUNCTION taking `(spec, obs, refuse)`, not a
-block. `plan` is not passed, so a guard cannot reach it -- verified: a guard
-touching it now fails with *'plan' was not declared in this scope*. It can say
-no and say why, and nothing else.
+Every close is the same move, and it is the only one worth making: **pass a hook
+what it may touch, and nothing else.** A block that expands inside someone
+else's scope inherits every name in it, and then compliance is discipline. A
+function inherits its parameters, and then compliance is the signature.
 
-**Closed:** the naming rule is a test (`Modules.EveryModuleKindCarriesItsModulesName`)
+**The plan guard** is a function taking `(spec, obs, refuse)`. `plan` is not
+passed, so a guard can say no and say why, and nothing else.
+
+**The projection hook** calls a function taking `(in, qualified, step, json& mine)`,
+where `mine` is the module's own subtree of `Observations::extensions`. The
+projected catalog is not passed, so a module cannot change how a CORE kind plans
+two steps later. The slot name is injected by the BUILD
+(`PGLASWELL_MODULE_SLOT`, set around each module's include in `CMakeLists.txt`),
+not spelled by the module -- so a module cannot name `core` or another module's
+slot either, because it never names a slot at all.
+
+**Both key hooks** `static_assert(is_module_kind(...))`. `is_module_kind` is a
+constexpr switch generated from the same `kinds.inc` list the enum arms come
+from, so it cannot drift from what a module actually declared: answering for
+`kAddColumn` is now a compile error rather than a silent change to a core kind's
+grouping.
+
+**The naming rule** is a test (`Modules.EveryModuleKindCarriesItsModulesName`)
 derived from the enabled module list, so it holds for modules that do not exist
 yet.
 
-**Open, and honestly so:** `OBJECT_KEY`, `CONFLICT_KEYS` and `PROJECT` are keyed
-by enum id, and a module naming a CORE kind that core does not already case
-compiles. The compiler catches the common case and not the residue. Nothing in
-the Citus module does this -- `PROJECT` writes only `extensions["citus"]`, and
-both key hooks name only `citus_*` kinds -- but that is discipline, not
-mechanism.
-
-Closing it wants the same treatment the guard got: functions taking only what
-they may touch, rather than blocks inheriting a scope. `PROJECT` should receive
-`json& mine` (its own extension slot) instead of `projected`. That is the next
-piece of work on this seam and it is recorded here rather than in a comment
-nobody reads.
+One thing the compiler cannot reach: a module's PLANNER writes `Step` objects,
+and a step's SQL is a string. Nothing stops a module's own kind emitting whatever
+SQL it likes -- that is the point of a module. What the rule forbids is a module
+changing what core emits for a CORE kind, and every seam that could have done
+that now refuses to compile.
 
 ### Naming: every module kind carries its module's name
 

@@ -18,6 +18,12 @@
 
 namespace pglaswell {
 
+// Inside the namespace, like every module header: what a module's kinds leave
+// behind for the steps after them. Included HERE because project() below is the
+// first thing that reaches for it, and a module header included down with the
+// planners (line ~800) would arrive several hundred lines too late.
+#include "modules/enabled_project_headers.h"
+
 
 // --- per-intent rules ------------------------------------------------------
 
@@ -210,11 +216,25 @@ inline void project(const Intent& in, const Step& step, Observations& projected)
 // database as it was rather than as the earlier step will have left it --
 // which is how a function colocated with a table distributed two steps above
 // would have been refused for colocating with something "not distributed".
-// Variadic because the block is ordinary C++ and contains commas at brace
-// depth the preprocessor does not see -- a json{...} initialiser split into
-// nine "arguments" the first time this was written.
-#define PGLASWELL_PROJECT(enum_id, ...) \
-    case IntentKind::enum_id: { __VA_ARGS__ return; }
+//
+// The arm calls a FUNCTION and hands it `projected.extensions[<its module>]`:
+// its own subtree, and nothing else. This used to expand a raw block, which
+// inherited this scope -- `projected`, `plan`, `out`, all of it -- so a module
+// could have rewritten a core table's projection and changed how a core kind
+// plans, which THE RULE (modules/README.md) forbids. An audit found it
+// reachable; a function signature makes it unsayable.
+//
+// PGLASWELL_MODULE_SLOT comes from the generated include, not from the module,
+// so the slot is not the module's to choose.
+#define PGLASWELL_PROJECT(enum_id, project_fn)                                 \
+    case IntentKind::enum_id:                                                  \
+      static_assert(is_module_kind(IntentKind::enum_id),                       \
+                    "a module may only project for kinds IT declared; "        \
+                    "projecting for a core kind would change how a core kind " \
+                    "plans");                                                  \
+      project_fn(in, qualified, step,                                          \
+                 projected.extensions[PGLASWELL_MODULE_SLOT]);                 \
+      return;
 #include "modules/enabled_project.inc"
 #undef PGLASWELL_PROJECT
     case IntentKind::kAddColumn:
