@@ -27,6 +27,48 @@ PGLASWELL_PLAN_GUARD(
     //
     // This applies to EVERY kind, not just this module's: a plain create_table
     // on a Citus cluster is propagated DDL too.
+    // PACED DML AGAINST A DISTRIBUTED TABLE IS REFUSED, and this is not a
+    // performance judgement -- it does not work at all.
+    //
+    // The paced walk takes its batch with FOR UPDATE, which is what makes the
+    // keyset cursor safe: without it two batches could select the same rows.
+    // Citus rejects that outright on a multi-shard query:
+    //
+    //   ERROR: could not run distributed query with FOR UPDATE/SHARE commands
+    //
+    // So today this is emitted, accepted by the planner, and fails AT
+    // EXECUTION -- partway through a migration, on a cluster, with earlier
+    // batches already committed. Refusing beforehand and naming the reading is
+    // what this tool does everywhere else.
+    //
+    // It is liftable: confining a batch to ONE shard makes FOR UPDATE legal
+    // again, measured at Task Count 1. That is shard-aligned batching, and it
+    // is a change to how the executor walks rather than to what it refuses.
+    // Until it exists, this is the honest answer.
+    for (const auto& in : spec.intents) {
+      const bool paced_dml = in.kind == IntentKind::kBackfill ||
+                             in.kind == IntentKind::kUpdateRows ||
+                             in.kind == IntentKind::kDeleteRows ||
+                             in.kind == IntentKind::kMergeRows;
+      if (!paced_dml) continue;
+      const auto qualified = in.qualified_table();
+      const auto tables = citus.value("tables", json::object());
+      if (!tables.contains(qualified)) continue;  // local table: unaffected
+      const auto method = tables[qualified].value("partmethod", "");
+      if (method == "n") continue;  // reference table: single placement per node
+      plan.ok = false;
+      plan.conflicts.push_back(
+          "\"" + in.kind_name + "\" on " + qualified +
+          " is a paced walk, and " + qualified +
+          " is distributed. The walk takes each batch with FOR UPDATE so the "
+          "keyset cursor cannot select the same rows twice, and Citus refuses "
+          "that on a multi-shard query: \"could not run distributed query with "
+          "FOR UPDATE/SHARE commands\". It would be accepted here and fail "
+          "partway through, with earlier batches already committed. Until "
+          "batches are confined to one shard, run this change through a "
+          "single-shard path or undistribute the table first.");
+    }
+
     if (propagation == "off" || propagation == "false") {
       plan.ok = false;
       plan.conflicts.push_back(

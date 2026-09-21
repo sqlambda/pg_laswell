@@ -27,9 +27,20 @@ json table_with_pk(std::vector<std::string> pk_columns, long long rows = 10) {
   columns["balance"] = json{{"type", "numeric"}};
   json pk_cols = json::array();
   for (const auto& c : pk_columns) pk_cols.push_back(c);
+  // The INDEX as well as the constraint. A keyset walk needs a unique index on
+  // the key alone -- unique_key_index() reads `indexes`, not `constraints` --
+  // and a fixture with only the constraint made two "this is allowed" tests
+  // fail for a reason that had nothing to do with what they were testing.
+  json indexes = json::object();
+  indexes["t_pkey"] = json{{"leading_column", pk_columns.front()},
+                           {"columns", pk_cols},
+                           {"is_unique", true},
+                           {"is_valid", true},
+                           {"predicate", ""}};
   return json{{"exists", true},
               {"reltuples", rows},
               {"columns", columns},
+              {"indexes", indexes},
               {"constraints", json{{"t_pkey", json{{"type", "p"},
                                                    {"columns", pk_cols}}}}}};
 }
@@ -277,4 +288,54 @@ TEST(CitusPlanner, AskingForConcurrentlyAlwaysWithoutTheCallIsRefused) {
       << (p.conflicts.empty() ? "none" : p.conflicts[0]);
   EXPECT_TRUE(conflicts_mention(p, "concurrently: never"))
       << "the refusal must say what the author can write instead";
+}
+
+TEST(CitusPlanner, PacedDmlOnADistributedTableIsRefusedBeforeItRuns) {
+  // Not a performance judgement: Citus rejects FOR UPDATE on a multi-shard
+  // query outright, so this was emitted, accepted, and failed AT EXECUTION --
+  // partway through, with earlier batches already committed.
+  const auto obs = citus_observations(
+      citus_obs(json{{"public.accounts",
+                      json{{"partmethod", "h"}, {"distribution_column", "id"}}}}),
+      json{{"public.accounts", table_with_pk({"id"}, 100000)}});
+  const auto p = plan_citus(json{{"kind", "backfill"}, {"schema", "public"},
+                                 {"table", "accounts"}, {"key", "id"},
+                                 {"set", json{{"balance", "0"}}},
+                                 {"where", "balance IS NULL"},
+                                 {"verify_remaining", "balance IS NULL"}}, obs);
+  EXPECT_FALSE(p.ok);
+  EXPECT_TRUE(conflicts_mention(p, "FOR UPDATE/SHARE"))
+      << (p.conflicts.empty() ? "none" : p.conflicts[0]);
+  EXPECT_TRUE(conflicts_mention(p, "partway through"))
+      << "the refusal must say what would have happened, or it reads as "
+         "conservatism rather than a fact about Citus";
+}
+
+TEST(CitusPlanner, PacedDmlOnALocalTableInACitusDatabaseIsUnaffected) {
+  // The refusal is about the TABLE being distributed, not about Citus being
+  // installed. A local table in a Citus database walks exactly as it always
+  // did, and refusing it would take a working thing away.
+  const auto obs = citus_observations(
+      citus_obs(), json{{"public.staging", table_with_pk({"id"}, 100000)}});
+  const auto p = plan_citus(json{{"kind", "backfill"}, {"schema", "public"},
+                                 {"table", "staging"}, {"key", "id"},
+                                 {"set", json{{"balance", "0"}}},
+                                 {"where", "balance IS NULL"},
+                                 {"verify_remaining", "balance IS NULL"}}, obs);
+  EXPECT_TRUE(p.ok) << (p.conflicts.empty() ? "" : p.conflicts[0]);
+}
+
+TEST(CitusPlanner, PacedDmlOnAReferenceTableIsAllowed) {
+  // A reference table has one placement per node and is not sharded, so the
+  // multi-shard FOR UPDATE restriction does not apply to it.
+  const auto obs = citus_observations(
+      citus_obs(json{{"public.currencies",
+                      json{{"partmethod", "n"}, {"distribution_column", ""}}}}),
+      json{{"public.currencies", table_with_pk({"id"}, 100)}});
+  const auto p = plan_citus(json{{"kind", "backfill"}, {"schema", "public"},
+                                 {"table", "currencies"}, {"key", "id"},
+                                 {"set", json{{"balance", "0"}}},
+                                 {"where", "balance IS NULL"},
+                                 {"verify_remaining", "balance IS NULL"}}, obs);
+  EXPECT_TRUE(p.ok) << (p.conflicts.empty() ? "" : p.conflicts[0]);
 }
