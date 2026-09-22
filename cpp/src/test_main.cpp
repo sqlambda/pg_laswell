@@ -11188,6 +11188,54 @@ TEST_F(DatabaseTest, ABatchIsBoundedByBytesAsWellAsRows) {
   }
 }
 
+TEST(Executor, AShardCursorRoundTripsAndRefusesWhatItCannotRead) {
+  // The cursor of a shard-confined walk says WHICH distribution value and HOW
+  // FAR into it. A misread does not fail loudly: it resumes at the start of some
+  // group, silently redoing or skipping a whole shard, and the job reports
+  // success. So the decoder refuses anything it cannot read, and this asserts
+  // both halves of that.
+  using pglaswell::ShardCursor;
+
+  // Round trip, including the values a delimiter-based encoding would ruin.
+  for (const auto& pair : std::vector<std::pair<std::string, std::string>>{
+           {"3", "800"},
+           {"tenant,with,commas", "key\"with\"quotes"},
+           {"", ""},
+           {"5", ""},
+           {std::string("unit\x1f") + "separator", std::string("and\x1f") + "another"}}) {
+    ShardCursor out;
+    ASSERT_TRUE(ShardCursor::decode(
+        ShardCursor{pair.first, pair.second}.encode(), out))
+        << pair.first << " / " << pair.second;
+    EXPECT_EQ(out.group, pair.first);
+    EXPECT_EQ(out.key, pair.second);
+  }
+
+  // The fresh-start sentinel resume_cursor returns when there is nothing to
+  // resume. Accepted BY NAME, and it cannot collide with a real cursor because
+  // a real one is always a JSON array.
+  {
+    ShardCursor out{"x", "y"};
+    EXPECT_TRUE(ShardCursor::decode("0", out));
+    EXPECT_TRUE(ShardCursor::decode("", out));
+  }
+
+  // Everything else it cannot read is refused rather than guessed at. Each of
+  // these would otherwise be read as "the beginning", which is the failure the
+  // decoder exists to prevent.
+  for (const char* bad : {"800",              // a plain key: an OLD cursor format
+                          "[\"3\"]",           // one element
+                          "[\"3\",\"8\",\"9\"]",  // three
+                          "[3,800]",          // numbers, not strings
+                          "{\"group\":\"3\"}",   // an object
+                          "not json at all",
+                          "[\"3\",null]"}) {
+    ShardCursor out;
+    EXPECT_FALSE(ShardCursor::decode(bad, out))
+        << "read as a cursor when it is not one: " << bad;
+  }
+}
+
 // --- conformance: every kind, executed ------------------------------------
 
 #include "conformance.inc"

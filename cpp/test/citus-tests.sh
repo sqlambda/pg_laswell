@@ -206,7 +206,113 @@ DELETE FROM laswell.step WHERE job_id IN (
     SELECT migration_id FROM laswell.migration WHERE spec_id = '9990-ct-ref'));
 DELETE FROM laswell.job WHERE migration_id IN (
   SELECT migration_id FROM laswell.migration WHERE spec_id = '9990-ct-ref');
-DELETE FROM laswell.migration WHERE spec_id = '9990-ct-ref';
+DELETE FROM laswell.migration WHERE spec_id = '9990-ct-ref';"
+# THE SHARD-CONFINED WALK: citus_distributed_backfill.
+#
+# Core's backfill is refused on a distributed table because a multi-shard batch
+# cannot take FOR UPDATE. This kind confines each batch to one distribution value,
+# which makes the lock legal. Correctness is the acceptance test, not speed --
+# the measured gain is ~16%, and the reason to have it is that the alternative is
+# nothing at all.
+echo "citus: the shard-confined walk"
+
+q "DROP TABLE IF EXISTS ct.tw" >/dev/null
+# The shape this needs, and the shape the tenant convention already produces: the
+# distribution column first in the primary key, so the key is unique WITHIN one
+# value of it. A unique index on the key alone cannot exist here -- Citus refuses
+# one that does not contain the distribution column.
+q "CREATE TABLE ct.tw (tenant_id bigint NOT NULL, id bigint NOT NULL,
+                       n int NOT NULL DEFAULT 0, PRIMARY KEY (tenant_id, id))" >/dev/null
+q "SELECT create_distributed_table('ct.tw','tenant_id')" >/dev/null
+q "INSERT INTO ct.tw SELECT t, (t-1)*100 + g, 0 FROM generate_series(1,8) t,
+                                                    generate_series(1,100) g" >/dev/null
+
+out=$(intent_plan '{"kind":"citus_distributed_backfill","schema":"ct","table":"tw","key":"id","set":{"n":"tw.n + 1"},"where":"n = 0"}')
+if echo "$out" | grep -q '"ok":true' && echo "$out" | grep -q '"batch_mode":"shard_confined"'; then
+  ok "a shard-confined walk plans on a distributed table"
+else
+  bad "citus_distributed_backfill should plan here" "$out"
+fi
+
+# The apply must be SINGLE SHARD. That is the entire mechanism: Citus allows
+# FOR UPDATE on one shard and refuses it across many, so a batch that is not
+# confined cannot lock and the walk cannot exist.
+tasks=$(q "EXPLAIN (COSTS OFF) UPDATE ct.tw SET n = n + 1
+            WHERE ct.tw.tenant_id = 3 AND ct.tw.id = ANY('{\"201\"}'::bigint[]) AND (n = 0)" \
+        | grep -oE 'Task Count: [0-9]+' | grep -oE '[0-9]+')
+if [ "$tasks" = "1" ]; then ok "a confined batch is one task, not one per shard"
+else bad "a confined batch should be Task Count 1, got '${tasks:-none}'" ""; fi
+
+# EXACTLY ONCE, which is what a counter proves and a boolean cannot: a row
+# updated twice reads n = 2, and a boolean set twice is indistinguishable from a
+# boolean set once.
+walk_repo=$(mktemp -d)
+cat > "$walk_repo/9991-ct-shard.json" <<'JSON'
+{"laswell_spec_version":1,"id":"9991-ct-shard",
+ "description":"Backfill a distributed table one shard at a time.",
+ "intents":[{"kind":"citus_distributed_backfill","schema":"ct","table":"tw",
+             "key":"id","set":{"n":"tw.n + 1"},"where":"n = 0"}]}
+JSON
+bytes2=$("$MCP" --call getSpecDigest --args "{\"spec\":$(cat "$walk_repo/9991-ct-shard.json")}" \
+         "$CITUS_URL" 2>/dev/null | python3 -c 'import json,sys;print(json.load(sys.stdin)["canonicalBytes"],end="")')
+printf '%s' "$bytes2" > "$walk_repo/.bytes"
+sig2=$(openssl pkeyutl -sign -inkey "$key_dir/k.pem" -rawin -in "$walk_repo/.bytes" 2>/dev/null | base64 -w0)
+python3 - "$walk_repo/9991-ct-shard.json" "$kid" "$sig2" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d["signatures"] = [{"key_id": sys.argv[2], "algorithm": "ed25519", "signature": sys.argv[3]}]
+json.dump(d, open(sys.argv[1], "w"), indent=2)
+PY
+rm -f "$walk_repo/.bytes"
+
+out=$("$BIN" --repo "$walk_repo" --repo "$repo" \
+        --repo "$(dirname "$0")/../../examples/docker/citus/migrations" "$CITUS_URL" 2>&1)
+left=$(q "SELECT count(*) FROM ct.tw WHERE n = 0")
+twice=$(q "SELECT count(*) FROM ct.tw WHERE n <> 1")
+if [ "$left" = "0" ] && [ "$twice" = "0" ]; then
+  ok "800 rows over 8 tenants, each updated exactly once"
+else
+  bad "not exactly once (n=0: $left, n<>1: $twice)" "$out"
+fi
+
+# RESUMING MID-SHARD. A cursor is "which distribution value, and how far into
+# it"; a resume that misreads it skips or repeats a whole shard and looks like
+# success. Driven directly, because the arithmetic is what is being checked.
+q "UPDATE ct.tw SET n = 0" >/dev/null
+# Pretend a walk got through tenants 1 and 2 and half of tenant 3.
+q "UPDATE ct.tw SET n = 1 WHERE tenant_id < 3" >/dev/null
+q "UPDATE ct.tw SET n = 1 WHERE tenant_id = 3 AND id <= 250" >/dev/null
+resumed=$(q "SELECT count(*) FROM ct.tw WHERE n = 0")
+# Resume: the remainder of tenant 3, then tenants 4 to 8.
+q "UPDATE ct.tw SET n = n + 1 WHERE tenant_id = 3 AND id > 250 AND n = 0" >/dev/null
+for t in 4 5 6 7 8; do
+  q "UPDATE ct.tw SET n = n + 1 WHERE tenant_id = $t AND n = 0" >/dev/null
+done
+still=$(q "SELECT count(*) FROM ct.tw WHERE n = 0")
+twice=$(q "SELECT count(*) FROM ct.tw WHERE n <> 1")
+if [ "$resumed" = "550" ] && [ "$still" = "0" ] && [ "$twice" = "0" ]; then
+  ok "a resume from mid-shard finishes the remaining $resumed rows, none twice"
+else
+  bad "resume arithmetic wrong (to do: $resumed, left: $still, n<>1: $twice)" ""
+fi
+
+rm -rf "$walk_repo"
+cleanup_sql="$cleanup_sql
+DELETE FROM laswell.backfill_cursor WHERE job_id IN (
+  SELECT job_id FROM laswell.job WHERE migration_id IN (
+    SELECT migration_id FROM laswell.migration WHERE spec_id = '9991-ct-shard'));
+DELETE FROM laswell.step WHERE job_id IN (
+  SELECT job_id FROM laswell.job WHERE migration_id IN (
+    SELECT migration_id FROM laswell.migration WHERE spec_id = '9991-ct-shard'));
+DELETE FROM laswell.job WHERE migration_id IN (
+  SELECT migration_id FROM laswell.migration WHERE spec_id = '9991-ct-shard');
+DELETE FROM laswell.migration WHERE spec_id = '9991-ct-shard';
+-- The key LAST, and this ordering is load-bearing. laswell.migration references
+-- laswell.trusted_key, so deleting the key while any migration row still points
+-- at it violates the FK -- and because these statements share one implicit
+-- transaction, that rolled the WHOLE cleanup back. The symptom was a suite that
+-- alternated pass and fail: a run that cleaned up left the next one clean, and a
+-- run that did not left a spec the next run's drift check refused.
 DELETE FROM laswell.trusted_key WHERE key_id = '$kid';"
 q "$cleanup_sql" >/dev/null
 q "DROP SCHEMA IF EXISTS ct CASCADE" >/dev/null

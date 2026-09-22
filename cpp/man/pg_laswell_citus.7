@@ -160,6 +160,79 @@ has to be propagated too or the copies diverge.
 The function must already exist; create it in an earlier specification and order
 the two with
 .Va depends_on .
+.Ss Cm citus_distributed_backfill
+A paced backfill that walks one shard at a time.
+.Pp
+Required:
+.Va schema ,
+.Va table ,
+.Va key ,
+.Va set ,
+.Va where .
+Optional:
+.Va verify_remaining ,
+.Va assert_invariants .
+The same vocabulary
+.Cm backfill
+takes, minus the distribution column -- that is read from
+.Va pg_dist_partition ,
+because it is a fact about the cluster rather than an author's choice.
+.Pp
+This kind exists because core's
+.Cm backfill
+is refused on a distributed table and cannot be otherwise.
+A keyset walk takes each batch with
+.Ic FOR UPDATE ,
+so the cursor cannot select the same rows twice, and Citus refuses that on a
+multi-shard query.
+Confining a batch to one shard makes the lock legal again, and the only
+confinement Citus pushes down is an
+.Em equality on the distribution column :
+a hash-range predicate is not pushed down, so it reads every shard and is refused
+just the same.
+.Pp
+So the walk gains an outer dimension.
+It iterates distribution values, and keyset-walks the key inside each; the cursor
+records both, as
+.Ql ["3","800"] .
+The write comes back
+.Li Task Count: 1 .
+.Bl -tag -width Ds
+.It Va key
+Must be unique
+.Em within
+one distribution value, which a unique index on
+.Pq Va distribution column , Va key
+in that order provides -- the primary key of any table whose tenant column comes
+first.
+A unique index on
+.Va key
+alone cannot exist on a distributed table: Citus refuses one that does not
+contain the distribution column, so requiring it would refuse every table.
+.It Va where
+Mandatory, as for
+.Cm backfill :
+a walk with no predicate can never report itself finished, and would rewrite
+every row on every run.
+It is also what makes a re-run cheap and a resume correct.
+.El
+.Pp
+Refused when the table is not distributed
+.Pq use Cm backfill ,
+when it is a reference table
+.Pq Cm backfill No works there ,
+and when the distribution column
+.Em is
+the walk key -- then one value holds one row, and every batch would be a single
+row.
+.Pp
+The gain is not speed.
+A shard-ordered walk measures about 16% better per row than a key-ordered one,
+not the eightfold a first measurement suggested: that figure compared rows
+already confined against rows spread across shards, a shape a key-ordered walk
+cannot produce.
+The reason to have this kind is that on a distributed table the alternative is
+not a slower walk, it is no walk at all.
 .\" END CITUS KIND LIST
 .Sh READINGS
 With the module built in, every plan against a database where the

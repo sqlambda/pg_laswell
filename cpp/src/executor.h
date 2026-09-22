@@ -80,12 +80,58 @@ inline std::string strip_semicolon(const std::string& s) {
 // a second statement, and two of them broke. One function cannot drift from
 // itself.
 struct BatchOutcome {
+  // True when a batch only advanced past finished groups without doing work. The
+  // walk is NOT over: reading considered == 0 as "finished" here would stop at
+  // the first run of 64 empty tenants and report success.
+  bool skipped_only = false;
   // Rows CONSIDERED, not rows changed. The walk ends when a batch considers
   // nothing; a batch that considered rows and changed none is still progress,
   // and reading it as "finished" is how a merge that matched nothing reported
   // success having merged nothing.
   long long considered = 0;
   std::string cursor;
+};
+
+// WHERE a shard-confined walk has got to: which distribution value, and how far
+// into it. JSON rather than a delimiter, because a delimiter has to be a byte no
+// key contains and there is no such byte -- and because `last_key` is read by
+// people looking at a stuck job, so ["3","5571"] beats an escaped blob.
+//
+// An empty string means "not started". A group with an empty key means "this
+// group, from the beginning", which is what advancing to the next group leaves
+// behind.
+struct ShardCursor {
+  std::string group;
+  std::string key;
+
+  std::string encode() const {
+    return json::array({group, key}).dump();
+  }
+
+  // Tolerant on purpose: a cursor that cannot be parsed must not be read as
+  // "start of some group", because that would silently redo or skip a shard and
+  // look like success. Anything unparseable is reported as such by the caller.
+  static bool decode(const std::string& text, ShardCursor& out) {
+    // "0" is resume_cursor's sentinel for "nothing to resume from", and also
+    // what it returns when it rejects a stale cursor. An encoded shard cursor is
+    // always a JSON array, so the two cannot be confused -- which is why this
+    // accepts the sentinel by name and still refuses anything else it cannot
+    // read. Refusing is the point: a cursor read as "the start of some group"
+    // when it means something else would silently redo or skip a whole shard.
+    if (text.empty() || text == "0") return true;  // not started
+    json j;
+    try {
+      j = json::parse(text);
+    } catch (const std::exception&) {
+      return false;
+    }
+    if (!j.is_array() || j.size() != 2 || !j[0].is_string() || !j[1].is_string()) {
+      return false;
+    }
+    out.group = j[0].get<std::string>();
+    out.key = j[1].get<std::string>();
+    return true;
+  }
 };
 
 // `apply_sql` empty means the one-statement form, where the mutation's own
@@ -149,6 +195,112 @@ inline BatchOutcome run_paced_batch(pqxx::work& txn,
   out.cursor = keys.back();
   out.considered = static_cast<long long>(r.size());
   if (out.considered == 0) out.considered = static_cast<long long>(keys.size());
+  return out;
+}
+
+// An empty position is a real NULL, not an empty string: the parameter takes the
+// column's own type and '' is not a bigint.
+inline std::optional<std::string> maybe(const std::string& v) {
+  if (v.empty()) return std::nullopt;
+  return v;
+}
+
+// ONE BATCH of a shard-confined walk, and the only implementation of it.
+//
+// Three statements, and the order is the algorithm: which distribution values
+// remain, which keys remain inside one of them, and the change to exactly those
+// keys. The middle statement is the one allowed to take FOR UPDATE, because an
+// equality on the distribution column makes it single-shard -- which is the whole
+// reason this shape exists. See modules/citus/plan.h.
+//
+// Returns considered == 0 only when there is no group left with work in it, which
+// is the walk's one end condition.
+inline BatchOutcome run_shard_confined_batch(pqxx::work& txn,
+                                             const std::string& groups_sql,
+                                             const std::string& select_sql,
+                                             const std::string& apply_sql,
+                                             const ShardCursor& from, int batch,
+                                             long long batch_bytes) {
+  BatchOutcome out;
+  ShardCursor at = from;
+  out.cursor = at.encode();
+
+  // Up to this many groups are looked at in one batch before giving up the
+  // transaction. A group whose rows are all done contributes no work, and a
+  // cluster can hold many such groups, so a batch that could only skip ONE
+  // would take a transaction per finished tenant.
+  constexpr int kGroupsPerBatch = 64;
+
+  for (int looked = 0; looked < kGroupsPerBatch; ++looked) {
+    if (at.group.empty()) {
+      // `groups_sql` carries the predicate too, so a distribution value with no
+      // matching rows never becomes a group at all.
+      const auto g = pqxx_exec(txn, groups_sql,
+                               pqxx::params{maybe(at.group), 1});
+      if (g.empty()) {  // no values left: the walk is finished
+        out.cursor = at.encode();
+        return out;
+      }
+      at.group = g[0][0].as<std::string>();
+      at.key.clear();
+    }
+
+    const auto sel = pqxx_exec(txn, select_sql,
+                               pqxx::params{at.group, maybe(at.key), batch});
+    if (sel.empty()) {
+      // This group is done. Advance past it and look at the next one: `groups_sql`
+      // is keyset-walked on the group, so an empty key with a group set means
+      // "everything in this group is done", and the next iteration asks for the
+      // next group after it.
+      const auto g = pqxx_exec(txn, groups_sql,
+                               pqxx::params{maybe(at.group), 1});
+      if (g.empty()) {
+        out.cursor = at.encode();
+        return out;  // finished
+      }
+      at.group = g[0][0].as<std::string>();
+      at.key.clear();
+      continue;
+    }
+
+    std::vector<std::string> keys;
+    keys.reserve(static_cast<std::size_t>(sel.size()));
+    long long bytes = 0;
+    for (const auto& row : sel) {
+      auto v = row[0].as<std::string>();
+      if (!keys.empty() && bytes + static_cast<long long>(v.size()) > batch_bytes) {
+        break;
+      }
+      bytes += static_cast<long long>(v.size());
+      keys.push_back(std::move(v));
+    }
+
+    std::string literal = "{";
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+      if (i != 0) literal += ',';
+      literal += '"';
+      for (const char c : keys[i]) {
+        if (c == '"' || c == '\\') literal += '\\';
+        literal += c;
+      }
+      literal += '"';
+    }
+    literal += "}";
+
+    const auto r = pqxx_exec(txn, apply_sql, pqxx::params{at.group, literal});
+    at.key = keys.back();
+    out.cursor = at.encode();
+    out.considered = static_cast<long long>(r.size());
+    if (out.considered == 0) out.considered = static_cast<long long>(keys.size());
+    return out;
+  }
+
+  // Ran out of group-skipping budget without finding work. Not finished -- the
+  // cursor moved, so the next batch resumes from where this one stopped rather
+  // than starting over.
+  out.considered = 0;
+  out.cursor = at.encode();
+  out.skipped_only = true;
   return out;
 }
 
@@ -498,12 +650,22 @@ class Executor {
     // those keys. The CTE form could not be routed by Citus, and a single
     // statement's LIMIT can only bound a batch by rows -- accumulating to a byte
     // budget needs the keys in hand before the mutation is sent.
+    const auto batch_mode = detail_json.value("batch_mode", "");
     const bool two_statement =
-        detail_json.value("batch_mode", "") == "two_statement" &&
-        step["sql"].size() > 1;
+        batch_mode == "two_statement" && step["sql"].size() > 1;
+    // A shard-confined walk: three statements, and a cursor that is a pair. Only
+    // a module's kind asks for it, but the loop is core's -- a module declares
+    // the mode, it does not bring its own executor.
+    const bool shard_confined =
+        batch_mode == "shard_confined" && step["sql"].size() > 2;
     const auto apply_sql =
-        two_statement ? detail::strip_semicolon(step["sql"][1].get<std::string>())
-                      : std::string();
+        (two_statement || shard_confined)
+            ? detail::strip_semicolon(
+                  step["sql"][shard_confined ? 2 : 1].get<std::string>())
+            : std::string();
+    const auto confined_select_sql =
+        shard_confined ? detail::strip_semicolon(step["sql"][1].get<std::string>())
+                       : std::string();
     const auto key_column = detail_json.value("key", "id");
 
     resume_qualified_ = detail_json.value("qualified", "");
@@ -559,6 +721,7 @@ class Executor {
       const auto txn_started = detail::steady_ms();
       long long rows_this_txn = 0;
       CommitReason reason = CommitReason::kInterval;
+      bool skipped_groups_only = false;
 
       while (true) {
         // batch_rows bounds how long ONE STATEMENT runs, and therefore
@@ -570,11 +733,42 @@ class Executor {
                               : e.batch_rows;
         long long affected = 0;
         try {
-          const auto outcome =
-              run_paced_batch(w.txn(), sql, apply_sql, cursor, batch,
-                              e.batch_bytes);
+          BatchOutcome outcome;
+          if (shard_confined) {
+            ShardCursor at;
+            if (!ShardCursor::decode(cursor, at)) {
+              // A cursor that will not parse must stop the step, not be read as
+              // the start of some group: that would silently redo or skip a
+              // whole shard and look like success.
+              record_step(ordinal, step, "failed", rows_done,
+                          json{{"error",
+                                "the recorded cursor \"" + cursor +
+                                    "\" is not a shard-confined cursor, so where "
+                                    "this walk had got to cannot be known"},
+                               {"hint",
+                                "Cancel the job and start a new one; the rows "
+                                "already done are still done, and the predicate "
+                                "excludes them."}});
+              w.rollback();
+              throw std::runtime_error(
+                  "a shard-confined walk could not read its own cursor: \"" +
+                  cursor + "\"");
+            }
+            outcome = run_shard_confined_batch(w.txn(), sql, confined_select_sql,
+                                               apply_sql, at, batch,
+                                               e.batch_bytes);
+          } else {
+            outcome = run_paced_batch(w.txn(), sql, apply_sql, cursor, batch,
+                                      e.batch_bytes);
+          }
           affected = outcome.considered;
           cursor = outcome.cursor;
+          // A batch that only advanced past finished groups did no work and is
+          // not the end of the walk. Treated as progress so the loop continues,
+          // and not counted as rows.
+          if (affected == 0 && outcome.skipped_only) {
+            skipped_groups_only = true;
+          }
         } catch (const pqxx::sql_error& ex) {
           if (detail::is_query_canceled(ex) &&
               job_->pacing.cancel_requested.exchange(false)) {
@@ -602,9 +796,17 @@ class Executor {
         // throughout -- indistinguishable from a stuck job.
         publish_backfill(ordinal, rows_done, rows_committed, commits, cursor,
                          reasons, detail_json, "in_flight");
-        if (affected == 0) {
+        if (affected == 0 && !skipped_groups_only) {
           done = true;
           reason = CommitReason::kFinal;
+          break;
+        }
+        if (skipped_groups_only) {
+          // Groups were skipped, none had work, and the walk is NOT over. Commit
+          // what the cursor now says and come back: treating this as finished
+          // would stop at the first run of finished tenants and report success.
+          skipped_groups_only = false;
+          reason = CommitReason::kInterval;
           break;
         }
 

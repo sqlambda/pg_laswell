@@ -123,3 +123,43 @@ inline void parse_citus_distribute_function(Intent& in) {
   }
 }
 
+
+// A paced backfill confined to one shard at a time.
+//
+// The same vocabulary core's backfill uses -- key, set, where -- because it is
+// the same operation. What it does NOT take is the distribution column: that is
+// a catalog fact read from pg_dist_partition, not an author's choice, and a spec
+// naming it could disagree with the cluster.
+inline void parse_citus_distributed_backfill(Intent& in) {
+  const auto at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(
+      in.body,
+      {"kind", "schema", "table", "key", "set", "where", "verify_remaining",
+       "assert_invariants"},
+      at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at),
+                             "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at),
+                             "table", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "key", at), "key",
+                             in.ordinal);
+  if (!in.body.contains("set") || !in.body["set"].is_object() ||
+      in.body["set"].empty()) {
+    detail::fail(at + " needs a non-empty \"set\" of column to expression",
+                 "The same shape backfill takes.");
+  }
+  for (auto it = in.body["set"].begin(); it != in.body["set"].end(); ++it) {
+    detail::require_identifier(it.key(), "set", in.ordinal);
+    if (!it.value().is_string()) {
+      detail::fail(at + ".set." + it.key() + " must be a SQL expression string",
+                   "");
+    }
+  }
+  // Mandatory, exactly as core's backfill requires it: a walk with no predicate
+  // rewrites every row and can never report itself finished.
+  if (detail::require_string(in.body, "where", at).empty()) {
+    detail::fail(at + " needs a \"where\"",
+                 "A backfill without a predicate has no way to say it is done, "
+                 "and would rewrite every row on every run.");
+  }
+}

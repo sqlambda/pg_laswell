@@ -877,6 +877,28 @@ class Catalog {
             // The attempt runs inside a SAVEPOINT because a failed statement
             // aborts the whole transaction: without one, the fallback and every
             // later step would fail with 25P02 instead of being checked.
+            // GENERIC_PLAN first, PREPARE as the fallback, and the FALLBACK'S
+            // error is the one reported.
+            //
+            // GENERIC_PLAN is unavailable on a Citus table at any server
+            // version, and it fails in more than one way: "EXPLAIN GENERIC_PLAN
+            // is currently not supported for Citus tables" (XX000), "could not
+            // create distributed plan" (0A000), and -- for a statement carrying
+            // an explicitly cast parameter -- "no value found for parameter 1"
+            // (42704). Matching those strings was the first attempt and it was
+            // brittle by construction: the third one was found only because a
+            // new kind emitted a cast, and it was reported as a failing
+            // statement when the statement was fine.
+            //
+            // So GENERIC_PLAN's failure is not itself reported. PREPARE decides:
+            // it reaches parse errors and planning errors alike, so if it
+            // succeeds the statement is well formed and plannable and the only
+            // thing lost is the stronger check; if it fails, ITS error is the
+            // real one and is what surfaces.
+            //
+            // The savepoint is required rather than tidy: a failed statement
+            // aborts the transaction, so without one the fallback and every
+            // later step would fail with 25P02 instead of being checked.
             bool verified = false;
             if (server_version >= 160000) {
               session.txn().exec("SAVEPOINT laswell_generic_plan");
@@ -884,38 +906,31 @@ class Catalog {
                 session.txn().exec("EXPLAIN (GENERIC_PLAN, FORMAT JSON) " + stmt);
                 session.txn().exec("RELEASE SAVEPOINT laswell_generic_plan");
                 verified = true;
-              } catch (const pqxx::sql_error& ge) {
+              } catch (const pqxx::sql_error&) {
                 session.txn().exec("ROLLBACK TO SAVEPOINT laswell_generic_plan");
                 session.txn().exec("RELEASE SAVEPOINT laswell_generic_plan");
-                // Only when GENERIC_PLAN itself is what cannot be done here.
-                // Any other error is the statement's and must be reported.
-                const std::string what = ge.what();
-                const bool generic_plan_unavailable =
-                    what.find("GENERIC_PLAN") != std::string::npos ||
-                    what.find("could not create distributed plan") !=
-                        std::string::npos;
-                if (!generic_plan_unavailable) throw;
               }
             }
             if (!verified) {
               session.txn().exec("PREPARE laswell_dry AS " + stmt);
               session.txn().exec("DEALLOCATE laswell_dry");
-              // PREPARE is a WEAKER check here and saying so is the point.
+              // PREPARE is a WEAKER check and saying so is the point.
               //
               // Measured on Citus 13: PREPARE accepts a multi-shard
-              // SELECT ... FOR UPDATE that EXECUTE then refuses with
-              // "could not run distributed query with FOR UPDATE/SHARE
-              // commands". Citus defers its planning to execution, so a
-              // statement it cannot route passes PREPARE.
+              // SELECT ... FOR UPDATE that EXECUTE then refuses with "could not
+              // run distributed query with FOR UPDATE/SHARE commands". Citus
+              // defers its planning to execution, so a statement it cannot route
+              // passes PREPARE.
               //
-              // The first version of this fallback reported such a step as
-              // verified, which traded a false failure for a false success --
-              // the worse of the two, because the dry run exists to be believed.
-              // The step is named unverified instead, with the reason, and the
-              // real check for these lives in cpp/test/citus-tests.sh where the
-              // statement is executed against a cluster.
-              // Once per STEP, not once per statement: a two-statement batch
-              // takes this path twice and listed its ordinal twice.
+              // An earlier version reported such a step as verified, trading a
+              // false failure for a false success -- the worse of the two,
+              // because the dry run exists to be believed. The step is named
+              // unverified instead, and the real check for these lives in
+              // cpp/test/citus-tests.sh where the statement is executed against
+              // a cluster.
+              //
+              // Once per STEP, not once per statement: a multi-statement batch
+              // takes this path more than once and listed its ordinal each time.
               if (std::find(out.unverified_steps.begin(),
                             out.unverified_steps.end(),
                             steps[i].first) == out.unverified_steps.end()) {

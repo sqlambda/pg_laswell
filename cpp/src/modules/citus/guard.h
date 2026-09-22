@@ -87,10 +87,11 @@ inline void citus_plan_refusals(const Spec& spec, const Observations& obs,
             "cursor cannot select the same rows twice, and Citus refuses that on "
             "a multi-shard query: \"could not run distributed query with FOR "
             "UPDATE/SHARE commands\". It would be accepted here and fail partway "
-            "through, with earlier batches already committed. Supply the rows "
-            "explicitly instead -- update_rows, delete_rows with values, and "
-            "insert_rows all run on a distributed table -- or undistribute the "
-            "table for the migration.");
+            "through, with earlier batches already committed. Use "
+            "\"citus_distributed_backfill\", which walks one shard at a time so "
+            "the lock is legal, or supply the rows explicitly -- update_rows, "
+            "delete_rows with values, and insert_rows all run on a distributed "
+            "table.");
         continue;
       }
 
