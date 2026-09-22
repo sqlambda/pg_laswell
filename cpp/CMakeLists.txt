@@ -262,6 +262,18 @@ if(BUILD_TESTING)
         message(STATUS "python3 not found: skipping the manpage_kinds test")
     endif()
 
+    # What a fixed Observations literal cannot see: the Citus module's refusals
+    # are unit-tested against hand-written readings, which proves the DECISION
+    # and nothing about whether Citus can plan and run the statement the planner
+    # emits. That gap cost a defect -- a correct decision whose statement the
+    # dry run could not verify -- so the seam gets a test against a real
+    # cluster. It SKIPs loudly without one rather than passing quietly.
+    if(PGLASWELL_MODULES)
+        add_test(NAME citus_tests
+                 COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/citus-tests.sh
+                         $<TARGET_FILE:pg_laswell> $<TARGET_FILE:pg_laswell_mcp>)
+    endif()
+
     # The --call contract, at the process level. The exit code is the whole
     # point of that mode and gtest cannot see it: the suite observes return
     # values, not process status. Runs without a database too, covering the

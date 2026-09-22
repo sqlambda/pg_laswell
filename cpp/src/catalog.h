@@ -856,9 +856,44 @@ class Catalog {
             // without binding values. On older servers PREPARE catches the
             // same class of error. Never ANALYZE: EXPLAIN must not execute the
             // thing being planned.
+            //
+            // GENERIC_PLAN is ALSO unavailable on a Citus table, at any server
+            // version. Measured on Citus 13: "EXPLAIN GENERIC_PLAN is currently
+            // not supported for Citus tables" (XX000) for a reference table, and
+            // "could not create distributed plan" (0A000) for a distributed one.
+            //
+            // That is a limit of the CHECK, not a fault in the statement. A
+            // paced walk over a reference table executes correctly -- measured,
+            // 10 batches, 500 rows, nothing left -- and reporting it as a failed
+            // plan told the author their specification was wrong when it was
+            // not. PREPARE reaches the same class of error and Citus supports
+            // it, so fall back to it rather than call a working statement
+            // broken.
+            //
+            // The attempt runs inside a SAVEPOINT because a failed statement
+            // aborts the whole transaction: without one, the fallback and every
+            // later step would fail with 25P02 instead of being checked.
+            bool verified = false;
             if (server_version >= 160000) {
-              session.txn().exec("EXPLAIN (GENERIC_PLAN, FORMAT JSON) " + stmt);
-            } else {
+              session.txn().exec("SAVEPOINT laswell_generic_plan");
+              try {
+                session.txn().exec("EXPLAIN (GENERIC_PLAN, FORMAT JSON) " + stmt);
+                session.txn().exec("RELEASE SAVEPOINT laswell_generic_plan");
+                verified = true;
+              } catch (const pqxx::sql_error& ge) {
+                session.txn().exec("ROLLBACK TO SAVEPOINT laswell_generic_plan");
+                session.txn().exec("RELEASE SAVEPOINT laswell_generic_plan");
+                // Only when GENERIC_PLAN itself is what cannot be done here.
+                // Any other error is the statement's and must be reported.
+                const std::string what = ge.what();
+                const bool generic_plan_unavailable =
+                    what.find("GENERIC_PLAN") != std::string::npos ||
+                    what.find("could not create distributed plan") !=
+                        std::string::npos;
+                if (!generic_plan_unavailable) throw;
+              }
+            }
+            if (!verified) {
               session.txn().exec("PREPARE laswell_dry AS " + stmt);
               session.txn().exec("DEALLOCATE laswell_dry");
             }
