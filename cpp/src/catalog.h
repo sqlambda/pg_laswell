@@ -12,6 +12,7 @@
 // all marshalling code, and it is pg_licht's dominant pattern for the same
 // reason.
 
+#include <algorithm>
 #include <optional>
 #include <string>
 #include <vector>
@@ -763,6 +764,9 @@ class Catalog {
 
   struct DryRun {
     bool ran = false;
+    // Why a step could only be checked WEAKLY, when that is the case. Empty
+    // when every step was either fully checked or not reached.
+    std::string weak_verification;
     std::vector<Problem> problems;
     std::vector<int> unverified_steps;  // could not be included, or not reached
     std::string skipped_reason;
@@ -896,6 +900,37 @@ class Catalog {
             if (!verified) {
               session.txn().exec("PREPARE laswell_dry AS " + stmt);
               session.txn().exec("DEALLOCATE laswell_dry");
+              // PREPARE is a WEAKER check here and saying so is the point.
+              //
+              // Measured on Citus 13: PREPARE accepts a multi-shard
+              // SELECT ... FOR UPDATE that EXECUTE then refuses with
+              // "could not run distributed query with FOR UPDATE/SHARE
+              // commands". Citus defers its planning to execution, so a
+              // statement it cannot route passes PREPARE.
+              //
+              // The first version of this fallback reported such a step as
+              // verified, which traded a false failure for a false success --
+              // the worse of the two, because the dry run exists to be believed.
+              // The step is named unverified instead, with the reason, and the
+              // real check for these lives in cpp/test/citus-tests.sh where the
+              // statement is executed against a cluster.
+              // Once per STEP, not once per statement: a two-statement batch
+              // takes this path twice and listed its ordinal twice.
+              if (std::find(out.unverified_steps.begin(),
+                            out.unverified_steps.end(),
+                            steps[i].first) == out.unverified_steps.end()) {
+                out.unverified_steps.push_back(steps[i].first);
+              }
+              if (out.weak_verification.empty()) {
+                out.weak_verification =
+                    "a statement was checked by PREPARE rather than by "
+                    "EXPLAIN (GENERIC_PLAN), which this server does not support "
+                    "for these tables -- Citus among them. PREPARE catches a "
+                    "malformed statement and not one the extension will refuse "
+                    "to route, because Citus plans at execution time. Those "
+                    "steps are listed as unverified rather than claimed as "
+                    "checked.";
+              }
             }
           } else {
             session.txn().exec(stmt);  // real DDL, rolled back below

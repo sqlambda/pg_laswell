@@ -359,6 +359,12 @@ inline json plan_migration_tool(ToolContext& ctx, const json& args) {
             "transaction block (CREATE INDEX CONCURRENTLY) and were skipped "
             "rather than silently passed."}};
     if (!dry.skipped_reason.empty()) d["skippedReason"] = dry.skipped_reason;
+    // Named separately from the note, which a later branch may overwrite: a
+    // reader deciding whether to trust this plan needs to see that some of it
+    // was checked more weakly than the rest.
+    if (!dry.weak_verification.empty()) {
+      d["weakVerification"] = dry.weak_verification;
+    }
     if (dry.depends_on_skipped) {
       d["note"] =
           "verification stopped at a step that depends on one which cannot run "

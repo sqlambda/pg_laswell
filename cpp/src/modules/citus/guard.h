@@ -34,45 +34,80 @@ inline void citus_plan_refusals(const Spec& spec, const Observations& obs,
     //
     // This applies to EVERY kind, not just this module's: a plain create_table
     // on a Citus cluster is propagated DDL too.
-    // PACED DML AGAINST A DISTRIBUTED TABLE IS REFUSED, and this is not a
-    // performance judgement -- it does not work at all.
+    // WHAT ACTUALLY FAILS ON A DISTRIBUTED TABLE, per form rather than per kind.
     //
-    // The paced walk takes its batch with FOR UPDATE, which is what makes the
-    // keyset cursor safe: without it two batches could select the same rows.
-    // Citus rejects that outright on a multi-shard query:
+    // This used to refuse backfill, update_rows, delete_rows and merge_rows
+    // alike, all with one explanation about FOR UPDATE. Measured on Citus 13,
+    // coordinator and two workers, by preparing and EXECUTING each emitted
+    // statement against a distributed table:
     //
-    //   ERROR: could not run distributed query with FOR UPDATE/SHARE commands
+    //   backfill                     FAILS -- multi-shard FOR UPDATE
+    //   delete_rows with `where`     FAILS -- same, same statement shape
+    //   merge_rows                   FAILS -- but for MERGE, not FOR UPDATE:
+    //                                "non-IMMUTABLE functions are not yet
+    //                                 supported in MERGE sql with distributed
+    //                                 tables"
+    //   update_rows                  WORKS  -- was refused anyway
+    //   delete_rows with `values`    WORKS  -- was refused anyway
+    //   insert_rows                  WORKS  -- was never refused
+    //   copy_rows                    WORKS  -- Citus routes COPY natively
     //
-    // So today this is emitted, accepted by the planner, and fails AT
-    // EXECUTION -- partway through a migration, on a cluster, with earlier
-    // batches already committed. Refusing beforehand and naming the reading is
-    // what this tool does everywhere else.
-    //
-    // It is liftable: confining a batch to ONE shard makes FOR UPDATE legal
-    // again, measured at Task Count 1. That is shard-aligned batching, and it
-    // is a change to how the executor walks rather than to what it refuses.
-    // Until it exists, this is the honest answer.
+    // The reason only the first two take FOR UPDATE is that only they walk the
+    // TARGET table by key. The rest get their rows from the specification, join
+    // to them, and take no row locks -- so the explanation was wrong for every
+    // kind it was wrong to refuse, which is how over-refusing survived: the
+    // message sounded like it applied.
     for (const auto& in : spec.intents) {
-      const bool paced_dml = in.kind == IntentKind::kBackfill ||
-                             in.kind == IntentKind::kUpdateRows ||
-                             in.kind == IntentKind::kDeleteRows ||
-                             in.kind == IntentKind::kMergeRows;
-      if (!paced_dml) continue;
       const auto qualified = in.qualified_table();
       const auto tables = citus.value("tables", json::object());
       if (!tables.contains(qualified)) continue;  // local table: unaffected
       const auto method = tables[qualified].value("partmethod", "");
-      if (method == "n") continue;  // reference table: single placement per node
-      refuse(
-          "\"" + in.kind_name + "\" on " + qualified +
-          " is a paced walk, and " + qualified +
-          " is distributed. The walk takes each batch with FOR UPDATE so the "
-          "keyset cursor cannot select the same rows twice, and Citus refuses "
-          "that on a multi-shard query: \"could not run distributed query with "
-          "FOR UPDATE/SHARE commands\". It would be accepted here and fail "
-          "partway through, with earlier batches already committed. Until "
-          "batches are confined to one shard, run this change through a "
-          "single-shard path or undistribute the table first.");
+      if (method == "n") continue;  // reference table: one placement per node
+
+      // A keyset walk over the target takes each batch with FOR UPDATE, which is
+      // what stops the cursor selecting the same rows twice. Citus refuses that
+      // on a multi-shard query, so this is not a performance judgement -- it
+      // does not run at all, and without the refusal it would be accepted here
+      // and fail partway through with earlier batches already committed.
+      //
+      // Liftable, and intended to be: confining a batch to ONE shard makes
+      // FOR UPDATE legal again (measured: an equality filter on the distribution
+      // column returns rows under FOR UPDATE where the multi-shard form
+      // errors). That needs the walk to iterate distribution values, which is a
+      // change to how the executor walks rather than to what it refuses.
+      const bool target_keyset_walk =
+          in.kind == IntentKind::kBackfill ||
+          (in.kind == IntentKind::kDeleteRows && !in.body.contains("values") &&
+           !in.body.contains("select"));
+      if (target_keyset_walk) {
+        refuse(
+            "\"" + in.kind_name + "\" on " + qualified +
+            " walks the table by key, and " + qualified +
+            " is distributed. Each batch is taken with FOR UPDATE so the keyset "
+            "cursor cannot select the same rows twice, and Citus refuses that on "
+            "a multi-shard query: \"could not run distributed query with FOR "
+            "UPDATE/SHARE commands\". It would be accepted here and fail partway "
+            "through, with earlier batches already committed. Supply the rows "
+            "explicitly instead -- update_rows, delete_rows with values, and "
+            "insert_rows all run on a distributed table -- or undistribute the "
+            "table for the migration.");
+        continue;
+      }
+
+      // MERGE is refused for its own reasons, which have nothing to do with
+      // pacing or row locks. Naming the right restriction matters: told it was
+      // about FOR UPDATE, an author would look for a way to avoid a row lock
+      // that this statement never takes.
+      if (in.kind == IntentKind::kMergeRows) {
+        refuse(
+            "\"merge_rows\" on " + qualified + " cannot run: " + qualified +
+            " is distributed, and Citus restricts MERGE against a distributed "
+            "target -- measured: \"non-IMMUTABLE functions are not yet supported "
+            "in MERGE sql with distributed tables\". This is a limit of MERGE on "
+            "Citus, not of the pacing. Express the change as update_rows and "
+            "insert_rows, which both run here.");
+        continue;
+      }
     }
 
     if (propagation == "off" || propagation == "false") {

@@ -96,6 +96,59 @@ else
   bad "a local table should plan with a clean dry run" "$out"
 fi
 
+# WHICH FORMS RUN ON A DISTRIBUTED TABLE, one case per form.
+#
+# The guard refused four kinds with one explanation about FOR UPDATE. Two of them
+# work; a third fails for an unrelated reason. Only a real cluster can say which,
+# which is why this list lives here: each expectation below was established by
+# preparing and EXECUTING the emitted statement against a distributed table.
+echo "citus: which write forms a distributed table accepts"
+
+intent_plan() {  # intent_plan <json-intent>
+  "$MCP" --call planMigration --args "{\"spec\":{\"laswell_spec_version\":1,
+     \"id\":\"ct-form\",\"description\":\"form probe\",\"intents\":[$1]},
+     \"skipTrustChecks\":true}" "$CITUS_URL" 2>&1
+}
+
+expect_form() {  # expect_form <label> <allow|refuse> <needle-if-refused> <intent>
+  local label=$1 want=$2 needle=$3 intent=$4
+  local out; out=$(intent_plan "$intent")
+  if [ "$want" = allow ]; then
+    if echo "$out" | grep -q '"ok":true'; then ok "$label runs on a distributed table"
+    else bad "$label should run on a distributed table" "$out"; fi
+  else
+    if echo "$out" | grep -q '"ok":false' && echo "$out" | grep -q "$needle"; then
+      ok "$label is refused, and the reason names $needle"
+    else
+      bad "$label should be refused naming $needle" "$out"
+    fi
+  fi
+}
+
+# Refused, and for the reason that is actually true of them: they walk the target
+# by key and take FOR UPDATE, which Citus will not do across shards.
+expect_form "backfill" refuse "walks the table by key" \
+  '{"kind":"backfill","schema":"ct","table":"dist","key":"id","set":{"flag":"true"},"where":"flag IS NULL"}'
+expect_form "delete_rows by predicate" refuse "walks the table by key" \
+  '{"kind":"delete_rows","schema":"ct","table":"dist","key":"id","where":"v < 0"}'
+
+# Refused for its OWN reason. Told it was about FOR UPDATE, an author would go
+# looking for a way to avoid a row lock this statement never takes.
+expect_form "merge_rows" refuse "MERGE" \
+  '{"kind":"merge_rows","schema":"ct","table":"dist","key":"id","columns":["id","v"],"values":[[1,7]]}'
+
+# Allowed, because they run. Their rows come from the specification, so they join
+# to them and take no row locks -- the restriction above does not apply, and
+# refusing them was refusing work that succeeds.
+expect_form "update_rows" allow "" \
+  '{"kind":"update_rows","schema":"ct","table":"dist","key":"id","columns":["id","v"],"values":[[1,7]]}'
+expect_form "delete_rows by values" allow "" \
+  '{"kind":"delete_rows","schema":"ct","table":"dist","key":"id","columns":["id"],"values":[[499]]}'
+expect_form "insert_rows" allow "" \
+  '{"kind":"insert_rows","schema":"ct","table":"dist","key":"id","columns":["id","v"],"values":[[9001,1]]}'
+expect_form "copy_rows" allow "" \
+  '{"kind":"copy_rows","schema":"ct","table":"dist","columns":["id","v"],"values":[[9002,1]]}'
+
 # And the reference-table walk must actually MOVE THE ROWS. Planning cleanly is
 # not the claim being made; finishing is.
 echo "citus: the reference-table walk, executed"
