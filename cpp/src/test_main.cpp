@@ -1706,6 +1706,40 @@ pglaswell::Spec spec_of(const json& intents) {
   return pglaswell::parse_spec(doc);
 }
 
+// Drive a paced step to completion the way the executor does, through the
+// executor's own run_paced_batch. Returns rows considered across every batch.
+//
+// Three harnesses used to keep their own copy of this loop, and each copy ran
+// every statement in the step with the cursor and batch parameters. That was
+// wrong as soon as a batch became a selection plus an apply: the apply takes one
+// parameter and got two. The loop lives in one place now, and it is the same one
+// production uses.
+inline long long drive_paced_step(const pglaswell::ConnConfig& cfg,
+                                  const pglaswell::Step& step,
+                                  const char* app_name) {
+  const auto strip = [](const std::string& q) {
+    return q.empty() || q.back() != ';' ? q : q.substr(0, q.size() - 1);
+  };
+  const bool two = step.detail.value("batch_mode", "") == "two_statement" &&
+                   step.sql.size() > 1;
+  const auto select_sql = strip(step.sql[0]);
+  const auto apply_sql = two ? strip(step.sql[1]) : std::string();
+
+  std::string cursor = "0";
+  long long considered = 0;
+  for (int pass = 0; pass < 1000; ++pass) {
+    pglaswell::WriteSession b(cfg);
+    b.begin(app_name);
+    const auto out = pglaswell::run_paced_batch(b.txn(), select_sql, apply_sql,
+                                                cursor, 1000, 1 << 20);
+    b.commit();
+    if (out.considered == 0) break;
+    considered += out.considered;
+    cursor = out.cursor;
+  }
+  return considered;
+}
+
 std::vector<const pglaswell::Step*> steps_of(const pglaswell::Plan& p,
                                              const std::string& kind) {
   std::vector<const pglaswell::Step*> out;
@@ -6755,11 +6789,19 @@ TEST(Planner, PreserveIsRealForEveryRowLevelKindAndEveryForm) {
   const json del_where{{"kind", "delete_rows"}, {"schema", "shop"}, {"table", "orders"},
                        {"key", "id"}, {"where", "status = 'old'"}, {"preserve", preserve}};
 
+  // How the capture is RESTRICTED to the rows the statement changes. The kinds
+  // whose rows come from the specification join to a relation holding them
+  // (`src` unpaced, `batch` paced). A keyset walk over the TARGET names an
+  // explicit key array instead, because its batch is a selection plus an apply
+  // rather than one statement with a CTE -- two statements is what Citus can
+  // route and what lets a batch be bounded by bytes. Either way the property
+  // asserted is the same: the capture covers exactly those rows, and it travels
+  // in the same statement as the mutation.
   struct Form { json intent; bool paced; const char* join_alias; };
   for (const Form& f : {Form{update, false, "src"}, Form{update, true, "batch"},
                        Form{merge, false, "src"}, Form{merge, true, "batch"},
                        Form{del_values, false, "src"}, Form{del_values, true, "batch"},
-                       Form{del_where, true, "batch"}}) {
+                       Form{del_where, true, nullptr}}) {
     pglaswell::ExecutorConfig cfg;
     if (f.paced) cfg.dml_single_txn_rows = 1;  // force the paced form
     const auto plan = pglaswell::plan_migration(spec_of(json::array({f.intent})), obs_dml(), cfg);
@@ -6776,11 +6818,32 @@ TEST(Planner, PreserveIsRealForEveryRowLevelKindAndEveryForm) {
     const auto sql = all_sql(change);
     EXPECT_NE(sql.find("preserved AS ("), std::string::npos) << label << ": " << sql;
     EXPECT_NE(sql.find("INSERT INTO \"archive\".\"orders_before\""), std::string::npos) << label << ": " << sql;
-    EXPECT_NE(sql.find(std::string(", ") + f.join_alias + " AS pb"), std::string::npos)
-        << label << ": the capture must join to the rows this statement changes:\n" << sql;
-    EXPECT_NE(sql.find("= pb.\"id\""), std::string::npos) << label << ": " << sql;
+    if (f.join_alias != nullptr) {
+      EXPECT_NE(sql.find(std::string(", ") + f.join_alias + " AS pb"), std::string::npos)
+          << label << ": the capture must join to the rows this statement changes:\n" << sql;
+      EXPECT_NE(sql.find("= pb.\"id\""), std::string::npos) << label << ": " << sql;
+      EXPECT_EQ(change.sql.size(), 1u)
+          << label << ": ONE statement, or the capture is not atomic with the change";
+    } else {
+      // The two-statement walk. The capture must name the SAME key array the
+      // mutation does, and must sit in the same statement as it -- one snapshot,
+      // so the INSERT reads the rows as they were.
+      const auto apply = change.sql.back();
+      EXPECT_NE(apply.find("WITH preserved AS ("), std::string::npos) << label << ": " << apply;
+      EXPECT_EQ(apply.find("SELECT"), apply.rfind("SELECT"))
+          << label << ": the apply statement should hold one SELECT, the capture's";
+      const auto uses = [&apply](const std::string& needle) {
+        std::size_t n = 0, at = 0;
+        while ((at = apply.find(needle, at)) != std::string::npos) { ++n; at += needle.size(); }
+        return n;
+      };
+      EXPECT_EQ(uses("= ANY($1::bigint[])"), 2u)
+          << label << ": the capture and the delete must name the same keys:\n" << apply;
+      EXPECT_EQ(change.sql.size(), 2u)
+          << label << ": a keyset walk over the target is a selection and an apply";
+      EXPECT_EQ(change.detail.value("batch_mode", ""), "two_statement") << label;
+    }
     EXPECT_EQ(change.detail.value("preserve", ""), "archive.orders_before") << label;
-    EXPECT_EQ(change.sql.size(), 1u) << label << ": ONE statement, or the capture is not atomic with the change";
 
     // What is saved. A change saves the key and what it touches; a delete
     // saves the whole row, because a pre-image of a deleted row that holds
@@ -9097,11 +9160,10 @@ TEST_F(DatabaseTest, TheRemainingKindsRunAndRowSecurityReallyHidesEverything) {
     ASSERT_EQ(steps.size(), 1u);
     pglaswell::WriteSession w(cfg);
     w.begin("pg_laswell/test/rest-delete");
-    const std::string stmt = steps[0]->sql[0];
-    const auto rows = pglaswell::pqxx_exec(
-        w.txn(), stmt.substr(0, stmt.size() - 1), pqxx::params{"0", 1000});
     w.commit();
-    EXPECT_EQ(rows.size(), 40u) << "the paced delete statement is malformed";
+    const auto considered =
+        drive_paced_step(cfg, *steps[0], "pg_laswell/test/rest-delete");
+    EXPECT_EQ(considered, 40) << "the paced delete statement is malformed";
   }
   {
     pglaswell::ReadSession r(cfg);
@@ -9904,9 +9966,19 @@ TEST(Planner, PreserveCapturesInTheSameStatementAsTheUpdate) {
   EXPECT_NE(all_sql(*s[0]).find("laswell_saved_at"), std::string::npos);
   EXPECT_NE(all_sql(*s[0]).find("COMMENT ON TABLE"), std::string::npos);
 
-  // One statement, not two: the INSERT is a CTE of the UPDATE.
+  // The capture is a CTE of the UPDATE, which is the property that matters: one
+  // snapshot, so the INSERT reads the rows as they were and there is no window
+  // in which one committed and the other did not.
+  //
+  // It is now the FIRST CTE of the apply statement rather than a second one
+  // after `batch`, because a batch is a selection and an apply rather than one
+  // statement with a CTE. The property is unchanged; only where the WITH sits
+  // moved, so this asserts the property and not the old spelling.
+  const auto apply = s[1]->sql.back();
+  EXPECT_NE(apply.find("WITH preserved AS ("), std::string::npos) << apply;
+  EXPECT_NE(apply.find("UPDATE "), std::string::npos)
+      << "the capture must travel with the UPDATE, not alone:\n" << apply;
   const auto sql = all_sql(*s[1]);
-  EXPECT_NE(sql.find(", preserved AS ("), std::string::npos) << sql;
   EXPECT_NE(sql.find("INSERT INTO \"archive\".\"orders_before\" (\"id\", \"fulfilment_region\")"),
             std::string::npos) << sql;
   // Quoted, and asserted to BE there before the ordering is compared: with an
@@ -11023,6 +11095,99 @@ TEST_F(DatabaseTest, AnExpressionIndexInTheDatabaseDoesNotBreakPlanning) {
   EXPECT_TRUE(plan.ok) << (plan.conflicts.empty() ? "" : plan.conflicts[0]);
 }
 
+TEST_F(DatabaseTest, ABatchIsBoundedByBytesAsWellAsRows) {
+  // batch_rows bounds how many rows one statement touches. It says nothing about
+  // how much memory the executor holds or how large the array literal it sends
+  // is, and those differ by three orders of magnitude between a bigint key and a
+  // composite text one. 1000 rows is a rounding error for the first and megabytes
+  // for the second.
+  //
+  // Only the two-statement form can honour a byte budget at all: a single
+  // statement with LIMIT is bounded by rows by construction, because the keys
+  // never come back to the client before the mutation runs.
+  pglaswell::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = url_;
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test");
+    w.txn().exec("DROP TABLE IF EXISTS wide_keys");
+    w.txn().exec("CREATE TABLE wide_keys (k text PRIMARY KEY, flag boolean)");
+    // 100-byte keys, so a 250-byte budget admits two of them and not three.
+    w.txn().exec("INSERT INTO wide_keys SELECT repeat('k', 90) || lpad(g::text, 10, '0'),"
+                 " NULL FROM generate_series(1, 20) g");
+    w.commit();
+  }
+
+  const std::string select_sql =
+      "SELECT \"wide_keys\".\"k\" FROM \"public\".\"wide_keys\""
+      " WHERE \"wide_keys\".\"k\" > $1 AND (flag IS NULL)"
+      " ORDER BY \"wide_keys\".\"k\" LIMIT $2 FOR UPDATE OF \"wide_keys\"";
+  const std::string apply_sql =
+      "UPDATE \"public\".\"wide_keys\" SET \"flag\" = true"
+      " WHERE \"wide_keys\".\"k\" = ANY($1::text[]) AND (flag IS NULL)"
+      " RETURNING \"wide_keys\".\"k\"";
+
+  // A generous row limit and a mean byte limit: the bytes must be what bounds it.
+  std::string cursor;
+  int batches = 0;
+  long long applied = 0;
+  for (; batches < 100; ++batches) {
+    pglaswell::WriteSession b(cfg);
+    b.begin("pg_laswell/test/bytes");
+    const auto out = pglaswell::run_paced_batch(b.txn(), select_sql, apply_sql,
+                                                cursor, 1000, /*batch_bytes=*/250);
+    b.commit();
+    if (out.considered == 0) break;
+    applied += out.considered;
+    cursor = out.cursor;
+  }
+
+  EXPECT_EQ(applied, 20) << "the walk must still finish, batch budget or not";
+  // 20 keys of 100 bytes under a 250-byte budget: two per batch, so ten batches.
+  // Asserted as a range rather than exactly ten, because the point is that the
+  // budget bounded the batch and not that it bounded it to a particular number.
+  EXPECT_GE(batches, 8) << "the byte budget did not split the batch: " << batches;
+  EXPECT_LE(batches, 12) << "the byte budget split the batch too far: " << batches;
+
+  {
+    pglaswell::ReadSession r(cfg);
+    EXPECT_EQ(r.txn().exec("SELECT count(*) FROM wide_keys WHERE flag IS NULL")[0][0].as<int>(), 0)
+        << "rows were left behind";
+  }
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test");
+    w.txn().exec("DROP TABLE wide_keys");
+    w.commit();
+  }
+
+  // And a budget smaller than one key still makes progress rather than spinning:
+  // the first key is always admitted.
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test");
+    w.txn().exec("CREATE TABLE wide_keys (k text PRIMARY KEY, flag boolean)");
+    w.txn().exec("INSERT INTO wide_keys VALUES (repeat('x', 500), NULL)");
+    w.commit();
+  }
+  {
+    pglaswell::WriteSession b(cfg);
+    b.begin("pg_laswell/test/bytes-tiny");
+    const auto out = pglaswell::run_paced_batch(b.txn(), select_sql, apply_sql,
+                                                std::string(), 1000, /*batch_bytes=*/1);
+    b.commit();
+    EXPECT_EQ(out.considered, 1)
+        << "a budget below one key must still admit one, or the walk spins on it";
+  }
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test");
+    w.txn().exec("DROP TABLE wide_keys");
+    w.commit();
+  }
+}
+
 // --- conformance: every kind, executed ------------------------------------
 
 #include "conformance.inc"
@@ -11134,18 +11299,13 @@ TEST_F(DatabaseTest, EveryIntentKindPlansAndRunsAgainstARealDatabase) {
         // is being tested -- a batch statement that only works inside the
         // executor is a batch statement nobody can check.
         if (step.txn_class == pglaswell::TxnClass::kOwnTxnPerBatch) {
-          std::string cursor = "0";
-          for (int pass = 0; pass < 100; ++pass) {
-            pglaswell::WriteSession b(cfg);
-            b.begin("pg_laswell/conformance/batch");
-            const auto rows =
-                pglaswell::pqxx_exec(b.txn(), trimmed,
-                                     pqxx::params{cursor, 1000});
-            for (const auto& row : rows) cursor = row[0].as<std::string>();
-            b.commit();
-            if (rows.empty()) break;
-          }
-          continue;
+          // Driven through the executor's OWN batch driver, not a copy of it.
+          // The copy that used to live here ran every statement of the step with
+          // the cursor and batch parameters, which broke the moment a batch
+          // became a selection plus an apply -- exactly the drift this comment
+          // used to warn about while demonstrating it.
+          drive_paced_step(cfg, step, "pg_laswell/conformance/batch");
+          break;  // the whole step is driven at once, statements and all
         }
         // The plan says which statements cannot run in a transaction block;
         // honouring that here is part of what is being tested.
@@ -11366,17 +11526,8 @@ TEST_F(DatabaseTest, ReservedWordIdentifiersAreQuotedEverywhereTheyAreEmitted) {
       for (const auto& q : step.sql) {
         const auto trimmed = q.substr(0, q.size() - 1);
         if (step.txn_class == pglaswell::TxnClass::kOwnTxnPerBatch) {
-          std::string cursor = "0";
-          for (int pass = 0; pass < 100; ++pass) {
-            pglaswell::WriteSession b(cfg);
-            b.begin("pg_laswell/test/reserved-batch");
-            const auto rows = pglaswell::pqxx_exec(
-                b.txn(), trimmed, pqxx::params{cursor, 1000});
-            for (const auto& row : rows) cursor = row[0].as<std::string>();
-            b.commit();
-            if (rows.empty()) break;
-          }
-          continue;
+          drive_paced_step(cfg, step, "pg_laswell/test/reserved-batch");
+          break;  // the whole step is driven at once, statements and all
         }
         pglaswell::WriteSession w(cfg);
         try {

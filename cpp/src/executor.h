@@ -71,6 +71,87 @@ inline std::string strip_semicolon(const std::string& s) {
 
 }  // namespace detail
 
+// ONE BATCH of a paced step, and the only implementation of it.
+//
+// The executor calls this, and so do the tests. That is deliberate: the
+// conformance harness already carried the comment "a batch statement that only
+// works inside the executor is a batch statement nobody can check", and it had
+// its own copy of the loop to say so. Two copies became three when a batch grew
+// a second statement, and two of them broke. One function cannot drift from
+// itself.
+struct BatchOutcome {
+  // Rows CONSIDERED, not rows changed. The walk ends when a batch considers
+  // nothing; a batch that considered rows and changed none is still progress,
+  // and reading it as "finished" is how a merge that matched nothing reported
+  // success having merged nothing.
+  long long considered = 0;
+  std::string cursor;
+};
+
+// `apply_sql` empty means the one-statement form, where the mutation's own
+// RETURNING both applies and advances. Otherwise `select_sql` selects and LOCKS
+// the batch's keys and `apply_sql` names exactly those keys -- the form Citus
+// can route, and the only form that can bound a batch by bytes as well as rows,
+// because the keys must be in hand before the mutation is sent.
+inline BatchOutcome run_paced_batch(pqxx::work& txn,
+                                    const std::string& select_sql,
+                                    const std::string& apply_sql,
+                                    const std::string& cursor, int batch,
+                                    long long batch_bytes) {
+  BatchOutcome out;
+  out.cursor = cursor;
+  if (apply_sql.empty()) {
+    const auto r = pqxx_exec(txn, select_sql, pqxx::params{cursor, batch});
+    out.considered = static_cast<long long>(r.size());
+    for (const auto& row : r) out.cursor = row[0].as<std::string>();
+    return out;
+  }
+
+  // The lock taken here is what makes the two statements safe as one: nothing
+  // can change these rows before the apply below, because both run in this
+  // transaction.
+  const auto sel = pqxx_exec(txn, select_sql, pqxx::params{cursor, batch});
+  std::vector<std::string> keys;
+  keys.reserve(static_cast<std::size_t>(sel.size()));
+  long long bytes = 0;
+  for (const auto& row : sel) {
+    auto v = row[0].as<std::string>();
+    // Stop between keys rather than mid-array, so an applied batch is always
+    // one that both the planner's LIMIT and this budget allowed. Never zero
+    // keys: a single oversized key still makes progress, where stopping at zero
+    // would spin forever on it.
+    if (!keys.empty() && bytes + static_cast<long long>(v.size()) > batch_bytes) {
+      break;
+    }
+    bytes += static_cast<long long>(v.size());
+    keys.push_back(std::move(v));
+  }
+  if (keys.empty()) return out;
+
+  // A PostgreSQL array literal, quoted element by element so a text key
+  // containing a comma, a brace or a quote survives. Paired with the
+  // ::<keytype>[] cast the planner emitted.
+  std::string literal = "{";
+  for (std::size_t i = 0; i < keys.size(); ++i) {
+    if (i != 0) literal += ',';
+    literal += '"';
+    for (const char c : keys[i]) {
+      if (c == '"' || c == '\\') literal += '\\';
+      literal += c;
+    }
+    literal += '"';
+  }
+  literal += "}";
+
+  const auto r = pqxx_exec(txn, apply_sql, pqxx::params{literal});
+  // The cursor advances over what was CONSIDERED -- the selection -- not over
+  // what the mutation returned.
+  out.cursor = keys.back();
+  out.considered = static_cast<long long>(r.size());
+  if (out.considered == 0) out.considered = static_cast<long long>(keys.size());
+  return out;
+}
+
 class Executor {
  public:
   Executor(ConnConfig cfg, std::shared_ptr<Job> job, Ledger* ledger,
@@ -413,6 +494,16 @@ class Executor {
     const auto& e = cfg_.executor;
     const auto detail_json = step.value("detail", json::object());
     const auto sql = detail::strip_semicolon(step["sql"][0].get<std::string>());
+    // Two statements: select and lock the batch's keys, then apply to exactly
+    // those keys. The CTE form could not be routed by Citus, and a single
+    // statement's LIMIT can only bound a batch by rows -- accumulating to a byte
+    // budget needs the keys in hand before the mutation is sent.
+    const bool two_statement =
+        detail_json.value("batch_mode", "") == "two_statement" &&
+        step["sql"].size() > 1;
+    const auto apply_sql =
+        two_statement ? detail::strip_semicolon(step["sql"][1].get<std::string>())
+                      : std::string();
     const auto key_column = detail_json.value("key", "id");
 
     resume_qualified_ = detail_json.value("qualified", "");
@@ -479,11 +570,11 @@ class Executor {
                               : e.batch_rows;
         long long affected = 0;
         try {
-          const auto r = pqxx_exec(w.txn(), sql, pqxx::params{cursor, batch});
-          affected = static_cast<long long>(r.size());
-          for (const auto& row : r) {
-            cursor = row[0].as<std::string>();
-          }
+          const auto outcome =
+              run_paced_batch(w.txn(), sql, apply_sql, cursor, batch,
+                              e.batch_bytes);
+          affected = outcome.considered;
+          cursor = outcome.cursor;
         } catch (const pqxx::sql_error& ex) {
           if (detail::is_query_canceled(ex) &&
               job_->pacing.cancel_requested.exchange(false)) {

@@ -40,6 +40,12 @@ struct ExecutorConfig {
   int batch_rows = 1000;
   int commit_interval_ms = 1000;
   int batch_cap_rows = 10000;  // backstop against pathological row widths
+  // How much KEY MATERIAL one batch may accumulate before it is applied, in
+  // bytes. batch_rows bounds the row count; this bounds the memory the executor
+  // holds and the size of the array literal it sends. They are different limits
+  // because a bigint key is 8 bytes of value and a composite text key can be
+  // hundreds: 1000 rows is a rounding error for one and megabytes for the other.
+  int batch_bytes = 1 << 20;  // 1 MiB of keys
 
   // Where a row-level DML intent stops being a seed and starts being a
   // migration that has to be paced.
@@ -323,6 +329,7 @@ inline std::string with_application_name(const std::string& url,
 inline bool apply_executor_key(ExecutorConfig& e, const std::string& key,
                                const std::string& value, const std::string& w) {
   if (key == "batch_rows") { e.batch_rows = detail::positive_int(value, key, w); return true; }
+  if (key == "batch_bytes") { e.batch_bytes = detail::positive_int(value, key, w); return true; }
   if (key == "commit_interval_ms") { e.commit_interval_ms = detail::positive_int(value, key, w); return true; }
   if (key == "batch_cap_rows") { e.batch_cap_rows = detail::positive_int(value, key, w); return true; }
   if (key == "max_concurrent_operations") { e.max_concurrent_operations = detail::non_negative_int(value, key, w); return true; }

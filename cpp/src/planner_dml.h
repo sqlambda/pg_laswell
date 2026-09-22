@@ -452,6 +452,33 @@ inline std::string preserve_cte(const Preserved& pv,
          ")";
 }
 
+// The same pre-image capture, for a batch named by an explicit key array rather
+// than by a `batch` CTE. Kept beside its sibling so the two shapes of the same
+// idea are read together; the CTE form is still used by the kinds whose rows
+// come from the specification rather than from the target.
+//
+// Still a CTE on the mutating statement, which is what makes it a PRE-image:
+// every CTE in a statement sees the same snapshot, so this reads the rows as
+// they were before the UPDATE beside it changes them.
+inline std::string preserve_cte_by_keys(const Preserved& pv,
+                                       const std::string& target_sql_rel,
+                                       const std::string& target_ref,
+                                       const std::string& key,
+                                       const std::string& key_array) {
+  const auto k = quote_identifier(key);
+  std::vector<std::string> quoted, selected;
+  for (const auto& c : pv.cols) {
+    quoted.push_back(quote_identifier(c));
+    selected.push_back(target_ref + "." + quote_identifier(c));
+  }
+  return "preserved AS (\n"
+         "  INSERT INTO " + pv.sql_rel + " (" + join(quoted, ", ") + ")\n"
+         "  SELECT " + join(selected, ", ") + "\n"
+         "    FROM " + target_sql_rel + "\n"
+         "   WHERE " + target_ref + "." + k + " = " + key_array + "\n"
+         ")";
+}
+
 // Every column the observation knows, for a kind whose change is the whole row.
 inline std::vector<std::string> all_columns(const json& columns) {
   std::vector<std::string> names;
@@ -593,6 +620,27 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
 
   // The pre-image, when asked for. See plan_preserve(): one implementation
   // shared with update_rows, merge_rows and delete_rows.
+  // TWO STATEMENTS, not one statement with a CTE. The batch's keys are selected
+  // and locked, then the update names them as an explicit array.
+  //
+  // The CTE form was correct on plain PostgreSQL and could not be planned by
+  // Citus at all: a CTE is evaluated on the coordinator, so its values are not
+  // known at plan time and the statement cannot be routed. Two statements each
+  // route on their own -- the SELECT by its predicate, the UPDATE by its key
+  // list -- which is what makes a paced walk possible on a Citus table, and is
+  // the shape a shard-confined batch needs.
+  //
+  // It is also what lets a batch be ACCUMULATED: the executor reads keys until
+  // it has enough rows or enough bytes, then applies them in one statement.
+  // A single statement with LIMIT can only be bounded by rows.
+  const auto k = detail::quote_identifier(key);
+  const auto key_type = columns.value(key, json::object()).value("type", "text");
+  // Quoted-literal array elements, so a text key containing a comma, a quote or
+  // a brace survives. Cast to the key's own type, which the observation knows:
+  // ANY('{"1","2"}'::bigint[]) is the same predicate as = b.id was, for every
+  // key type this tool supports.
+  const std::string key_array = "ANY($1::" + key_type + "[])";
+
   std::string preserve_cte;
   {
     std::vector<std::string> changed;
@@ -601,27 +649,39 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
     }
     detail::Preserved pv;
     if (detail::plan_preserve(in, columns, sql_rel, key, changed, out, pv)) {
-      preserve_cte = ", " + detail::preserve_cte(pv, sql_rel, rel, key, "batch");
+      preserve_cte =
+          "WITH " + detail::preserve_cte_by_keys(pv, sql_rel, rel, key, key_array) +
+          "\n";
       step.detail["preserve"] = pv.qualified;
     }
   }
 
-  const std::string batch_sql =
-      "WITH batch AS (\n"
-      "  SELECT " + rel + "." + detail::quote_identifier(key) + "\n"
-      "    FROM " + sql_rel + (from.empty() ? "" : ", " + from) + "\n"
-      "   WHERE " + rel + "." + detail::quote_identifier(key) + " > $1 AND (" + where + ")\n"
-      "   ORDER BY " + rel + "." + detail::quote_identifier(key) + "\n"
-      "   LIMIT $2\n"
-      "   FOR UPDATE OF " + rel + "\n"
-      ")" + preserve_cte + "\n"
-      "UPDATE " + sql_rel + "\n"
-      "   SET " + detail::join(assignments, ", ") + "\n"
-      "  FROM batch AS b" + (from.empty() ? "" : ", " + from) + "\n"
-      " WHERE " + rel + "." + detail::quote_identifier(key) + " = b." + detail::quote_identifier(key) + "\n"
-      "RETURNING " + rel + "." + detail::quote_identifier(key) + ";";
+  const std::string select_sql =
+      "SELECT " + rel + "." + k + "\n"
+      "  FROM " + sql_rel + (from.empty() ? "" : ", " + from) + "\n"
+      " WHERE " + rel + "." + k + " > $1 AND (" + where + ")\n"
+      " ORDER BY " + rel + "." + k + "\n"
+      " LIMIT $2\n"
+      " FOR UPDATE OF " + rel + ";";
 
-  step.sql.push_back(batch_sql);
+  // The predicate is re-applied. Inside the same transaction the rows are locked
+  // by the SELECT above, so it cannot change which rows match -- it is there
+  // because `where` is also what constrains any `from` relation, and an UPDATE
+  // carrying FROM without it would be a cross join.
+  const std::string apply_sql =
+      preserve_cte +
+      "UPDATE " + sql_rel + "\n"
+      "   SET " + detail::join(assignments, ", ") + "\n" +
+      (from.empty() ? "" : "  FROM " + from + "\n") +
+      " WHERE " + rel + "." + k + " = " + key_array + " AND (" + where + ")\n"
+      "RETURNING " + rel + "." + k + ";";
+
+  step.sql.push_back(select_sql);
+  step.sql.push_back(apply_sql);
+  // Which loop the executor runs. Named rather than inferred from the number of
+  // statements: the kinds whose rows come from the specification still emit one.
+  step.detail["batch_mode"] = "two_statement";
+  step.detail["key_type"] = key_type;
   step.detail["qualified"] = qualified;
   // Carried so the executor can check a resume cursor against the predicate
   // rather than trusting it.
@@ -1320,21 +1380,30 @@ inline void plan_delete_rows(const Intent& in, const Observations& obs,
     // selected is a row the delete removes.
     //
     step.txn_class = TxnClass::kOwnTxnPerBatch;
+    // Two statements, for the same reasons as backfill: a CTE cannot be routed
+    // by Citus, and a batch bounded by bytes as well as rows needs its keys in
+    // hand before the mutation is sent. See plan_backfill for the full note.
+    const auto del_key_type =
+        columns.value(key, json::object()).value("type", "text");
+    const std::string del_key_array = "ANY($1::" + del_key_type + "[])";
     step.sql.push_back(
-        "WITH batch AS (\n"
-        "  SELECT " + sql_rel + "." + k + "\n"
-        "    FROM " + sql_rel + "\n"
-        "   WHERE " + sql_rel + "." + k + " > $1 AND (" + where + ")\n"
-        "   ORDER BY " + sql_rel + "." + k + "\n"
-        "   LIMIT $2\n"
-        "   FOR UPDATE\n"
-        ")" +
-        (preserved ? ", " + detail::preserve_cte(pv, sql_rel, sql_rel, key, "batch")
-                   : std::string()) + "\n"
+        "SELECT " + sql_rel + "." + k + "\n"
+        "  FROM " + sql_rel + "\n"
+        " WHERE " + sql_rel + "." + k + " > $1 AND (" + where + ")\n"
+        " ORDER BY " + sql_rel + "." + k + "\n"
+        " LIMIT $2\n"
+        " FOR UPDATE;");
+    step.sql.push_back(
+        (preserved
+             ? "WITH " + detail::preserve_cte_by_keys(pv, sql_rel, sql_rel, key,
+                                                      del_key_array) + "\n"
+             : std::string()) +
         "DELETE FROM " + sql_rel + "\n"
-        " USING batch AS b\n"
-        " WHERE " + sql_rel + "." + k + " = b." + k + "\n"
+        " WHERE " + sql_rel + "." + k + " = " + del_key_array +
+        " AND (" + where + ")\n"
         "RETURNING " + sql_rel + "." + k + ";");
+    step.detail["batch_mode"] = "two_statement";
+    step.detail["key_type"] = del_key_type;
     detail::attach_pacing_detail(step, in, cfg, src, qualified, key, where);
     step.detail["rows_estimated"] = rows;
     step.lock = "RowExclusiveLock on " + qualified +
