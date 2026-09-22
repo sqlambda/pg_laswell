@@ -25,6 +25,99 @@ namespace pglaswell {
 #include "modules/enabled_project_headers.h"
 
 
+// A storage-parameter list as PostgreSQL wants it inside WITH (...) or
+// SET (...). Shared, because create_table and set_table_options both write one
+// and two renderers for one syntax drift the day the second is written.
+//
+// The keys arrive from a json object, which nlohmann keeps sorted, so the
+// rendering is deterministic and planDigest is stable across runs.
+inline std::string storage_parameters(const json& options) {
+  std::vector<std::string> pairs;
+  for (const auto& [k, v] : options.items()) {
+    pairs.push_back(k + " = " + (v.is_string() ? v.get<std::string>() : v.dump()));
+  }
+  return detail::join(pairs, ", ");
+}
+
+// One key column of an index, in the form the spec now allows: a bare name, or
+// an object naming a column or an expression with an optional operator class,
+// direction and nulls placement.
+struct IndexColumn {
+  std::string name;        // empty when this is an expression
+  std::string expression;  // empty when this is a column
+  std::string opclass;     // empty means the type's default
+  std::string direction;   // "asc", "desc", or empty for PostgreSQL's default
+  std::string nulls;       // "first", "last", or empty for the default
+};
+
+inline std::vector<IndexColumn> index_columns(const json& body) {
+  std::vector<IndexColumn> out;
+  for (const auto& c : body.value("columns", json::array())) {
+    IndexColumn k;
+    if (c.is_string()) {
+      k.name = c.get<std::string>();
+    } else {
+      k.name = c.value("name", "");
+      k.expression = c.value("expression", "");
+      k.opclass = c.value("opclass", "");
+      k.direction = c.value("direction", "");
+      k.nulls = c.value("nulls", "");
+    }
+    out.push_back(std::move(k));
+  }
+  return out;
+}
+
+// One key column as PostgreSQL's grammar wants it:
+//   { name | ( expression ) } [ opclass ] [ ASC | DESC ] [ NULLS FIRST | LAST ]
+// The operator class comes BEFORE the direction, which is the one ordering in
+// this clause that reads backwards from how people say it.
+inline std::string index_column_sql(const IndexColumn& k) {
+  std::string out = k.expression.empty()
+                        ? detail::quote_identifier(k.name)
+                        : "(" + k.expression + ")";
+  if (!k.opclass.empty()) out += " " + detail::quote_identifier(k.opclass);
+  if (k.direction == "desc") out += " DESC";
+  else if (k.direction == "asc") out += " ASC";
+  if (k.nulls == "first") out += " NULLS FIRST";
+  else if (k.nulls == "last") out += " NULLS LAST";
+  return out;
+}
+
+// How this spec's key columns sort, in the vocabulary the catalog reports
+// (`column_order`), so the two can be compared directly. PostgreSQL's defaults
+// are ASC NULLS LAST and DESC NULLS FIRST -- stated here rather than left
+// implicit, because comparing an unstated default against a reported one is
+// exactly where an equivalence check goes quietly wrong.
+inline std::vector<std::string> index_order_terms(
+    const std::vector<IndexColumn>& keys) {
+  std::vector<std::string> out;
+  for (const auto& k : keys) {
+    const bool desc = k.direction == "desc";
+    const std::string nulls =
+        k.nulls.empty() ? (desc ? "first" : "last") : k.nulls;
+    out.push_back(std::string(desc ? "desc" : "asc") + " nulls " + nulls);
+  }
+  return out;
+}
+
+// Would a backward scan of an index ordered `have` serve one ordered `want`?
+//
+// Only if EVERY key column is flipped. A btree reads backwards as a whole, so
+// (a DESC, b DESC) answers (a ASC, b ASC) at the same cost -- but (a ASC,
+// b DESC) answers neither, and treating that as equivalent would leave the
+// database without the index the spec asked for while reporting success.
+inline bool is_full_reverse(const std::vector<std::string>& have,
+                            const std::vector<std::string>& want) {
+  if (have.size() != want.size() || have.empty()) return false;
+  for (std::size_t i = 0; i < have.size(); ++i) {
+    const bool h_desc = have[i].rfind("desc", 0) == 0;
+    const bool w_desc = want[i].rfind("desc", 0) == 0;
+    if (h_desc == w_desc) return false;
+  }
+  return true;
+}
+
 // --- per-intent rules ------------------------------------------------------
 
 // Defined below, after the rule that reaches for it: a partitioned parent
@@ -244,10 +337,23 @@ inline void project(const Intent& in, const Step& step, Observations& projected)
                {"projected_by_step", step.ordinal}};
       return;
     case IntentKind::kCreateIndex: {
+      const auto keys = index_columns(in.body);
+      bool has_expr = false;
       std::vector<std::string> cols;
-      for (const auto& c : in.body.value("columns", json::array())) {
+      for (const auto& k : keys) {
+        if (!k.expression.empty()) has_expr = true;
+        cols.push_back(k.name);
+      }
+      // INCLUDE columns follow the key columns in the catalog's `columns`, so
+      // the projection has to say the same -- key_column_count is what tells
+      // the two apart, and a projection that omitted it would have a later step
+      // read this index's payload as part of its key.
+      const auto key_count = static_cast<int>(cols.size());
+      for (const auto& c : in.body.value("include", json::array())) {
         cols.push_back(c.get<std::string>());
       }
+      std::vector<std::string> opclasses;
+      for (const auto& k : keys) opclasses.push_back(k.opclass);
       // The full column list and the predicate, not just the leading column.
       // unique_key_index() proves a key unique only from those two -- a
       // composite or partial unique index does not make its leading column
@@ -261,8 +367,12 @@ inline void project(const Intent& in, const Step& step, Observations& projected)
                {"is_unique", in.body.value("unique", false)},
                {"leading_column", cols.empty() ? "" : cols[0]},
                {"columns", cols},
+               {"key_column_count", key_count},
+               {"column_order", index_order_terms(keys)},
+               {"column_opclasses", opclasses},
+               {"method", in.body.value("method", "btree")},
                {"predicate", in.body.value("where", "")},
-               {"has_expressions", false},
+               {"has_expressions", has_expr},
                {"definition", "(planned by step " + std::to_string(step.ordinal) + ")"},
                {"projected_by_step", step.ordinal}};
       return;
@@ -491,17 +601,30 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
   const auto method = in.body.value("method", "btree");
   const auto where = in.body.value("where", "");
 
-  std::vector<std::string> columns;
-  for (const auto& c : in.body.value("columns", json::array())) {
-    columns.push_back(c.get<std::string>());
+  const auto keys = index_columns(in.body);
+  const bool has_expression_key =
+      std::any_of(keys.begin(), keys.end(),
+                  [](const IndexColumn& k) { return !k.expression.empty(); });
+  std::vector<std::string> include_columns;
+  for (const auto& c : in.body.value("include", json::array())) {
+    include_columns.push_back(c.get<std::string>());
   }
+
   // Two lists, deliberately. `columns` is compared against the catalog's own
   // column names -- which arrive unquoted -- so quoting it in place would make
   // every equivalence check compare unequal things, which is the very failure
   // require_identifier's comment warns about. `quoted_columns` is the one that
   // reaches SQL.
+  //
+  // An expression key contributes an EMPTY name rather than being dropped: the
+  // equivalence check declines to compare an index with expressions at all, and
+  // a list that silently skipped them would compare a three-column index as
+  // though it had two.
+  std::vector<std::string> columns;
+  for (const auto& k : keys) columns.push_back(k.name);
   std::vector<std::string> quoted_columns;
-  for (const auto& c : columns) quoted_columns.push_back(detail::quote_identifier(c));
+  for (const auto& k : keys) quoted_columns.push_back(index_column_sql(k));
+  const auto want_order = index_order_terms(keys);
 
   if (!t.value("exists", false)) {
     step.action = Action::kConflict;
@@ -613,17 +736,82 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
       const auto& ex = it.value();
       if (!ex.value("is_valid", false)) continue;
       // An index over expressions cannot be compared by column name, and a
-      // partial comparison would be worse than none.
+      // partial comparison would be worse than none. That cuts both ways: if
+      // THIS spec indexes an expression, there is equally nothing to compare.
       if (ex.value("has_expressions", false)) continue;
+      if (has_expression_key) continue;
       if (ex.value("method", "") != method) continue;
 
+      // Key columns only. The catalog lists INCLUDE payload in `columns` too,
+      // and payload neither orders nor restricts anything -- so an index keyed
+      // the same with different payload is a DIFFERENT index, and comparing the
+      // concatenation would have called them equal.
       std::vector<std::string> ex_cols;
       for (const auto& c : ex.value("columns", json::array())) {
         ex_cols.push_back(c.get<std::string>());
       }
+      const auto ex_key_count = static_cast<std::size_t>(
+          ex.value("key_column_count", static_cast<int>(ex_cols.size())));
+      std::vector<std::string> ex_include;
+      if (ex_key_count < ex_cols.size()) {
+        ex_include.assign(ex_cols.begin() + static_cast<long>(ex_key_count),
+                          ex_cols.end());
+        ex_cols.resize(ex_key_count);
+      }
+
+      std::vector<std::string> ex_order;
+      for (const auto& o : ex.value("column_order", json::array())) {
+        ex_order.push_back(o.get<std::string>());
+      }
+      std::vector<std::string> ex_opclasses;
+      for (const auto& o : ex.value("column_opclasses", json::array())) {
+        ex_opclasses.push_back(o.get<std::string>());
+      }
+      std::vector<std::string> want_opclasses;
+      for (const auto& k : keys) want_opclasses.push_back(k.opclass);
+
       const auto ex_pred = normalize(ex.value("predicate", ""));
-      const bool same_shape =
-          ex_cols == columns && ex.value("is_unique", false) == unique;
+      // Same columns is no longer enough to call two indexes the same. An
+      // operator class changes which operators the index can answer at all, and
+      // a direction changes which orderings it serves -- so an index differing
+      // in either is a different index, and adopting or renaming it would leave
+      // the database without what the spec asked for while reporting success.
+      //
+      // A reading that does not carry column_order or column_opclasses cannot
+      // support the EQUIVALENCE conclusion -- rather than assume they match, a
+      // missing reading is not a matching one. It does not block the weaker
+      // prefix-redundancy warning below, which is a claim about column names
+      // only and is true whatever the ordering.
+      const bool comparable =
+          ex_order.size() == ex_cols.size() && ex_opclasses.size() == ex_cols.size();
+
+      const bool same_columns = ex_cols == columns;
+      const bool same_include = ex_include == include_columns;
+      const bool same_opclasses = comparable && ex_opclasses == want_opclasses;
+      const bool same_order = comparable && ex_order == want_order;
+
+      // A btree reads backwards as a whole, so an index whose every key column
+      // is flipped answers this one's ordering at the same cost. Worth saying,
+      // because building the mirror image is a second index paid for forever --
+      // but it is a WARNING, since the two are not interchangeable for anything
+      // that depends on physical order, and this tool does not know what else
+      // reads them.
+      if (comparable && same_columns && same_include && same_opclasses &&
+          !same_order && ex_pred == want_pred &&
+          ex.value("is_unique", false) == unique &&
+          is_full_reverse(ex_order, want_order)) {
+        plan.warnings.push_back(
+            "\"" + name + "\" is the exact reverse of the existing index \"" +
+            it.key() + "\" on " + qualified +
+            ". A btree scans backwards at the same cost, so that index already "
+            "serves this ordering; build this one only if something depends on "
+            "the physical order rather than the sort it can produce.");
+        continue;
+      }
+
+      const bool same_shape = comparable && same_columns && same_include &&
+                              same_opclasses && same_order &&
+                              ex.value("is_unique", false) == unique;
 
       // Same columns, predicates that did not normalise to the same string.
       // Equivalence is not provable here, so this warns and names both rather
@@ -758,8 +946,19 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
   }
 
   std::string columns_sql = detail::join(quoted_columns, ", ");
+  // INCLUDE sits between the key list and WHERE. Covering columns are stored
+  // but not keyed, so they answer a query from the index without ordering or
+  // restricting anything.
+  std::string include_sql;
+  if (!include_columns.empty()) {
+    std::vector<std::string> quoted_include;
+    for (const auto& c : include_columns) {
+      quoted_include.push_back(detail::quote_identifier(c));
+    }
+    include_sql = " INCLUDE (" + detail::join(quoted_include, ", ") + ")";
+  }
   const std::string tail = " ON " + sql_rel + " USING " + method + " (" +
-                           columns_sql + ")" +
+                           columns_sql + ")" + include_sql +
                            (where.empty() ? "" : " WHERE " + where) + ";";
 
   // The rule that replaces a hardcoded size ceiling (S12). A plain build takes
@@ -2064,12 +2263,8 @@ inline void plan_physical(const Intent& in, const Observations& obs, Plan& plan,
       std::vector<std::string> sql;
       const json options = in.body.value("options", json::object());
       if (!options.empty()) {
-        std::vector<std::string> pairs;
-        for (const auto& [k, v] : options.items()) {
-          pairs.push_back(k + " = " + (v.is_string() ? v.get<std::string>() : v.dump()));
-        }
         sql.push_back("ALTER TABLE " + sql_rel + " SET (" +
-                      detail::join(pairs, ", ") + ");");
+                      storage_parameters(options) + ");");
       }
       if (in.body.contains("reset")) {
         std::vector<std::string> names;
@@ -3512,6 +3707,15 @@ inline void plan_create_table(const Intent& in, const Observations& obs,
                     "\n)";
   if (in.body.contains("partition_by")) {
     sql += " PARTITION BY " + in.body.value("partition_by", "");
+  }
+  // WITH comes after PARTITION BY in CREATE TABLE's grammar, which is the
+  // reverse of how they read. Storage parameters at CREATE time rather than a
+  // second set_table_options intent: a table's fillfactor is a property of the
+  // table, and splitting it meant the spec that creates the table did not fully
+  // describe it.
+  const json options = in.body.value("options", json::object());
+  if (!options.empty()) {
+    sql += " WITH (" + storage_parameters(options) + ")";
   }
   step.sql.push_back(sql + ";");
   step.sql.push_back("COMMENT ON TABLE " + sql_rel + " IS " +

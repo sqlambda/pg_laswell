@@ -377,16 +377,44 @@ inline json plan_migration_tool(ToolContext& ctx, const json& args) {
           "that costs.";
     }
     if (!dry.problems.empty()) {
-      d["problems"] = dry.problems;
+      // `problems` stays an array of strings, because callers read it as one.
+      // The SQLSTATE now leads each line, since that is the part a reader can
+      // look up, and `problemDetail` carries the same facts apart so a formatter
+      // can lay them out instead of re-parsing a sentence.
+      json problems = json::array();
+      json detail = json::array();
+      for (const auto& prob : dry.problems) {
+        problems.push_back("step " + std::to_string(prob.step) + ": " +
+                           (prob.sqlstate.empty() ? "" : prob.sqlstate + " ") +
+                           prob.message);
+        detail.push_back(json{{"step", prob.step},
+                              {"sqlstate", prob.sqlstate},
+                              {"message", prob.message},
+                              {"statement", prob.statement}});
+      }
+      d["problems"] = problems;
+      d["problemDetail"] = detail;
       out["ok"] = false;
       out["error"] = "the plan failed when applied to a rolled-back transaction";
+      // A server error carrying a SQLSTATE is the SPECIFICATION's fault far
+      // more often than the planner's: the plan was valid SQL and PostgreSQL
+      // declined it. The old wording asserted the opposite by default and told
+      // the reader to file a defect, which is how "extension citus must be
+      // installed in schema pg_catalog" -- a one-key fix in the spec -- became a
+      // bug report. Name the likely cause, and keep the defect route for the
+      // case that has no server error to explain it.
       std::string hint =
-          "The statements above did not run against the real schema. If the "
-          "spec looks right, this is a pg_laswell defect -- please report it "
-          "with the rendered plan.";
+          dry.problems.front().sqlstate.empty()
+              ? "Nothing ran against the real schema. If the spec looks right, "
+                "this is a pg_laswell defect -- please report it with the "
+                "rendered plan."
+              : "Nothing ran against the real schema. PostgreSQL rejected a "
+                "statement the plan built, so the specification is the first "
+                "place to look; report it as a pg_laswell defect if the "
+                "statement above is not what the spec asked for.";
       for (const auto& prob : dry.problems) {
-        if (prob.find("FROM-clause") != std::string::npos ||
-            prob.find("FROM") != std::string::npos) {
+        if (prob.message.find("FROM-clause") != std::string::npos ||
+            prob.message.find("FROM") != std::string::npos) {
           hint =
               "A backfill's where/set/from expressions reference the target "
               "table BY ITS OWN NAME (\"orders.warehouse_id\"), not by an "

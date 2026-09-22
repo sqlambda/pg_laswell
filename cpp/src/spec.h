@@ -631,8 +631,8 @@ inline void parse_create_index(Intent& in) {
   const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
   detail::reject_unknown_keys(
       in.body,
-      {"kind", "schema", "table", "name", "columns", "unique", "method",
-       "where", "comment", "on_equivalent_index"},
+      {"kind", "schema", "table", "name", "columns", "include", "unique",
+       "method", "where", "comment", "on_equivalent_index"},
       at);
   detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
   detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
@@ -644,9 +644,92 @@ inline void parse_create_index(Intent& in) {
       in.body["columns"].empty()) {
     detail::fail(at + " needs a non-empty \"columns\" array", "");
   }
+  // A column is a bare name, or an object saying more about it. The string form
+  // is unchanged and stays canonical, so every specification written before this
+  // parses to the same bytes and no applied migration is disturbed.
+  //
+  // The object form exists because an index PostgreSQL accepts was unreachable:
+  // require_identifier admits "ts" and refuses "ts DESC", "lower(name)" and
+  // "a text_pattern_ops" alike. A schema needing a functional index could not
+  // put its table in a repository at all -- not the index, the whole table,
+  // because the index had to be applied somewhere and that somewhere was then
+  // outside the ledger.
   for (const auto& c : in.body["columns"]) {
-    if (!c.is_string()) detail::fail(at + ".columns entries must be strings", "");
-    detail::require_identifier(c.get<std::string>(), "columns", in.ordinal);
+    if (c.is_string()) {
+      detail::require_identifier(c.get<std::string>(), "columns", in.ordinal);
+      continue;
+    }
+    if (!c.is_object()) {
+      detail::fail(at + ".columns entries must be a column name or an object",
+                   "A string is the column name. An object takes \"name\" or "
+                   "\"expression\", plus any of \"direction\", \"nulls\" "
+                   "and \"opclass\".");
+    }
+    detail::reject_unknown_keys(
+        c, {"name", "expression", "direction", "nulls", "opclass"},
+        at + ".columns");
+    const bool has_name = c.contains("name");
+    const bool has_expr = c.contains("expression");
+    if (has_name == has_expr) {
+      detail::fail(at + ".columns entries need exactly one of \"name\" and "
+                        "\"expression\"",
+                   "\"name\" indexes a column; \"expression\" indexes the "
+                   "result of an expression over the row. An entry with both, "
+                   "or neither, does not say what to index.");
+    }
+    if (has_name) {
+      detail::require_identifier(detail::require_string(c, "name", at + ".columns"),
+                                 "name", in.ordinal);
+    } else {
+      // Raw SQL, like "where" on the same intent: an expression cannot be an
+      // identifier and there is nothing to validate it against without a
+      // server. It is signed with the rest of the specification, which is what
+      // makes it reviewable.
+      if (detail::require_string(c, "expression", at + ".columns").empty()) {
+        detail::fail(at + ".columns expression must not be empty", "");
+      }
+    }
+    if (c.contains("direction")) {
+      const auto d = c["direction"];
+      if (!d.is_string() || (d != "asc" && d != "desc")) {
+        detail::fail(at + ".columns direction must be \"asc\" or \"desc\"", "");
+      }
+    }
+    if (c.contains("nulls")) {
+      const auto n = c["nulls"];
+      if (!n.is_string() || (n != "first" && n != "last")) {
+        detail::fail(at + ".columns nulls must be \"first\" or \"last\"",
+                     "PostgreSQL defaults to NULLS LAST for ASC and NULLS "
+                     "FIRST for DESC; state it only when you want the other.");
+      }
+    }
+    if (c.contains("opclass")) {
+      detail::require_identifier(
+          detail::require_string(c, "opclass", at + ".columns"), "opclass",
+          in.ordinal);
+    }
+  }
+
+  // Covering columns: stored in the index but not part of its key, so they
+  // answer a query from the index without ordering or restricting anything.
+  if (in.body.contains("include")) {
+    if (!in.body["include"].is_array() || in.body["include"].empty()) {
+      detail::fail(at + ".include must be a non-empty array of column names", "");
+    }
+    for (const auto& c : in.body["include"]) {
+      if (!c.is_string()) {
+        detail::fail(at + ".include entries must be column names", "");
+      }
+      detail::require_identifier(c.get<std::string>(), "include", in.ordinal);
+    }
+    // Measured on 18.6: INCLUDE is a btree/gist feature. A GIN index with
+    // INCLUDE fails 0A000 at execution, which this can say beforehand.
+    const auto method = in.body.value("method", "btree");
+    if (method != "btree" && method != "gist" && method != "spgist") {
+      detail::fail(at + " uses include with method \"" + method + "\"",
+                   "INCLUDE is supported by btree, gist and spgist only. Drop "
+                   "include, or index those columns as key columns.");
+    }
   }
   (void)detail::require_string(in.body, "comment", at);
 
@@ -2281,10 +2364,36 @@ inline void parse_create_table(Intent& in) {
   const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
   detail::reject_unknown_keys(
       in.body, {"kind", "schema", "table", "columns", "comment", "primary_key",
-                "partition_by", "unlogged"}, at);
+                "partition_by", "unlogged", "options"}, at);
   detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
   detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
   detail::require_string(in.body, "comment", at);
+  // Storage parameters at creation. The same shape set_table_options takes,
+  // minus "reset": there is nothing to reset on a table being created, and an
+  // accepted key that can never do anything is worse than a refused one.
+  if (in.body.contains("options")) {
+    if (!in.body["options"].is_object()) {
+      detail::fail(at + ".options must be an object of name to value", "");
+    }
+    for (const auto& [k, v] : in.body["options"].items()) {
+      detail::require_identifier(k, "options", in.ordinal);
+      if (!v.is_string() && !v.is_number()) {
+        detail::fail(at + ".options." + k + " must be a string or a number", "");
+      }
+    }
+    // Measured on 18.6: CREATE TABLE ... PARTITION BY ... WITH (fillfactor)
+    // fails 42809, "cannot specify storage parameters for a partitioned
+    // table". A partitioned parent holds no rows, so it has no storage to
+    // parametrise. Both keys are in the specification, so this needs no
+    // reading of the database and is refused here rather than at execution.
+    if (in.body.contains("partition_by")) {
+      detail::fail(at + " gives storage options to a partitioned table",
+                   "A partitioned parent holds no rows, so PostgreSQL refuses "
+                   "storage parameters on it (42809). Put the options on the "
+                   "leaf partitions -- each is its own create_table -- or drop "
+                   "partition_by.");
+    }
+  }
   if (!in.body.contains("columns") || !in.body["columns"].is_array() ||
       in.body["columns"].empty()) {
     detail::fail(at + ".columns must be a non-empty array",

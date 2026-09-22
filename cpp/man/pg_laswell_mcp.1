@@ -709,6 +709,39 @@ gives them.
 requires an explicit
 .Va name ,
 because a derived name is a name nobody can search for during an incident.
+.Pp
+Each entry of
+.Va columns
+is a column name, or an object saying more about that position:
+.Va name
+or
+.Va expression
+.Pq exactly one of the two ,
+with any of
+.Va direction
+.Pq Cm asc | Cm desc ,
+.Va nulls
+.Pq Cm first | Cm last
+and
+.Va opclass .
+A sibling
+.Va include
+lists covering columns, which are stored in the index but not part of its key.
+.Bd -literal -offset indent
+"columns": [
+  "account_id",
+  {"name": "ts", "direction": "desc"},
+  {"expression": "lower(name)"}
+],
+"include": ["status"]
+.Ed
+.Pp
+An index differing only in a column's direction or operator class is a
+.Em different
+index, and is treated as one: an existing index is adopted or renamed only when
+its ordering and operator classes match as well as its columns.
+Where every key column is exactly reversed, the plan says so and builds nothing,
+because a btree scans backwards at the same cost.
 .Va on_equivalent_index
 selects what happens when an equivalent index already exists under a different
 name:

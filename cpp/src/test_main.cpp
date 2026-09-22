@@ -3133,6 +3133,61 @@ TEST_F(ToolTest, TheDryRunCatchesSqlThatDoesNotWorkAgainstTheRealSchema) {
             std::string::npos);
 }
 
+TEST_F(ToolTest, ARejectedStatementIsReportedWithTheServersOwnWords) {
+  // The dry run's whole value is that PostgreSQL answers before the real schema
+  // is touched. That answer used to be recorded and then dropped: a rejected
+  // statement reported "the plan failed when applied to a rolled-back
+  // transaction" and invited a defect report, with the server's explanation
+  // sitting unused one field away.
+  //
+  // Reported from a real conversion: CREATE EXTENSION citus SCHEMA public is
+  // valid SQL that Citus rejects, and the reader was sent to file a bug rather
+  // than delete one key.
+  make_shop(cfg());
+  json doc = minimal_spec();
+  doc["intents"][1]["set"] = json{{"fulfilment_region", "w.no_such_column"}};
+  const auto parsed = pglaswell::parse_spec(doc);
+  doc["signatures"] = json::array({{{"key_id", test_key().key_id},
+                                    {"algorithm", "ed25519"},
+                                    {"signature", base64(sign(parsed.canonical_bytes))}}});
+
+  const auto p = payload(call("planMigration", json{{"spec", doc}}));
+  ASSERT_FALSE(p.value("ok", true)) << p.dump(2);
+  ASSERT_TRUE(p["dryRun"].contains("problemDetail")) << p.dump(2);
+  const auto& d = p["dryRun"]["problemDetail"][0];
+
+  // The SQLSTATE, because it is the part a reader can look up. 42703 is
+  // undefined_column.
+  EXPECT_EQ(d.value("sqlstate", ""), "42703") << d.dump(2);
+  // The server's words, without pqxx's "ERROR:  " prefix or its trailing
+  // newline -- this is a field, not a line of output.
+  EXPECT_NE(d.value("message", "").find("no_such_column"), std::string::npos)
+      << d.dump(2);
+  EXPECT_EQ(d.value("message", "").rfind("ERROR", 0), std::string::npos)
+      << "the ERROR: prefix is presentation and does not belong in a field";
+  EXPECT_TRUE(d.value("message", "").empty() || d.value("message", "").back() != '\n');
+  // The statement that produced it, so the reader does not have to guess which
+  // of a multi-step plan failed.
+  EXPECT_NE(d.value("statement", "").find("no_such_column"), std::string::npos)
+      << d.dump(2);
+  EXPECT_GE(d.value("step", -1), 0);
+
+  // And the hint no longer asserts that the tool is at fault. A server error
+  // carrying a SQLSTATE means the plan was valid SQL that PostgreSQL declined,
+  // which points at the specification first.
+  const auto hint = p.value("hint", "");
+  EXPECT_NE(hint.find("specification is the first place to look"),
+            std::string::npos)
+      << hint;
+
+  // The string form stays a string, because callers read it as one, and now
+  // leads with the SQLSTATE.
+  ASSERT_TRUE(p["dryRun"].contains("problems")) << p.dump(2);
+  EXPECT_NE(p["dryRun"]["problems"][0].get<std::string>().find("42703"),
+            std::string::npos)
+      << p["dryRun"]["problems"][0];
+}
+
 TEST_F(ToolTest, AConcurrentIndexBuildIsReportedAsUnverifiedNotSilentlyPassed) {
   // CREATE INDEX CONCURRENTLY cannot run inside a transaction block, so a dry
   // run cannot cover it. Saying so is the difference between a check and a
@@ -4946,6 +5001,13 @@ TEST(Planner, AnEquivalentIndexUnderAnotherNameIsRenamedNotRebuilt) {
       json{{"is_valid", true}, {"is_unique", false}, {"method", "btree"},
            {"predicate", "(status = 'open'::text)"}, {"has_expressions", false},
            {"columns", json::array({"fulfilment_region", "created_at"})},
+           // What a real reading carries. The matcher declines to compare an
+           // index whose ordering and operator classes it cannot see -- a
+           // missing reading is not a matching one -- so a fixture without
+           // these is a fixture of an index this tool would not touch.
+           {"key_column_count", 2},
+           {"column_order", json::array({"asc nulls last", "asc nulls last"})},
+           {"column_opclasses", json::array({"", ""})},
            {"leading_column", "fulfilment_region"}};
 
   const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(minimal_spec()), obs, {});
@@ -4979,6 +5041,13 @@ TEST(Planner, RenamingAConstraintBackedIndexIsRefused) {
            {"predicate", "(status = 'open'::text)"}, {"has_expressions", false},
            {"constraint_backed", true},
            {"columns", json::array({"fulfilment_region", "created_at"})},
+           // What a real reading carries. The matcher declines to compare an
+           // index whose ordering and operator classes it cannot see -- a
+           // missing reading is not a matching one -- so a fixture without
+           // these is a fixture of an index this tool would not touch.
+           {"key_column_count", 2},
+           {"column_order", json::array({"asc nulls last", "asc nulls last"})},
+           {"column_opclasses", json::array({"", ""})},
            {"leading_column", "fulfilment_region"}};
   const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(minimal_spec()), obs, {});
   EXPECT_FALSE(plan.ok) << plan.render();
@@ -4995,6 +5064,13 @@ TEST(Planner, OnEquivalentIndexAdoptChangesNothing) {
       json{{"is_valid", true}, {"is_unique", false}, {"method", "btree"},
            {"predicate", "(status = 'open'::text)"}, {"has_expressions", false},
            {"columns", json::array({"fulfilment_region", "created_at"})},
+           // What a real reading carries. The matcher declines to compare an
+           // index whose ordering and operator classes it cannot see -- a
+           // missing reading is not a matching one -- so a fixture without
+           // these is a fixture of an index this tool would not touch.
+           {"key_column_count", 2},
+           {"column_order", json::array({"asc nulls last", "asc nulls last"})},
+           {"column_opclasses", json::array({"", ""})},
            {"leading_column", "fulfilment_region"}};
   auto doc = minimal_spec();
   for (auto& i : doc["intents"]) {
@@ -5015,6 +5091,13 @@ TEST(Planner, OnEquivalentIndexRefuseRestoresTheConflict) {
       json{{"is_valid", true}, {"is_unique", false}, {"method", "btree"},
            {"predicate", "(status = 'open'::text)"}, {"has_expressions", false},
            {"columns", json::array({"fulfilment_region", "created_at"})},
+           // What a real reading carries. The matcher declines to compare an
+           // index whose ordering and operator classes it cannot see -- a
+           // missing reading is not a matching one -- so a fixture without
+           // these is a fixture of an index this tool would not touch.
+           {"key_column_count", 2},
+           {"column_order", json::array({"asc nulls last", "asc nulls last"})},
+           {"column_opclasses", json::array({"", ""})},
            {"leading_column", "fulfilment_region"}};
   auto doc = minimal_spec();
   for (auto& i : doc["intents"]) {
@@ -5045,6 +5128,13 @@ TEST(Planner, ADifferentPredicateWarnsRatherThanRefusing) {
       json{{"is_valid", true}, {"is_unique", false}, {"method", "btree"},
            {"predicate", "(status = 'closed'::text)"}, {"has_expressions", false},
            {"columns", json::array({"fulfilment_region", "created_at"})},
+           // What a real reading carries. The matcher declines to compare an
+           // index whose ordering and operator classes it cannot see -- a
+           // missing reading is not a matching one -- so a fixture without
+           // these is a fixture of an index this tool would not touch.
+           {"key_column_count", 2},
+           {"column_order", json::array({"asc nulls last", "asc nulls last"})},
+           {"column_opclasses", json::array({"", ""})},
            {"leading_column", "fulfilment_region"}};
   const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(minimal_spec()), obs, {});
   EXPECT_TRUE(plan.ok) << plan.render();
@@ -5055,6 +5145,86 @@ TEST(Planner, ADifferentPredicateWarnsRatherThanRefusing) {
   EXPECT_TRUE(warned) << json(plan.warnings).dump(2);
 }
 
+TEST(Planner, AMixedOrderingIsNotSatisfiedByAnAscendingOrADescendingIndex) {
+  // The case a human converting SQL by hand gets wrong, and the one that made
+  // recording indoption necessary. A btree scans backwards as a WHOLE, so
+  // (a DESC, b DESC) serves (a ASC, b ASC) -- but (a ASC, b DESC) is served by
+  // neither, and before the ordering was observed at all, an existing (a, b)
+  // compared equal to every one of these.
+  //
+  // Under the default on_equivalent_index the consequence was not a wasted
+  // index but a wrong one: the ascending index would have been RENAMED to the
+  // declared name and the spec reported satisfied, leaving the database without
+  // the ordering it asked for and the ledger saying it had it.
+  const auto spec_for = [](json columns) {
+    json doc = minimal_spec();
+    doc["intents"] = json::array({json{{"kind", "create_index"},
+                                       {"schema", "shop"},
+                                       {"table", "orders"},
+                                       {"name", "orders_mixed_idx"},
+                                       {"columns", std::move(columns)},
+                                       {"comment", "Mixed ordering."}}});
+    return pglaswell::parse_spec(doc);
+  };
+  const auto with_index = [](const char* name, json order) {
+    auto obs = observations(1024, 10);
+    obs.tables["shop.orders"]["indexes"][name] =
+        json{{"is_valid", true},      {"is_unique", false},
+             {"method", "btree"},     {"predicate", ""},
+             {"has_expressions", false},
+             {"columns", json::array({"fulfilment_region", "created_at"})},
+             {"key_column_count", 2},
+             {"column_order", std::move(order)},
+             {"column_opclasses", json::array({"", ""})},
+             {"leading_column", "fulfilment_region"}};
+    return obs;
+  };
+  const json mixed = json::array(
+      {"fulfilment_region", json{{"name", "created_at"}, {"direction", "desc"}}});
+
+  // Against an all-ascending index: build, and do not call it a reverse.
+  for (const char* existing_order : {"asc", "desc"}) {
+    const json order = json::array({std::string(existing_order) + " nulls " +
+                                        (std::string(existing_order) == "desc"
+                                             ? "first"
+                                             : "last"),
+                                    std::string(existing_order) + " nulls " +
+                                        (std::string(existing_order) == "desc"
+                                             ? "first"
+                                             : "last")});
+    const auto obs = with_index("uniform", order);
+    const auto plan = pglaswell::plan_migration(spec_for(mixed), obs, {});
+    ASSERT_TRUE(plan.ok) << plan.render();
+    const auto* step = find_step(plan, "create_index");
+    ASSERT_NE(step, nullptr);
+    const auto sql = all_sql(*step);
+    EXPECT_NE(sql.find("CREATE INDEX"), std::string::npos)
+        << "a uniformly " << existing_order
+        << " index must not satisfy a mixed ordering:\n" << sql;
+    EXPECT_EQ(sql.find("RENAME TO"), std::string::npos)
+        << "the existing index was renamed into the declared name, which leaves "
+           "the database without the ordering the spec asked for:\n" << sql;
+    for (const auto& w : plan.warnings) {
+      EXPECT_EQ(w.find("exact reverse"), std::string::npos)
+          << "a partial flip is not a reverse: " << w;
+    }
+  }
+
+  // And the same mixed ordering IS recognised, or the test above would pass
+  // against a planner that simply never matches anything.
+  {
+    const auto obs = with_index("already_mixed",
+                               json::array({"asc nulls last", "desc nulls first"}));
+    const auto plan = pglaswell::plan_migration(spec_for(mixed), obs, {});
+    ASSERT_TRUE(plan.ok) << plan.render();
+    const auto* step = find_step(plan, "create_index");
+    ASSERT_NE(step, nullptr);
+    EXPECT_NE(all_sql(*step).find("RENAME TO"), std::string::npos)
+        << "an index with the SAME mixed ordering should be adopted:\n"
+        << all_sql(*step);
+  }
+}
+
 TEST(Planner, APrefixRedundantIndexWarnsRatherThanRefusing) {
   // There are legitimate reasons to want a narrower index -- size, fillfactor
   // -- so refusing would be the tool overriding a judgement it cannot make.
@@ -5063,6 +5233,10 @@ TEST(Planner, APrefixRedundantIndexWarnsRatherThanRefusing) {
       json{{"is_valid", true}, {"is_unique", false}, {"method", "btree"},
            {"predicate", "(status = 'open'::text)"}, {"has_expressions", false},
            {"columns", json::array({"fulfilment_region", "created_at", "id"})},
+           {"key_column_count", 3},
+           {"column_order", json::array({"asc nulls last", "asc nulls last",
+                                         "asc nulls last"})},
+           {"column_opclasses", json::array({"", "", ""})},
            {"leading_column", "fulfilment_region"}};
   const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(minimal_spec()), obs, {});
   EXPECT_TRUE(plan.ok) << plan.render();
@@ -5094,6 +5268,13 @@ TEST(Planner, AnInvalidDuplicateDoesNotBlockTheRebuild) {
       json{{"is_valid", false}, {"is_unique", false}, {"method", "btree"},
            {"predicate", "(status = 'open'::text)"}, {"has_expressions", false},
            {"columns", json::array({"fulfilment_region", "created_at"})},
+           // What a real reading carries. The matcher declines to compare an
+           // index whose ordering and operator classes it cannot see -- a
+           // missing reading is not a matching one -- so a fixture without
+           // these is a fixture of an index this tool would not touch.
+           {"key_column_count", 2},
+           {"column_order", json::array({"asc nulls last", "asc nulls last"})},
+           {"column_opclasses", json::array({"", ""})},
            {"leading_column", "fulfilment_region"}};
   const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(minimal_spec()), obs, {});
   EXPECT_TRUE(plan.ok) << plan.render();
@@ -5108,6 +5289,13 @@ TEST(Planner, APartialAndAFullIndexAreDifferentNotAmbiguous) {
       json{{"is_valid", true}, {"is_unique", false}, {"method", "btree"},
            {"predicate", "(status = 'open'::text)"}, {"has_expressions", false},
            {"columns", json::array({"fulfilment_region", "created_at"})},
+           // What a real reading carries. The matcher declines to compare an
+           // index whose ordering and operator classes it cannot see -- a
+           // missing reading is not a matching one -- so a fixture without
+           // these is a fixture of an index this tool would not touch.
+           {"key_column_count", 2},
+           {"column_order", json::array({"asc nulls last", "asc nulls last"})},
+           {"column_opclasses", json::array({"", ""})},
            {"leading_column", "fulfilment_region"}};
   auto doc = minimal_spec();
   for (auto& i : doc["intents"]) {
@@ -10784,6 +10972,57 @@ TEST(Planner, AnOrdinaryMigrationHasNoPrerequisites) {
   EXPECT_EQ(plan.render().find("before this can run"), std::string::npos);
 }
 
+TEST_F(DatabaseTest, AnExpressionIndexInTheDatabaseDoesNotBreakPlanning) {
+  // An index whose first key is an EXPRESSION names no attribute, so
+  // pg_attribute has no row for it and both `leading_column` and `columns`
+  // aggregated to SQL NULL. A json null is not a missing key, so
+  // value("leading_column", "") returned the null rather than the default and
+  // the next conversion threw type_error.302 out of the planner.
+  //
+  // This was reachable before pg_laswell could CREATE such an index -- any
+  // database that already had one broke planning for its whole table -- and it
+  // surfaced the moment a conformance case built one. The fix is in the
+  // observation: no nulls where a reader expects a string or an array.
+  pglaswell::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = url_;
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test");
+    w.txn().exec("DROP TABLE IF EXISTS expr_idx_probe");
+    w.txn().exec("CREATE TABLE expr_idx_probe (id bigint PRIMARY KEY, name text)");
+    w.txn().exec("CREATE INDEX expr_idx_probe_lower ON expr_idx_probe (lower(name))");
+    w.commit();
+  }
+
+  pglaswell::Catalog cat(cfg);
+  const auto obs = cat.observe({"public"}, {"expr_idx_probe"}, {});
+  const auto& ix =
+      obs.table("public.expr_idx_probe")["indexes"]["expr_idx_probe_lower"];
+  ASSERT_TRUE(ix.is_object()) << obs.tables.dump(2);
+  EXPECT_TRUE(ix.value("has_expressions", false));
+  // The two fields that were null. Absent-or-empty is fine; null is not.
+  EXPECT_FALSE(ix["leading_column"].is_null()) << ix.dump(2);
+  EXPECT_FALSE(ix["columns"].is_null()) << ix.dump(2);
+  EXPECT_EQ(ix.value("leading_column", std::string("unset")), "");
+
+  // And the reader that threw. No EXPECT_NO_THROW: an exception here fails the
+  // test on its own, and the macro cannot take a brace-enclosed body anyway.
+  json doc = json{{"laswell_spec_version", 1},
+                  {"id", "expr-idx"},
+                  {"description", "plan against a table with an expression index"},
+                  {"intents", json::array({json{{"kind", "add_column"},
+                                                {"schema", "public"},
+                                                {"table", "expr_idx_probe"},
+                                                {"column", "note"},
+                                                {"type", "text"},
+                                                {"nullable", true},
+                                                {"comment", "Note."}}})}};
+  const auto spec = pglaswell::parse_spec(doc);
+  const auto plan = pglaswell::plan_migration(spec, obs, pglaswell::ExecutorConfig{});
+  EXPECT_TRUE(plan.ok) << (plan.conflicts.empty() ? "" : plan.conflicts[0]);
+}
+
 // --- conformance: every kind, executed ------------------------------------
 
 #include "conformance.inc"
@@ -11927,7 +12166,13 @@ TEST_F(DeployTest, ADryRunSaysWhyASpecWasRefusedWhenThereIsNoPlanToShow) {
   EXPECT_EQ(result, pglaswell::DeployResult::kRefused) << text;
   EXPECT_NE(text.find("untrusted"), std::string::npos) << text;
   // The point of the test: a reason, not just the verdict.
-  EXPECT_NE(text.find("REFUSED"), std::string::npos) << text;
+  //
+  // "not accepted", the same words the apply path uses. This branch covers a
+  // spec that never got as far as a plan -- an untrusted signature, or a plan
+  // the dry run rejected -- and it used to say REFUSED here and "not accepted"
+  // there for the identical condition, which reads as two different outcomes.
+  // REFUSED is kept for a plan that WAS built and rejected on its conflicts.
+  EXPECT_NE(text.find("not accepted"), std::string::npos) << text;
   EXPECT_NE(text.find("not accepted by this machine"), std::string::npos)
       << "the refusal must say WHY, and this is the gate that said no:\n" << text;
   EXPECT_EQ(column_count("orders", "cu"), 0) << "a dry run applied something";

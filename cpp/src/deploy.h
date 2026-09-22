@@ -352,6 +352,33 @@ class Deployment {
     }
   }
 
+  // What the server said, when a dry run is what refused the plan.
+  //
+  // This existed in the JSON as dryRun.problemDetail and was printed nowhere:
+  // the deployment binary showed "the plan failed when applied to a rolled-back
+  // transaction" and stopped, so a CREATE EXTENSION that PostgreSQL rejected
+  // for naming a schema looked like a tool defect. The check is the good part;
+  // discarding its finding was the defect.
+  void report_dry_run_problems(std::ostream& out, const json& plan) const {
+    const auto dry = plan.value("dryRun", json::object());
+    for (const auto& d : dry.value("problemDetail", json::array())) {
+      const auto stmt = d.value("statement", "");
+      const auto state = d.value("sqlstate", "");
+      if (!stmt.empty()) out << "      statement: " << stmt << "\n";
+      // PostgreSQL's answer can carry its own HINT: or DETAIL: lines. They are
+      // worth printing -- the hint is often the fix -- but they arrive as one
+      // string with newlines in it, which would break out of this block's
+      // margin. Indent every continuation to line up under the first.
+      std::string msg = d.value("message", "");
+      for (std::size_t i = msg.find('\n'); i != std::string::npos;
+           i = msg.find('\n', i + 18)) {
+        msg.replace(i, 1, "\n                 ");
+      }
+      out << "      server:    " << (state.empty() ? "" : state + " ") << msg
+          << "\n";
+    }
+  }
+
   void report_not_accepted(std::ostream& out, const std::string& id,
                            const json& started) const {
     const auto conflicts = started.value("conflicts", json::array());
@@ -363,8 +390,12 @@ class Deployment {
       return;
     }
     out << "  " << id << ": not accepted\n";
-    for (const char* k : {"error", "hint"}) {
-      if (started.contains(k)) out << "      " << as_text(started[k]) << "\n";
+    if (started.contains("error")) {
+      out << "      " << as_text(started["error"]) << "\n";
+    }
+    report_dry_run_problems(out, started);
+    if (started.contains("hint")) {
+      out << "      " << as_text(started["hint"]) << "\n";
     }
     // A trust failure says which gate refused, and that is the whole answer.
     for (const char* gate : {"clientTrust", "databaseTrust"}) {
@@ -406,8 +437,13 @@ class Deployment {
   DeployResult report_plan_outcome(std::ostream& out, const std::string& id,
                                    const json& plan) const {
     if (plan.contains("error")) {
-      out << "  " << id << ": REFUSED\n";
+      // "not accepted", matching the apply path: this is the same condition
+      // reported by the same tool, and two words for it read as two outcomes.
+      // REFUSED below is a plan that was built and rejected on its conflicts,
+      // which is a different thing and keeps the stronger word.
+      out << "  " << id << ": not accepted\n";
       out << "      " << as_text(plan["error"]) << "\n";
+      report_dry_run_problems(out, plan);
       if (plan.contains("hint")) out << "      " << as_text(plan["hint"]) << "\n";
       return DeployResult::kRefused;
     }

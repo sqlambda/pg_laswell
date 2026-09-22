@@ -397,7 +397,11 @@ class Observer {
   // Which topology's reading applies, decided once. Empty means plain
   // PostgreSQL, where the local reading is the whole truth.
   std::string topology_;
-  bool topology_probed_ = false;
+  // Atomic because start() clears it from the CALLER's thread while the observer
+  // thread reads it. Everything it guards -- topology_ and the two SQL pointers
+  // -- is written and read only by the observer thread, so the flag is the one
+  // thing that crosses.
+  std::atomic<bool> topology_probed_{false};
   const char* topology_any_sql_ = nullptr;
   const char* topology_observer_sql_ = nullptr;
 
@@ -414,6 +418,12 @@ class Observer {
   // once at startup and the race had nowhere to happen.
   void start() {
     std::lock_guard<std::mutex> lock(lifecycle_m_);
+    // Every startMigration reaches here, including one whose predecessor just
+    // created the extension whose topology this probes for. Clearing the flag
+    // before the early return is deliberate: the common case is an observer
+    // already running, and that is exactly the case that would otherwise keep
+    // a stale answer.
+    topology_probed_ = false;
     if (thread_.joinable()) return;
     {
       std::lock_guard<std::mutex> lock2(m_);
@@ -459,15 +469,23 @@ class Observer {
       pqxx::work txn(*conn_);
       txn.exec("SET TRANSACTION READ ONLY");
 
-      // Does a module's topology-wide reading apply here? Asked ONCE per
-      // connection rather than per tick: the answer is a property of the
-      // cluster, and a tick runs every few hundred milliseconds.
+      // Does a module's topology-wide reading apply here? Asked once per
+      // MIGRATION rather than per tick: a tick runs every few hundred
+      // milliseconds, and the answer can only change when DDL has run.
+      //
+      // It used to be once per connection, which was wrong in one reachable
+      // case: a repository that creates the Citus extension and then
+      // distributes a table. The observer probed before the extension existed,
+      // found nothing, and kept reading pg_locks on the coordinator for the
+      // rest of the deployment -- where a shard-level wait reads as zero
+      // waiters. The run was then paced against a blind reading precisely when
+      // it had just started working on a distributed table. start() clears the
+      // flag, so each migration gets one fresh probe.
       //
       // This is the substitutive seam, and it is safe precisely because waiter
       // counts are already outside planDigest (kObservedDetailKeys): changing
       // HOW a reading is taken cannot change what a plan says it will do.
-      if (!topology_probed_) {
-        topology_probed_ = true;
+      if (!topology_probed_.exchange(true)) {
 #define PGLASWELL_TOPOLOGY(module_name, applies_sql, any_sql, observer_sql) \
         do {                                                                \
           const auto a = txn.exec(applies_sql);                             \

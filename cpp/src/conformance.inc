@@ -121,6 +121,57 @@ inline std::vector<Case> cases() {
      "SELECT indisvalid::text FROM pg_index WHERE indexrelid='cf.t_amount_idx'::regclass",
      "true"},
 
+    // The forms require_identifier used to refuse. Each reads pg_get_indexdef
+    // back rather than merely checking the index exists: what is being proved
+    // is that the DIRECTION, the OPERATOR CLASS and the EXPRESSION survived
+    // into the index PostgreSQL actually built, and an existence check would
+    // pass just as happily on an ascending index of the same columns.
+    {"create_index_descending", {},
+     json{{"kind","create_index"},{"schema","cf"},{"table","t"},
+          {"name","t_desc_idx"},
+          {"columns",json::array({"amount",
+                                  json{{"name","code"},{"direction","desc"}}})},
+          {"comment","Newest first."}},
+     "SELECT (pg_get_indexdef('cf.t_desc_idx'::regclass)"
+     " LIKE '%code DESC%')::text",
+     "true"},
+
+    {"create_index_expression", {},
+     json{{"kind","create_index"},{"schema","cf"},{"table","t"},
+          {"name","t_lower_idx"},
+          {"columns",json::array({json{{"expression","lower(code)"}}})},
+          {"comment","Case-insensitive lookup."}},
+     "SELECT (pg_get_indexdef('cf.t_lower_idx'::regclass)"
+     " LIKE '%lower(code)%')::text",
+     "true"},
+
+    {"create_index_opclass", {},
+     json{{"kind","create_index"},{"schema","cf"},{"table","t"},
+          {"name","t_pattern_idx"},
+          {"columns",json::array({json{{"name","code"},
+                                       {"opclass","text_pattern_ops"}}})},
+          {"comment","LIKE prefix lookup."}},
+     "SELECT (pg_get_indexdef('cf.t_pattern_idx'::regclass)"
+     " LIKE '%text_pattern_ops%')::text", "true"},
+
+    {"create_index_include", {},
+     json{{"kind","create_index"},{"schema","cf"},{"table","t"},
+          {"name","t_cover_idx"},{"columns",json::array({"code"})},
+          {"include",json::array({"amount"})},{"comment","Covering."}},
+     "SELECT (indnkeyatts = 1 AND indnatts = 2)::text FROM pg_index"
+     " WHERE indexrelid='cf.t_cover_idx'::regclass", "true"},
+
+    {"create_table_options",
+     {},
+     json{{"kind","create_table"},{"schema","cf"},{"table","with_options"},
+          {"columns",json::array({json{{"name","id"},{"type","bigint"},
+                                       {"nullable",false},{"comment","Key."}}})},
+          {"primary_key",json::array({"id"})},
+          {"options",json{{"fillfactor","90"}}},
+          {"comment","Storage options at creation."}},
+     "SELECT reloptions::text FROM pg_class WHERE oid='cf.with_options'::regclass",
+     "{fillfactor=90}"},
+
     {"add_unique_constraint", {},
      json{{"kind","add_unique_constraint"},{"schema","cf"},{"table","t"},
           {"name","t_code_uq"},{"columns",json::array({"code"})}},

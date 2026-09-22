@@ -126,13 +126,54 @@ SELECT COALESCE(
                    -- these are never renamed.
                    'constraint_backed', EXISTS (SELECT 1 FROM pg_constraint k
                                                  WHERE k.conindid = i.indexrelid),
-                   'columns', (SELECT JSONB_AGG(a.attname ORDER BY k.ord)
+                   -- COALESCE, because an index over an EXPRESSION has attnum
+                   -- 0 for that position and the join drops it -- an index
+                   -- entirely of expressions aggregates to SQL NULL. A null
+                   -- here reaches a reader as json null, and value("columns",
+                   -- json::array()) returns the null rather than the default,
+                   -- so the very next get<std::string>() throws. Measured: a
+                   -- backfill on a table carrying one expression index threw
+                   -- type_error.302 out of the planner.
+                   'columns', COALESCE((SELECT JSONB_AGG(a.attname ORDER BY k.ord)
                                  FROM unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord)
                                  JOIN pg_attribute a ON a.attrelid = t.oid
-                                                    AND a.attnum = k.attnum),
-                   'leading_column', (SELECT a.attname FROM pg_attribute a
+                                                    AND a.attnum = k.attnum), '[]'::jsonb),
+                   -- How many of indkey are KEY columns. The rest are INCLUDE
+                   -- payload, which does not order or restrict anything, so an
+                   -- index keyed the same with different payload is a different
+                   -- index and must not be mistaken for an equivalent one.
+                   'key_column_count', i.indnkeyatts,
+                   -- Per-key-column sort order, as PostgreSQL stores it in
+                   -- indoption: bit 0 is DESC, bit 1 is NULLS FIRST. Without
+                   -- these, (a, b) and (a, b DESC) read as the same index --
+                   -- and the equivalence check would have renamed one into the
+                   -- other and called the spec satisfied.
+                   'column_order', COALESCE((SELECT JSONB_AGG(
+                                      CASE WHEN (o.opt & 1) = 1 THEN 'desc'
+                                           ELSE 'asc' END ||
+                                      CASE WHEN (o.opt & 2) = 2 THEN ' nulls first'
+                                           ELSE ' nulls last' END
+                                      ORDER BY o.ord)
+                                     FROM unnest(i.indoption) WITH ORDINALITY AS o(opt, ord)
+                                    WHERE o.ord <= i.indnkeyatts), '[]'::jsonb),
+                   -- The operator class of each key column, named only when it
+                   -- is NOT the type's default: a spec that says nothing means
+                   -- the default, so recording the default everywhere would
+                   -- make every ordinary index look opclass-bearing.
+                   'column_opclasses', COALESCE((SELECT JSONB_AGG(
+                                          CASE WHEN oc.opcdefault THEN ''
+                                               ELSE oc.opcname END
+                                          ORDER BY c.ord)
+                                         FROM unnest(i.indclass) WITH ORDINALITY AS c(oid, ord)
+                                         JOIN pg_opclass oc ON oc.oid = c.oid
+                                        WHERE c.ord <= i.indnkeyatts), '[]'::jsonb),
+                   -- Same reason: indkey[0] = 0 when the first key column is
+                   -- an expression, which names no attribute. Empty string, not
+                   -- null: readers treat "" as "no leading column I can name",
+                   -- which is exactly the truth here.
+                   'leading_column', COALESCE((SELECT a.attname FROM pg_attribute a
                                        WHERE a.attrelid = t.oid
-                                         AND a.attnum = i.indkey[0])))
+                                         AND a.attnum = i.indkey[0]), '')))
                    FROM pg_index i
                    JOIN pg_class ic ON ic.oid = i.indexrelid
                    JOIN pg_am am ON am.oid = ic.relam
@@ -705,14 +746,44 @@ class Catalog {
     stream.complete();
   }
 
+  // What failed, as three separate facts rather than one sentence.
+  //
+  // It used to be a single string, and the deployment binary printed none of it
+  // -- so a spec that PostgreSQL rejected reported only "the plan failed when
+  // applied to a rolled-back transaction" and invited a defect report, while
+  // the server had said exactly what was wrong. The server's answer is the
+  // whole value of this check; throwing it away left the check saying only
+  // that it had run.
+  struct Problem {
+    int step = -1;
+    std::string sqlstate;   // "0A000". Empty when the failure carried none.
+    std::string message;    // the server's own words, without ERROR: or newline
+    std::string statement;  // the statement that produced it
+  };
+
   struct DryRun {
     bool ran = false;
-    std::vector<std::string> problems;
+    std::vector<Problem> problems;
     std::vector<int> unverified_steps;  // could not be included, or not reached
     std::string skipped_reason;
     int timed_out_at = -1;
     bool depends_on_skipped = false;
   };
+
+  // pqxx hands back the server's line verbatim -- "ERROR:  extension ...\n".
+  // The prefix and the newline are presentation, and this is a field, so they
+  // are stripped here rather than by every reader.
+  static std::string server_message(const std::string& raw) {
+    std::string m = raw;
+    const std::string prefix = "ERROR:";
+    if (m.rfind(prefix, 0) == 0) m.erase(0, prefix.size());
+    while (!m.empty() && (m.back() == '\n' || m.back() == '\r' || m.back() == ' ')) {
+      m.pop_back();
+    }
+    std::size_t i = 0;
+    while (i < m.size() && (m[i] == ' ' || m[i] == '\t')) ++i;
+    return m.substr(i);
+  }
 
   // `copy_payloads` is parallel to `steps`: a null entry for an ordinary step,
   // and for a copy_rows step the {copy_columns, copy_rows, qualified} detail its
@@ -763,8 +834,11 @@ class Catalog {
           long long sent = 0;
           stream_copy(session, copy_payloads[i], sent);
         } catch (const pqxx::sql_error& e) {
-          out.problems.push_back(
-              "step " + std::to_string(steps[i].first) + " (COPY): " + e.what());
+          out.problems.push_back(Problem{steps[i].first, e.sqlstate(),
+                                        server_message(e.what()),
+                                        "COPY into " +
+                                            copy_payloads[i].value("qualified",
+                                                                   "?")});
           break;
         }
         continue;
@@ -810,8 +884,8 @@ class Catalog {
             session.rollback();
             return out;
           }
-          out.problems.push_back("step " + std::to_string(steps[i].first) + ": " +
-                                 e.what());
+          out.problems.push_back(Problem{steps[i].first, e.sqlstate(),
+                                        server_message(e.what()), stmt});
           session.rollback();
           return out;
         }
