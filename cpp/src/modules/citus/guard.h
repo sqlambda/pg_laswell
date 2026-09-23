@@ -75,25 +75,13 @@ inline void citus_plan_refusals(const Spec& spec, const Observations& obs,
       // column returns rows under FOR UPDATE where the multi-shard form
       // errors). That needs the walk to iterate distribution values, which is a
       // change to how the executor walks rather than to what it refuses.
-      const bool target_keyset_walk =
-          in.kind == IntentKind::kBackfill ||
-          (in.kind == IntentKind::kDeleteRows && !in.body.contains("values") &&
-           !in.body.contains("select"));
-      if (target_keyset_walk) {
-        refuse(
-            "\"" + in.kind_name + "\" on " + qualified +
-            " walks the table by key, and " + qualified +
-            " is distributed. Each batch is taken with FOR UPDATE so the keyset "
-            "cursor cannot select the same rows twice, and Citus refuses that on "
-            "a multi-shard query: \"could not run distributed query with FOR "
-            "UPDATE/SHARE commands\". It would be accepted here and fail partway "
-            "through, with earlier batches already committed. Use "
-            "\"citus_distributed_backfill\", which walks one shard at a time so "
-            "the lock is legal, or supply the rows explicitly -- update_rows, "
-            "delete_rows with values, and insert_rows all run on a distributed "
-            "table.");
-        continue;
-      }
+      // backfill and delete_rows by predicate are not refused here any more.
+      // Both walk the target and take FOR UPDATE, which Citus refuses across
+      // shards -- and core now reads citus_required_confinement (confine.h) and
+      // walks a distributed table one distribution value at a time, which makes
+      // the lock single-shard. The refusal that remains for them, when the
+      // distribution column IS the walk key, is core's, because it is core's
+      // walk that cannot be shaped.
 
       // MERGE is refused for its own reasons, which have nothing to do with
       // pacing or row locks. Naming the right restriction matters: told it was

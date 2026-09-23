@@ -1720,22 +1720,34 @@ inline long long drive_paced_step(const pglaswell::ConnConfig& cfg,
   const auto strip = [](const std::string& q) {
     return q.empty() || q.back() != ';' ? q : q.substr(0, q.size() - 1);
   };
-  const bool two = step.detail.value("batch_mode", "") == "two_statement" &&
-                   step.sql.size() > 1;
-  const auto select_sql = strip(step.sql[0]);
-  const auto apply_sql = two ? strip(step.sql[1]) : std::string();
+  const auto mode = step.detail.value("batch_mode", "");
+  const bool two = mode == "two_statement" && step.sql.size() > 1;
+  const bool grouped = mode == "grouped" && step.sql.size() > 2;
 
   std::string cursor = "0";
   long long considered = 0;
   for (int pass = 0; pass < 1000; ++pass) {
     pglaswell::WriteSession b(cfg);
     b.begin(app_name);
-    const auto out = pglaswell::run_paced_batch(b.txn(), select_sql, apply_sql,
-                                                cursor, 1000, 1 << 20);
+    pglaswell::BatchOutcome out;
+    if (grouped) {
+      pglaswell::GroupCursor at;
+      if (!pglaswell::GroupCursor::decode(cursor, at)) {
+        ADD_FAILURE() << "unreadable grouped cursor: " << cursor;
+        return considered;
+      }
+      out = pglaswell::run_grouped_batch(b.txn(), strip(step.sql[0]),
+                                         strip(step.sql[1]), strip(step.sql[2]),
+                                         at, 1000, 1 << 20);
+    } else {
+      out = pglaswell::run_paced_batch(b.txn(), strip(step.sql[0]),
+                                       two ? strip(step.sql[1]) : std::string(),
+                                       cursor, 1000, 1 << 20);
+    }
     b.commit();
-    if (out.considered == 0) break;
-    considered += out.considered;
     cursor = out.cursor;
+    if (out.considered == 0 && !out.skipped_only) break;
+    considered += out.considered;
   }
   return considered;
 }
@@ -5257,6 +5269,52 @@ TEST(Planner, AMixedOrderingIsNotSatisfiedByAnAscendingOrADescendingIndex) {
         << "an index with the SAME mixed ordering should be adopted:\n"
         << all_sql(*step);
   }
+}
+
+TEST(Planner, ABackfillWhoseKeyIsUniqueOnlyWithinAGroupWalksGroupByGroup) {
+  // CORE behaviour, so tested in core: a module-off build must do this too. A
+  // table whose only proof of uniqueness is (tenant_id, id) -- the primary key of
+  // every table whose tenant column comes first -- was refused by backfill on
+  // every server. It is now walked one tenant at a time.
+  //
+  // The outcome alone cannot tell the walks apart (the apply matches keys by
+  // value, so a whole-table walk on a non-unique key still finishes), which is
+  // why the CHOICE is asserted here: walking `id` across the table would give
+  // up the batch bound on every run of equal ids.
+  pglaswell::Observations obs;
+  obs.server_version = 180000;
+  obs.server = json{{"max_connections", 100}, {"current_backends", 5}};
+  obs.tables["public.ledger"] = json{
+      {"exists", true},
+      {"reltuples", 100000},
+      {"columns", json{{"tenant_id", {{"type", "bigint"}}},
+                       {"id", {{"type", "bigint"}}},
+                       {"balance", {{"type", "numeric"}}}}},
+      {"indexes", json{{"ledger_pkey",
+                        json{{"is_unique", true}, {"is_valid", true},
+                             {"predicate", ""}, {"has_expressions", false},
+                             {"columns", json::array({"tenant_id", "id"})},
+                             {"key_column_count", 2},
+                             {"leading_column", "tenant_id"}}}}}};
+  json doc = minimal_spec();
+  doc["intents"] = json::array({json{{"kind", "backfill"}, {"schema", "public"},
+                                     {"table", "ledger"}, {"key", "id"},
+                                     {"set", {{"balance", "0"}}},
+                                     {"where", "balance IS NULL"}}});
+  const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(doc), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto* s = find_step(plan, "backfill");
+  ASSERT_NE(s, nullptr);
+  EXPECT_EQ(s->detail.value("batch_mode", ""), "grouped") << plan.render();
+  EXPECT_EQ(s->detail.value("group_column", ""), "tenant_id");
+  EXPECT_EQ(s->detail.value("supporting_index", ""), "ledger_pkey");
+  // No module decided this -- and none may be credited with it.
+  EXPECT_FALSE(s->detail.contains("confined_by"));
+  ASSERT_EQ(s->sql.size(), 3u);
+  EXPECT_NE(s->sql[1].find("\"tenant_id\" = $1"), std::string::npos) << s->sql[1];
+  EXPECT_NE(s->sql[2].find("\"tenant_id\" = $1"), std::string::npos)
+      << "the change must stay inside the group: id is unique only within one,\n"
+      << s->sql[2];
 }
 
 TEST(Planner, APrefixRedundantIndexWarnsRatherThanRefusing) {
@@ -11188,13 +11246,13 @@ TEST_F(DatabaseTest, ABatchIsBoundedByBytesAsWellAsRows) {
   }
 }
 
-TEST(Executor, AShardCursorRoundTripsAndRefusesWhatItCannotRead) {
-  // The cursor of a shard-confined walk says WHICH distribution value and HOW
+TEST(Executor, AGroupCursorRoundTripsAndRefusesWhatItCannotRead) {
+  // The cursor of a grouped walk says WHICH group value and HOW
   // FAR into it. A misread does not fail loudly: it resumes at the start of some
   // group, silently redoing or skipping a whole shard, and the job reports
   // success. So the decoder refuses anything it cannot read, and this asserts
   // both halves of that.
-  using pglaswell::ShardCursor;
+  using pglaswell::GroupCursor;
 
   // Round trip, including the values a delimiter-based encoding would ruin.
   for (const auto& pair : std::vector<std::pair<std::string, std::string>>{
@@ -11203,9 +11261,9 @@ TEST(Executor, AShardCursorRoundTripsAndRefusesWhatItCannotRead) {
            {"", ""},
            {"5", ""},
            {std::string("unit\x1f") + "separator", std::string("and\x1f") + "another"}}) {
-    ShardCursor out;
-    ASSERT_TRUE(ShardCursor::decode(
-        ShardCursor{pair.first, pair.second}.encode(), out))
+    GroupCursor out;
+    ASSERT_TRUE(GroupCursor::decode(
+        GroupCursor{pair.first, pair.second}.encode(), out))
         << pair.first << " / " << pair.second;
     EXPECT_EQ(out.group, pair.first);
     EXPECT_EQ(out.key, pair.second);
@@ -11215,9 +11273,9 @@ TEST(Executor, AShardCursorRoundTripsAndRefusesWhatItCannotRead) {
   // resume. Accepted BY NAME, and it cannot collide with a real cursor because
   // a real one is always a JSON array.
   {
-    ShardCursor out{"x", "y"};
-    EXPECT_TRUE(ShardCursor::decode("0", out));
-    EXPECT_TRUE(ShardCursor::decode("", out));
+    GroupCursor out{"x", "y"};
+    EXPECT_TRUE(GroupCursor::decode("0", out));
+    EXPECT_TRUE(GroupCursor::decode("", out));
   }
 
   // Everything else it cannot read is refused rather than guessed at. Each of
@@ -11230,8 +11288,8 @@ TEST(Executor, AShardCursorRoundTripsAndRefusesWhatItCannotRead) {
                           "{\"group\":\"3\"}",   // an object
                           "not json at all",
                           "[\"3\",null]"}) {
-    ShardCursor out;
-    EXPECT_FALSE(ShardCursor::decode(bad, out))
+    GroupCursor out;
+    EXPECT_FALSE(GroupCursor::decode(bad, out))
         << "read as a cursor when it is not one: " << bad;
   }
 }

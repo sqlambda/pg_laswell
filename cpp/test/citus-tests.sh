@@ -69,13 +69,15 @@ plan_for() {  # plan_for <table> -- prints the planMigration JSON
 
 echo "citus: the paced walk, per table type"
 
-# A DISTRIBUTED table is refused at plan time, naming the Citus restriction.
-# Multi-shard FOR UPDATE does not merely perform badly -- it cannot run.
+# ct.dist is distributed on its own key. A backfill confines each batch to one
+# distribution value, so here every batch would be one row: refused, naming why
+# and what runs instead. (A table distributed on a DIFFERENT column is walked --
+# see the grouped walk below.)
 out=$(plan_for dist)
-if echo "$out" | grep -q '"ok":false' && echo "$out" | grep -q 'is distributed'; then
-  ok "a distributed table is refused, and the refusal names why"
+if echo "$out" | grep -q '"ok":false' && echo "$out" | grep -q 'which is the walk key'; then
+  ok "a table distributed on its walk key is refused, and the refusal names why"
 else
-  bad "a distributed table should be refused" "$out"
+  bad "a table distributed on its walk key should be refused" "$out"
 fi
 
 # A REFERENCE table is allowed, and the DRY RUN must agree. This is the case
@@ -127,9 +129,9 @@ expect_form() {  # expect_form <label> <allow|refuse> <needle-if-refused> <inten
 
 # Refused, and for the reason that is actually true of them: they walk the target
 # by key and take FOR UPDATE, which Citus will not do across shards.
-expect_form "backfill" refuse "walks the table by key" \
+expect_form "backfill on a table distributed on its key" refuse "which is the walk key" \
   '{"kind":"backfill","schema":"ct","table":"dist","key":"id","set":{"flag":"true"},"where":"flag IS NULL"}'
-expect_form "delete_rows by predicate" refuse "walks the table by key" \
+expect_form "delete_rows by predicate on a table distributed on its key" refuse "which is the walk key" \
   '{"kind":"delete_rows","schema":"ct","table":"dist","key":"id","where":"v < 0"}'
 
 # Refused for its OWN reason. Told it was about FOR UPDATE, an author would go
@@ -207,14 +209,15 @@ DELETE FROM laswell.step WHERE job_id IN (
 DELETE FROM laswell.job WHERE migration_id IN (
   SELECT migration_id FROM laswell.migration WHERE spec_id = '9990-ct-ref');
 DELETE FROM laswell.migration WHERE spec_id = '9990-ct-ref';"
-# THE SHARD-CONFINED WALK: citus_distributed_backfill.
+# THE GROUPED WALK, through plain `backfill`.
 #
-# Core's backfill is refused on a distributed table because a multi-shard batch
-# cannot take FOR UPDATE. This kind confines each batch to one distribution value,
-# which makes the lock legal. Correctness is the acceptance test, not speed --
-# the measured gain is ~16%, and the reason to have it is that the alternative is
-# nothing at all.
-echo "citus: the shard-confined walk"
+# The author writes backfill whatever the server runs. Core asks the Citus
+# module one question -- must row-locking batches on this table be confined to
+# one value of a column? -- and for a distributed table the answer is its
+# distribution column, so core walks one value at a time and FOR UPDATE becomes
+# single-shard. Correctness is the acceptance test, not speed: the measured gain
+# is ~16%, and the reason to have it is that the alternative is no walk at all.
+echo "citus: the grouped walk"
 
 q "DROP TABLE IF EXISTS ct.tw" >/dev/null
 # The shape this needs, and the shape the tenant convention already produces: the
@@ -227,11 +230,20 @@ q "SELECT create_distributed_table('ct.tw','tenant_id')" >/dev/null
 q "INSERT INTO ct.tw SELECT t, (t-1)*100 + g, 0 FROM generate_series(1,8) t,
                                                     generate_series(1,100) g" >/dev/null
 
-out=$(intent_plan '{"kind":"citus_distributed_backfill","schema":"ct","table":"tw","key":"id","set":{"n":"tw.n + 1"},"where":"n = 0"}')
-if echo "$out" | grep -q '"ok":true' && echo "$out" | grep -q '"batch_mode":"shard_confined"'; then
-  ok "a shard-confined walk plans on a distributed table"
+out=$(intent_plan '{"kind":"backfill","schema":"ct","table":"tw","key":"id","set":{"n":"tw.n + 1"},"where":"n = 0"}')
+if echo "$out" | grep -q '"ok":true' && echo "$out" | grep -q '"batch_mode":"grouped"' \
+   && echo "$out" | grep -q '"confined_by":"citus"'; then
+  ok "a plain backfill on a distributed table plans as a grouped walk, and says the citus reading decided"
 else
-  bad "citus_distributed_backfill should plan here" "$out"
+  bad "backfill should plan grouped here, confined by the citus reading" "$out"
+fi
+
+# delete_rows by predicate walks the target the same way, and groups the same way.
+out=$(intent_plan '{"kind":"delete_rows","schema":"ct","table":"tw","key":"id","where":"n < 0"}')
+if echo "$out" | grep -q '"ok":true' && echo "$out" | grep -q '"batch_mode":"grouped"'; then
+  ok "delete_rows by predicate on a distributed table plans as a grouped walk"
+else
+  bad "delete_rows by predicate should plan grouped here" "$out"
 fi
 
 # The apply must be SINGLE SHARD. That is the entire mechanism: Citus allows
@@ -250,7 +262,7 @@ walk_repo=$(mktemp -d)
 cat > "$walk_repo/9991-ct-shard.json" <<'JSON'
 {"laswell_spec_version":1,"id":"9991-ct-shard",
  "description":"Backfill a distributed table one shard at a time.",
- "intents":[{"kind":"citus_distributed_backfill","schema":"ct","table":"tw",
+ "intents":[{"kind":"backfill","schema":"ct","table":"tw",
              "key":"id","set":{"n":"tw.n + 1"},"where":"n = 0"}]}
 JSON
 bytes2=$("$MCP" --call getSpecDigest --args "{\"spec\":$(cat "$walk_repo/9991-ct-shard.json")}" \

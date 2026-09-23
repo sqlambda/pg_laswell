@@ -224,6 +224,30 @@ inline std::vector<Case> cases() {
           {"set",json{{"note","'filled'"}}},{"where","note IS NULL OR note = 'x'"}},
      "SELECT count(*)::text FROM cf.t WHERE note='filled'", "50"},
 
+    // A tenant table: its only proof of uniqueness is the primary key
+    // (tenant_id, id), so `id` is unique only within a tenant. Refused on every
+    // server before; now walked one tenant at a time, and this proves that walk
+    // RUNS on plain PostgreSQL and touches every row exactly once.
+    //
+    // What it does not prove, and why: that the grouping was chosen. Mutating
+    // the planner to walk `id` across the whole table still passes here, because
+    // the apply matches keys by VALUE -- a batch boundary inside a run of equal
+    // ids still updates the whole run, and the next batch starts past it. So a
+    // non-unique key costs the batch its BOUND (one statement touched 1002 rows
+    // against a limit of 1000 when this was tried), not its completeness. The
+    // choice of walk is asserted by the planner tests; three tenants of 500
+    // rows here make the walk cross group boundaries mid-run.
+    {"backfill_grouped",
+     {"CREATE TABLE cf.tenanted (tenant_id bigint NOT NULL, id bigint NOT NULL,"
+      " n int NOT NULL DEFAULT 0, PRIMARY KEY (tenant_id, id))",
+      "INSERT INTO cf.tenanted SELECT t, g, 0"
+      " FROM generate_series(1,3) t, generate_series(1,500) g"},
+     json{{"kind","backfill"},{"schema","cf"},{"table","tenanted"},{"key","id"},
+          {"set",json{{"n","tenanted.n + 1"}}},{"where","n = 0"}},
+     // Exactly once, which a counter proves and a boolean cannot.
+     "SELECT (count(*) FILTER (WHERE n = 1) = 1500 AND count(*) = 1500)::text"
+     " FROM cf.tenanted", "true"},
+
     {"delete_rows", {},
      json{{"kind","delete_rows"},{"schema","cf"},{"table","t"},{"key","id"},
           {"where","id > 40"}},

@@ -58,10 +58,10 @@ covers `modules/*/plan.h` too. Nothing will fail the build if a module sneaks in
 a non-determinism, so a module's planner must be a pure function of
 `(Intent, Observations, ExecutorConfig)` by discipline.
 
-### THE RULE: a module may not change what core emits
+### THE RULE: a module may inform core's SQL, never write it
 
-Three shapes are permitted and a fourth is forbidden, and the prohibition is
-what keeps the whole design safe rather than merely tidy.
+Four shapes are permitted and one is forbidden, and the line between them is what
+keeps the design safe rather than merely tidy.
 
 **Permitted:**
 
@@ -71,35 +71,64 @@ what keeps the whole design safe rather than merely tidy.
   `budget` erased), so overriding them cannot change the receipt.
 - **refusing** -- a plan-level guard may declare a plan impossible. It says no;
   it does not rewrite.
+- **informing** -- a module answers a QUESTION core asks, and core decides what
+  follows. There is one such question today, asked through `confine.h`: *must
+  row-locking batches on this table be confined to single values of a column, and
+  which?* Citus answers "its distribution column" for a distributed table, and
+  core's `backfill` and `delete_rows` then walk it one value at a time, which is
+  what makes their `FOR UPDATE` single-shard. The module contributes a column
+  name. Every statement is core's.
 
-**Forbidden: a module may not alter the SQL core emits for a CORE kind.**
+**Forbidden: a module may not emit or rewrite SQL for a CORE kind, and may not
+shape a plan for a table it has no reading about.**
 
-Not a style preference. It is the property the build-time argument rests on:
+The second half is the guarantee that survives from the old rule and is tested
+as such (`CitusPlanner.AModuleThatHasNothingToSayChangesNothing`, and every
+golden plan unchanged): for a table a module says nothing about, a build with the
+module and a build without it emit the same statements.
 
-> the module set can never silently alter a plan, only decide whether there is
-> one
+#### Why this changed, 2026-09-22
 
-Break that and the same signed specification means different things on two
-builds -- which is precisely why a `dlopen` plugin is refused above. A
-build-time module that could rewrite core's output would have the same dangerous
-power, just acquired at a different moment. It would also falsify the reason
-`modules` is recorded in the plan and NOT hashed
-(`planner_base.h`): "for a specification this binary can plan at all, the module
-set does not change a single statement."
+The rule used to read *"a module may not alter the SQL core emits for a core
+kind"*, and it sent a paced walk on a distributed table to a module kind of its
+own, `citus_distributed_backfill`, with core's `backfill` refusing and naming it.
+Three things overturned that, and the first is decisive:
 
-**So when a vendor needs different SQL for something core already does, that is
-a NEW KIND in the module, never a hook into core's.** A paced walk on a Citus
-distributed table cannot use core's `backfill` -- Citus refuses multi-shard
-`FOR UPDATE` -- so the answer is a module kind, `citus_distributed_backfill`,
-and core's `backfill` refuses the distributed case and names it.
+1. **One configuration, several targets.** A single `laswell.ini` can point one
+   repository at plain PostgreSQL in development, Citus in staging to validate an
+   upgrade, and some other PostgreSQL-compatible server that needs a module of its
+   own. A specification that has to name its vendor's kind can serve only one of
+   them. A backfill is a backfill whatever the server runs; the binary adapts per
+   target through readings, which is what readings are for.
+2. **The builds already disagreed, in the worse direction.** Measured, same
+   specification, same distributed table (distributed on its own key): a build
+   WITHOUT the module planned the walk, passed the dry run -- `PREPARE` cannot see
+   what Citus will refuse to route -- and would have failed partway through
+   execution. A build with it refused. "A module must not make builds differ" was
+   already false; what the old rule bought was a difference in which the plain
+   build was the dangerous one.
+3. **The old argument pointed the other way.** It said a table local today and
+   distributed tomorrow makes an explicit kind wrong, and treated that as a reason
+   to refuse. It is a reason to infer: the specification written while the table
+   was local must still run after it is distributed.
 
-The author declaring it rather than the planner inferring it cuts slightly
-against "declare the outcome, let the planner decide how". Two things settle it:
-`target.connection` already puts topology in a specification, and a shard-ordered
-single-shard-batched walk genuinely IS a different operation -- one a reviewer of
-a signed specification should see named rather than discover in a plan. And when
-a table is local today and distributed tomorrow, the kind becomes wrong, which
-is exactly when a refusal beats a silent change of strategy.
+#### What keeps it honest without hashing `modules`
+
+A plan a module has shaped emits different statements, so its `planDigest`
+differs by construction -- "what ran is what you were shown" holds, because what
+you are shown is the grouped walk. And it says so: the step records
+`confined_by` and its `why` names the reading that decided. The recorded reason
+`modules` is not hashed (`planner_base.h`) is reworded accordingly: the module
+set can change statements, but only through readings that already change them,
+so hashing the set would add nothing a reader of the statements does not see.
+
+### `citus_distributed_backfill`, removed
+
+`citus_distributed_backfill` existed for one commit and was never pushed. It was
+removed rather than kept as "the explicit form", because two ways to do one thing
+is the cost the lab's first report named ("the request would have added a second
+way to do it"), and because an explicit form is precisely the vendor-naming the
+multi-target case cannot use.
 
 ### What is ENFORCED, and what is only asked (audited 2026-09-21)
 
@@ -118,6 +147,7 @@ weaker than "I tried to break it":
 | `PLAN_GUARD` pushing a warning | `error: 'plan' was not declared in this scope` | **was a hole, now closed** |
 | `TOPOLOGY` merge | counts only ever raised | compliant |
 | `OBSERVE` | writes only `extensions[<module>]` | compliant |
+| `CONFINEMENT` | a function `(const Observations&, table) -> column`; it cannot reach the plan or name another table | compliant by construction |
 
 Every close is the same move, and it is the only one worth making: **pass a hook
 what it may touch, and nothing else.** A block that expands inside someone

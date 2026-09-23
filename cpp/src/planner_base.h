@@ -169,13 +169,25 @@ struct Plan {
   // migration -- otherwise "what ran" is under-specified in the one place this
   // project treats as authoritative.
   //
-  // NOT HASHED, and the reason is specific rather than convenient: for a
-  // specification this binary can plan at all, the module set does not change
-  // a single statement. One it cannot plan is refused outright, because an
-  // unknown kind is a fatal refusal of the whole file -- so the module set can
-  // never silently alter a plan, only decide whether there is one. Hashing it
-  // would instead change every existing digest and make two builds disagree
-  // about specs they both handle identically.
+  // NOT HASHED, and the reason is specific rather than convenient. A module can
+  // change a plan in exactly two ways, and neither needs the set in the digest:
+  //
+  //   - by refusing it, or by not knowing a kind (a fatal refusal of the whole
+  //     file). Then there is no plan to digest.
+  //   - through a READING core interprets -- today, which column row-locking
+  //     batches on a table must be confined to. Then core emits different
+  //     statements, so the digest differs already, and the step names the
+  //     reading (`confined_by`).
+  //
+  // Everything else plans identically with or without the module, and that is
+  // tested. Hashing the set would change every existing digest and make two
+  // builds disagree about specs they handle statement-for-statement the same,
+  // while telling a reader nothing the statements do not.
+  //
+  // This used to say "the module set does not change a single statement". It
+  // stopped being true on 2026-09-22, when core's backfill began reading
+  // confinement from a module so that one repository could run on plain
+  // PostgreSQL and on Citus alike -- see modules/README.md, THE RULE.
   static json modules() {
 #ifdef PGLASWELL_MODULE_SET
     const std::string set = PGLASWELL_MODULE_SET;

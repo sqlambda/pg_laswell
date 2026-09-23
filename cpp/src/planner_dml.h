@@ -51,6 +51,40 @@
 
 namespace pglaswell {
 
+// Every enabled module's answer to one question: must row-locking batches on
+// this table be confined to single values of a column, and which? Inside the
+// namespace, like every module header.
+#include "modules/enabled_confinement_headers.h"
+
+// The column a module requires row-locking batches on `qualified` to be confined
+// to, or "" when none does. `decided_by` names the module that answered, so a
+// plan shaped by the answer can say which reading decided -- which is what keeps
+// a module-shaped plan honest: its statements differ, so planDigest differs, and
+// its `why` names the reason.
+//
+// The first module to answer wins. Two modules answering for the same table
+// would mean two vendors claiming one database, which is not a configuration
+// this can resolve; the first is at least deterministic, because the module list
+// is ordered by the build.
+inline std::string required_confinement(const Observations& obs,
+                                        const std::string& qualified,
+                                        std::string& decided_by) {
+#define PGLASWELL_CONFINEMENT(module_name, confine_fn)       \
+  {                                                          \
+    auto column = confine_fn(obs, qualified);                \
+    if (!column.empty()) {                                   \
+      decided_by = module_name;                              \
+      return column;                                         \
+    }                                                        \
+  }
+#include "modules/enabled_confinements.h"
+#undef PGLASWELL_CONFINEMENT
+  (void)obs;
+  (void)qualified;
+  decided_by.clear();
+  return {};
+}
+
 namespace detail {
 
 // --- rendering literal rows -------------------------------------------------
@@ -308,6 +342,44 @@ inline void emit_sequence_catchup(const Intent& in, const json& columns,
 // candidate, for the message. `reason` says why that candidate does not count,
 // so a refusal can name the actual problem instead of saying "no unique index"
 // about a table that visibly has one.
+// The grouped counterpart: a unique index on EXACTLY (group, key), group first,
+// which makes `key` unique within one value of `group` and serves
+// `group = X AND key > Y ORDER BY key` without a sort.
+//
+// Held to the same standard as unique_key_index -- unique, valid, not partial, a
+// reading that says which columns it covers -- because a weaker proof here is a
+// walk that revisits or skips rows inside a group, and the group structure makes
+// that no less silent. When `required_group` is set, only that group column
+// qualifies: a module has said batches must be confined to it, and a different
+// grouping would not satisfy the reason the module gave.
+inline bool unique_group_key_index(const json& t, const std::string& key,
+                                   const std::string& required_group,
+                                   std::string& group, std::string& index_name) {
+  const json indexes = t.value("indexes", json::object());
+  for (auto it = indexes.begin(); it != indexes.end(); ++it) {
+    const auto& ix = it.value();
+    if (!ix.value("is_unique", false) || !ix.value("is_valid", false)) continue;
+    if (ix.value("has_expressions", false)) continue;
+    if (!ix.contains("columns") || !ix["columns"].is_array() ||
+        !ix.contains("predicate")) {
+      continue;
+    }
+    if (!ix.value("predicate", "").empty()) continue;
+    const auto& cols = ix["columns"];
+    const auto key_count = static_cast<std::size_t>(
+        ix.value("key_column_count", static_cast<int>(cols.size())));
+    if (key_count != 2 || cols.size() < 2) continue;
+    if (!cols[0].is_string() || !cols[1].is_string()) continue;
+    if (cols[1].get<std::string>() != key) continue;
+    const auto g = cols[0].get<std::string>();
+    if (!required_group.empty() && g != required_group) continue;
+    group = g;
+    index_name = it.key();
+    return true;
+  }
+  return false;
+}
+
 inline bool unique_key_index(const json& t, const std::string& key,
                              std::string& index_name,
                              std::string* reason = nullptr) {
@@ -333,7 +405,12 @@ inline bool unique_key_index(const json& t, const std::string& key,
            "columns it covers or whether it is partial, so it proves nothing");
       continue;
     }
-    if (ix["columns"].size() != 1) {
+    // KEY columns, not all of them: the catalog lists INCLUDE payload after the
+    // key, and a unique index on (id) INCLUDE (x) proves id unique -- the payload
+    // is stored, not constrained. Counting it refused that index as proof.
+    const auto key_count = static_cast<std::size_t>(ix.value(
+        "key_column_count", static_cast<int>(ix["columns"].size())));
+    if (key_count != 1) {
       std::vector<std::string> names;
       for (const auto& c : ix["columns"]) {
         names.push_back(c.is_string() ? c.get<std::string>() : "<expression>");
@@ -566,16 +643,73 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
   // The same proof merge_rows and update_rows demand, from the same helper:
   // this used to be a private copy that checked only the leading column, and
   // a copy is how one of them gets fixed and the other does not.
-  std::string supporting_index, unproven;
-  if (!detail::unique_key_index(t, key, supporting_index, &unproven)) {
+  // WHICH WALK. Two shapes, chosen from readings, and the author never names one:
+  // a backfill is a backfill, whatever the server is running. One configuration
+  // can point the same repository at plain PostgreSQL in development, Citus in
+  // staging and some other compatible server in production, and a specification
+  // that had to name its walk could serve only one of them.
+  //
+  //   ordinary  the key is unique on its own; walk it across the table. This is
+  //             the walk every earlier release emitted, and for such a table on
+  //             plain PostgreSQL the SQL is unchanged byte for byte.
+  //   grouped   iterate the values of a group column and walk the key inside
+  //             each. Chosen when a module says row-locking batches on this
+  //             table must be confined to one value of a column -- Citus, for a
+  //             distributed table, because FOR UPDATE across shards is refused --
+  //             or when the only proof of uniqueness is an index on
+  //             (group, key), as for any table whose tenant column comes first.
+  //             Such a table was simply refused before, on every server.
+  std::string confined_by;
+  const auto required_group = required_confinement(obs, qualified, confined_by);
+  std::string supporting_index, unproven, group_column;
+  bool grouped = false;
+  if (required_group.empty() &&
+      detail::unique_key_index(t, key, supporting_index, &unproven)) {
+    grouped = false;
+  } else if (!required_group.empty() && required_group == key) {
+    // Confinement is an equality on the group column, so when that column IS
+    // the key every group holds exactly one row: technically a walk, and one row
+    // of progress per batch. Refused rather than shipped as that.
     step.action = Action::kConflict;
-    step.why = "no unique index proves " + key + " unique";
+    step.why = "row-locking batches on " + qualified +
+               " must be confined to one value of " + key +
+               ", which is the walk key";
     plan.conflicts.push_back(
-        qualified + " has no valid unique index on (" + key + ") alone" +
-        (unproven.empty() ? "" : " (" + unproven + ")") +
-        ", so a keyset walk could skip or repeat rows. Create one first: "
-        "CREATE UNIQUE INDEX CONCURRENTLY ... ON " + qualified + " (" + key + ");");
+        step.why + " -- the " + confined_by + " reading says so, and with the "
+        "two the same every batch would be a single row. Walk a different key "
+        "that is unique within one " + key + ", or supply the rows with "
+        "update_rows, which needs no walk.");
     return;
+  } else {
+    std::string grouped_index;
+    if (detail::unique_group_key_index(t, key, required_group, group_column,
+                                        grouped_index)) {
+      grouped = true;
+      supporting_index = grouped_index;
+    } else {
+      step.action = Action::kConflict;
+      if (!required_group.empty()) {
+        step.why = "no unique index on (" + required_group + ", " + key +
+                   ") covers " + qualified;
+        plan.conflicts.push_back(
+            step.why + ". The " + confined_by + " reading says row-locking "
+            "batches on this table must be confined to one value of " +
+            required_group + ", so " + key + " only has to be unique WITHIN one "
+            "-- which a unique index on (" + required_group + ", " + key +
+            "), in that order, proves. Create it, or walk a key that such an "
+            "index already covers.");
+      } else {
+        step.why = "no unique index proves " + key + " unique";
+        plan.conflicts.push_back(
+            qualified + " has no valid unique index on (" + key + ") alone" +
+            (unproven.empty() ? "" : " (" + unproven + ")") +
+            ", nor on (<group>, " + key + ") with " + key + " second, so a "
+            "keyset walk could skip or repeat rows. Create one first: "
+            "CREATE UNIQUE INDEX CONCURRENTLY ... ON " + qualified + " (" + key +
+            ");");
+      }
+      return;
+    }
   }
 
   const long long rows = t.value("reltuples", 0LL);
@@ -676,11 +810,72 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
       " WHERE " + rel + "." + k + " = " + key_array + " AND (" + where + ")\n"
       "RETURNING " + rel + "." + k + ";";
 
-  step.sql.push_back(select_sql);
-  step.sql.push_back(apply_sql);
-  // Which loop the executor runs. Named rather than inferred from the number of
-  // statements: the kinds whose rows come from the specification still emit one.
-  step.detail["batch_mode"] = "two_statement";
+  if (!grouped) {
+    step.sql.push_back(select_sql);
+    step.sql.push_back(apply_sql);
+    // Which loop the executor runs. Named rather than inferred from the number
+    // of statements: the kinds whose rows come from the specification still
+    // emit one.
+    step.detail["batch_mode"] = "two_statement";
+  } else {
+    // Three statements, and the order is the algorithm: which group values
+    // remain, which keys remain inside one, the change to exactly those keys --
+    // still restricted to the group, because the key is only unique within one
+    // and because a module may need the equality to keep the batch confined.
+    //
+    // `$1 IS NULL` means "before the first": an unstarted position cannot be ''
+    // when the parameter takes the column's own type. The COMPARISON comes first
+    // in each guard, or a bare PREPARE fails 42P08 "could not determine data type
+    // of parameter $1"; a cast would fix that and break EXPLAIN (GENERIC_PLAN)
+    // instead, so the order is what satisfies both.
+    const auto g = detail::quote_identifier(group_column);
+    const std::string from_list = from.empty() ? "" : ", " + from;
+    step.sql.push_back(
+        "SELECT DISTINCT " + rel + "." + g + "\n"
+        "  FROM " + sql_rel + from_list + "\n"
+        " WHERE (" + rel + "." + g + " > $1 OR $1 IS NULL) AND (" + where + ")\n"
+        " ORDER BY " + rel + "." + g + "\n"
+        " LIMIT $2;");
+    step.sql.push_back(
+        "SELECT " + rel + "." + k + "\n"
+        "  FROM " + sql_rel + from_list + "\n"
+        " WHERE " + rel + "." + g + " = $1\n"
+        "   AND (" + rel + "." + k + " > $2 OR $2 IS NULL) AND (" + where + ")\n"
+        " ORDER BY " + rel + "." + k + "\n"
+        " LIMIT $3\n"
+        " FOR UPDATE OF " + rel + ";");
+    const std::string in_batch = "ANY($2::" + key_type + "[])";
+    std::string grouped_preserve;
+    if (step.detail.contains("preserve")) {
+      // The capture names the group as well as the keys: a key is unique only
+      // WITHIN a group here, so ANY(keys) alone would also capture the rows of
+      // other groups that happen to share a key value -- a pre-image of rows
+      // this batch never touched.
+      detail::Preserved pv;
+      std::vector<std::string> changed;
+      for (auto it = in.body["set"].begin(); it != in.body["set"].end(); ++it) {
+        changed.push_back(it.key());
+      }
+      std::vector<Step> discard;  // the side table step was already emitted above
+      detail::plan_preserve(in, columns, sql_rel, key, changed, discard, pv);
+      grouped_preserve =
+          "WITH " +
+          detail::preserve_cte_by_keys(pv, sql_rel, rel, key,
+                                       in_batch + " AND " + rel + "." + g + " = $1") +
+          "\n";
+    }
+    step.sql.push_back(
+        grouped_preserve +
+        "UPDATE " + sql_rel + "\n"
+        "   SET " + detail::join(assignments, ", ") + "\n" +
+        (from.empty() ? "" : "  FROM " + from + "\n") +
+        " WHERE " + rel + "." + g + " = $1\n"
+        "   AND " + rel + "." + k + " = " + in_batch + " AND (" + where + ")\n"
+        "RETURNING " + rel + "." + k + ";");
+    step.detail["batch_mode"] = "grouped";
+    step.detail["group_column"] = group_column;
+    if (!confined_by.empty()) step.detail["confined_by"] = confined_by;
+  }
   step.detail["key_type"] = key_type;
   step.detail["qualified"] = qualified;
   // Carried so the executor can check a resume cursor against the predicate
@@ -711,9 +906,18 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
   }
 
   step.why = std::to_string(rows) + " rows estimated; keyset walk on " + key +
+             (grouped ? " within each " + group_column : std::string()) +
              " via " + supporting_index + ", " + std::to_string(cfg.batch_rows) +
              " rows per batch, committing on a lock waiter or " +
              std::to_string(cfg.commit_interval_ms) + "ms";
+  if (grouped) {
+    step.why += confined_by.empty()
+                    ? "; grouped because " + key + " is unique only within one " +
+                          group_column
+                    : "; grouped because the " + confined_by +
+                          " reading requires row-locking batches on this table "
+                          "to be confined to one " + group_column;
+  }
 
   // Without an index that supports (key) under the filter, each batch may
   // rescan from the start -- quadratic in the table size. A warning rather
@@ -1385,24 +1589,77 @@ inline void plan_delete_rows(const Intent& in, const Observations& obs,
     // hand before the mutation is sent. See plan_backfill for the full note.
     const auto del_key_type =
         columns.value(key, json::object()).value("type", "text");
-    const std::string del_key_array = "ANY($1::" + del_key_type + "[])";
-    step.sql.push_back(
-        "SELECT " + sql_rel + "." + k + "\n"
-        "  FROM " + sql_rel + "\n"
-        " WHERE " + sql_rel + "." + k + " > $1 AND (" + where + ")\n"
-        " ORDER BY " + sql_rel + "." + k + "\n"
-        " LIMIT $2\n"
-        " FOR UPDATE;");
-    step.sql.push_back(
-        (preserved
-             ? "WITH " + detail::preserve_cte_by_keys(pv, sql_rel, sql_rel, key,
-                                                      del_key_array) + "\n"
-             : std::string()) +
-        "DELETE FROM " + sql_rel + "\n"
-        " WHERE " + sql_rel + "." + k + " = " + del_key_array +
-        " AND (" + where + ")\n"
-        "RETURNING " + sql_rel + "." + k + ";");
-    step.detail["batch_mode"] = "two_statement";
+    // The same question backfill asks. Unlike backfill, a delete never required
+    // its key to be unique -- the apply removes by value -- so the ONLY reason to
+    // group here is a module's reading that row-locking batches on this table
+    // must be confined. On plain PostgreSQL nothing changes.
+    std::string confined_by;
+    const auto group_column = required_confinement(obs, qualified, confined_by);
+    if (!group_column.empty() && group_column == key) {
+      step.action = Action::kConflict;
+      step.why = "row-locking batches on " + qualified +
+                 " must be confined to one value of " + key +
+                 ", which is the walk key";
+      plan.conflicts.push_back(
+          step.why + " -- the " + confined_by + " reading says so, and with the "
+          "two the same every batch would be a single row. Supply the keys with "
+          "delete_rows `values`, which needs no walk.");
+      return;
+    }
+    if (group_column.empty()) {
+      const std::string del_key_array = "ANY($1::" + del_key_type + "[])";
+      step.sql.push_back(
+          "SELECT " + sql_rel + "." + k + "\n"
+          "  FROM " + sql_rel + "\n"
+          " WHERE " + sql_rel + "." + k + " > $1 AND (" + where + ")\n"
+          " ORDER BY " + sql_rel + "." + k + "\n"
+          " LIMIT $2\n"
+          " FOR UPDATE;");
+      step.sql.push_back(
+          (preserved
+               ? "WITH " + detail::preserve_cte_by_keys(pv, sql_rel, sql_rel, key,
+                                                        del_key_array) + "\n"
+               : std::string()) +
+          "DELETE FROM " + sql_rel + "\n"
+          " WHERE " + sql_rel + "." + k + " = " + del_key_array +
+          " AND (" + where + ")\n"
+          "RETURNING " + sql_rel + "." + k + ";");
+      step.detail["batch_mode"] = "two_statement";
+    } else {
+      // Grouped, exactly as backfill does it: see plan_backfill for why each
+      // guard reads `x > $n OR $n IS NULL`, comparison first.
+      const auto g = detail::quote_identifier(group_column);
+      const std::string in_batch = "ANY($2::" + del_key_type + "[])";
+      step.sql.push_back(
+          "SELECT DISTINCT " + sql_rel + "." + g + "\n"
+          "  FROM " + sql_rel + "\n"
+          " WHERE (" + sql_rel + "." + g + " > $1 OR $1 IS NULL) AND (" + where + ")\n"
+          " ORDER BY " + sql_rel + "." + g + "\n"
+          " LIMIT $2;");
+      step.sql.push_back(
+          "SELECT " + sql_rel + "." + k + "\n"
+          "  FROM " + sql_rel + "\n"
+          " WHERE " + sql_rel + "." + g + " = $1\n"
+          "   AND (" + sql_rel + "." + k + " > $2 OR $2 IS NULL) AND (" + where + ")\n"
+          " ORDER BY " + sql_rel + "." + k + "\n"
+          " LIMIT $3\n"
+          " FOR UPDATE;");
+      step.sql.push_back(
+          (preserved
+               ? "WITH " +
+                     detail::preserve_cte_by_keys(
+                         pv, sql_rel, sql_rel, key,
+                         in_batch + " AND " + sql_rel + "." + g + " = $1") +
+                     "\n"
+               : std::string()) +
+          "DELETE FROM " + sql_rel + "\n"
+          " WHERE " + sql_rel + "." + g + " = $1\n"
+          "   AND " + sql_rel + "." + k + " = " + in_batch + " AND (" + where + ")\n"
+          "RETURNING " + sql_rel + "." + k + ";");
+      step.detail["batch_mode"] = "grouped";
+      step.detail["group_column"] = group_column;
+      step.detail["confined_by"] = confined_by;
+    }
     step.detail["key_type"] = del_key_type;
     detail::attach_pacing_detail(step, in, cfg, src, qualified, key, where);
     step.detail["rows_estimated"] = rows;

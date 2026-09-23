@@ -160,79 +160,6 @@ has to be propagated too or the copies diverge.
 The function must already exist; create it in an earlier specification and order
 the two with
 .Va depends_on .
-.Ss Cm citus_distributed_backfill
-A paced backfill that walks one shard at a time.
-.Pp
-Required:
-.Va schema ,
-.Va table ,
-.Va key ,
-.Va set ,
-.Va where .
-Optional:
-.Va verify_remaining ,
-.Va assert_invariants .
-The same vocabulary
-.Cm backfill
-takes, minus the distribution column -- that is read from
-.Va pg_dist_partition ,
-because it is a fact about the cluster rather than an author's choice.
-.Pp
-This kind exists because core's
-.Cm backfill
-is refused on a distributed table and cannot be otherwise.
-A keyset walk takes each batch with
-.Ic FOR UPDATE ,
-so the cursor cannot select the same rows twice, and Citus refuses that on a
-multi-shard query.
-Confining a batch to one shard makes the lock legal again, and the only
-confinement Citus pushes down is an
-.Em equality on the distribution column :
-a hash-range predicate is not pushed down, so it reads every shard and is refused
-just the same.
-.Pp
-So the walk gains an outer dimension.
-It iterates distribution values, and keyset-walks the key inside each; the cursor
-records both, as
-.Ql ["3","800"] .
-The write comes back
-.Li Task Count: 1 .
-.Bl -tag -width Ds
-.It Va key
-Must be unique
-.Em within
-one distribution value, which a unique index on
-.Pq Va distribution column , Va key
-in that order provides -- the primary key of any table whose tenant column comes
-first.
-A unique index on
-.Va key
-alone cannot exist on a distributed table: Citus refuses one that does not
-contain the distribution column, so requiring it would refuse every table.
-.It Va where
-Mandatory, as for
-.Cm backfill :
-a walk with no predicate can never report itself finished, and would rewrite
-every row on every run.
-It is also what makes a re-run cheap and a resume correct.
-.El
-.Pp
-Refused when the table is not distributed
-.Pq use Cm backfill ,
-when it is a reference table
-.Pq Cm backfill No works there ,
-and when the distribution column
-.Em is
-the walk key -- then one value holds one row, and every batch would be a single
-row.
-.Pp
-The gain is not speed.
-A shard-ordered walk measures about 16% better per row than a key-ordered one,
-not the eightfold a first measurement suggested: that figure compared rows
-already confined against rows spread across shards, a shape a key-ordered walk
-cannot produce.
-The reason to have this kind is that on a distributed table the alternative is
-not a slower walk, it is no walk at all.
 .\" END CITUS KIND LIST
 .Sh READINGS
 With the module built in, every plan against a database where the
@@ -264,6 +191,72 @@ Where the module applies, waiters come from
 and activity from
 .Va citus_stat_activity ,
 which see the whole cluster.
+.Sh WRITES ON A DISTRIBUTED TABLE
+A specification does not name its vendor to do an ordinary thing.
+The same
+.Cm backfill
+runs on plain PostgreSQL in development and on a distributed table in staging;
+the binary adapts per target through what it reads.
+Measured on Citus 13, preparing and executing each statement against a
+distributed table:
+.Bl -column "delete_rows by predicate" "grouped walk" -offset indent
+.It Sy form Ta Sy outcome
+.It Cm insert_rows Ta runs
+.It Cm copy_rows Ta runs Pq Citus routes COPY itself
+.It Cm update_rows Ta runs
+.It Cm delete_rows No by values Ta runs
+.It Cm backfill Ta grouped walk
+.It Cm delete_rows No by predicate Ta grouped walk
+.It Cm merge_rows Ta refused
+.El
+.Pp
+The first four take their rows from the specification and join to them; they
+take no row locks, so nothing about them is distributed-specific.
+.Pp
+The two walks select each batch
+.Ic FOR UPDATE ,
+which stops the keyset cursor selecting the same rows twice, and Citus refuses
+that on a multi-shard query.
+So core asks this module one question -- must row-locking batches on this table
+be confined to single values of a column, and which? -- and for a distributed
+table the answer is its distribution column.
+Core then walks one value at a time: which values remain, which keys remain
+inside one, and the change to exactly those keys, each confined by an equality on
+the distribution column.
+That is the only confinement Citus pushes down; a hash-range predicate is not,
+reads every shard, and is refused the same way.
+The write comes back
+.Li Task Count: 1 .
+.Pp
+The step records
+.Va batch_mode
+as
+.Cm grouped
+and
+.Va confined_by
+as
+.Cm citus ,
+and its reason says the Citus reading decided.
+The cursor records both positions, as
+.Ql ["3","800"] ,
+and a walk that fails on one value resumes after the last committed batch --
+verified by failing one tenant partway and retrying.
+.Pp
+For
+.Cm backfill
+the key must be unique
+.Em within
+one distribution value, which a unique index on
+.Pq Va distribution column , Va key
+in that order proves.
+A unique index on the key alone cannot exist on a distributed table: Citus
+refuses one that does not contain the distribution column.
+.Pp
+The gain is not speed.
+A shard-ordered walk measured about 16% better per row than a key-ordered one,
+not the eightfold a first measurement suggested.
+The reason to have it is that on a distributed table the alternative is not a
+slower walk, it is no walk at all.
 .Sh REFUSALS
 These are the reason the module exists: each is a Citus error that would
 otherwise surface at execution, partway through a migration, on a cluster, with
@@ -286,29 +279,28 @@ The ledger would record the migration as fully applied, the coordinator would
 agree, and the shards would not have it.
 A warning would be a false reassurance; refusing is recoverable in one
 statement.
-.It A paced walk against a distributed table
-.Cm backfill ,
-.Cm update_rows ,
-.Cm delete_rows
-and
-.Cm merge_rows
-pace themselves by taking each batch
-.Ic FOR UPDATE ,
-which is what stops a keyset cursor selecting the same rows twice.
-Citus rejects that on a multi-shard query:
+.It Cm merge_rows No on a distributed table
+Refused, for a reason that has nothing to do with pacing: Citus restricts MERGE
+against a distributed target.
 .Bd -literal -offset indent
-ERROR: could not run distributed query with FOR UPDATE/SHARE commands
+ERROR: non-IMMUTABLE functions are not yet supported in MERGE sql
+       with distributed tables
 .Ed
 .Pp
-So this does not merely perform badly -- it does not run at all, and without the
-refusal it would be accepted here and fail partway through.
-Reference tables are exempt: one placement per node is not a multi-shard query.
-Local tables on a Citus cluster are unaffected.
-.Pp
-Liftable, and intended to be: confining a batch to one shard makes
-.Ic FOR UPDATE
-legal again.
-Until then this is the honest answer.
+Express the change as
+.Cm update_rows
+and
+.Cm insert_rows ,
+which both run.
+.It A walk whose key is the distribution column
+.Cm backfill
+and
+.Cm delete_rows
+by predicate walk a distributed table one distribution value at a time (see
+.Sx WRITES ON A DISTRIBUTED TABLE ) .
+When the distribution column is the walk key, every value holds one row and every
+batch would be a single row, so the walk is refused and the refusal names what
+runs instead.
 .El
 .Ss Per kind
 .Bl -bullet -compact

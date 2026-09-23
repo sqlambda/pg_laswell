@@ -305,25 +305,103 @@ TEST(CitusPlanner, AskingForConcurrentlyAlwaysWithoutTheCallIsRefused) {
       << "the refusal must say what the author can write instead";
 }
 
-TEST(CitusPlanner, PacedDmlOnADistributedTableIsRefusedBeforeItRuns) {
-  // Not a performance judgement: Citus rejects FOR UPDATE on a multi-shard
-  // query outright, so this was emitted, accepted, and failed AT EXECUTION --
-  // partway through, with earlier batches already committed.
+// A backfill on a distributed table is a BACKFILL. The author does not name a
+// Citus kind for it: core reads citus_required_confinement and walks one
+// distribution value at a time, which makes FOR UPDATE single-shard. One
+// repository can then serve plain PostgreSQL in development and Citus in
+// staging with the same signed specification.
+namespace {
+json tenant_backfill(const char* table) {
+  return json{{"kind", "backfill"}, {"schema", "public"}, {"table", table},
+              {"key", "id"}, {"set", json{{"balance", "0"}}},
+              {"where", "balance IS NULL"}};
+}
+}  // namespace
+
+TEST(CitusPlanner, ABackfillOnADistributedTableWalksOneDistributionValueAtATime) {
+  const auto obs = citus_observations(
+      citus_obs(json{{"public.ledger",
+                      json{{"partmethod", "h"}, {"distribution_column", "tenant_id"}}}}),
+      json{{"public.ledger", table_with_pk({"tenant_id", "id"}, 100000)}});
+  const auto p = plan_citus(tenant_backfill("ledger"), obs);
+  ASSERT_TRUE(p.ok) << (p.conflicts.empty() ? "" : p.conflicts[0]);
+  const auto& step = p.steps.back();
+  EXPECT_EQ(step.detail.value("batch_mode", ""), "grouped");
+  EXPECT_EQ(step.detail.value("group_column", ""), "tenant_id");
+  // The plan says WHICH reading shaped it, which is what keeps a module-shaped
+  // plan honest: its statements differ from the plain one, so its digest does,
+  // and its why names the reason.
+  EXPECT_EQ(step.detail.value("confined_by", ""), "citus");
+  EXPECT_NE(step.why.find("citus reading"), std::string::npos) << step.why;
+  ASSERT_EQ(step.sql.size(), 3u);
+  // The locking statement and the change are both confined by the equality --
+  // the only confinement Citus pushes down -- or the lock is multi-shard again.
+  EXPECT_NE(step.sql[1].find("\"tenant_id\" = $1"), std::string::npos) << step.sql[1];
+  EXPECT_NE(step.sql[1].find("FOR UPDATE"), std::string::npos) << step.sql[1];
+  EXPECT_NE(step.sql[2].find("\"tenant_id\" = $1"), std::string::npos) << step.sql[2];
+}
+
+TEST(CitusPlanner, ABackfillWhoseKeyIsTheDistributionColumnIsRefusedWithTheReason) {
+  // Confinement is an equality on the distribution column, so when that column
+  // is the key every batch is one row. Refused, and the refusal says why and
+  // what runs instead -- not "FOR UPDATE", which is the mechanism, not the
+  // reason this particular table cannot be walked.
   const auto obs = citus_observations(
       citus_obs(json{{"public.accounts",
                       json{{"partmethod", "h"}, {"distribution_column", "id"}}}}),
       json{{"public.accounts", table_with_pk({"id"}, 100000)}});
-  const auto p = plan_citus(json{{"kind", "backfill"}, {"schema", "public"},
-                                 {"table", "accounts"}, {"key", "id"},
-                                 {"set", json{{"balance", "0"}}},
-                                 {"where", "balance IS NULL"},
-                                 {"verify_remaining", "balance IS NULL"}}, obs);
+  const auto p = plan_citus(tenant_backfill("accounts"), obs);
   EXPECT_FALSE(p.ok);
-  EXPECT_TRUE(conflicts_mention(p, "FOR UPDATE/SHARE"))
+  EXPECT_TRUE(conflicts_mention(p, "which is the walk key"))
       << (p.conflicts.empty() ? "none" : p.conflicts[0]);
-  EXPECT_TRUE(conflicts_mention(p, "partway through"))
-      << "the refusal must say what would have happened, or it reads as "
-         "conservatism rather than a fact about Citus";
+  EXPECT_TRUE(conflicts_mention(p, "update_rows"))
+      << "the refusal must name what runs instead";
+}
+
+TEST(CitusPlanner, ABackfillNeedsItsKeyUniqueWithinOneDistributionValue) {
+  // A unique index with the columns the other way round, (id, tenant_id), proves
+  // the pair unique but not id within one tenant in the order the walk needs --
+  // and a grouping other than the one Citus requires would not make the lock
+  // single-shard. Refused, naming the index that would do.
+  const auto obs = citus_observations(
+      citus_obs(json{{"public.ledger",
+                      json{{"partmethod", "h"}, {"distribution_column", "tenant_id"}}}}),
+      json{{"public.ledger", table_with_pk({"id", "tenant_id"}, 100000)}});
+  const auto p = plan_citus(tenant_backfill("ledger"), obs);
+  EXPECT_FALSE(p.ok);
+  EXPECT_TRUE(conflicts_mention(p, "(tenant_id, id)"))
+      << (p.conflicts.empty() ? "none" : p.conflicts[0]);
+}
+
+TEST(CitusPlanner, WithoutAReadingTheSameTableGroupsOnlyBecauseOfItsIndex) {
+  // The same (tenant_id, id) table on plain PostgreSQL. It is walked grouped
+  // too -- the key is unique only within a tenant, which was reason enough to
+  // refuse it on every server before -- but NOTHING claims a module decided it.
+  const auto obs = citus_observations(
+      json(nullptr), json{{"public.ledger", table_with_pk({"tenant_id", "id"}, 100000)}});
+  const auto p = plan_citus(tenant_backfill("ledger"), obs);
+  ASSERT_TRUE(p.ok) << (p.conflicts.empty() ? "" : p.conflicts[0]);
+  const auto& step = p.steps.back();
+  EXPECT_EQ(step.detail.value("batch_mode", ""), "grouped");
+  EXPECT_FALSE(step.detail.contains("confined_by")) << step.detail.dump(2);
+}
+
+TEST(CitusPlanner, AModuleThatHasNothingToSayChangesNothing) {
+  // What the revised rule still guarantees: a module may shape a plan only
+  // through a reading about THAT table. For a table the Citus reading says
+  // nothing about -- local in a Citus database -- the plan is the one a build
+  // without the module emits, statement for statement.
+  const auto with = citus_observations(
+      citus_obs(), json{{"public.staging", table_with_pk({"id"}, 100000)}});
+  const auto without = citus_observations(
+      json(nullptr), json{{"public.staging", table_with_pk({"id"}, 100000)}});
+  const auto a = plan_citus(tenant_backfill("staging"), with);
+  const auto b = plan_citus(tenant_backfill("staging"), without);
+  ASSERT_TRUE(a.ok && b.ok);
+  ASSERT_EQ(a.steps.size(), b.steps.size());
+  for (std::size_t i = 0; i < a.steps.size(); ++i) {
+    EXPECT_EQ(a.steps[i].sql, b.steps[i].sql) << "step " << i;
+  }
 }
 
 TEST(CitusPlanner, PacedDmlOnALocalTableInACitusDatabaseIsUnaffected) {

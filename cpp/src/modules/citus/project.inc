@@ -16,8 +16,3 @@ PGLASWELL_PROJECT(kCitusCreateReferenceTable, citus_project_reference_table)
 // Nothing to project: a specification distributing the same function twice is
 // a duplicate for the author to fix, not a state a later step reads.
 PGLASWELL_PROJECT(kCitusDistributeFunction, citus_project_nothing)
-
-// Nothing to project: a paced walk changes ROWS, and no later step in the same
-// specification plans against row values. The arm exists because -Wswitch wants
-// every declared kind named, which is the guarantee being paid for.
-PGLASWELL_PROJECT(kCitusDistributedBackfill, citus_project_nothing)

@@ -1606,10 +1606,30 @@ A module may add kinds, may add readings of its own, and may refuse -- including
 refusing a
 .Em core
 kind whose plan would be wrong on that vendor's topology.
-What it may not do is change the SQL core emits for a core kind.
-That boundary is enforced by the build rather than asked for in review; see
+It may also
+.Em inform
+core: answer a question core asks, after which core decides what to emit.
+There is one such question, and it is how the same
+.Cm backfill
+runs on plain PostgreSQL and on a distributed table: must row-locking batches on
+this table be confined to single values of a column, and which?
+Where a module answers, the step records the reading as
+.Va confined_by
+and its reason names it, and because the statements differ so does
+.Va planDigest .
+.Pp
+What a module may not do is emit or rewrite SQL for a core kind, or shape a plan
+for a table it has no reading about.
+For such a table a build with the module and one without it emit the same
+statements, and that is tested.
+The boundary is enforced by the build rather than asked for in review; see
 .Pa cpp/src/modules/README.md
 in the source.
+.Pp
+This is what lets one configuration serve several targets.
+The same repository can run against plain PostgreSQL in development and a Citus
+cluster in staging: a specification never names its vendor to do an ordinary
+thing, and the binary adapts per target through what it reads.
 .Pp
 Every kind a module adds carries the module's name as its prefix, so
 .Cm citus_distribute_table

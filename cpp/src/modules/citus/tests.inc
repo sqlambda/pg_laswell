@@ -23,12 +23,6 @@ PGLASWELL_DEFERRED_CASE("citus_distribute_table",
 PGLASWELL_DEFERRED_CASE("citus_create_reference_table",
     "needs a Citus cluster: a reference table is replicated to every node, and "
     "one node cannot show that")
-PGLASWELL_DEFERRED_CASE("citus_distributed_backfill",
-    "needs a DISTRIBUTED table with a distribution column that is not the walk "
-    "key, which one database cannot provide: the whole point is that batches are "
-    "confined by an equality on the distribution column, and there is no "
-    "distribution without a cluster. Covered by cpp/test/citus-tests.sh, which "
-    "runs the walk against a real coordinator and counts the rows.")
 PGLASWELL_DEFERRED_CASE("citus_distribute_function",
     "needs a Citus cluster and a distributed table to colocate against")
 #endif
@@ -46,7 +40,4 @@ PGLASWELL_KIND_BODY("citus_create_reference_table",
 PGLASWELL_KIND_BODY("citus_distribute_function",
   R"({"kind":"citus_distribute_function","schema":"s","name":"f",
       "arguments":"integer"})")
-PGLASWELL_KIND_BODY("citus_distributed_backfill",
-  R"({"kind":"citus_distributed_backfill","schema":"s","table":"t","key":"id",
-      "set":{"flag":"true"},"where":"flag IS NULL"})")
 #endif
