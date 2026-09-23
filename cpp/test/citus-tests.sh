@@ -275,25 +275,50 @@ else
   bad "not exactly once (n=0: $left, n<>1: $twice)" "$out"
 fi
 
-# RESUMING MID-SHARD. A cursor is "which distribution value, and how far into
-# it"; a resume that misreads it skips or repeats a whole shard and looks like
-# success. Driven directly, because the arithmetic is what is being checked.
+# RESUMING MID-SHARD, through the executor.
+#
+# An earlier version of this case drove the SQL by hand and passed -- while the
+# executor could not resume at all: its staleness check cast the cursor as
+# bigint, a shard cursor is ["4","400"], the cast threw, and a check that throws
+# is read as "stale". Every retry restarted from the top, and because the
+# predicate hides rows already done, the outcome looked identical. The case
+# below makes one shard fail, commits per batch so earlier shards stay done,
+# retries, and reads WHERE the retry started.
 q "UPDATE ct.tw SET n = 0" >/dev/null
-# Pretend a walk got through tenants 1 and 2 and half of tenant 3.
-q "UPDATE ct.tw SET n = 1 WHERE tenant_id < 3" >/dev/null
-q "UPDATE ct.tw SET n = 1 WHERE tenant_id = 3 AND id <= 250" >/dev/null
-resumed=$(q "SELECT count(*) FROM ct.tw WHERE n = 0")
-# Resume: the remainder of tenant 3, then tenants 4 to 8.
-q "UPDATE ct.tw SET n = n + 1 WHERE tenant_id = 3 AND id > 250 AND n = 0" >/dev/null
-for t in 4 5 6 7 8; do
-  q "UPDATE ct.tw SET n = n + 1 WHERE tenant_id = $t AND n = 0" >/dev/null
-done
+q "$(printf "DELETE FROM laswell.backfill_cursor WHERE job_id IN (SELECT job_id FROM laswell.job WHERE migration_id IN (SELECT migration_id FROM laswell.migration WHERE spec_id = '9991-ct-shard'));\nDELETE FROM laswell.step WHERE job_id IN (SELECT job_id FROM laswell.job WHERE migration_id IN (SELECT migration_id FROM laswell.migration WHERE spec_id = '9991-ct-shard'));\nDELETE FROM laswell.job WHERE migration_id IN (SELECT migration_id FROM laswell.migration WHERE spec_id = '9991-ct-shard');\nDELETE FROM laswell.migration WHERE spec_id = '9991-ct-shard';")" >/dev/null
+q "ALTER TABLE ct.tw ADD CONSTRAINT tw_block_t5 CHECK (NOT (tenant_id = 5 AND n > 0))" >/dev/null
+
+# A commit per batch, or the walk is one transaction and the failure takes every
+# row with it -- correct, and not the case under test. --config replaces the
+# connection source, so the section is built from CITUS_URL.
+paced_ini=$(mktemp); chmod 600 "$paced_ini"
+python3 - "$CITUS_URL" > "$paced_ini" <<'PY'
+import sys, urllib.parse as u
+p = u.urlparse(sys.argv[1])
+print("[executor]\nbatch_rows = 25\nbatch_cap_rows = 25\n"
+      "commit_interval_ms = 1\nobserver_tick_ms = 1\n")
+print("[citus]")
+print(f"host = {p.hostname}\nport = {p.port or 5432}\n"
+      f"dbname = {p.path.lstrip('/')}\nuser = {p.username}")
+if p.password: print(f"password = {p.password}")
+PY
+repos=(--repo "$walk_repo" --repo "$repo" --repo "$(dirname "$0")/../../examples/docker/citus/migrations")
+
+"$BIN" --config "$paced_ini" "${repos[@]}" >/dev/null 2>&1; first=$?
+q "ALTER TABLE ct.tw DROP CONSTRAINT tw_block_t5" >/dev/null
+out=$("$BIN" --config "$paced_ini" "${repos[@]}" 2>&1); second=$?
+rm -f "$paced_ini"
+
+resumed=$(q "SELECT s.detail->>'resumedFrom' FROM laswell.step s JOIN laswell.job j USING (job_id)
+              JOIN laswell.migration m USING (migration_id)
+             WHERE m.spec_id = '9991-ct-shard' AND j.state = 'succeeded'")
 still=$(q "SELECT count(*) FROM ct.tw WHERE n = 0")
 twice=$(q "SELECT count(*) FROM ct.tw WHERE n <> 1")
-if [ "$resumed" = "550" ] && [ "$still" = "0" ] && [ "$twice" = "0" ]; then
-  ok "a resume from mid-shard finishes the remaining $resumed rows, none twice"
+if [ "$first" != 0 ] && [ "$second" = 0 ] && [ "$resumed" = '["4","400"]' ] \
+   && [ "$still" = 0 ] && [ "$twice" = 0 ]; then
+  ok "a walk that failed on tenant 5 resumed from $resumed and finished, none twice"
 else
-  bad "resume arithmetic wrong (to do: $resumed, left: $still, n<>1: $twice)" ""
+  bad "retry did not resume (first=$first second=$second resumedFrom=${resumed:-none} left=$still n<>1=$twice)" "$out"
 fi
 
 rm -rf "$walk_repo"

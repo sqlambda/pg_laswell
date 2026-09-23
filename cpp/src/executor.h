@@ -671,7 +671,16 @@ class Executor {
     resume_qualified_ = detail_json.value("qualified", "");
     resume_key_ = key_column;
     resume_where_ = step["detail"].value("where", "");
+    // Non-empty only for a shard-confined walk, whose cursor is a pair and whose
+    // staleness check therefore has a different shape. See cursor_is_stale.
+    resume_dist_ = detail_json.value("distribution_column", "");
     std::string cursor = resume_cursor(ordinal);
+    // Recorded so a resume is VISIBLE. Without it a retry that resumed and one
+    // that silently started over were indistinguishable -- the predicate hides
+    // rows already done, so both finish with the same count -- and that is
+    // exactly how a staleness check that could not read its own cursor went
+    // unnoticed: every shard-confined retry restarted from the top.
+    const std::string resumed_from = cursor;
     long long rows_done = 0;      // includes the open transaction
     long long rows_committed = 0; // survives a crash
     int commits = 0;
@@ -856,6 +865,7 @@ class Executor {
            {"commits", commits},
            {"commitReasons", reasons},
            {"finalCursor", cursor},
+           {"resumedFrom", resumed_from == "0" ? json(nullptr) : json(resumed_from)},
            {"key", key_column}};
     // What this step DID, and deliberately not what bloat resulted.
     //
@@ -976,12 +986,44 @@ class Executor {
   std::string resume_qualified_;
   std::string resume_key_;
   std::string resume_where_;
+  std::string resume_dist_;
 
   bool cursor_is_stale(ReadSession& r, const std::string& from) {
     if (resume_qualified_.empty() || resume_where_.empty()) return false;
     try {
+      // A shard-confined cursor is a pair, so "everything at or below it is
+      // done" means: every earlier distribution value, and within the current
+      // one every key up to the recorded one. The check asks whether any row in
+      // that region still matches the predicate -- the same question as below,
+      // over a region with two edges instead of one.
+      if (!resume_dist_.empty()) {
+        ShardCursor at;
+        if (!ShardCursor::decode(from, at)) return true;  // unreadable: start over
+        if (at.group.empty()) return false;               // nothing claimed yet
+        const auto rel = resume_qualified_;
+        const auto d = detail::quote_identifier(resume_dist_);
+        const auto k = detail::quote_identifier(resume_key_);
+        if (at.key.empty()) {
+          const auto res = pqxx_exec(
+              r.txn(),
+              "SELECT EXISTS (SELECT 1 FROM " + rel + " WHERE " + d +
+                  " < $1 AND (" + resume_where_ + "))",
+              pqxx::params{at.group});
+          return !res.empty() && res[0][0].as<bool>();
+        }
+        const auto res = pqxx_exec(
+            r.txn(),
+            "SELECT EXISTS (SELECT 1 FROM " + rel + " WHERE (" + d + " < $1 OR (" +
+                d + " = $1 AND " + k + " <= $2)) AND (" + resume_where_ + "))",
+            pqxx::params{at.group, at.key});
+        return !res.empty() && res[0][0].as<bool>();
+      }
+      // No cast on the parameter. It was `$1::bigint`, which made the check
+      // throw for every text or uuid key -- and a check that throws is read as
+      // "stale", so a backfill keyed on anything but an integer could never
+      // resume, silently. The comparison fixes the type from the column.
       const auto q = "SELECT EXISTS (SELECT 1 FROM " + resume_qualified_ +
-                     " WHERE " + resume_key_ + " <= $1::bigint AND (" +
+                     " WHERE " + resume_key_ + " <= $1 AND (" +
                      resume_where_ + "))";
       const auto res = pqxx_exec(r.txn(), q, pqxx::params{from});
       return !res.empty() && res[0][0].as<bool>();

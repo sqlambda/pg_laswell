@@ -12377,6 +12377,79 @@ TEST_F(DeployTest, ADryRunSaysWhyASpecWasRefusedWhenThereIsNoPlanToShow) {
   EXPECT_EQ(column_count("orders", "cu"), 0) << "a dry run applied something";
 }
 
+TEST_F(DeployTest, AFailedMigrationIsRetriedAndResumesWhereItStopped) {
+  // Two defects, found together by asking what happens when a backfill fails
+  // partway.
+  //
+  // The deployment acted on "pending" alone. A spec whose last job FAILED was
+  // listed with no status, not counted and not run, and the run exited 0 --
+  // measured: 400 of 800 rows done, and every later run said "0 pending".
+  //
+  // And the resume the executor was built for could not happen for most keys:
+  // the staleness check cast the recorded cursor as $1::bigint, threw on a text
+  // key, and a check that throws is read as "stale" -- so the retry quietly
+  // started over. The predicate hides rows already done, so the outcome looked
+  // identical; only where the retry STARTED differs, and nothing recorded that.
+  exec("DROP SCHEMA IF EXISTS shop CASCADE");
+  exec("CREATE SCHEMA shop");
+  exec("CREATE TABLE shop.tk (k text PRIMARY KEY, flag boolean)");
+  exec("INSERT INTO shop.tk SELECT 'k' || lpad(g::text, 4, '0'), NULL"
+       " FROM generate_series(1, 400) g");
+  // Blocks the second half, so the first run commits some batches and fails.
+  exec("ALTER TABLE shop.tk ADD CONSTRAINT tk_block CHECK (NOT (k > 'k0200' AND flag))");
+
+  // A commit per batch, or the whole walk is one transaction and the failure
+  // rolls every row back -- correct, and not the case under test.
+  auto& e = ctx_->registry.mutable_get(ctx_->registry.default_name()).executor;
+  e.batch_rows = 25;
+  e.batch_cap_rows = 25;
+  e.commit_interval_ms = 1;
+  e.observer_tick_ms = 1;
+
+  write_spec("0001.json",
+             json{{"laswell_spec_version", 1},
+                  {"id", "0001-text-key"},
+                  {"description", "a backfill keyed on text"},
+                  {"intents", json::array({json{{"kind", "backfill"},
+                                                {"schema", "shop"},
+                                                {"table", "tk"},
+                                                {"key", "k"},
+                                                {"set", {{"flag", "true"}}},
+                                                {"where", "flag IS NULL"}}})}});
+
+  const auto [first, first_text] = deploy();
+  EXPECT_NE(first, pglaswell::DeployResult::kOk) << first_text;
+
+  // The half-done state, and the status run over it. Exiting 0 here would tell
+  // a pipeline the database is where the repository says it is.
+  const auto [status, status_text] = deploy(/*dry_run=*/false, /*status_only=*/true);
+  EXPECT_NE(status, pglaswell::DeployResult::kOk)
+      << "a failed migration is unfinished work:\n" << status_text;
+  EXPECT_NE(status_text.find("will be retried"), std::string::npos) << status_text;
+
+  exec("ALTER TABLE shop.tk DROP CONSTRAINT tk_block");
+  const auto [second, second_text] = deploy();
+  EXPECT_EQ(second, pglaswell::DeployResult::kOk) << second_text;
+  EXPECT_NE(second_text.find("1 retried"), std::string::npos) << second_text;
+
+  pglaswell::ReadSession r(cfg());
+  EXPECT_EQ(r.txn().exec("SELECT count(*) FROM shop.tk WHERE flag IS NULL")[0][0].as<int>(), 0)
+      << "the retry did not finish the walk";
+  // Where the retry STARTED. Not from the top: from the last committed key of
+  // the failed run, which is at or below k0200 and not empty.
+  const auto resumed = r.txn().exec(
+      "SELECT s.detail->>'resumedFrom' FROM laswell.step s"
+      "  JOIN laswell.job j USING (job_id) WHERE j.state = 'succeeded'"
+      "  AND j.migration_id = (SELECT migration_id FROM laswell.migration"
+      "                         WHERE spec_id = '0001-text-key')");
+  ASSERT_EQ(resumed.size(), 1u);
+  ASSERT_FALSE(resumed[0][0].is_null())
+      << "the retry started over: a text-keyed cursor was read as stale";
+  const auto from = resumed[0][0].as<std::string>();
+  EXPECT_GT(from, std::string("k0000")) << from;
+  EXPECT_LE(from, std::string("k0200")) << from;
+}
+
 TEST_F(DeployTest, HeldAndNotForHereAreReportedAndAreNotFailures) {
   exec("DROP SCHEMA IF EXISTS shop CASCADE");
   exec("CREATE SCHEMA shop");

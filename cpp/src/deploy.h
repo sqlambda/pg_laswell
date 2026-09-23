@@ -128,17 +128,40 @@ class Deployment {
     }
 
     std::map<std::string, json> by_id;
-    int pending = 0, held = 0, elsewhere = 0;
+    int pending = 0, retry = 0, held = 0, elsewhere = 0;
     for (const auto& m : listing.value("migrations", json::array())) {
       by_id[m.value("specId", "")] = m;
       const auto status = m.value("status", "");
       if (status == "pending") ++pending;
+      // A spec whose last job FAILED is not done, and is run again. The
+      // repository already classed it as runnable; this loop used to act on
+      // "pending" alone, so a failed migration was listed with no status, not
+      // counted, not run, and the deployment exited 0 -- measured: a
+      // shard-confined backfill that failed on one tenant left 400 of 800 rows
+      // undone, and every later run reported "0 pending" and succeeded.
+      //
+      // Running it again is what the executor was built for: resume_cursor
+      // selects a failed, cancelled or interrupted job's cursor on purpose, so
+      // a paced walk continues from its last COMMITTED batch rather than from
+      // the top, and the backfill's own predicate makes rows already done
+      // invisible either way.
+      if (status == "failed") ++retry;
       if (status == "held_for_release" || status == "held_for_epoch") ++held;
       if (status == "retired_epoch") ++elsewhere;
       if (status == "wrong_environment" || status == "wrong_database") ++elsewhere;
     }
 
     report_plan(out, listing, pending);
+    if (retry > 0) {
+      out << "  " << retry << " migration" << (retry == 1 ? "" : "s")
+          << " failed on an earlier run and will be retried; a paced walk "
+             "resumes from its last committed batch:\n";
+      for (const auto& m : listing.value("migrations", json::array())) {
+        if (m.value("status", "") == "failed") {
+          out << "    " << m.value("specId", "") << "\n";
+        }
+      }
+    }
     // Held and not-for-here are reported and are NOT failures. A deployment
     // that skips them has done its job: the first is waiting on an approval
     // this database has not been given, the second belongs to another
@@ -160,7 +183,13 @@ class Deployment {
       out << "  (" << held << " held, " << elsewhere
           << " for another database or environment)\n";
     }
-    if (opts_.status_only || pending == 0) return DeployResult::kOk;
+    // --status reports; it does not pass judgement. But a failed migration is
+    // unfinished work, and a status run that exits 0 over it tells a pipeline
+    // the database is where the repository says it should be when it is not.
+    if (opts_.status_only) {
+      return retry > 0 ? DeployResult::kRefused : DeployResult::kOk;
+    }
+    if (pending + retry == 0) return DeployResult::kOk;
 
     // Levels run in order; within a level, groups run one after another,
     // because parallel_subsets() puts two migrations in DIFFERENT groups
@@ -171,9 +200,9 @@ class Deployment {
         std::vector<std::string> ids;
         for (const auto& s : group.value("specs", json::array())) {
           const auto id = s.get<std::string>();
-          if (by_id.count(id) && by_id[id].value("status", "") == "pending") {
-            ids.push_back(id);
-          }
+          if (!by_id.count(id)) continue;
+          const auto st = by_id[id].value("status", "");
+          if (st == "pending" || st == "failed") ids.push_back(id);
         }
         if (ids.empty()) continue;
         const auto r = run_group(out, ids, by_id);
@@ -181,8 +210,12 @@ class Deployment {
       }
     }
 
-    out << (opts_.dry_run ? "dry run complete: every pending migration planned\n"
-                          : "applied " + std::to_string(pending) + " migration(s)\n");
+    out << (opts_.dry_run
+                ? "dry run complete: every pending migration planned\n"
+                : "applied " + std::to_string(pending + retry) + " migration(s)" +
+                      (retry > 0 ? " (" + std::to_string(retry) + " retried)"
+                                 : std::string()) +
+                      "\n");
     return DeployResult::kOk;
   }
 
@@ -193,7 +226,8 @@ class Deployment {
     // reaches two servers should say so before it reaches either.
     std::set<std::string> connections;
     for (const auto& m : listing.value("migrations", json::array())) {
-      if (m.value("status", "") == "pending") {
+      const auto st = m.value("status", "");
+      if (st == "pending" || st == "failed") {
         connections.insert(m.value("connection", ""));
       }
     }
