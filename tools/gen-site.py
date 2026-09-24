@@ -65,6 +65,7 @@ def tests():
         counted = None  # one macro is no longer one test
 
     measured = None
+    listed = set()
     for candidate in ('cpp/build/pg_laswell_mcp_test', 'build/pg_laswell_mcp_test'):
         path = os.path.join(ROOT, candidate)
         if not os.path.exists(path):
@@ -72,13 +73,39 @@ def tests():
         try:
             out = subprocess.run([path, '--gtest_list_tests'], capture_output=True,
                                  text=True, timeout=120).stdout
-            n = sum(1 for line in out.splitlines()
-                    if line.startswith('  ') and not line.strip().startswith('#'))
-            if n:
-                measured = n
+            suite = ''
+            for line in out.splitlines():
+                if not line.startswith(' ') and line.strip().endswith('.'):
+                    suite = line.strip()
+                elif line.startswith('  ') and not line.strip().startswith('#'):
+                    listed.add(suite + line.split()[0])
+            if listed:
+                measured = len(listed)
                 break
         except Exception:
             pass
+
+    # A module's tests live in modules/<name>/tests*.inc and are compiled in only
+    # when the build enabled that module. Counted when -- and only when -- the
+    # binary actually carries them, so the check stays exact for a PostgreSQL-only
+    # build (what the release ships, and what the page describes) and for a
+    # module build alike. Without this, any module build on the machine that runs
+    # the site script made the source and the binary disagree by the module's
+    # test count, and the page refused to build.
+    if counted is not None and measured is not None:
+        mods = os.path.join(ROOT, 'cpp', 'src', 'modules')
+        for mod in sorted(os.listdir(mods)) if os.path.isdir(mods) else []:
+            if not os.path.isdir(os.path.join(mods, mod)):
+                continue  # README.md sits beside the module directories
+            names = set()
+            for f in sorted(os.listdir(os.path.join(mods, mod))):
+                if f.startswith('tests') and f.endswith('.inc'):
+                    text = _read('cpp', 'src', 'modules', mod, f)
+                    names |= {'%s.%s' % m for m in
+                              re.findall(r'^TEST(?:_F)?\(\s*(\w+)\s*,\s*(\w+)\s*\)',
+                                         text, re.M)}
+            if names and names <= listed:
+                counted += len(names)
 
     if counted is not None and measured is not None and counted != measured:
         sys.exit('gen-site: the source says %d tests and the binary says %d. One '

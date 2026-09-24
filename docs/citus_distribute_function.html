@@ -1,6 +1,6 @@
 <!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>copy_rows — pg_laswell</title>
+<title>citus_distribute_function — pg_laswell</title>
 <style>
 :root{--fg:#333;--bg:#fff;--muted:#666;--rule:#ddd;--link:#0066a4;
       --code-bg:#f7f7f7;--code-rule:#e0e0e0;--req:#a33;--accent:#0e6ba8;
@@ -70,64 +70,38 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
  --dd:#c2c2c2;--req-bg:#3a2526;--req-rule:#573537;--opt-bg:#1d2a33;
  --opt-rule:#2b3f4d;--note-bg:#1a2126;--warn-bg:#2a2119}
 </style></head><body><div class="wrap">
-<nav class="crumb"><div class="l"><a href="index.html">Intent kinds</a><span>Rows</span></div><div class="r"><a href="merge_rows.html">← merge_rows</a><a href="citus_distribute_table.html">citus_distribute_table →</a></div></nav>
-<h1><code>copy_rows</code></h1>
-<p class="purpose">—- copy_rows ———————————————————————————————</p>
+<nav class="crumb"><div class="l"><a href="index.html">Intent kinds</a><span>Module: citus</span></div><div class="r"><a href="citus_create_reference_table.html">← citus_create_reference_table</a></div></nav>
+<h1><code>citus_distribute_function</code></h1>
+<p class="purpose"><strong>A citus module kind.</strong> Known only to a binary built with <code>-DPGLASWELL_MODULES=citus</code> -- <code>--version</code> then prints <code>modules: citus</code>. A PostgreSQL-only build refuses it as an unknown kind, and with it the whole specification. See <code>pg_laswell_citus(7)</code>.</p>
 <h2>Synopsis</h2><pre>{
-  &quot;kind&quot;: &quot;copy_rows&quot;,
+  &quot;kind&quot;: &quot;citus_distribute_function&quot;,
   &quot;schema&quot;: &lt;required&gt;,
-  &quot;table&quot;: &lt;required&gt;,
-  &quot;columns&quot;: &lt;optional&gt;,
-  &quot;values&quot;: &lt;optional&gt;,
-  &quot;verify_remaining&quot;: &lt;optional&gt;,
-  &quot;assert_invariants&quot;: &lt;optional&gt;
+  &quot;name&quot;: &lt;required&gt;,
+  &quot;arguments&quot;: &lt;required&gt;,
+  &quot;distribution_argument&quot;: &lt;optional&gt;,
+  &quot;colocate_with&quot;: &lt;optional&gt;,
+  &quot;force_delegation&quot;: &lt;optional&gt;,
+  &quot;comment&quot;: &lt;optional&gt;
 }</pre>
-<h2>Description</h2>
-<p>—- copy_rows ———————————————————————————————</p>
-<p>COPY is the fifth way PostgreSQL writes rows and the only one in this family the paced executor cannot drive. Measured on 18.6 (S21): a COPY whose second of three rows violated the primary key rolled back ALL THREE. It is one transaction&#x27;s worth of work whatever its size, so there is no batch boundary to place and nothing for a lock waiter to interrupt.</p>
-<p>That is stated in the plan rather than worked around, because the honest answer for a large load is that COPY is the wrong shape for a paced migration and insert_rows with &quot;select&quot; is the right one.</p>
-<p>Two more measurements worth carrying into the plan, both of which contradict what COPY is usually assumed to do:</p>
-<p>* it is NOT a fast path around constraints. A COPY into a child table whose parent row was missing failed on the foreign key exactly as an INSERT would. Row triggers fire too. * ON_ERROR ignore does not make COPY safe, it makes it QUIET: it skipped the malformed row, wrote the other two, and reported success. A step that can succeed having written less than the spec listed has to say so.</p>
 <h2>Parameters</h2><dl class="params">
 <dt>schema<span class="tag req">required</span></dt>
 <dd>&nbsp;</dd>
-<dt>table<span class="tag req">required</span></dt>
+<dt>name<span class="tag req">required</span></dt>
 <dd>&nbsp;</dd>
-<dt>columns<span class="tag opt">optional</span></dt>
-<dd>COPY with no column list binds by position, so a table that gains a column would silently shift every value.</dd>
-<dt>values<span class="tag opt">optional</span></dt>
-<dd>copy_rows sends literal rows over the protocol as COPY ... FROM STDIN. Reading a server-side file would need superuser and would put the real change somewhere the signature does not cover.</dd>
-<dt>verify_remaining<span class="tag opt">optional</span></dt>
+<dt>arguments<span class="tag req">required</span></dt>
 <dd>&nbsp;</dd>
-<dt>assert_invariants<span class="tag opt">optional</span></dt>
+<dt>distribution_argument<span class="tag opt">optional</span></dt>
+<dd>&nbsp;</dd>
+<dt>colocate_with<span class="tag opt">optional</span></dt>
+<dd>&nbsp;</dd>
+<dt>force_delegation<span class="tag opt">optional</span></dt>
+<dd>&nbsp;</dd>
+<dt>comment<span class="tag opt">optional</span></dt>
 <dd>&nbsp;</dd>
 </dl>
 <div class="note">Any key not listed here is <strong>refused</strong>, not ignored: a key this binary skips and a newer one honours would be a silent difference between what was reviewed and what ran.</div>
 <h2>Examples</h2>
-<p>From the conformance suite, which plans this intent and <em>applies</em> it to a real PostgreSQL on every test run:</p>
-<pre>{
- &quot;kind&quot;: &quot;copy_rows&quot;,
- &quot;schema&quot;: &quot;cf&quot;,
- &quot;table&quot;: &quot;t&quot;,
- &quot;columns&quot;: [
-  &quot;id&quot;,
-  &quot;amount&quot;,
-  &quot;code&quot;
- ],
- &quot;values&quot;: [
-  [
-   204,
-   10,
-   &quot;z4&quot;
-  ],
-  [
-   205,
-   11,
-   &quot;z5&quot;
-  ]
- ]
-}</pre>
-<p>Afterwards, <code>SELECT string_agg(code,&#x27;,&#x27; ORDER BY id) FROM cf.t WHERE id IN (204,205)</code> returns <code>z4,z5</code>.</p>
-<h2>See also</h2><p><a href="backfill.html"><code>backfill</code></a>, <a href="delete_rows.html"><code>delete_rows</code></a>, <a href="insert_rows.html"><code>insert_rows</code></a>, <a href="update_rows.html"><code>update_rows</code></a>, <a href="merge_rows.html"><code>merge_rows</code></a></p>
+<div class="note warn">No single-database example: needs a Citus cluster and a distributed table to colocate against. This kind is covered by <code>cpp/test/replication-tests.sh</code>, which builds two clusters.</div>
+<h2>See also</h2><p><a href="citus_distribute_table.html"><code>citus_distribute_table</code></a>, <a href="citus_create_reference_table.html"><code>citus_create_reference_table</code></a></p>
 <footer>Generated from <code>cpp/src/spec.h</code> and <code>cpp/src/conformance.inc</code> by <code>tools/gen-manual.py</code>. The manual page <code>pg_laswell_mcp(1)</code> remains the authoritative reference for everything that is not a per-kind option.</footer>
 </div></body></html>

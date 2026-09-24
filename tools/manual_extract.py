@@ -273,6 +273,39 @@ def deferred(conf):
     return out
 
 
+def module_kinds():
+    """[(module, kind, parse_fn, parse_text, plan_text, deferred_reason)] for every
+    module in the source tree, enabled or not.
+
+    Read from the module's OWN kinds.inc, parse.h and plan.h, the same way core's
+    kinds are read from spec.h, so a module kind's options come from the
+    reject_unknown_keys its parser actually enforces. Every module, not just the
+    ones a particular build enabled: the reference documents what exists, and
+    each page says which build it needs.
+    """
+    mods_dir = os.path.join(SRC, 'modules')
+    out = []
+    if not os.path.isdir(mods_dir):
+        return out
+    for mod in sorted(os.listdir(mods_dir)):
+        kinds_inc = os.path.join(mods_dir, mod, 'kinds.inc')
+        if not os.path.isfile(kinds_inc):
+            continue
+        rd = lambda f: (open(os.path.join(mods_dir, mod, f)).read()
+                        if os.path.isfile(os.path.join(mods_dir, mod, f)) else '')
+        parse_text, plan_text, tests = rd('parse.h'), rd('plan.h'), rd('tests.inc')
+        reasons = {}
+        for m in re.finditer(
+                r'PGLASWELL_DEFERRED_CASE\(\s*"([a-z_0-9]+)"\s*,\s*((?:"(?:[^"\\]|\\.)*"\s*)+)\)',
+                tests):
+            reasons[m.group(1)] = _cstr(m.group(2))
+        for m in re.finditer(r'^PGLASWELL_KIND\(\s*(\w+)\s*,\s*(\w+)\s*,\s*(\w+)\s*,',
+                             open(kinds_inc).read(), re.M):
+            out.append((mod, m.group(1), m.group(3), parse_text, plan_text,
+                        reasons.get(m.group(1))))
+    return out
+
+
 def collect():
     spec, conf = _read('spec.h'), _read('conformance.inc')
     disp, ex, defer = dispatch(spec), examples(conf), deferred(conf)
@@ -283,6 +316,11 @@ def collect():
              else {'accepted': [], 'required': [], 'enums': {}, 'hints': {},
                    'source': None})
         o.update(kind=name, enum=enum, example=ex.get(name), deferred=defer.get(name))
+        out.append(o)
+    for mod, name, fn, parse_text, plan_text, reason in module_kinds():
+        o = options(parse_text, fn)
+        o.update(kind=name, enum=None, example=None, deferred=reason, module=mod,
+                 module_parse=parse_text, module_plan=plan_text)
         out.append(o)
     return out
 

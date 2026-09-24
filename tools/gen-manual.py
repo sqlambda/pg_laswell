@@ -122,7 +122,15 @@ FAMILIES = [
 ]
 
 
+# kind -> module, filled in main(). A module kind belongs to its module's
+# family, whatever its name would otherwise match: citus_create_reference_table
+# is not a core "table" kind, and filing it beside create_table would say it is.
+MODULE_OF = {}
+
+
 def family(kind):
+    if kind in MODULE_OF:
+        return 'Module: ' + MODULE_OF[kind]
     for name, pat in FAMILIES:
         if re.search(pat, kind):
             return name
@@ -210,6 +218,19 @@ def describe(kind, spec, planner, planner_dml, sections):
         return sections[kind]
     p = leading_comment(spec, 'inline void parse_%s(' % kind)
     return p or []
+
+
+def prose_for(d, spec, planner, planner_dml, sections):
+    """Prose for a collected kind. A module kind is described from its OWN files --
+    the planner's comment, then the parser's -- in the order core's kinds are."""
+    if d.get('module'):
+        for text, sig in ((d['module_plan'], 'inline void plan_%s('),
+                          (d['module_parse'], 'inline void parse_%s(')):
+            got = leading_comment(text, sig % d['kind'])
+            if got:
+                return got
+        return []
+    return describe(d['kind'], spec, planner, planner_dml, sections)
 
 
 def md(text):
@@ -401,6 +422,14 @@ def page(d, all_kinds, prose, prev_k, next_k):
                  '<a href="%s.html">%s →</a>' % (next_k, next_k) if next_k else ''))
 
     h.append('<h1><code>%s</code></h1>' % E(k))
+    if d.get('module'):
+        mod = d['module']
+        h.append('<p class="purpose"><strong>A %s module kind.</strong> Known only to '
+                 'a binary built with <code>-DPGLASWELL_MODULES=%s</code> -- '
+                 '<code>--version</code> then prints <code>modules: %s</code>. A '
+                 'PostgreSQL-only build refuses it as an unknown kind, and with it the '
+                 'whole specification. See <code>pg_laswell_%s(7)</code>.</p>'
+                 % (E(mod), E(mod), E(mod), E(mod)))
     if purpose:
         h.append('<p class="purpose">%s</p>' % md(purpose))
 
@@ -487,7 +516,9 @@ def index_page(data):
     for d in sorted(data, key=lambda x: x['kind']):
         req = [x for x in d['accepted'] if x in d['required'] and x != 'kind']
         opt = [x for x in d['accepted'] if x not in d['required'] and x != 'kind']
-        ex = 'tested' if d['example'] else ('two clusters' if d['deferred'] else '—')
+        ex = ('tested' if d['example'] else
+              'live cluster' if d.get('module') and d['deferred'] else
+              'two clusters' if d['deferred'] else '—')
         h.append('<tr><td class="k"><a href="%s.html">%s</a></td><td>%d</td>'
                  '<td>%d</td><td>%s</td></tr>' % (d['kind'], E(d['kind']),
                                                   len(req), len(opt), ex))
@@ -506,7 +537,7 @@ def single_file(data, spec, planner, planner_dml, sections):
     names = [d['kind'] for d in data]
     body = []
     for i, d in enumerate(data):
-        prose = describe(d['kind'], spec, planner, planner_dml, sections)
+        prose = prose_for(d, spec, planner, planner_dml, sections)
         p = page(d, names, prose, None, None)
         inner = p[p.index('<h1>'):p.index('<footer>')]
         inner = inner.replace('href="index.html"', 'href="#top"')
@@ -537,6 +568,9 @@ def main():
     planner = X._read('planner.h')
     planner_dml = X._read('planner_dml.h')
     names = [d['kind'] for d in data]
+    for d in data:
+        if d.get('module'):
+            MODULE_OF[d['kind']] = d['module']
     sections = section_prose(planner)
     sections.update(section_prose(planner_dml))
     if not single:
@@ -551,7 +585,7 @@ def main():
         return
 
     for i, d in enumerate(data):
-        prose = describe(d['kind'], spec, planner, planner_dml, sections)
+        prose = prose_for(d, spec, planner, planner_dml, sections)
         p = page(d, names, prose,
                  names[i - 1] if i else None,
                  names[i + 1] if i + 1 < len(names) else None)
@@ -561,7 +595,7 @@ def main():
         f.write(index_page(data))
 
     described = sum(1 for d in data
-                    if describe(d['kind'], spec, planner, planner_dml, sections))
+                    if prose_for(d, spec, planner, planner_dml, sections))
     print("wrote %d pages + index to %s" % (len(data), out))
     print("  with a description: %d / %d" % (described, len(data)))
     print("  with a tested example: %d / %d" % (
