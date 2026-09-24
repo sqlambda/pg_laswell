@@ -18,9 +18,8 @@ drifted. And it never states a number it cannot derive.
 repository, signing, planning, dry run, paced execution, ledger — with 355 tests
 green on GCC and Clang, under AddressSanitizer/UBSan and ThreadSanitizer.
 Packages build for seven targets — deb, rpm and tarball, x86_64 and arm64, plus
-macOS arm64 — in two variants, `pg-laswell` (PostgreSQL only) and
-`pg-laswell-citus` (with the Citus module), each installed and run inside the
-platform it targets before upload. The manual is the authoritative reference. Not yet published anywhere.
+macOS arm64 — each with the Citus module compiled in, and each installed and
+run inside the platform it targets before upload. The manual is the authoritative reference. Not yet published anywhere.
 
 **Everything here is measured against PostgreSQL 18, and the suite runs against
 15 through 18.** One kind does not reach as far back as the rest: `merge_rows`
@@ -221,8 +220,8 @@ cmake --build cpp/build
 ctest --test-dir cpp/build
 ```
 
-`-DPGLASWELL_MODULES=citus` builds the Citus variant. How a module is written,
-and how a variant is shipped, is in
+`-DPGLASWELL_MODULES=citus` builds what the release ships. How a module is
+written, and why there is one package, is in
 [cpp/src/modules/README.md](cpp/src/modules/README.md).
 
 ## Poolers

@@ -273,30 +273,33 @@ it. Say the vendor is called `acme`.
 9. **Document** in `man/pg_laswell_acme.7`. `tools/check-manual.py` fails until
    every kind in `kinds.inc` has a section there.
 
-## Shipping a variant
+## Shipping: one package, every module
 
-One source tree, one package per configuration. A build is named after its
-modules, so
+The released package, `pg-laswell`, carries every module:
 
-    cmake -S cpp -B build                          # package: pg-laswell
-    cmake -S cpp -B build -DPGLASWELL_MODULES=citus  # package: pg-laswell-citus
+    cmake -S cpp -B build -DPGLASWELL_MODULES=citus
 
-produce two packages that install the same two binaries. Each variant declares
-that it conflicts with, replaces and provides `pg-laswell`: one binary is
-installed at a time, and anything that depends on `pg-laswell` is satisfied by
-either. The variant also installs its man7 page, and `--version` prints the
-module set, so what is installed is always visible.
+A module is safe to carry on servers without its extension. Its kinds are
+prefixed with its vendor's name, its reading is absent when the extension is
+not installed, and for a table it has nothing to say about it changes no
+statement (the build with the module and the one without are tested to plan
+identically). One configuration therefore serves several targets with one
+binary. A repository of core kinds runs unchanged on a developer's plain
+PostgreSQL and on a Citus staging cluster, where core consults the module and
+walks each shard separately. Specifications that use `citus_*` kinds are refused
+where Citus is absent, as a whole, with the missing extension named.
 
-This is how one configuration serves several targets. A repository whose
-specifications use only core kinds runs unchanged on a developer's PostgreSQL
-and on a Citus staging cluster: on Citus, core consults the module (`confine.h`)
-and walks each shard separately where a plain walk would be refused.
-Specifications that use `citus_*` kinds are refused as a whole by a core-only
-binary, so a target that needs them has to run the variant, and nothing is
-skipped without anyone noticing. A server needing a different vendor gets its own
-module and its own variant: `-DPGLASWELL_MODULES=acme` builds `pg-laswell-acme`.
-Modules can be combined (`"citus;acme"` builds `pg-laswell-citus-acme`) as long as
-their kind names do not collide, which the naming rule above guarantees.
+A source build with no `PGLASWELL_MODULES` stays PostgreSQL-only. CI builds both
+ways, because the build without modules is what proves a module changes nothing
+it has no reading about.
+
+**When to split.** Separate packages, or modules as shared libraries, are
+deferred until two modules actually conflict: two vendors that cannot be
+compiled into one binary, or a module whose presence changes behaviour on
+servers without its extension. Until then, a choice of variant is a decision
+every user would have to make for no benefit. If it comes to shared libraries,
+the `dlopen` objection above still has to be answered: a binary missing a module
+must refuse the specification, not skip the step.
 
 ## Scope
 

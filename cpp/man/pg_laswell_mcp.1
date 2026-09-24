@@ -1612,16 +1612,11 @@ Modules are chosen when the binary is configured:
 cmake -S cpp -B build -DPGLASWELL_MODULES=citus
 .Ed
 .Pp
-Each module set is its own package, named after it:
-.Li pg-laswell
-is PostgreSQL only, and
-.Li pg-laswell-citus
-carries the Citus module and its page,
-.Xr pg_laswell_citus 7 .
-They install the same two binaries, so one replaces the other, and the variant
-also provides
-.Li pg-laswell
-for anything that depends on it.
+The released package is built with every module, so
+.Xr pg_laswell_citus 7
+is installed beside this page.
+A module's kinds are refused where its extension is absent, and a server without
+the extension plans exactly as a build without the module would.
 .Pp
 .Fl -version
 names the set a binary was built with, and says nothing when it was built with

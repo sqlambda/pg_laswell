@@ -343,31 +343,9 @@ message(STATUS "Using compiler: ${CMAKE_CXX_COMPILER} (${CMAKE_CXX_COMPILER_ID})
 message(STATUS "Requested C++ standard: ${CMAKE_CXX_STANDARD}")
 message(STATUS "Sanitizer: ${PGLASWELL_SANITIZER}")
 
-# One source tree, one package per module set. A build is named after the
-# modules it carries -- pg-laswell, pg-laswell-citus -- because the two install
-# the same binaries with DIFFERENT vocabularies, and which one is on a machine
-# has to be answerable by the package manager, not only by --version.
-#
-# Every variant conflicts with, replaces and provides pg-laswell: exactly one is
-# installed at a time (they own the same paths), switching is an ordinary
-# install, and anything that depends on pg-laswell is satisfied by either. See
-# src/modules/README.md, "Shipping a variant".
-if(_mod_names)
-    string(JOIN "-" _variant ${_mod_names})
-    set(CPACK_PACKAGE_NAME "pg-laswell-${_variant}")
-    string(JOIN ", " _mod_words ${_mod_names})
-    set(CPACK_PACKAGE_DESCRIPTION_SUMMARY
-        "Lock-aware PostgreSQL migration executor (MCP server), with modules: ${_mod_words}")
-    set(CPACK_DEBIAN_PACKAGE_CONFLICTS "pg-laswell")
-    set(CPACK_DEBIAN_PACKAGE_REPLACES "pg-laswell")
-    set(CPACK_DEBIAN_PACKAGE_PROVIDES "pg-laswell")
-    set(CPACK_RPM_PACKAGE_CONFLICTS "pg-laswell")
-    set(CPACK_RPM_PACKAGE_PROVIDES "pg-laswell")
-else()
-    set(CPACK_PACKAGE_NAME "pg-laswell")
-    set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Lock-aware PostgreSQL migration executor (MCP server)")
-endif()
+set(CPACK_PACKAGE_NAME "pg-laswell")
 set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Lock-aware PostgreSQL migration executor (MCP server)")
 set(CPACK_PACKAGE_VENDOR "sqlambda")
 # Mandatory for the DEB generator, which fails the whole package without it.
 set(CPACK_PACKAGE_CONTACT "https://github.com/sqlambda/pg_laswell")
