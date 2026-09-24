@@ -460,6 +460,35 @@ SELECT COALESCE((
        (SELECT p.oid::regprocedure::text FROM pg_proc p WHERE p.oid = t.oid) END,
     'returns', CASE WHEN $1 = 'function' THEN
        (SELECT PG_GET_FUNCTION_RESULT(p.oid) FROM pg_proc p WHERE p.oid = t.oid) END,
+    -- A function's input arguments in order: name (NULL when unnamed), type and
+    -- type category. Read by the Citus module to check a distribution argument
+    -- before Citus does -- it refuses a name that does not exist or a position
+    -- out of range (22023), and ACCEPTS a type that cannot be coerced to the
+    -- group's, after which every call fails. IN and INOUT only: an OUT argument
+    -- is not something a caller passes, and $n counts the ones it does.
+    'arguments', CASE WHEN $1 = 'function' THEN COALESCE((
+       SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
+                'name', NULLIF(a.name, ''),
+                'type_oid', a.typ::bigint,
+                'type', format_type(a.typ, NULL),
+                'category', ty.typcategory::text) ORDER BY a.ord)
+         FROM pg_proc pp,
+              LATERAL unnest(pp.proargtypes::oid[]) WITH ORDINALITY AS a0(typ, ord)
+              LEFT JOIN LATERAL (
+                SELECT (pp.proargnames)[
+                         -- proargnames spans ALL arguments when any are OUT;
+                         -- proargtypes lists only the inputs. Map input
+                         -- position to overall position through proargmodes.
+                         CASE WHEN pp.proargmodes IS NULL THEN a0.ord::int
+                         ELSE (SELECT m.pos FROM (
+                                 SELECT row_number() OVER () AS pos, mode
+                                   FROM unnest(pp.proargmodes) AS mode) m
+                                WHERE m.mode IN ('i','b','v')
+                                ORDER BY m.pos OFFSET a0.ord - 1 LIMIT 1)
+                         END] AS name) nm ON true
+              CROSS JOIN LATERAL (SELECT a0.typ, a0.ord, nm.name) a
+              JOIN pg_type ty ON ty.oid = a.typ
+        WHERE pp.oid = t.oid), '[]'::jsonb) END,
     'owner', CASE $1
        WHEN 'function' THEN (SELECT PG_GET_USERBYID(proowner) FROM pg_proc WHERE oid = t.oid)
        WHEN 'type' THEN (SELECT PG_GET_USERBYID(typowner) FROM pg_type WHERE oid = t.oid)

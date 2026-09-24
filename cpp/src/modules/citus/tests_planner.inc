@@ -14,7 +14,7 @@ json citus_obs(json tables = json::object(), int workers = 2,
   return json{{"version", "13.2-1"},
               {"worker_count", workers},
               {"tables", std::move(tables)},
-              {"distributed_functions", json::array()},
+              {"function_distribution", json::object()},
               {"calls", calls},
               {"settings", json{{"enable_ddl_propagation", propagation},
                                 {"max_adaptive_executor_pool_size", "16"}}}};
@@ -479,4 +479,244 @@ TEST(CitusPlanner, WithoutTheEarlierIntentTheSameColocationIsRefused) {
                             obs);
   EXPECT_FALSE(p.ok);
   EXPECT_TRUE(conflicts_mention(p, "does not record as distributed"));
+}
+
+// --- §6 refusals and the function no-op, each against a fixed reading ------
+
+namespace {
+json dist_entry(const char* column, long long type_oid, const char* type,
+                const char* category, long long group) {
+  return json{{"partmethod", "h"}, {"repmodel", "s"},
+              {"distribution_column", column},
+              {"distribution_type_oid", type_oid}, {"distribution_type", type},
+              {"distribution_type_category", category}, {"colocationid", group},
+              {"shard_count", 32}, {"replication_factor", 1}};
+}
+json typed_table(const char* column, long long type_oid, const char* type) {
+  json t = table_with_pk({column}, 10);
+  t["columns"][column] = json{{"type", type}, {"type_oid", type_oid}};
+  return t;
+}
+}  // namespace
+
+TEST(CitusPlanner, ColocationRequiresTheSameDistributionTypeExactly) {
+  // Measured: Citus refuses int against a bigint group as firmly as text --
+  // "Distribution column types don't match". Checked by oid, the comparison
+  // that cannot disagree with Citus's.
+  for (const auto& [oid, type, want_ok] :
+       std::vector<std::tuple<long long, const char*, bool>>{
+           {20, "bigint", true}, {23, "integer", false}, {25, "text", false}}) {
+    const auto obs = citus_observations(
+        citus_obs(json{{"public.a", dist_entry("id", 20, "bigint", "N", 9)}}),
+        json{{"public.b", typed_table("id", oid, type)}});
+    const auto p = plan_citus(json{{"kind", "citus_distribute_table"},
+                                   {"schema", "public"}, {"table", "b"},
+                                   {"distribution_column", "id"},
+                                   {"colocate_with", "public.a"},
+                                   {"comment", "x"}}, obs);
+    EXPECT_EQ(p.ok, want_ok) << type << ": "
+                             << (p.conflicts.empty() ? "" : p.conflicts[0]);
+    if (!want_ok) {
+      EXPECT_TRUE(conflicts_mention(p, "same type exactly")) << type;
+    }
+  }
+}
+
+namespace {
+pglaswell::Observations function_obs(json distribution, json arguments,
+                                     long long group_type_oid = 20,
+                                     const char* group_category = "N") {
+  json citus = citus_obs(json{{"public.accounts",
+                               dist_entry("id", group_type_oid, "bigint",
+                                          group_category, 9)}});
+  citus["function_distribution"] = std::move(distribution);
+  auto obs = citus_observations(citus, json::object());
+  obs.objects["function:public.f"] =
+      json{{"exists", true}, {"kind", "function"},
+           {"signature", "public.f(bigint)"}, {"arguments", std::move(arguments)}};
+  return obs;
+}
+pglaswell::Plan plan_function(const pglaswell::Observations& obs, const char* arg) {
+  return plan_citus(json{{"kind", "citus_distribute_function"}, {"schema", "public"},
+                         {"name", "f"}, {"arguments", "bigint"},
+                         {"distribution_argument", arg},
+                         {"colocate_with", "public.accounts"}, {"comment", "x"}},
+                    obs);
+}
+const pglaswell::Step* function_step(const pglaswell::Plan& p) {
+  for (const auto& s : p.steps) {
+    if (s.kind == "citus_distribute_function") return &s;
+  }
+  return nullptr;
+}
+const json kBigintTid = json::array({json{{"name", "tid"}, {"type_oid", 20},
+                                          {"type", "bigint"}, {"category", "N"}}});
+}  // namespace
+
+TEST(CitusPlanner, AFunctionCitusMerelyKnowsIsNotAlreadyDistributed) {
+  // The no-op this replaces. On Citus 11+ every CREATE FUNCTION is propagated
+  // and recorded in pg_dist_object with no distribution argument and no
+  // colocation, and the first reading listed names only -- so every function
+  // read as "already distributed", and the kind reported satisfied and routed
+  // nothing. A function that is only propagated must be distributed.
+  const auto obs = function_obs(
+      json{{"public.f", json{{"argument_index", nullptr}, {"colocationid", nullptr}}}},
+      kBigintTid);
+  const auto p = plan_function(obs, "tid");
+  ASSERT_TRUE(p.ok) << (p.conflicts.empty() ? "" : p.conflicts[0]);
+  const auto* s = function_step(p);
+  ASSERT_NE(s, nullptr);
+  EXPECT_EQ(s->action, pglaswell::Action::kApply)
+      << "a propagated function was reported as already distributed";
+}
+
+TEST(CitusPlanner, AFunctionIsSatisfiedOnlyWhenItRoutesAsAsked) {
+  // Routed on the same argument in the same group: nothing to do.
+  {
+    const auto p = plan_function(
+        function_obs(json{{"public.f", json{{"argument_index", 0}, {"colocationid", 9}}}},
+                     kBigintTid), "tid");
+    const auto* s = function_step(p);
+    ASSERT_NE(s, nullptr);
+    EXPECT_EQ(s->action, pglaswell::Action::kSatisfied);
+  }
+  // Routed some other way: re-applied, and the plan says what changes. Measured,
+  // Citus switches an existing distribution with no error.
+  {
+    const auto obs = function_obs(
+        json{{"public.f", json{{"argument_index", 1}, {"colocationid", 9}}}},
+        json::array({kBigintTid[0], json{{"name", "x"}, {"type_oid", 23},
+                                         {"type", "integer"}, {"category", "N"}}}));
+    const auto p = plan_function(obs, "tid");
+    const auto* s = function_step(p);
+    ASSERT_NE(s, nullptr);
+    EXPECT_EQ(s->action, pglaswell::Action::kApply);
+    bool warned = false;
+    for (const auto& w : p.warnings) {
+      if (w.find("re-distributes") != std::string::npos) warned = true;
+    }
+    EXPECT_TRUE(warned) << "a changed routing must be named";
+  }
+}
+
+TEST(CitusPlanner, ADistributionArgumentMustBeOneTheFunctionHas) {
+  // Citus refuses both (22023); the plan refuses first and lists the inputs.
+  const auto obs = function_obs(json::object(), kBigintTid);
+  for (const char* bad : {"nope", "$2", "$0", "$x"}) {
+    const auto p = plan_function(obs, bad);
+    EXPECT_FALSE(p.ok) << bad;
+    EXPECT_TRUE(conflicts_mention(p, "tid $1 bigint")) << bad;
+  }
+  EXPECT_TRUE(plan_function(obs, "tid").ok);
+  EXPECT_TRUE(plan_function(obs, "$1").ok);
+}
+
+TEST(CitusPlanner, AnArgumentThatCannotBeCoercedToTheGroupIsRefused) {
+  // Measured: Citus ACCEPTS a text argument on a bigint group, and then every
+  // call fails, "Cannot coerce text to bigint". Across categories: refused.
+  const auto text_arg = json::array({json{{"name", "tid"}, {"type_oid", 25},
+                                          {"type", "text"}, {"category", "S"}}});
+  const auto p = plan_function(function_obs(json::object(), text_arg), "tid");
+  EXPECT_FALSE(p.ok);
+  EXPECT_TRUE(conflicts_mention(p, "every call")) << (p.conflicts.empty() ? "" : p.conflicts[0]);
+
+  // Within a category: measured, int on bigint is pushed down. Allowed, with a
+  // warning that only that pair was measured.
+  const auto int_arg = json::array({json{{"name", "tid"}, {"type_oid", 23},
+                                         {"type", "integer"}, {"category", "N"}}});
+  const auto q = plan_function(function_obs(json::object(), int_arg), "tid");
+  EXPECT_TRUE(q.ok) << (q.conflicts.empty() ? "" : q.conflicts[0]);
+  EXPECT_FALSE(q.warnings.empty());
+}
+
+TEST(CitusPlanner, AManagedLocalTableIsNotAReferenceTable) {
+  // Citus records a managed local table with partmethod 'n' as it does a
+  // reference table; repmodel tells them apart ('t' replicated, 's' one
+  // placement). Reporting the first as "already a reference table" would
+  // claim a table on one node is replicated. Measured: create_reference_table
+  // converts it without error, so it is applied.
+  const auto plan_ref = [](const char* repmodel) {
+    const auto obs = citus_observations(
+        citus_obs(json{{"public.r", json{{"partmethod", "n"}, {"repmodel", repmodel},
+                                         {"distribution_column", nullptr},
+                                         {"colocationid", 0}}}}),
+        json{{"public.r", table_with_pk({"id"}, 10)}});
+    return plan_citus(json{{"kind", "citus_create_reference_table"},
+                           {"schema", "public"}, {"table", "r"}}, obs);
+  };
+  const auto replicated = plan_ref("t");
+  ASSERT_FALSE(replicated.steps.empty());
+  EXPECT_EQ(replicated.steps.back().action, pglaswell::Action::kSatisfied);
+  const auto managed = plan_ref("s");
+  ASSERT_FALSE(managed.steps.empty());
+  EXPECT_EQ(managed.steps.back().action, pglaswell::Action::kApply);
+}
+
+namespace {
+// Every table the FK tests name, with the columns and keys core's add_foreign_key
+// checks for before the guard is ever reached: without these, core refuses a
+// table that "does not exist", and a test of the guard tests nothing.
+json fk_table(std::vector<std::string> pk) {
+  json t = table_with_pk(pk, 10);
+  for (const char* c : {"tenant_id", "id", "other", "rid"}) {
+    t["columns"][c] = json{{"type", "bigint"}, {"type_oid", 20}};
+  }
+  return t;
+}
+pglaswell::Plan plan_fk(json tables, const char* child, json cols, const char* parent,
+                        json refs) {
+  const json readings = {{"public.d1", fk_table({"tenant_id", "id"})},
+                         {"public.d2", fk_table({"tenant_id", "id"})},
+                         {"public.d3", fk_table({"tenant_id", "id"})},
+                         {"public.r", fk_table({"id"})},
+                         {"public.ml", fk_table({"id"})},
+                         {"public.plain", fk_table({"id"})}};
+  const auto obs = citus_observations(citus_obs(std::move(tables)), readings);
+  return plan_citus(json{{"kind", "add_foreign_key"}, {"schema", "public"},
+                         {"table", child}, {"name", "fk"}, {"columns", std::move(cols)},
+                         {"references_schema", "public"}, {"references_table", parent},
+                         {"references_columns", std::move(refs)}},
+                    obs);
+}
+bool fk_refused(const pglaswell::Plan& p, const char* needle) {
+  return !p.ok && conflicts_mention(p, needle);
+}
+}  // namespace
+
+TEST(CitusPlanner, ForeignKeysFollowCitusRulesForEachPairOfTableKinds) {
+  // Every combination was measured against Citus 13; each refusal quotes it.
+  const json d1 = dist_entry("tenant_id", 20, "bigint", "N", 9);
+  const json d2 = dist_entry("tenant_id", 20, "bigint", "N", 9);
+  const json d3 = dist_entry("tenant_id", 20, "bigint", "N", 12);
+  const json ref = json{{"partmethod", "n"}, {"repmodel", "t"}, {"colocationid", 0}};
+  const json managed = json{{"partmethod", "n"}, {"repmodel", "s"}, {"colocationid", 0}};
+  const json tables = {{"public.d1", d1}, {"public.d2", d2}, {"public.d3", d3},
+                       {"public.r", ref}, {"public.ml", managed}};
+  const json tc = json::array({"tenant_id", "other"});
+  const json ti = json::array({"tenant_id", "id"});
+
+  {
+    const auto ok = plan_fk(tables, "d2", tc, "d1", ti);
+    EXPECT_TRUE(ok.ok) << "colocated, same ordinal: "
+                       << (ok.conflicts.empty() ? "" : ok.conflicts[0]);
+  }
+  EXPECT_TRUE(fk_refused(plan_fk(tables, "d2", json::array({"other", "tenant_id"}), "d1", ti),
+                         "same position"))
+      << "colocated, distribution column at a different position";
+  EXPECT_TRUE(fk_refused(plan_fk(tables, "d3", tc, "d1", ti), "not colocated"));
+  EXPECT_TRUE(plan_fk(tables, "d2", json::array({"other"}), "r",
+                      json::array({"id"})).ok) << "distributed -> reference";
+  EXPECT_TRUE(fk_refused(plan_fk(tables, "d2", json::array({"other"}), "plain",
+                                 json::array({"id"})), "(local)"))
+      << "distributed -> plain local";
+  // The case the first guard let through: a MANAGED local table is local, not
+  // reference, whatever its partmethod says.
+  EXPECT_TRUE(fk_refused(plan_fk(tables, "d2", json::array({"other"}), "ml",
+                                 json::array({"id"})), "(local)"))
+      << "distributed -> Citus-managed local";
+  EXPECT_TRUE(fk_refused(plan_fk(tables, "r", json::array({"id"}), "d1",
+                                 json::array({"tenant_id"})), "reference or local"));
+  EXPECT_TRUE(fk_refused(plan_fk(tables, "plain", ti, "d1", ti), "reference or local"));
+  EXPECT_TRUE(plan_fk(tables, "plain", json::array({"rid"}), "r",
+                      json::array({"id"})).ok) << "local -> reference";
 }

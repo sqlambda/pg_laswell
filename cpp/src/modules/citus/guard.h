@@ -6,109 +6,172 @@
 // NOT the plan. A guard can say no and say why; it cannot reach what core
 // emits. An audit found the earlier block form compiled happily while pushing
 // a warning, which is the forbidden shape available by accident.
+//
+// Three passes, each independent: DDL propagation, what a distributed table
+// cannot do, and foreign keys by the kinds of table at their two ends. Every
+// refusal quotes the Citus error it pre-empts, so the author reads the rule
+// they would otherwise have hit at execution.
 template <typename Refuse>
 inline void citus_plan_refusals(const Spec& spec, const Observations& obs,
                                 const Refuse& refuse) {
-
   const auto& citus = obs.extension("citus");
-  if (!citus.empty()) {
-    const auto settings = citus.value("settings", json::object());
-    const auto propagation = settings.value("enable_ddl_propagation", "");
+  if (citus.empty()) return;
+  const auto tables = citus.value("tables", json::object());
+  // "distributed", "reference" or "local". A table Citus does not record is a
+  // plain local table in a Citus database, and walks and writes as it always did.
+  //
+  // partmethod 'n' is NOT enough to call a table a reference table. Citus also
+  // records a CITUS-MANAGED LOCAL table with partmethod 'n' -- measured: adding a
+  // foreign key from a local table to a reference table silently added the
+  // local one to Citus metadata -- and the two differ in repmodel: 't' for a
+  // reference table, 's' for a managed local one. Treating the second as the
+  // first let a distributed-to-local foreign key past this guard.
+  const auto kind_of = [&tables](const std::string& qualified) -> std::string {
+    const auto it = tables.find(qualified);
+    if (it == tables.end()) return "local";
+    if (it->value("partmethod", "") != "n") return "distributed";
+    return it->value("repmodel", "") == "t" ? "reference" : "local";
+  };
 
-    // DECIDED: a hard refusal, not a warning. CITUS.md §10 asks for the
-    // decision and this is it, with the reason.
-    //
-    // With citus.enable_ddl_propagation off, DDL runs on the coordinator and
-    // NOT on the workers. The coordinator's catalog and the workers' then
-    // diverge -- and they diverge SILENTLY, because every reading pg_laswell
-    // takes, including the drift check itself, is taken on the coordinator.
-    // The ledger would record a migration as fully applied, the coordinator
-    // would agree, and the shards would not have it.
-    //
-    // That is the precise failure the whole repository model exists to catch,
-    // occurring one level below where the repository can see. A warning would
-    // be a false reassurance: the run succeeds, the output looks right, and
-    // the cluster is broken in a way nothing here will ever report. Refusing
-    // is recoverable in one statement; silent divergence is not recoverable at
-    // all without comparing every worker by hand.
-    //
-    // This applies to EVERY kind, not just this module's: a plain create_table
-    // on a Citus cluster is propagated DDL too.
-    // WHAT ACTUALLY FAILS ON A DISTRIBUTED TABLE, per form rather than per kind.
-    //
-    // This used to refuse backfill, update_rows, delete_rows and merge_rows
-    // alike, all with one explanation about FOR UPDATE. Measured on Citus 13,
-    // coordinator and two workers, by preparing and EXECUTING each emitted
-    // statement against a distributed table:
-    //
-    //   backfill                     FAILS -- multi-shard FOR UPDATE
-    //   delete_rows with `where`     FAILS -- same, same statement shape
-    //   merge_rows                   FAILS -- but for MERGE, not FOR UPDATE:
-    //                                "non-IMMUTABLE functions are not yet
-    //                                 supported in MERGE sql with distributed
-    //                                 tables"
-    //   update_rows                  WORKS  -- was refused anyway
-    //   delete_rows with `values`    WORKS  -- was refused anyway
-    //   insert_rows                  WORKS  -- was never refused
-    //   copy_rows                    WORKS  -- Citus routes COPY natively
-    //
-    // The reason only the first two take FOR UPDATE is that only they walk the
-    // TARGET table by key. The rest get their rows from the specification, join
-    // to them, and take no row locks -- so the explanation was wrong for every
-    // kind it was wrong to refuse, which is how over-refusing survived: the
-    // message sounded like it applied.
-    for (const auto& in : spec.intents) {
-      const auto qualified = in.qualified_table();
-      const auto tables = citus.value("tables", json::object());
-      if (!tables.contains(qualified)) continue;  // local table: unaffected
-      const auto method = tables[qualified].value("partmethod", "");
-      if (method == "n") continue;  // reference table: one placement per node
-
-      // A keyset walk over the target takes each batch with FOR UPDATE, which is
-      // what stops the cursor selecting the same rows twice. Citus refuses that
-      // on a multi-shard query, so this is not a performance judgement -- it
-      // does not run at all, and without the refusal it would be accepted here
-      // and fail partway through with earlier batches already committed.
-      //
-      // Liftable, and intended to be: confining a batch to ONE shard makes
-      // FOR UPDATE legal again (measured: an equality filter on the distribution
-      // column returns rows under FOR UPDATE where the multi-shard form
-      // errors). That needs the walk to iterate distribution values, which is a
-      // change to how the executor walks rather than to what it refuses.
-      // backfill and delete_rows by predicate are not refused here any more.
-      // Both walk the target and take FOR UPDATE, which Citus refuses across
-      // shards -- and core now reads citus_required_confinement (confine.h) and
-      // walks a distributed table one distribution value at a time, which makes
-      // the lock single-shard. The refusal that remains for them, when the
-      // distribution column IS the walk key, is core's, because it is core's
-      // walk that cannot be shaped.
-
-      // MERGE is refused for its own reasons, which have nothing to do with
-      // pacing or row locks. Naming the right restriction matters: told it was
-      // about FOR UPDATE, an author would look for a way to avoid a row lock
-      // that this statement never takes.
-      if (in.kind == IntentKind::kMergeRows) {
-        refuse(
-            "\"merge_rows\" on " + qualified + " cannot run: " + qualified +
-            " is distributed, and Citus restricts MERGE against a distributed "
-            "target -- measured: \"non-IMMUTABLE functions are not yet supported "
-            "in MERGE sql with distributed tables\". This is a limit of MERGE on "
-            "Citus, not of the pacing. Express the change as update_rows and "
-            "insert_rows, which both run here.");
-        continue;
-      }
-    }
-
-    if (propagation == "off" || propagation == "false") {
-      refuse(
-          "citus.enable_ddl_propagation is off, so DDL would run on the "
-          "coordinator and not on the workers. The coordinator's catalog and "
-          "the workers' would diverge, and every reading pg_laswell takes -- "
-          "including the check that catches drift -- is taken on the "
-          "coordinator, so nothing here would ever report it. Turn it on for "
-          "the migration: SET citus.enable_ddl_propagation TO on; (or ALTER "
-          "SYSTEM, if it is off by default here).");
-    }
+  // 1. DDL PROPAGATION. DECIDED: a hard refusal, not a warning -- CITUS.md §10
+  // asked for the decision and this is it, with the reason.
+  //
+  // With citus.enable_ddl_propagation off, DDL runs on the coordinator and NOT
+  // on the workers. The coordinator's catalog and the workers' then diverge --
+  // and they diverge SILENTLY, because every reading pg_laswell takes,
+  // including the drift check itself, is taken on the coordinator. The ledger
+  // would record a migration as fully applied, the coordinator would agree, and
+  // the shards would not have it.
+  //
+  // That is the precise failure the whole repository model exists to catch,
+  // occurring one level below where the repository can see. A warning would be
+  // a false reassurance. Refusing is recoverable in one statement; silent
+  // divergence is not recoverable at all without comparing every worker by
+  // hand. It applies to EVERY kind: a plain create_table on a Citus cluster is
+  // propagated DDL too.
+  const auto settings = citus.value("settings", json::object());
+  const auto propagation = settings.value("enable_ddl_propagation", "");
+  if (propagation == "off" || propagation == "false") {
+    refuse(
+        "citus.enable_ddl_propagation is off, so DDL would run on the "
+        "coordinator and not on the workers. The coordinator's catalog and the "
+        "workers' would diverge, and every reading pg_laswell takes -- including "
+        "the check that catches drift -- is taken on the coordinator, so nothing "
+        "here would ever report it. Turn it on for the migration: SET "
+        "citus.enable_ddl_propagation TO on; (or ALTER SYSTEM, if it is off by "
+        "default here).");
   }
 
+  // 2. WHAT A DISTRIBUTED TABLE CANNOT DO, per form rather than per kind.
+  // Measured on Citus 13, preparing and EXECUTING each emitted statement:
+  //
+  //   insert_rows, copy_rows, update_rows, delete_rows by values   run
+  //   backfill, delete_rows by predicate      run, as a grouped walk
+  //   merge_rows                              refused, for MERGE
+  //
+  // The two walks are not refused here: they take FOR UPDATE, which Citus
+  // refuses across shards, and core reads citus_required_confinement
+  // (confine.h) and walks one distribution value at a time, which makes the lock
+  // single-shard. The refusal that remains for them -- a distribution column
+  // that IS the walk key -- is core's, because it is core's walk that cannot be
+  // shaped.
+  for (const auto& in : spec.intents) {
+    if (in.kind != IntentKind::kMergeRows) continue;
+    const auto qualified = in.qualified_table();
+    if (kind_of(qualified) != "distributed") continue;
+    // Naming the right restriction matters: told it was about FOR UPDATE, an
+    // author would look for a way to avoid a row lock this statement never
+    // takes.
+    refuse(
+        "\"merge_rows\" on " + qualified + " cannot run: " + qualified +
+        " is distributed, and Citus restricts MERGE against a distributed target "
+        "-- measured: \"non-IMMUTABLE functions are not yet supported in MERGE "
+        "sql with distributed tables\". This is a limit of MERGE on Citus, not of "
+        "the pacing. Express the change as update_rows and insert_rows, which "
+        "both run here.");
+  }
+
+  // 3. FOREIGN KEYS, by the kinds of table at the two ends. Measured on Citus 13,
+  // every combination:
+  //
+  //   distributed -> distributed, colocated, distribution columns at the
+  //                  same position in both key lists                  runs
+  //   distributed -> distributed, not colocated                       refused
+  //   distributed -> distributed, colocated, distribution column
+  //                  at a different position                          refused
+  //   distributed -> reference                                        runs
+  //   distributed -> local                                            refused
+  //   reference   -> distributed, local -> distributed                refused
+  //   reference   -> local, local -> reference                        run
+  //
+  // Only readings are checked: a table distributed earlier in the same
+  // specification has no reading yet. The dry run executes the DDL inside the
+  // transaction it rolls back, so that case is still caught before anything
+  // commits -- by PostgreSQL rather than here.
+  for (const auto& in : spec.intents) {
+    if (in.kind != IntentKind::kAddForeignKey) continue;
+    const auto child = in.qualified_table();
+    const auto parent =
+        in.body.value("references_schema", in.body.value("schema", "")) + "." +
+        in.body.value("references_table", "");
+    const auto ck = kind_of(child);
+    const auto pk = kind_of(parent);
+
+    if (ck != "distributed" && pk == "distributed") {
+      refuse("add_foreign_key from " + child + " (a " + ck + " table) to " + parent +
+             " (distributed) cannot run: Citus does not support foreign keys "
+             "from reference or local tables to distributed ones -- \"Reference "
+             "tables and local tables can only have foreign keys to reference "
+             "tables and local tables\".");
+      continue;
+    }
+    if (ck != "distributed" || pk == "reference") continue;  // both supported
+    if (pk == "local") {
+      refuse("add_foreign_key from " + child + " (distributed) to " + parent +
+             " (local) cannot run: a distributed table can reference only a "
+             "colocated distributed table or a reference table. Make " + parent +
+             " a reference table first, or distribute it colocated with " + child +
+             ".");
+      continue;
+    }
+
+    // distributed -> distributed.
+    const auto& c = tables[child];
+    const auto& p = tables[parent];
+    if (c.value("colocationid", -1) != p.value("colocationid", -2)) {
+      refuse("add_foreign_key from " + child + " to " + parent + " cannot run: "
+             "both are distributed and they are not colocated (groups " +
+             std::to_string(c.value("colocationid", 0)) + " and " +
+             std::to_string(p.value("colocationid", 0)) + "). Citus supports a "
+             "foreign key between distributed tables only inside one colocation "
+             "group, where the referencing and referenced rows are on the same "
+             "node.");
+      continue;
+    }
+    // Same position in both key lists, not merely present. Measured: a key that
+    // maps some other column onto the parent's distribution column is refused --
+    // "including partition column in the same ordinal in the both tables".
+    const auto cols = in.body.value("columns", json::array());
+    const auto refs = in.body.value("references_columns", json::array());
+    const auto cd = c.value("distribution_column", "");
+    const auto pd = p.value("distribution_column", "");
+    int ci = -1, pi = -1;
+    for (std::size_t i = 0; i < cols.size(); ++i) {
+      if (cols[i] == cd) ci = static_cast<int>(i);
+    }
+    for (std::size_t i = 0; i < refs.size(); ++i) {
+      if (refs[i] == pd) pi = static_cast<int>(i);
+    }
+    if (ci >= 0 && ci == pi) continue;
+    const std::string what =
+        ci < 0 ? "does not include " + cd
+               : (pi < 0 ? "does not reference " + pd
+                         : std::string("pairs them at different positions"));
+    refuse("add_foreign_key from " + child + " to " + parent + " cannot run: the "
+           "key must pair " + child + "." + cd + " with " + parent + "." + pd +
+           " at the same position in both column lists, and it " + what +
+           ". Citus: \"foreign keys are supported ... between two colocated "
+           "tables including partition column in the same ordinal in the both "
+           "tables\".");
+  }
 }

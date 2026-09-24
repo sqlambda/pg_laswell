@@ -176,9 +176,43 @@ inline void plan_citus_distribute_table(const Intent& in, const Observations& ob
           "depends_on will order for you.");
       return;
     }
+    // The distribution columns must be the SAME type -- exactly, not the same
+    // family. Measured on Citus 13: colocating an int column with a bigint
+    // group is refused as firmly as text with bigint, "cannot colocate tables
+    // ... Distribution column types don't match". Checked by oid, the one
+    // comparison that cannot disagree with Citus's.
+    //
+    // Only when both types are READ. A target distributed earlier in this same
+    // specification is a projection with no column types, and a table created
+    // earlier in it may be too; the dry run executes create_distributed_table
+    // for real inside the transaction it rolls back, so that case is still
+    // caught before anything commits -- just by PostgreSQL rather than here.
+    const auto want_oid = other.value("distribution_type_oid", 0LL);
+    const auto have_oid =
+        columns.value(column, json::object()).value("type_oid", 0LL);
+    if (want_oid != 0 && have_oid != 0 && want_oid != have_oid) {
+      step.action = Action::kConflict;
+      const auto have_type =
+          columns.value(column, json::object()).value("type", "?");
+      const auto want_type = other.value("distribution_type", "?");
+      step.why = qualified + "." + column + " is " + have_type + ", and " +
+                 with + " is distributed on a " + want_type + " column";
+      plan.conflicts.push_back(
+          step.why + ". Citus colocates only tables whose distribution columns "
+          "are the same type exactly -- int and bigint are refused as firmly as "
+          "text and bigint (\"Distribution column types don't match\"). Change "
+          "the column's type in an earlier specification, or colocate with "
+          "none.");
+      return;
+    }
     step.detail["colocate_with"] = with;
     step.detail["colocation_group"] = other.value("colocationid", 0);
     step.detail["adopted_shard_count"] = other.value("shard_count", 0);
+    // Adopted, not checked: measured, a session asking for a different
+    // citus.shard_replication_factor joins the group with the GROUP's factor
+    // and no error. Recorded so the plan says what the table will actually get.
+    step.detail["adopted_replication_factor"] =
+        other.value("replication_factor", 0);
   }
 
   // concurrently: auto is where the planner earns its keep. The same shape as
@@ -312,11 +346,22 @@ inline void plan_citus_create_reference_table(const Intent& in, const Observatio
   if (already) {
     const auto& d = citus_table(citus, qualified);
     const auto method = d.value("partmethod", "");
-    if (method == "n") {
+    // partmethod 'n' alone does not make a reference table: Citus records a
+    // CITUS-MANAGED LOCAL table the same way, and tells them apart by repmodel
+    // -- 't' replicated, 's' a single placement on the coordinator. Calling the
+    // second "already a reference table" would report success for a table that
+    // is on one node. Measured: create_reference_table converts it (to n/t) with
+    // no error, so it is simply applied.
+    if (method == "n" && d.value("repmodel", "") == "t") {
       step.action = Action::kSatisfied;
       step.why = qualified + " is already a reference table";
       return;
     }
+    if (method == "n") {
+      already = false;  // a managed local table: convert it, below
+    }
+  }
+  if (already) {
     step.action = Action::kConflict;
     step.why = qualified + " is already distributed, not a reference table";
     plan.conflicts.push_back(
@@ -381,14 +426,13 @@ inline void plan_citus_distribute_function(const Intent& in, const Observations&
     return;
   }
 
-  const auto distributed = citus.value("distributed_functions", json::array());
-  for (const auto& d : distributed) {
-    if (d.get<std::string>() == qualified_fn) {
-      step.action = Action::kSatisfied;
-      step.why = signature + " is already distributed";
-      return;
-    }
-  }
+  // Whether it is ALREADY distributed as asked is decided below, once the
+  // argument and group are resolved: "Citus knows this function" is not the
+  // question, because on Citus 11+ it knows every function that was created.
+  const auto dist_map = citus.value("function_distribution", json::object());
+  const json existing = dist_map.value(qualified_fn, json(nullptr));
+  int routed_index = -1;           // 0-based, as Citus stores it; -1 = not routed
+  long long target_group = -1;
 
   const auto with = in.body.value("colocate_with", "");
   const auto dist_arg = in.body.value("distribution_argument", "");
@@ -406,6 +450,126 @@ inline void plan_citus_distribute_function(const Intent& in, const Observations&
       return;
     }
     step.detail["colocation_group"] = other.value("colocationid", 0);
+    target_group = other.value("colocationid", -1LL);
+
+    // WHICH ARGUMENT, and whether it can route. Measured on Citus 13:
+    //
+    //   a name the function does not have, or $n out of range
+    //     -> refused, 22023 "the distribution argument is not valid"
+    //   a bigint argument on a bigint group  -> pushed down to the shard
+    //   an int argument on a bigint group    -> pushed down (Citus coerces)
+    //   a text argument on a bigint group    -> ACCEPTED, and then EVERY CALL
+    //                                           fails: "Cannot coerce text to
+    //                                           bigint"
+    //
+    // The last is the one worth catching: Citus says yes to a distribution that
+    // breaks every invocation of the function. Across type categories there is
+    // no implicit coercion for it to use; within one there usually is, so a
+    // same-category mismatch is a warning, not a refusal.
+    const json arguments = fn.value("arguments", json(nullptr));
+    if (arguments.is_array()) {
+      int index = -1;
+      if (!dist_arg.empty() && dist_arg[0] == '$') {
+        try {
+          index = std::stoi(dist_arg.substr(1)) - 1;
+        } catch (const std::exception&) {
+          index = -1;
+        }
+        if (index < 0 || index >= static_cast<int>(arguments.size())) index = -1;
+      } else {
+        for (std::size_t i = 0; i < arguments.size(); ++i) {
+          if (arguments[i].value("name", json(nullptr)) == json(dist_arg)) {
+            index = static_cast<int>(i);
+            break;
+          }
+        }
+      }
+      if (index < 0) {
+        std::vector<std::string> names;
+        for (std::size_t i = 0; i < arguments.size(); ++i) {
+          const auto n = arguments[i].value("name", json(nullptr));
+          names.push_back((n.is_string() ? n.get<std::string>() + " " : "") + "$" +
+                          std::to_string(i + 1) + " " +
+                          arguments[i].value("type", "?"));
+        }
+        step.action = Action::kConflict;
+        step.why = "distribution_argument " + dist_arg + " is not an argument of " +
+                   qualified_fn;
+        plan.conflicts.push_back(
+            step.why + ". Its inputs are: " +
+            (names.empty() ? std::string("none") : detail::join(names, ", ")) +
+            ". Name one, or give its position as $n; Citus refuses anything else "
+            "(22023).");
+        return;
+      }
+      const auto& arg = arguments[static_cast<std::size_t>(index)];
+      const auto arg_oid = arg.value("type_oid", 0LL);
+      const auto want_oid = other.value("distribution_type_oid", 0LL);
+      if (arg_oid != 0 && want_oid != 0 && arg_oid != want_oid) {
+        const auto arg_cat = arg.value("category", "");
+        const auto want_cat = other.value("distribution_type_category", "");
+        const auto arg_type = arg.value("type", "?");
+        const auto want_type = other.value("distribution_type", "?");
+        if (!arg_cat.empty() && !want_cat.empty() && arg_cat != want_cat) {
+          step.action = Action::kConflict;
+          step.why = dist_arg + " is " + arg_type + ", and " + with +
+                     " is distributed on a " + want_type + " column";
+          plan.conflicts.push_back(
+              step.why + ". Citus ACCEPTS this distribution and then fails every "
+              "call to the function -- measured, \"Cannot coerce " + arg_type +
+              " to " + want_type + "\" -- because a routed call has to turn the "
+              "argument into the distribution column's type and there is no "
+              "implicit way to. Distribute on an argument of type " + want_type +
+              ", or colocate with a table distributed on " + arg_type + ".");
+          return;
+        }
+        plan.warnings.push_back(
+            dist_arg + " is " + arg_type + " and " + with + " is distributed on " +
+            want_type + ". Citus coerces within a type category -- measured, an "
+            "int argument on a bigint group is pushed down -- so this is expected "
+            "to route, but only int on bigint was measured.");
+      }
+      step.detail["distribution_argument_index"] = index + 1;
+      routed_index = index;
+    }
+  }
+
+  // ALREADY AS ASKED? Compared against the spec, not against "Citus lists it".
+  //
+  //   colocated: satisfied only when the function already routes on the SAME
+  //     argument in the SAME group. Anything else is re-applied, and that
+  //     converges: measured, calling create_distributed_function again on a
+  //     distributed function switches its argument, with no error.
+  //   not colocated: satisfied when Citus knows the function at all -- on
+  //     Citus 11+ propagation alone replicates it to every node, which is what
+  //     this form asks for.
+  if (!existing.is_null()) {
+    const auto have_index = existing.value("argument_index", json(nullptr));
+    const auto have_group = existing.value("colocationid", json(nullptr));
+    if (colocated) {
+      if (routed_index >= 0 && have_index.is_number() &&
+          have_index.get<int>() == routed_index && have_group.is_number() &&
+          have_group.get<long long>() == target_group) {
+        step.action = Action::kSatisfied;
+        step.why = signature + " already routes on " + dist_arg + " to the group of " +
+                   with;
+        return;
+      }
+      if (have_index.is_number()) {
+        plan.warnings.push_back(
+            signature + " is already distributed, routing on argument $" +
+            std::to_string(have_index.get<int>() + 1) + " in colocation group " +
+            (have_group.is_number() ? std::to_string(have_group.get<long long>())
+                                    : std::string("?")) +
+            "; this re-distributes it as the specification asks. Citus switches "
+            "an existing distribution without error, so calls route the new way "
+            "from the moment this commits.");
+      }
+    } else if (!have_index.is_number()) {
+      step.action = Action::kSatisfied;
+      step.why = signature + " is already replicated to every node";
+      return;
+    }
   }
 
   step.action = Action::kApply;

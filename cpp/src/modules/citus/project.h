@@ -27,6 +27,7 @@ inline void citus_project_distribute_table(const Intent& in,
                                           const Step& step, json& mine) {
   mine["tables"][qualified] = json{
       {"partmethod", "h"},
+      {"repmodel", "s"},
       {"distribution_column", in.body.value("distribution_column", "")},
       {"colocationid", 0},
       {"projected_by_step", step.ordinal}};
@@ -37,7 +38,10 @@ inline void citus_project_distribute_table(const Intent& in,
 inline void citus_project_reference_table(const Intent&,
                                          const std::string& qualified,
                                          const Step& step, json& mine) {
+  // repmodel 't' is what makes partmethod 'n' a REFERENCE table rather than a
+  // Citus-managed local one; readers tell the two apart by it.
   mine["tables"][qualified] = json{{"partmethod", "n"},
+                                  {"repmodel", "t"},
                                   {"distribution_column", ""},
                                   {"colocationid", 0},
                                   {"projected_by_step", step.ordinal}};

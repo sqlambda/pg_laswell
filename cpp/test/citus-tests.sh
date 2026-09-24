@@ -209,6 +209,58 @@ DELETE FROM laswell.step WHERE job_id IN (
 DELETE FROM laswell.job WHERE migration_id IN (
   SELECT migration_id FROM laswell.migration WHERE spec_id = '9990-ct-ref');
 DELETE FROM laswell.migration WHERE spec_id = '9990-ct-ref';"
+# THE §6 REFUSALS, each a Citus error found beforehand. Every expectation below
+# was measured against Citus 13 before the refusal was written.
+echo "citus: refusals before execution"
+q "CREATE TABLE ct.fa (tenant_id bigint NOT NULL, id bigint NOT NULL, other bigint,
+                       PRIMARY KEY (tenant_id, id))" >/dev/null
+q "CREATE TABLE ct.fb (tenant_id bigint NOT NULL, id bigint NOT NULL, other bigint,
+                       PRIMARY KEY (tenant_id, id))" >/dev/null
+q "CREATE TABLE ct.fc (tenant_id bigint NOT NULL, id bigint NOT NULL, other bigint,
+                       PRIMARY KEY (tenant_id, id))" >/dev/null
+q "SELECT create_distributed_table('ct.fa','tenant_id')" >/dev/null
+q "SELECT create_distributed_table('ct.fb','tenant_id', colocate_with => 'ct.fa')" >/dev/null
+q "SELECT create_distributed_table('ct.fc','tenant_id', colocate_with => 'none')" >/dev/null
+q "CREATE TABLE ct.fi (id int PRIMARY KEY)" >/dev/null
+
+fk_intent() {  # fk_intent <child> <cols> <parent> <refs>
+  echo "{\"kind\":\"add_foreign_key\",\"schema\":\"ct\",\"table\":\"$1\",\"name\":\"k_$1\",
+         \"columns\":$2,\"references_schema\":\"ct\",\"references_table\":\"$3\",
+         \"references_columns\":$4}"
+}
+expect_form "a foreign key between colocated tables, same ordinal" allow "" \
+  "$(fk_intent fb '["tenant_id","other"]' fa '["tenant_id","id"]')"
+expect_form "a foreign key between tables that are not colocated" refuse "not colocated" \
+  "$(fk_intent fc '["tenant_id","other"]' fa '["tenant_id","id"]')"
+expect_form "a foreign key pairing the distribution columns out of position" refuse "same position" \
+  "$(fk_intent fb '["other","tenant_id"]' fa '["tenant_id","id"]')"
+expect_form "a foreign key from a reference table to a distributed one" refuse "reference or local" \
+  "$(fk_intent ref '["id"]' fa '["tenant_id"]')"
+expect_form "colocating an int column with a bigint group" refuse "same type exactly" \
+  '{"kind":"citus_distribute_table","schema":"ct","table":"fi","distribution_column":"id","colocate_with":"ct.fa","comment":"x"}'
+
+# citus_distribute_function. On Citus 11+ every CREATE FUNCTION is propagated
+# and recorded in pg_dist_object, which the first reading took to mean "already
+# distributed" -- the kind reported satisfied for every function and routed
+# nothing. A function created a moment ago must plan an APPLY.
+q "CREATE OR REPLACE FUNCTION ct.fn(tid bigint) RETURNS bigint LANGUAGE plpgsql AS \$\$ BEGIN RETURN tid; END \$\$" >/dev/null
+q "CREATE OR REPLACE FUNCTION ct.fn_text(tid text) RETURNS bigint LANGUAGE plpgsql AS \$\$ BEGIN RETURN 1; END \$\$" >/dev/null
+fn_intent() {  # fn_intent <name> <arguments> <distribution_argument>
+  echo "{\"kind\":\"citus_distribute_function\",\"schema\":\"ct\",\"name\":\"$1\",
+         \"arguments\":\"$2\",\"distribution_argument\":\"$3\",
+         \"colocate_with\":\"ct.fa\",\"comment\":\"x\"}"
+}
+out=$(intent_plan "$(fn_intent fn bigint tid)")
+if echo "$out" | grep -q '"ok":true' && echo "$out" | grep -q '"action":"apply"'; then
+  ok "a function Citus merely knows about is distributed, not reported satisfied"
+else
+  bad "a propagated-only function should plan an apply" "$out"
+fi
+expect_form "a distribution argument the function does not have" refuse "is not an argument of" \
+  "$(fn_intent fn bigint nope)"
+expect_form "a text argument on a bigint group" refuse "every call" \
+  "$(fn_intent fn_text text tid)"
+
 # THE GROUPED WALK, through plain `backfill`.
 #
 # The author writes backfill whatever the server runs. Core asks the Citus

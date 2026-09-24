@@ -52,6 +52,29 @@ SELECT JSONB_BUILD_OBJECT(
                      CASE WHEN p.partkey IS NULL OR p.partkey = '' THEN NULL
                           ELSE column_to_column_name(p.logicalrelid, p.partkey)
                      END,
+                  -- The distribution column's TYPE, by oid, because Citus
+                  -- refuses to colocate two tables whose distribution columns
+                  -- differ in type -- EXACTLY, measured: int against bigint is
+                  -- refused as firmly as text against bigint ("Distribution
+                  -- column types don't match"). The category is what decides a
+                  -- distributed FUNCTION's argument, where Citus coerces
+                  -- within a category and fails every call across one.
+                  'distribution_type_oid',
+                     (SELECT a.atttypid::bigint FROM pg_attribute a
+                       WHERE a.attrelid = p.logicalrelid
+                         AND p.partkey IS NOT NULL AND p.partkey <> ''
+                         AND a.attname = column_to_column_name(p.logicalrelid, p.partkey)),
+                  'distribution_type',
+                     (SELECT format_type(a.atttypid, NULL) FROM pg_attribute a
+                       WHERE a.attrelid = p.logicalrelid
+                         AND p.partkey IS NOT NULL AND p.partkey <> ''
+                         AND a.attname = column_to_column_name(p.logicalrelid, p.partkey)),
+                  'distribution_type_category',
+                     (SELECT ty.typcategory::text FROM pg_attribute a
+                        JOIN pg_type ty ON ty.oid = a.atttypid
+                       WHERE a.attrelid = p.logicalrelid
+                         AND p.partkey IS NOT NULL AND p.partkey <> ''
+                         AND a.attname = column_to_column_name(p.logicalrelid, p.partkey)),
                   'colocationid', p.colocationid,
                   'repmodel', p.repmodel,
                   'shard_count', (SELECT cc.shardcount FROM pg_dist_colocation cc
@@ -65,12 +88,25 @@ SELECT JSONB_BUILD_OBJECT(
            JOIN pg_namespace n ON n.oid = c.relnamespace) AS t), '{}'::jsonb),
   -- Which functions are already distributed, so a second distribute_function is
   -- recognised as already done rather than attempted again.
-  'distributed_functions', COALESCE((
-     SELECT JSONB_AGG(DISTINCT n.nspname || '.' || pr.proname)
+  -- How each function Citus knows about is distributed. NOT a list of names:
+  -- that was the first version, and it made citus_distribute_function a silent
+  -- no-op. On Citus 11+ every CREATE FUNCTION is propagated to the workers and
+  -- recorded in pg_dist_object with NO distribution argument and NO colocation
+  -- -- measured, a function created a moment earlier and never distributed was
+  -- listed -- so "is it in pg_dist_object" answered yes for every function and
+  -- the kind reported "already distributed" without routing anything.
+  --
+  -- argument_index is 0-based, as Citus stores it; null means the function is
+  -- replicated to every node but calls to it are not routed.
+  'function_distribution', COALESCE((
+     SELECT JSONB_OBJECT_AGG(n.nspname || '.' || pr.proname,
+              JSONB_BUILD_OBJECT(
+                'argument_index', o.distribution_argument_index,
+                'colocationid', o.colocationid))
        FROM pg_dist_object o
        JOIN pg_proc pr ON pr.oid = o.objid
        JOIN pg_namespace n ON n.oid = pr.pronamespace
-      WHERE o.classid = 'pg_proc'::regclass), '[]'::jsonb),
+      WHERE o.classid = 'pg_proc'::regclass), '{}'::jsonb),
   -- WHICH CALLS THIS CITUS ACTUALLY HAS, which is a fact rather than a version
   -- comparison. CITUS.md suggests gating on citus_version() against a
   -- remembered minimum -- believed 11.1 for the concurrent form -- but a
