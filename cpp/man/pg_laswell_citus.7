@@ -310,8 +310,10 @@ They name nodes, and a node exists on one cluster only:
 on staging is not a host anywhere else.
 A specification that uses them describes that topology and is bound to the
 clusters it exists on.
+.Cm citus_ensure_workers
+takes its hosts from the configuration instead, and
 .Cm citus_rebalance_shards
-names nothing and runs on any cluster.
+names nothing: both run on any cluster.
 .Pp
 Each takes
 .Va host
@@ -332,6 +334,73 @@ A signed specification naming a shard would mean a different shard, or none, on
 every other target.
 Draining and rebalancing say what is wanted and leave the choice of shards to
 Citus.
+.Ss Cm citus_ensure_workers
+Make the cluster's workers the ones this connection's configuration lists, so a
+specification says
+.Em what
+the cluster should be and names no host.
+The same signed file then adds three workers on a staging cluster and twelve in
+production:
+.Bd -literal -offset indent
+{ "kind": "citus_ensure_workers",
+  "hosts_matching": "*.citus.internal",
+  "min_workers": 2 }
+.Ed
+.Pp
+The list comes from
+.Va citus.workers
+in the connection's section of the configuration file, a comma-separated list of
+.Ar host
+or
+.Ar host : Ns Ar port
+(port 5432 by default); see
+.Sx CONFIGURATION
+in
+.Xr pg_laswell_mcp 1 .
+A connection with none is refused, saying where to put it.
+.Pp
+Optional:
+.Va hosts_matching ,
+.Va min_workers ,
+.Va max_workers ,
+.Va unlisted ,
+.Va comment .
+.Bl -tag -width Ds
+.It Va hosts_matching
+A glob that every configured host must match, with
+.Ql *
+for any run of characters and
+.Ql \&?
+for one, and nothing else.
+.It Va min_workers Ns / Ns Va max_workers
+Bounds on how many workers the configuration may list.
+.It Va unlisted
+What happens to a registered worker the configuration does not list:
+.Cm keep
+(the default) leaves it and warns,
+.Cm refuse
+stops the plan, and
+.Cm remove
+removes it, which is refused while it still holds shards of a distributed table.
+.El
+.Pp
+.Sy The bounds are the reason to sign this kind rather than trust the file.
+The configuration is not signed, and a worker receives shards of the data, so
+without them whoever can edit the configuration decides which machines hold it.
+A configured host outside
+.Va hosts_matching ,
+or a count outside the bounds, is refused, not warned.
+.Pp
+Satisfied when every configured worker is registered and active and nothing is
+to be removed.
+Each worker is added with
+.Fn citus_add_node ,
+which connects to it, and the dry run executes the call, so an unreachable
+configured host is reported before the migration.
+Refused when the list names the coordinator, a host twice, or a worker that is
+registered and inactive.
+New workers hold no shards until the cluster is rebalanced, in a later
+specification.
 .Ss Cm citus_add_node
 Add a worker.
 Like every kind that names a node, it is bound to the clusters where that host
@@ -607,6 +676,15 @@ Undistributing, or adding to metadata, one end of a foreign key without
 Truncating local data that would cascade into a table's real rows.
 .It
 Removing a node that holds shards, or the coordinator.
+.It
+Configured workers outside the specification's
+.Va hosts_matching ,
+.Va min_workers
+or
+.Va max_workers ,
+or a connection with no
+.Va citus.workers
+at all.
 .It
 Draining a node when no other node may hold shards.
 .It

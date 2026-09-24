@@ -1349,6 +1349,32 @@ TEST(Config, AnUnknownExecutorKeyIsRefusedRatherThanIgnored) {
   EXPECT_NE(err.find("unknown key batch_row"), std::string::npos) << err;
 }
 
+TEST(Config, AModuleSettingBelongsToItsConnectionAndNeedsItsModule) {
+  // `citus.workers` in a connection section is that connection's, so one
+  // configuration can give staging three workers and production twelve while
+  // the signed specification names none of them.
+  const std::string body =
+      "[staging]\nhost = s\ncitus.workers = w1:5432, w2\n"
+      "[prod]\nhost = p\ncitus.workers = a, b, c\n";
+  if (pglaswell::detail::module_compiled_in("citus")) {
+    TempIni ini(body);
+    const auto r = pglaswell::Registry::from_ini(ini.path(), "t");
+    EXPECT_EQ(r.get("staging").executor.module_settings.at("citus.workers"),
+              "w1:5432, w2");
+    EXPECT_EQ(r.get("prod").executor.module_settings.at("citus.workers"), "a, b, c");
+    // Never passed to libpq, which would refuse the whole string at connect.
+    EXPECT_EQ(r.get("staging").conninfo.find("citus"), std::string::npos);
+  } else {
+    // A setting nothing reads would look configured and do nothing.
+    const auto err = config_error(body);
+    EXPECT_NE(err.find("no citus module"), std::string::npos) << err;
+  }
+  // A module no build has is refused either way, naming the line's section.
+  const auto err = config_error("[a]\nhost = x\nacme.nodes = n1\n");
+  EXPECT_NE(err.find("no acme module"), std::string::npos) << err;
+  EXPECT_NE(err.find("[a]"), std::string::npos) << err;
+}
+
 TEST(Config, ATrailingCommaInAListIsATypoNotAnEmptyEntry) {
   const auto err = config_error("[trust]\naccept = a, \n[a]\nhost=x\n");
   EXPECT_NE(err.find("empty entry"), std::string::npos) << err;

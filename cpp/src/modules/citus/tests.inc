@@ -45,6 +45,8 @@ PGLASWELL_DEFERRED_CASE("citus_drain_node",
     "needs a Citus cluster with two workers, one to drain onto the other")
 PGLASWELL_DEFERRED_CASE("citus_rebalance_shards",
     "needs a Citus cluster with two workers and shards out of balance")
+PGLASWELL_DEFERRED_CASE("citus_ensure_workers",
+    "needs a Citus cluster and a configuration naming its workers")
 #endif
 
 #ifdef PGLASWELL_KIND_BODY
@@ -82,4 +84,6 @@ PGLASWELL_KIND_BODY("citus_drain_node",
   R"({"kind":"citus_drain_node","host":"worker3"})")
 PGLASWELL_KIND_BODY("citus_rebalance_shards",
   R"({"kind":"citus_rebalance_shards"})")
+PGLASWELL_KIND_BODY("citus_ensure_workers",
+  R"({"kind":"citus_ensure_workers","hosts_matching":"worker*"})")
 #endif

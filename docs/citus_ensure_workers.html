@@ -1,6 +1,6 @@
 <!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>citus_undistribute_table — pg_laswell</title>
+<title>citus_ensure_workers — pg_laswell</title>
 <style>
 :root{--fg:#333;--bg:#fff;--muted:#666;--rule:#ddd;--link:#0066a4;
       --code-bg:#f7f7f7;--code-rule:#e0e0e0;--req:#a33;--accent:#0e6ba8;
@@ -70,32 +70,36 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
  --dd:#c2c2c2;--req-bg:#3a2526;--req-rule:#573537;--opt-bg:#1d2a33;
  --opt-rule:#2b3f4d;--note-bg:#1a2126;--warn-bg:#2a2119}
 </style></head><body><div class="wrap">
-<nav class="crumb"><div class="l"><a href="index.html">Intent kinds</a><span>Module: citus</span></div><div class="r"><a href="citus_alter_distributed_table.html">← citus_alter_distributed_table</a><a href="citus_add_local_table_to_metadata.html">citus_add_local_table_to_metadata →</a></div></nav>
-<h1><code>citus_undistribute_table</code></h1>
+<nav class="crumb"><div class="l"><a href="index.html">Intent kinds</a><span>Module: citus</span></div><div class="r"><a href="citus_rebalance_shards.html">← citus_rebalance_shards</a></div></nav>
+<h1><code>citus_ensure_workers</code></h1>
 <p class="purpose"><strong>A citus module kind.</strong> Known only to a binary built with <code>-DPGLASWELL_MODULES=citus</code> -- <code>--version</code> then prints <code>modules: citus</code>. A PostgreSQL-only build refuses it as an unknown kind, and with it the whole specification. See <code>pg_laswell_citus(7)</code>.</p>
-<p class="purpose">Turn a Citus table back into an ordinary one: its data is gathered back onto the coordinator.</p>
+<p class="purpose">The cluster&#x27;s workers are whatever THIS CONNECTION&#x27;s configuration says they are: <code>citus.workers = worker1:5432, worker2</code> in its section.</p>
 <h2>Synopsis</h2><pre>{
-  &quot;kind&quot;: &quot;citus_undistribute_table&quot;,
-  &quot;schema&quot;: &lt;required&gt;,
-  &quot;table&quot;: &lt;required&gt;,
-  &quot;cascade_via_foreign_keys&quot;: &lt;optional&gt;,
+  &quot;kind&quot;: &quot;citus_ensure_workers&quot;,
+  &quot;hosts_matching&quot;: &lt;optional&gt;,
+  &quot;min_workers&quot;: &lt;optional&gt;,
+  &quot;max_workers&quot;: &lt;optional&gt;,
+  &quot;unlisted&quot;: &quot;keep&quot; | &quot;refuse&quot; | &quot;remove&quot;,
   &quot;comment&quot;: &lt;optional&gt;
 }</pre>
 <h2>Description</h2>
-<p>Turn a Citus table back into an ordinary one: its data is gathered back onto the coordinator.</p>
+<p>The cluster&#x27;s workers are whatever THIS CONNECTION&#x27;s configuration says they are: <code>citus.workers = worker1:5432, worker2</code> in its section. The specification signs the intent and names no host, so the same bytes run on a staging cluster of three workers and a production one of twelve — the configuration supplies where, the signature covers what. Suggested from pgshard, which runs clusters of 2 to 6 workers from one repository and could otherwise only express that with one epoch per possible worker count.</p>
+<p>Because the addresses come from an UNSIGNED file, the specification can bound them: hosts_matching (a glob every configured host must match) and min_workers / max_workers. Without those, whoever can edit the configuration decides which machines receive shards of the data.</p>
 <h2>Parameters</h2><dl class="params">
-<dt>schema<span class="tag req">required</span></dt>
+<dt>hosts_matching<span class="tag opt">optional</span></dt>
+<dd>* matches any run of characters and ? one; nothing else is special. Every host in citus.workers must match it.</dd>
+<dt>min_workers<span class="tag opt">optional</span></dt>
 <dd>&nbsp;</dd>
-<dt>table<span class="tag req">required</span></dt>
+<dt>max_workers<span class="tag opt">optional</span></dt>
 <dd>&nbsp;</dd>
-<dt>cascade_via_foreign_keys<span class="tag opt">optional</span></dt>
-<dd>&nbsp;</dd>
+<dt>unlisted<span class="tag opt">optional</span></dt>
+<dd>One of <code>keep</code>, <code>refuse</code>, <code>remove</code>. What to do with a registered worker the configuration does not list. keep (the default) leaves it and says so; refuse stops the plan; remove takes it out of the cluster, and only once it holds no shards.</dd>
 <dt>comment<span class="tag opt">optional</span></dt>
 <dd>&nbsp;</dd>
 </dl>
 <div class="note">Any key not listed here is <strong>refused</strong>, not ignored: a key this binary skips and a newer one honours would be a silent difference between what was reviewed and what ran.</div>
 <h2>Examples</h2>
-<div class="note warn">No single-database example: needs a Citus cluster with a distributed table to gather back. This kind is covered by <code>cpp/test/replication-tests.sh</code>, which builds two clusters.</div>
-<h2>See also</h2><p><a href="citus_distribute_table.html"><code>citus_distribute_table</code></a>, <a href="citus_create_reference_table.html"><code>citus_create_reference_table</code></a>, <a href="citus_distribute_function.html"><code>citus_distribute_function</code></a>, <a href="citus_alter_distributed_table.html"><code>citus_alter_distributed_table</code></a>, <a href="citus_add_local_table_to_metadata.html"><code>citus_add_local_table_to_metadata</code></a>, <a href="citus_truncate_local_data.html"><code>citus_truncate_local_data</code></a>, <a href="citus_add_node.html"><code>citus_add_node</code></a>, <a href="citus_remove_node.html"><code>citus_remove_node</code></a>, <a href="citus_set_coordinator_host.html"><code>citus_set_coordinator_host</code></a>, <a href="citus_set_node_property.html"><code>citus_set_node_property</code></a>, <a href="citus_drain_node.html"><code>citus_drain_node</code></a>, <a href="citus_rebalance_shards.html"><code>citus_rebalance_shards</code></a>, <a href="citus_ensure_workers.html"><code>citus_ensure_workers</code></a></p>
+<div class="note warn">No single-database example: needs a Citus cluster and a configuration naming its workers. This kind is covered by <code>cpp/test/replication-tests.sh</code>, which builds two clusters.</div>
+<h2>See also</h2><p><a href="citus_distribute_table.html"><code>citus_distribute_table</code></a>, <a href="citus_create_reference_table.html"><code>citus_create_reference_table</code></a>, <a href="citus_distribute_function.html"><code>citus_distribute_function</code></a>, <a href="citus_alter_distributed_table.html"><code>citus_alter_distributed_table</code></a>, <a href="citus_undistribute_table.html"><code>citus_undistribute_table</code></a>, <a href="citus_add_local_table_to_metadata.html"><code>citus_add_local_table_to_metadata</code></a>, <a href="citus_truncate_local_data.html"><code>citus_truncate_local_data</code></a>, <a href="citus_add_node.html"><code>citus_add_node</code></a>, <a href="citus_remove_node.html"><code>citus_remove_node</code></a>, <a href="citus_set_coordinator_host.html"><code>citus_set_coordinator_host</code></a>, <a href="citus_set_node_property.html"><code>citus_set_node_property</code></a>, <a href="citus_drain_node.html"><code>citus_drain_node</code></a>, <a href="citus_rebalance_shards.html"><code>citus_rebalance_shards</code></a></p>
 <footer>Generated from <code>cpp/src/spec.h</code> and <code>cpp/src/conformance.inc</code> by <code>tools/gen-manual.py</code>. The manual page <code>pg_laswell_mcp(1)</code> remains the authoritative reference for everything that is not a per-kind option.</footer>
 </div></body></html>

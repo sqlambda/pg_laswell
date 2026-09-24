@@ -521,6 +521,52 @@ else
   bad "the drain's dry run changed the cluster or did not plan (may_hold=$(may_hold worker2))" "$out"
 fi
 
+# WORKERS FROM THE CONFIGURATION. One signed intent, and the connection's
+# configuration says which hosts are its workers -- so the case is run with a
+# configuration file, the only place citus.workers can live.
+workers_plan() {  # workers_plan <citus.workers> <intent>
+  local ini; ini=$(mktemp); chmod 600 "$ini"
+  python3 - "$CITUS_URL" "$1" > "$ini" <<'PY'
+import sys, urllib.parse as u
+p = u.urlparse(sys.argv[1])
+print("[citus]")
+print(f"host = {p.hostname}\nport = {p.port or 5432}\n"
+      f"dbname = {p.path.lstrip('/')}\nuser = {p.username}")
+if p.password: print(f"password = {p.password}")
+print(f"citus.workers = {sys.argv[2]}")
+PY
+  "$MCP" --config "$ini" --call planMigration --args "{\"spec\":{\"laswell_spec_version\":1,
+     \"id\":\"ct-workers\",\"description\":\"workers from config\",\"intents\":[$2]},
+     \"skipTrustChecks\":true}" 2>&1
+  rm -f "$ini"
+}
+ensure='{"kind":"citus_ensure_workers","hosts_matching":"worker*"}'
+out=$(workers_plan "worker1:5432, worker2:5432" "$ensure")
+if echo "$out" | grep -q '"ok":true' && echo "$out" | grep -q '"action":"satisfied"'; then
+  ok "the configured workers are the cluster's, so ensure_workers is satisfied"
+else
+  bad "ensure_workers should be satisfied by the configured workers" "$out"
+fi
+# Within the signed bounds and unreachable: found by the dry run, which executes
+# citus_add_node inside the transaction it rolls back.
+out=$(workers_plan "worker1, worker2, worker-laswell-no-such-host" "$ensure")
+if echo "$out" | grep -q '"problems"' && echo "$out" | grep -q 'worker-laswell-no-such-host'; then
+  ok "a configured worker that cannot be reached is found by the dry run"
+else
+  bad "the dry run should report the unreachable configured worker" "$out"
+fi
+out=$(workers_plan "worker1, worker2, elsewhere.example" "$ensure")
+if echo "$out" | grep -q '"ok":false' && echo "$out" | grep -q 'outside hosts_matching'; then
+  ok "a configured host outside the signed hosts_matching is refused"
+else
+  bad "a host outside hosts_matching should be refused" "$out"
+fi
+if [ "$(q "SELECT count(*) FROM pg_dist_node WHERE nodename LIKE '%laswell-no-such-host%'")" = 0 ]; then
+  ok "and nothing the dry runs added was left behind"
+else
+  bad "a dry run left a node registered" "$(q "SELECT nodename FROM pg_dist_node")"
+fi
+
 # And for real, through the executor: drain worker2, then let it hold shards
 # again and rebalance. Separate specifications, because an intent reads the
 # topology as it was when its specification was planned -- and the drain is run

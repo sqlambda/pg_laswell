@@ -1529,3 +1529,233 @@ inline void plan_citus_rebalance_shards(const Intent& in, const Observations& ob
       "moves listed are the plan at the time of reading; Citus decides again "
       "when it runs.");
 }
+
+// A glob with * and ?, nothing else -- enough to say "*.citus.internal" or
+// "10.20.30.*", and small enough to read. Written here rather than taken from
+// <fnmatch.h> because this header is included inside namespace pglaswell,
+// where a system header cannot go.
+inline bool citus_glob(const std::string& pat, const std::string& s) {
+  std::size_t p = 0, i = 0, star = std::string::npos, mark = 0;
+  while (i < s.size()) {
+    if (p < pat.size() && (pat[p] == '?' || pat[p] == s[i])) {
+      ++p; ++i;
+    } else if (p < pat.size() && pat[p] == '*') {
+      star = p++; mark = i;
+    } else if (star != std::string::npos) {
+      p = star + 1; i = ++mark;
+    } else {
+      return false;
+    }
+  }
+  while (p < pat.size() && pat[p] == '*') ++p;
+  return p == pat.size();
+}
+
+inline void plan_citus_ensure_workers(const Intent& in, const Observations& obs,
+                                      const ExecutorConfig& cfg, Plan& plan,
+                                      std::vector<Step>& out) {
+  Step step;
+  step.kind = in.kind_name;
+  struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
+  const auto& citus = obs.extension("citus");
+  if (!citus_present(in, step, plan, citus)) return;
+
+  const auto refuse = [&](const std::string& why, const std::string& more) {
+    step.action = Action::kConflict;
+    step.why = why;
+    plan.conflicts.push_back(why + ". " + more);
+  };
+
+  // WHICH WORKERS: from this connection's configuration, never from the spec.
+  const auto it = cfg.module_settings.find("citus.workers");
+  if (it == cfg.module_settings.end() || detail::trim(it->second).empty()) {
+    refuse("this connection's configuration lists no citus.workers",
+           "The specification says the cluster's workers are the configured "
+           "set, and there is no set: add `citus.workers = host1:5432, host2` "
+           "to this connection's section of the configuration file. With only "
+           "a connection URL there is no section to put it in.");
+    return;
+  }
+  struct Worker { std::string host; int port; };
+  std::vector<Worker> want;
+  std::vector<std::string> bad;
+  {
+    const auto& raw = it->second;
+    std::size_t start = 0;
+    while (start <= raw.size()) {
+      const auto comma = raw.find(',', start);
+      const auto item = detail::trim(raw.substr(
+          start, comma == std::string::npos ? std::string::npos : comma - start));
+      start = comma == std::string::npos ? raw.size() + 1 : comma + 1;
+      if (item.empty()) { bad.push_back("(an empty entry)"); continue; }
+      std::string host = item;
+      int port = 5432;
+      if (const auto colon = item.rfind(':'); colon != std::string::npos) {
+        host = item.substr(0, colon);
+        try {
+          std::size_t used = 0;
+          port = std::stoi(item.substr(colon + 1), &used);
+          if (used != item.size() - colon - 1 || port <= 0 || port > 65535) port = -1;
+        } catch (const std::exception&) {
+          port = -1;
+        }
+      }
+      if (host.empty() || port < 0 ||
+          host.find_first_of(" \t'\"") != std::string::npos) {
+        bad.push_back(item);
+        continue;
+      }
+      want.push_back({host, port});
+    }
+  }
+  if (!bad.empty()) {
+    refuse("citus.workers has entries that are not host or host:port: " +
+               detail::join(bad, ", "),
+           "Write it as a comma-separated list, e.g. `citus.workers = "
+           "worker1:5432, worker2`; the port defaults to 5432.");
+    return;
+  }
+  std::vector<std::string> names;
+  for (const auto& w : want) {
+    const auto n = w.host + ":" + std::to_string(w.port);
+    if (std::find(names.begin(), names.end(), n) != names.end()) {
+      refuse("citus.workers lists " + n + " twice",
+             "A duplicate is almost always a copy-paste of the wrong line; "
+             "the other host it was meant to be is then missing.");
+      return;
+    }
+    names.push_back(n);
+  }
+  step.detail["configured"] = names;
+  step.detail["source"] = "citus.workers in this connection's configuration";
+
+  // THE SIGNED BOUNDS on the unsigned list.
+  if (in.body.contains("hosts_matching")) {
+    const auto glob = in.body.value("hosts_matching", "");
+    std::vector<std::string> outside;
+    for (const auto& w : want) {
+      if (!citus_glob(glob, w.host)) outside.push_back(w.host);
+    }
+    if (!outside.empty()) {
+      refuse("citus.workers names " + detail::join(outside, ", ") +
+                 ", outside hosts_matching \"" + glob + "\"",
+             "The specification limits which hosts may become workers, and "
+             "the configuration names one it does not allow. A worker receives "
+             "shards of the data, so this is refused rather than warned: fix "
+             "the configuration, or sign a specification that allows it.");
+      return;
+    }
+  }
+  const int n = static_cast<int>(want.size());
+  if (in.body.contains("min_workers") && n < in.body["min_workers"].get<int>()) {
+    refuse("citus.workers lists " + std::to_string(n) + " workers, fewer than "
+               "min_workers " + std::to_string(in.body["min_workers"].get<int>()),
+           "The specification sets a floor, and this configuration is under it.");
+    return;
+  }
+  if (in.body.contains("max_workers") && n > in.body["max_workers"].get<int>()) {
+    refuse("citus.workers lists " + std::to_string(n) + " workers, more than "
+               "max_workers " + std::to_string(in.body["max_workers"].get<int>()),
+           "The specification sets a ceiling, and this configuration is over it.");
+    return;
+  }
+
+  // AGAINST THE CLUSTER.
+  const auto nodes = citus.value("nodes", json::array());
+  std::vector<std::string> add_sql, adding, removing, remove_sql, unlisted;
+  for (const auto& w : want) {
+    const auto name = w.host + ":" + std::to_string(w.port);
+    const json* found = nullptr;
+    for (const auto& nd : nodes) {
+      if (nd.value("nodename", "") == w.host && nd.value("nodeport", 0) == w.port) {
+        found = &nd;
+      }
+    }
+    if (found == nullptr) {
+      adding.push_back(name);
+      add_sql.push_back("SELECT citus_add_node(" + detail::quote_literal(w.host) +
+                        ", " + std::to_string(w.port) + ");");
+      continue;
+    }
+    if (found->value("groupid", -1) == 0) {
+      refuse("citus.workers lists " + name + ", which is the coordinator",
+             "The coordinator is registered separately (citus_set_coordinator_host); "
+             "listing it as a worker is a mistake in the configuration.");
+      return;
+    }
+    if (!found->value("isactive", true)) {
+      refuse(name + " is registered and inactive",
+             "Adding it again does not activate it; that is citus_activate_node, "
+             "and a node that was disabled usually was for a reason someone "
+             "should read first.");
+      return;
+    }
+  }
+  const auto policy = in.body.value("unlisted", "keep");
+  for (const auto& nd : nodes) {
+    if (nd.value("groupid", -1) == 0 || nd.value("noderole", "") != "primary") continue;
+    const auto name = nd.value("nodename", "") + ":" +
+                      std::to_string(nd.value("nodeport", 0));
+    if (std::find(names.begin(), names.end(), name) != names.end()) continue;
+    unlisted.push_back(name);
+    if (policy == "remove") {
+      const auto placements = nd.value("placements", 0LL);
+      if (placements > 0) {
+        refuse(name + " is not in citus.workers and holds " +
+                   std::to_string(placements) + " shard placements",
+               "unlisted: remove takes out only a worker that holds no shards. "
+               "Drain it first with citus_drain_node, in an earlier "
+               "specification.");
+        return;
+      }
+      removing.push_back(name);
+      remove_sql.push_back("SELECT citus_remove_node(" +
+                           detail::quote_literal(nd.value("nodename", "")) + ", " +
+                           std::to_string(nd.value("nodeport", 0)) + ");");
+    }
+  }
+  if (!unlisted.empty() && policy == "refuse") {
+    refuse("registered workers are not in citus.workers: " +
+               detail::join(unlisted, ", "),
+           "unlisted: refuse asks for the cluster to be exactly the configured "
+           "set. Add them to the configuration, or drain and remove them.");
+    return;
+  }
+  if (!unlisted.empty() && policy == "keep") {
+    plan.warnings.push_back(
+        "Registered workers not in citus.workers are kept: " +
+        detail::join(unlisted, ", ") +
+        ". Write unlisted: refuse to make that an error, or unlisted: remove to "
+        "take out the ones that hold no shards.");
+    step.detail["kept_unlisted"] = unlisted;
+  }
+
+  if (adding.empty() && removing.empty()) {
+    step.action = Action::kSatisfied;
+    step.why = "the cluster's workers are the " + std::to_string(n) +
+               " configured for this connection";
+    return;
+  }
+  step.action = Action::kApply;
+  step.txn_class = TxnClass::kRequired;
+  // Rehearsed by execution: both calls roll back cleanly (measured), and
+  // citus_add_node connects to the node as it runs, so an unreachable
+  // configured host is reported by the dry run, not the migration.
+  step.detail["rehearse_by"] = "execution";
+  if (!adding.empty()) step.detail["adding"] = adding;
+  if (!removing.empty()) step.detail["removing"] = removing;
+  step.lock = "no table lock: cluster metadata, propagated to every node";
+  std::vector<std::string> what;
+  if (!adding.empty()) what.push_back("adds " + detail::join(adding, ", "));
+  if (!removing.empty()) what.push_back("removes " + detail::join(removing, ", "));
+  step.why = detail::join(what, "; ") + ", so the workers are the " +
+             std::to_string(n) + " configured for this connection";
+  for (const auto& q : add_sql) step.sql.push_back(q);
+  for (const auto& q : remove_sql) step.sql.push_back(q);
+  if (!adding.empty()) {
+    plan.warnings.push_back(
+        "New workers hold no shards until the cluster is rebalanced -- "
+        "citus_rebalance_shards, in a LATER specification: this one's reading "
+        "was taken before they joined.");
+  }
+}

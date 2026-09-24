@@ -25,3 +25,7 @@ PGLASWELL_KIND(citus_set_coordinator_host,           kCitusSetCoordinatorHost,  
 PGLASWELL_KIND(citus_set_node_property,              kCitusSetNodeProperty,             parse_citus_set_node_property,              plan_citus_set_node_property)
 PGLASWELL_KIND(citus_drain_node,                     kCitusDrainNode,                   parse_citus_drain_node,                     plan_citus_drain_node)
 PGLASWELL_KIND(citus_rebalance_shards,               kCitusRebalanceShards,             parse_citus_rebalance_shards,               plan_citus_rebalance_shards)
+//
+// The workers named by the connection's configuration, not by the
+// specification: one signed file for clusters of any size. See parse.h.
+PGLASWELL_KIND(citus_ensure_workers,                 kCitusEnsureWorkers,               parse_citus_ensure_workers,                 plan_citus_ensure_workers)

@@ -1957,6 +1957,29 @@ at or above
 .Va pause_waiters
 would make the breaker flap, and is refused when the file is read rather than
 discovered during a migration.
+.Pp
+A key with a dot in a connection section is a
+.Em module setting
+for that connection:
+.Va citus.workers
+belongs to the Citus module.
+It is refused when the file is read if this binary has no module of that name,
+because a setting nothing reads would look configured and do nothing.
+Module settings describe the target, not the change, so they are the place for
+what differs between clusters that run the same signed specifications:
+.Bd -literal -offset indent
+[staging]
+service       = shop-staging
+citus.workers = st-w1, st-w2, st-w3
+
+[production]
+service       = shop-prod
+citus.workers = pr-w1, pr-w2, pr-w3, pr-w4, pr-w5, pr-w6
+.Ed
+.Pp
+See
+.Xr pg_laswell_citus 7 ,
+.Cm citus_ensure_workers .
 .Ss The connection budget
 .Va app_pool_size
 is the application's own connection-pool limit.

@@ -326,3 +326,53 @@ inline void parse_citus_rebalance_shards(Intent& in) {
   detail::reject_unknown_keys(in.body, {"kind", "transfer_mode", "comment"}, at);
   citus_parse_transfer_mode(in, at);
 }
+
+// The cluster's workers are whatever THIS CONNECTION's configuration says they
+// are: `citus.workers = worker1:5432, worker2` in its section. The specification
+// signs the intent and names no host, so the same bytes run on a staging
+// cluster of three workers and a production one of twelve -- the configuration
+// supplies where, the signature covers what. Suggested from pgshard, which runs
+// clusters of 2 to 6 workers from one repository and could otherwise only
+// express that with one epoch per possible worker count.
+//
+// Because the addresses come from an UNSIGNED file, the specification can bound
+// them: hosts_matching (a glob every configured host must match) and
+// min_workers / max_workers. Without those, whoever can edit the configuration
+// decides which machines receive shards of the data.
+inline void parse_citus_ensure_workers(Intent& in) {
+  const auto at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(
+      in.body,
+      {"kind", "hosts_matching", "min_workers", "max_workers", "unlisted",
+       "comment"},
+      at);
+  // Optional, so checked for type without require_string: the reference
+  // generator reads a require_* call as "required", which this key is not.
+  if (in.body.contains("hosts_matching") &&
+      (!in.body["hosts_matching"].is_string() ||
+       in.body["hosts_matching"].get<std::string>().empty())) {
+    detail::fail(at + ".hosts_matching must be a non-empty glob",
+                 "* matches any run of characters and ? one; nothing else is "
+                 "special. Every host in citus.workers must match it.");
+  }
+  for (const char* k : {"min_workers", "max_workers"}) {
+    if (in.body.contains(k) && (!in.body[k].is_number_integer() ||
+                                in.body[k].get<int>() < 1)) {
+      detail::fail(at + "." + k + " must be a positive integer", "");
+    }
+  }
+  if (in.body.contains("min_workers") && in.body.contains("max_workers") &&
+      in.body["min_workers"].get<int>() > in.body["max_workers"].get<int>()) {
+    detail::fail(at + ".min_workers is greater than max_workers", "");
+  }
+  if (in.body.contains("unlisted")) {
+    const auto u = in.body.value("unlisted", "");
+    if (u != "keep" && u != "refuse" && u != "remove") {
+      detail::fail(at + ".unlisted must be \"keep\", \"refuse\" or \"remove\"",
+                   "What to do with a registered worker the configuration does "
+                   "not list. keep (the default) leaves it and says so; refuse "
+                   "stops the plan; remove takes it out of the cluster, and only "
+                   "once it holds no shards.");
+    }
+  }
+}

@@ -1308,3 +1308,111 @@ TEST(CitusPlanner, TopologyArgumentsAreCheckedAtParse) {
   EXPECT_ANY_THROW(pglaswell::parse_spec(citus_spec(
       json{{"kind", "citus_move_shard_placement"}, {"shard_id", 102141}})));
 }
+
+// --- Workers from the configuration -----------------------------------------
+
+namespace {
+pglaswell::Plan plan_workers(const json& intent, json c, const std::string& workers) {
+  const auto spec = pglaswell::parse_spec(citus_spec(intent));
+  pglaswell::ExecutorConfig cfg;
+  if (!workers.empty()) cfg.module_settings["citus.workers"] = workers;
+  return pglaswell::plan_migration(spec, citus_observations(std::move(c), json::object()),
+                                   cfg);
+}
+const json kEnsure{{"kind", "citus_ensure_workers"}};
+}  // namespace
+
+TEST(CitusPlanner, TheSameSpecificationAddsWhateverThisConnectionConfigures) {
+  // The point of the kind: identical bytes, and the configuration of the
+  // connection decides how many workers that is.
+  const auto staging = plan_workers(kEnsure, cluster(), "worker1, worker2, worker3");
+  ASSERT_TRUE(staging.ok) << first_conflict(staging);
+  ASSERT_EQ(staging.steps[0].sql.size(), 1u);
+  EXPECT_EQ(staging.steps[0].sql[0], "SELECT citus_add_node('worker3', 5432);");
+  EXPECT_EQ(staging.steps[0].detail.value("rehearse_by", ""), "execution");
+
+  const auto prod = plan_workers(
+      kEnsure, cluster(), "worker1, worker2, w3:5433, w4:5433, w5:5433");
+  ASSERT_TRUE(prod.ok) << first_conflict(prod);
+  EXPECT_EQ(prod.steps[0].sql.size(), 3u);
+
+  const auto done = plan_workers(kEnsure, cluster(), "worker1:5432, worker2");
+  ASSERT_TRUE(done.ok);
+  EXPECT_EQ(done.steps[0].action, pglaswell::Action::kSatisfied);
+}
+
+TEST(CitusPlanner, WithoutConfiguredWorkersTheKindSaysWhereToPutThem) {
+  const auto p = plan_workers(kEnsure, cluster(), "");
+  EXPECT_FALSE(p.ok);
+  EXPECT_TRUE(conflicts_mention(p, "citus.workers")) << first_conflict(p);
+}
+
+TEST(CitusPlanner, TheSignedBoundsLimitWhatTheConfigurationMaySupply) {
+  // The configuration is unsigned; a worker receives shards of the data.
+  const json bounded{{"kind", "citus_ensure_workers"},
+                     {"hosts_matching", "worker*"}, {"max_workers", 3}};
+  EXPECT_TRUE(plan_workers(bounded, cluster(), "worker1, worker2, worker3").ok);
+  const auto rogue = plan_workers(bounded, cluster(), "worker1, worker2, evil.example");
+  EXPECT_FALSE(rogue.ok);
+  EXPECT_TRUE(conflicts_mention(rogue, "evil.example")) << first_conflict(rogue);
+  const auto many = plan_workers(bounded, cluster(), "worker1, worker2, worker3, worker4");
+  EXPECT_FALSE(many.ok);
+  EXPECT_TRUE(conflicts_mention(many, "max_workers")) << first_conflict(many);
+  const auto few = plan_workers(
+      json{{"kind", "citus_ensure_workers"}, {"min_workers", 3}}, cluster(),
+      "worker1, worker2");
+  EXPECT_FALSE(few.ok);
+  EXPECT_TRUE(conflicts_mention(few, "min_workers")) << first_conflict(few);
+}
+
+TEST(CitusPlanner, AWorkerTheConfigurationDoesNotListIsKeptRefusedOrRemoved) {
+  // worker2 is registered and unlisted; with shards, and without.
+  const auto kept = plan_workers(kEnsure, cluster(), "worker1");
+  ASSERT_TRUE(kept.ok);
+  EXPECT_EQ(kept.steps[0].action, pglaswell::Action::kSatisfied);
+  EXPECT_FALSE(kept.warnings.empty());
+
+  const auto strict = plan_workers(
+      json{{"kind", "citus_ensure_workers"}, {"unlisted", "refuse"}}, cluster(), "worker1");
+  EXPECT_FALSE(strict.ok);
+  EXPECT_TRUE(conflicts_mention(strict, "worker2:5432")) << first_conflict(strict);
+
+  const json remove{{"kind", "citus_ensure_workers"}, {"unlisted", "remove"}};
+  const auto holding = plan_workers(remove, cluster(), "worker1");
+  EXPECT_FALSE(holding.ok);
+  EXPECT_TRUE(conflicts_mention(holding, "citus_drain_node")) << first_conflict(holding);
+  const auto drained = plan_workers(
+      remove, cluster(json::array({node("coordinator", 0, false, 0),
+                                   node("worker1", 1, true, 64),
+                                   node("worker2", 2, false, 0)})),
+      "worker1");
+  ASSERT_TRUE(drained.ok) << first_conflict(drained);
+  EXPECT_EQ(drained.steps[0].sql[0], "SELECT citus_remove_node('worker2', 5432);");
+}
+
+TEST(CitusPlanner, AConfiguredWorkerListThatCannotBeRightIsRefused) {
+  EXPECT_FALSE(plan_workers(kEnsure, cluster(), "worker1, worker1:5432").ok);
+  EXPECT_FALSE(plan_workers(kEnsure, cluster(), "worker1,, worker3").ok);
+  EXPECT_FALSE(plan_workers(kEnsure, cluster(), "worker1:notaport").ok);
+  const auto coord = plan_workers(kEnsure, cluster(), "coordinator, worker1");
+  EXPECT_FALSE(coord.ok);
+  EXPECT_TRUE(conflicts_mention(coord, "coordinator")) << first_conflict(coord);
+}
+
+TEST(CitusPlanner, EnsureWorkersArgumentsAreCheckedAtParse) {
+  EXPECT_ANY_THROW(pglaswell::parse_spec(citus_spec(
+      json{{"kind", "citus_ensure_workers"}, {"workers", "w1"}})));
+  EXPECT_ANY_THROW(pglaswell::parse_spec(citus_spec(
+      json{{"kind", "citus_ensure_workers"}, {"min_workers", 4}, {"max_workers", 2}})));
+  EXPECT_ANY_THROW(pglaswell::parse_spec(citus_spec(
+      json{{"kind", "citus_ensure_workers"}, {"unlisted", "drop"}})));
+}
+
+TEST(CitusPlanner, TheGlobIsStarAndQuestionMarkOnly) {
+  EXPECT_TRUE(pglaswell::citus_glob("*.citus.internal", "w1.citus.internal"));
+  EXPECT_FALSE(pglaswell::citus_glob("*.citus.internal", "w1.citus.internal.evil"));
+  EXPECT_TRUE(pglaswell::citus_glob("10.20.30.?", "10.20.30.7"));
+  EXPECT_FALSE(pglaswell::citus_glob("10.20.30.?", "10.20.30.77"));
+  EXPECT_TRUE(pglaswell::citus_glob("worker*", "worker12"));
+  EXPECT_FALSE(pglaswell::citus_glob("worker*", "aworker1"));
+}
