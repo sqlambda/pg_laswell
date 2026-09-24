@@ -132,6 +132,10 @@ SELECT JSONB_BUILD_OBJECT(
      'shard_count', current_setting('citus.shard_count', true),
      'shard_replication_factor', current_setting('citus.shard_replication_factor', true),
      'multi_shard_modify_mode', current_setting('citus.multi_shard_modify_mode', true),
+     -- How often Citus's maintenance daemon resolves prepared transactions a
+     -- crashed coordinator session left on the workers. The length of the
+     -- window in which a killed multi-shard batch still holds its locks.
+     'recover_2pc_interval', current_setting('citus.recover_2pc_interval', true),
      'max_adaptive_executor_pool_size',
         current_setting('citus.max_adaptive_executor_pool_size', true),
      'enable_ddl_propagation', current_setting('citus.enable_ddl_propagation', true))

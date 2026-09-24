@@ -335,11 +335,65 @@ inline json compute_budget(const Observations& obs, const ExecutorConfig& cfg) {
   const auto& citus = obs.extension("citus");
   if (!citus.empty()) {
     const int workers = citus.value("worker_count", 0);
-    const auto pool = citus.value("settings", json::object())
-                          .value("max_adaptive_executor_pool_size", "");
+    const auto settings = citus.value("settings", json::object());
+    const auto pool = settings.value("max_adaptive_executor_pool_size", "");
+    // citus.multi_shard_modify_mode, READ rather than inherited unremarked: a
+    // plan whose connection use depends on a session setting it never names is
+    // not a function of the specification and the reading. Measured on Citus 13
+    // with a multi-shard UPDATE, counting one session's connections on ONE
+    // worker (pool size 16):
+    //
+    //   parallel,   fast shard tasks   1   -- the adaptive executor's slow start
+    //                                         opens more only when tasks linger
+    //   parallel,   slow shard tasks   6
+    //   sequential, either             1
+    //
+    // So "sequential" is a guaranteed 1 and "parallel" is an upper bound that
+    // depends on how long each shard's work takes -- which is why this states
+    // the bound and the mode rather than computing a single number.
+    const auto mode = settings.value("multi_shard_modify_mode", "");
     b["topology"] = "citus";
     b["workerCount"] = workers;
-    b["workerFanOutPerSession"] = pool.empty() ? json() : json(pool);
+    b["multiShardModifyMode"] = mode.empty() ? json() : json(mode);
+    if (mode == "sequential") {
+      b["workerFanOutPerSession"] = 1;
+      b["workerFanOutBasis"] =
+          "citus.multi_shard_modify_mode is sequential: one connection per "
+          "worker, whatever the pool size";
+    } else {
+      b["workerFanOutPerSession"] = pool.empty() ? json() : json(pool);
+      b["workerFanOutBasis"] =
+          "an UPPER BOUND under multi_shard_modify_mode " +
+          (mode.empty() ? std::string("(not readable)") : mode) +
+          ": the adaptive executor opens further connections only while shard "
+          "tasks run long -- measured, 1 per worker for fast tasks and 6 of a "
+          "possible 16 for slow ones";
+    }
+    // PACING ON A DISTRIBUTED TABLE, stated rather than silently reused. The
+    // constants -- batch_rows, commit_interval_ms, batch_cap_rows -- were
+    // derived on single-node PostgreSQL. What changes on Citus is the COMMIT,
+    // and it is not the same for every batch. Measured with
+    // citus.log_remote_commands:
+    //
+    //   a batch confined to one shard (every grouped walk)  plain COMMIT
+    //   a batch spanning shards                             PREPARE TRANSACTION
+    //                                                       + COMMIT PREPARED
+    //
+    // So a grouped walk paces exactly as it does on one node. A batch spanning
+    // shards -- update_rows, insert_rows or delete_rows by values on a
+    // distributed table -- is a two-phase commit, and if this process dies
+    // between the phases, the prepared transactions keep their locks on the
+    // workers until Citus's own recovery resolves them.
+    const auto recover = settings.value("recover_2pc_interval", "");
+    b["pacingBasis"] =
+        "batch_rows, commit_interval_ms and batch_cap_rows were derived on "
+        "single-node PostgreSQL. A grouped walk commits on one worker (measured: "
+        "plain COMMIT), so it paces the same here. A batch spanning shards commits "
+        "in two phases across workers (measured: PREPARE TRANSACTION), which the "
+        "constants were not measured against; if pg_laswell dies between the "
+        "phases, the prepared transactions hold their locks on the workers until "
+        "Citus resolves them, every citus.recover_2pc_interval (" +
+        (recover.empty() ? std::string("not readable") : recover) + ").";
     b["caveatTopology"] =
         "This headroom is the COORDINATOR's. On Citus one session opens up to "
         "citus.max_adaptive_executor_pool_size connections to each of " +

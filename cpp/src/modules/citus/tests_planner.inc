@@ -720,3 +720,39 @@ TEST(CitusPlanner, ForeignKeysFollowCitusRulesForEachPairOfTableKinds) {
   EXPECT_TRUE(plan_fk(tables, "plain", json::array({"rid"}), "r",
                       json::array({"id"})).ok) << "local -> reference";
 }
+
+TEST(CitusPlanner, TheBudgetNamesTheModifyModeItsFanOutDependsOn) {
+  // A plan whose connection use depends on a session setting it never names is
+  // not a function of the specification and the reading. Measured on Citus 13:
+  // sequential holds one connection per worker; parallel opens up to the pool
+  // size, and only while shard tasks run long.
+  const auto budget_for = [](const char* mode) {
+    json citus = citus_obs(json{{"public.ledger",
+                                 dist_entry("tenant_id", 20, "bigint", "N", 9)}});
+    citus["settings"]["multi_shard_modify_mode"] = mode;
+    const auto obs = citus_observations(
+        citus, json{{"public.ledger", table_with_pk({"tenant_id", "id"}, 10)}});
+    return pglaswell::detail::compute_budget(obs, pglaswell::ExecutorConfig{});
+  };
+  const auto seq = budget_for("sequential");
+  EXPECT_EQ(seq.value("multiShardModifyMode", ""), "sequential");
+  EXPECT_EQ(seq.value("workerFanOutPerSession", json()), json(1))
+      << "sequential is a guaranteed one connection per worker";
+  const auto par = budget_for("parallel");
+  EXPECT_EQ(par.value("multiShardModifyMode", ""), "parallel");
+  EXPECT_EQ(par.value("workerFanOutPerSession", json()), json("16"));
+  EXPECT_NE(par.value("workerFanOutBasis", "").find("UPPER BOUND"), std::string::npos)
+      << "parallel's fan-out is a bound, not a count";
+
+  // §7.4: the pacing constants are not silently reused. The budget says where
+  // they came from, that a grouped walk commits on one worker, and how long a
+  // killed multi-shard batch can hold locks.
+  json citus = citus_obs();
+  citus["settings"]["recover_2pc_interval"] = "1min";
+  const auto b = pglaswell::detail::compute_budget(
+      citus_observations(citus, json::object()), pglaswell::ExecutorConfig{});
+  const auto basis = b.value("pacingBasis", "");
+  EXPECT_NE(basis.find("single-node PostgreSQL"), std::string::npos) << basis;
+  EXPECT_NE(basis.find("plain COMMIT"), std::string::npos) << basis;
+  EXPECT_NE(basis.find("(1min)"), std::string::npos) << basis;
+}
