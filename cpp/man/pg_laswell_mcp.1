@@ -290,16 +290,53 @@ bounds the attempt, so planning can never queue behind anything.
 cannot run inside a transaction block, so it is listed as unverified rather
 than silently passed.
 .It
-Statements are planned with
+Queries are planned with
 .Ic EXPLAIN Pq Cm GENERIC_PLAN ,
 never executed, and
 .Cm ANALYZE
 is never used.
+Where the server cannot plan generically -- any Citus table -- the query is
+checked with
+.Ic PREPARE
+instead, which catches a malformed statement but not one an extension will
+refuse to route, and the step is reported as unverified with the reason.
+A step whose statements change the schema through a function call
+.Pq Citus's Fn create_distributed_table
+is executed like any other DDL, because planning a
+.Ic SELECT
+would not run it.
 .El
 .Pp
 Pass
 .Va dryRun
 false to decline it.
+.Pp
+.Em A dry run answers for one specification at a time.
+Each is planned against the database as it is now, so in a repository that has
+not been applied yet, a specification needing a table that an earlier
+.Em pending
+one creates is refused -- not because it is wrong, but because the table does
+not exist yet.
+To check a whole repository before it is applied, rehearse it as a chain:
+.Bd -literal -offset indent
+pg_laswell --repo ./migrations --dry-run=chain
+.Ed
+.Pp
+The chain takes every pending specification in dependency order, in one
+transaction per database with a savepoint for each, and plans each against the
+schema the ones before it produced -- the reading is taken through that same
+transaction, so it sees their uncommitted work.
+A specification that fails is rolled back to its savepoint and reported, and the
+chain continues; anything that depends on it is reported as not rehearsed, with
+the cause, rather than failing for a reason the earlier failure explains.
+Everything is rolled back at the end.
+.Pp
+It holds every lock every specification takes until that final rollback, so it
+is for an empty database or a restored copy.
+Against production it would block the application for the length of the run,
+which is why it is a separate mode and not what
+.Fl -dry-run
+does.
 .Sh PACING
 A backfill walks the table by keyset and commits on whichever comes first:
 .Bl -tag -width Ds -compact

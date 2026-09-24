@@ -313,13 +313,21 @@ class WriteSession {
     if (!r.empty() && !r[0][0].is_null()) {
       const int now = r[0][0].as<int>();
       if (now != backend_pid_) {
+        // The OBSERVATION is certain; the cause is not, so the message names
+        // what was seen and lists what commonly causes it. It used to say
+        // "almost certainly a transaction-mode pooler", and a lab whose
+        // PgBouncer ran in SESSION mode went to check pool_mode, found
+        // "session", and concluded pg_laswell was wrong -- when the real finding
+        // was that its DDL was going through a pooler at all. Session pooling
+        // still reassigns backends across separate client connections.
         throw std::runtime_error(
             "the backend pid changed from " + std::to_string(backend_pid_) +
             " to " + std::to_string(now) +
-            " between transactions, which means this connection is being "
-            "multiplexed -- almost certainly a transaction-mode pooler. "
-            "pg_laswell's executor requires a direct connection; see the "
-            "POOLERS section of man pg_laswell_mcp.");
+            " between transactions, so this is not a direct connection to one "
+            "PostgreSQL backend -- commonly a connection pooler (in ANY pool "
+            "mode, session included), a proxy, or a load balancer in front of "
+            "the server. pg_laswell's executor requires a direct connection; "
+            "see the POOLERS section of man pg_laswell_mcp.");
       }
     }
   }

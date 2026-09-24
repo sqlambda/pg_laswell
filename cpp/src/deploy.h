@@ -68,6 +68,10 @@ struct DeployOptions {
   // A manifest naming the sources, and saying whether they are all of them.
   std::string manifest;
   bool dry_run = false;      // plan everything, apply nothing
+  // --dry-run=chain: rehearse every pending specification in order, each on top
+  // of the ones before it, all rolled back. Holds every lock until the end, so
+  // it is for an empty database or a restored copy -- see ChainRehearsal.
+  bool chain = false;
   bool status_only = false;  // report what is pending, change nothing
   int poll_ms = 500;
   std::ostream* out = &std::cout;
@@ -190,6 +194,7 @@ class Deployment {
       return retry > 0 ? DeployResult::kRefused : DeployResult::kOk;
     }
     if (pending + retry == 0) return DeployResult::kOk;
+    if (opts_.chain) return run_chain(out, listing, by_id);
 
     // Levels run in order; within a level, groups run one after another,
     // because parallel_subsets() puts two migrations in DIFFERENT groups
@@ -269,6 +274,96 @@ class Deployment {
       s += x.get<std::string>();
     }
     return s;
+  }
+
+  // Every pending specification, in dependency order, each rehearsed on top of
+  // the ones before it and all of it rolled back. See ChainRehearsal for why this
+  // is its own mode and not what --dry-run does.
+  //
+  // It does NOT stop at the first failure: a rolled-back specification is
+  // reported and the chain goes on, so one pass shows every independent
+  // problem. What it will not do is rehearse something that depends on a
+  // failure -- that would report a missing table the failure explains, and send
+  // someone to debug the wrong specification.
+  DeployResult run_chain(std::ostream& out, const json& listing,
+                         std::map<std::string, json>& by_id) {
+    out << "rehearsing the chain: each specification on top of the ones before "
+           "it, in one transaction per database, all rolled back\n";
+    ChainRehearsal chain(ctx_);
+    std::set<std::string> broken;  // failed, incomplete, or blocked by either
+    int rehearsed = 0, failed = 0, incomplete = 0, blocked = 0;
+    for (const auto& level : listing.value("order", json::array())) {
+      for (const auto& group : level.value("groups", json::array())) {
+        for (const auto& s : group.value("specs", json::array())) {
+          const auto id = s.get<std::string>();
+          if (!by_id.count(id)) continue;
+          const auto st = by_id[id].value("status", "");
+          if (st != "pending" && st != "failed") continue;
+
+          std::string cause;
+          for (const auto& d : by_id[id].value("dependsOn", json::array())) {
+            if (d.is_string() && broken.count(d.get<std::string>())) {
+              cause = d.get<std::string>();
+              break;
+            }
+          }
+          if (!cause.empty()) {
+            out << "  " << id << ": not rehearsed -- depends on " << cause
+                << ", which did not rehearse cleanly\n";
+            broken.insert(id);
+            ++blocked;
+            continue;
+          }
+
+          json spec;
+          try {
+            spec = detail::read_spec_file(by_id[id].value("path", ""));
+          } catch (const std::exception& e) {
+            out << "  " << id << ": " << e.what() << "\n";
+            return DeployResult::kRepoProblem;
+          }
+          const auto result = chain.rehearse(spec, by_id[id].value("connection", ""));
+          const auto r = result.value("rehearsal", json::object());
+          const auto outcome = r.value("outcome", "");
+          if (outcome == "rehearsed") {
+            out << "  " << id << ": rehearsed, "
+                << result.value("steps", json::array()).size() << " step(s)";
+            const auto unverified = r.value("unverifiedSteps", json::array());
+            if (!unverified.empty()) {
+              out << ", " << unverified.size() << " not checkable in a transaction";
+            }
+            out << "\n";
+            ++rehearsed;
+            continue;
+          }
+          broken.insert(id);
+          if (outcome == "incomplete") {
+            out << "  " << id << ": incomplete -- " << r.value("reason", "") << "\n";
+            ++incomplete;
+            continue;
+          }
+          ++failed;
+          if (outcome == "failed") {
+            out << "  " << id << ": not accepted\n      "
+                << result.value("error", "") << "\n";
+            for (const auto& d : r.value("problemDetail", json::array())) {
+              out << "      statement: " << d.value("statement", "") << "\n"
+                  << "      server:    " << d.value("sqlstate", "") << " "
+                  << d.value("message", "") << "\n";
+            }
+            continue;
+          }
+          // Refused before anything ran: the plan's conflicts, or an error.
+          report_plan_outcome(out, id, result);
+        }
+      }
+    }
+    chain.end();
+    out << "chain: " << rehearsed << " rehearsed, " << failed << " failed, "
+        << incomplete << " incomplete, " << blocked
+        << " not rehearsed because of those -- nothing was committed\n";
+    return (failed + incomplete + blocked) == 0 ? DeployResult::kOk
+                                                : DeployResult::kRefused;
   }
 
   DeployResult run_group(std::ostream& out, const std::vector<std::string>& ids,

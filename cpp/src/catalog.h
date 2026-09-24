@@ -604,7 +604,7 @@ class Catalog {
   // Gathers everything the planner needs for the tables a spec names.
   // Observes non-relation objects. `keys` are "kind:schema.name" or
   // "kind:name" for the unqualified ones (schema, extension).
-  void observe_objects(ReadSession& s, Observations& obs,
+  void observe_objects(pqxx::work& txn, Observations& obs,
                        const std::vector<std::string>& keys) {
     for (const auto& key : keys) {
       if (obs.objects.contains(key)) continue;
@@ -620,13 +620,13 @@ class Catalog {
         schema = rest.substr(0, dot);
         name = rest.substr(dot + 1);
       }
-      const auto r = pqxx_exec(s.txn(), detail::kObjectObservationSql,
+      const auto r = pqxx_exec(txn, detail::kObjectObservationSql,
                                pqxx::params{kind, name, schema});
       if (!r.empty() && !r[0][0].is_null()) {
         obs.objects[key] = json::parse(r[0][0].as<std::string>());
       }
       if (kind == "extension") {
-        const auto a = pqxx_exec(s.txn(), detail::kAvailableExtensionSql,
+        const auto a = pqxx_exec(txn, detail::kAvailableExtensionSql,
                                  pqxx::params{name});
         if (!a.empty() && !a[0][0].is_null()) {
           const auto avail = json::parse(a[0][0].as<std::string>());
@@ -644,19 +644,19 @@ class Catalog {
   // A planner that cannot tell "not installed" from "installed and reporting
   // nothing" refuses the wrong things in both directions, which is why this
   // costs a probe query per module rather than a COALESCE.
-  void observe_extensions(ReadSession& s, Observations& obs) {
+  void observe_extensions(pqxx::work& txn, Observations& obs) {
 #define PGLASWELL_OBSERVE(module_name, present_sql, observation_sql)         \
     do {                                                                      \
-      const auto probe = s.txn().exec(present_sql);                           \
+      const auto probe = txn.exec(present_sql);                               \
       if (probe.empty() || !probe[0][0].as<bool>()) break;                    \
-      const auto r = s.txn().exec(observation_sql);                           \
+      const auto r = txn.exec(observation_sql);                               \
       if (!r.empty() && !r[0][0].is_null()) {                                 \
         obs.extensions[module_name] = json::parse(r[0][0].as<std::string>()); \
       }                                                                       \
     } while (false);
 #include "modules/enabled_observers.h"
 #undef PGLASWELL_OBSERVE
-    (void)s; (void)obs;
+    (void)txn; (void)obs;
   }
 
   Observations observe(const std::vector<std::string>& schemas,
@@ -674,8 +674,8 @@ class Catalog {
       obs.server = json::parse(server[0][0].as<std::string>());
     }
     obs.gathered_at = obs.server.value("now", json());
-    observe_objects(s, obs, object_keys);
-    observe_extensions(s, obs);
+    observe_objects(s.txn(), obs, object_keys);
+    observe_extensions(s.txn(), obs);
 
     for (std::size_t i = 0; i < schemas.size(); ++i) {
       const auto qualified = schemas[i] + "." + tables[i];
@@ -706,6 +706,44 @@ class Catalog {
         // is needed for whatever tables remain.
         s.txn().abort();
         s.renew();
+      }
+    }
+    return obs;
+  }
+
+  // The same reading, taken through a transaction the CALLER holds -- so it sees
+  // that transaction's uncommitted DDL. A chained rehearsal plans each
+  // specification against the schema the ones before it produced, and a reading
+  // on any other connection would see the database as it was before the
+  // rehearsal began, which is the limitation the rehearsal exists to remove.
+  //
+  // No lock-wait recovery, unlike observe(): renewing the transaction would
+  // throw away every earlier specification's work. A lock conflict here fails
+  // the rehearsal, and it runs against a restored copy, where there is nothing
+  // else to conflict with.
+  Observations observe_in(pqxx::work& txn, int server_version,
+                          const std::vector<std::string>& schemas,
+                          const std::vector<std::string>& tables,
+                          const std::vector<std::string>& object_keys = {}) {
+    if (schemas.size() != tables.size()) {
+      throw std::runtime_error("observe_in: schema/table lists differ in length");
+    }
+    Observations obs;
+    obs.server_version = server_version;
+    const auto server = txn.exec(detail::kServerObservationSql);
+    if (!server.empty() && !server[0][0].is_null()) {
+      obs.server = json::parse(server[0][0].as<std::string>());
+    }
+    obs.gathered_at = obs.server.value("now", json());
+    observe_objects(txn, obs, object_keys);
+    observe_extensions(txn, obs);
+    for (std::size_t i = 0; i < schemas.size(); ++i) {
+      const auto qualified = schemas[i] + "." + tables[i];
+      if (obs.tables.contains(qualified)) continue;
+      const auto r = pqxx_exec(txn, detail::kTableObservationSql,
+                               pqxx::params{schemas[i], tables[i]});
+      if (!r.empty() && !r[0][0].is_null()) {
+        obs.tables[qualified] = json::parse(r[0][0].as<std::string>());
       }
     }
     return obs;
@@ -746,6 +784,9 @@ class Catalog {
   // had been handed to the stream before the server refused one.
   static void stream_copy(WriteSession& session, const json& detail,
                           long long& written) {
+    stream_copy(session.txn(), detail, written);
+  }
+  static void stream_copy(pqxx::work& txn, const json& detail, long long& written) {
     std::vector<std::string> columns;
     for (const auto& c : detail.value("copy_columns", json::array())) {
       columns.push_back(pglaswell::detail::quote_identifier(c.get<std::string>()));
@@ -753,7 +794,7 @@ class Catalog {
     // copy_relation, not qualified: stream_to splices the path straight into
     // the COPY statement, so it has to be the quoted form.
     auto stream = pqxx::stream_to::raw_table(
-        session.txn(),
+        txn,
         detail.value("copy_relation", detail.value("qualified", "")),
         pglaswell::detail::join(columns, ", "));
     for (const auto& row : detail.value("copy_rows", json::array())) {
@@ -825,186 +866,180 @@ class Catalog {
   // and skipping it would leave the column count, the types and every
   // constraint on the table unverified, which is most of what a COPY can get
   // wrong. Streamed for real here, inside the transaction that is rolled back.
-  DryRun dry_run(const std::vector<std::pair<int, std::vector<std::string>>>& steps,
-                 const std::vector<bool>& txn_forbidden, int server_version,
-                 const std::vector<json>& copy_payloads = {}) {
-    DryRun out;
-    WriteSession w(cfg_);
-    // A dry run must never queue: it holds strong locks, and a planning call
-    // that blocks the application is worse than one that declines to check.
-    ConnConfig probe = cfg_;
-    probe.executor.lock_timeout_ms = kObservationLockTimeoutMs;
-    // The dry run runs the whole plan in one transaction, so a scanning step
-    // holds every lock the steps before it took. Bounded so a planning call
-    // can never block writes for the length of a scan: correctness is what a
-    // dry run proves, and it does not need to finish the work to prove it.
-    probe.statement_timeout_ms = cfg_.executor.dry_run_statement_timeout_ms;
-    WriteSession session(probe);
-
-    try {
-      session.begin("pg_laswell/dry-run (rolled back)");
-    } catch (const std::exception& e) {
-      out.skipped_reason = std::string("could not open a dry-run transaction: ") + e.what();
-      return out;
+  // ONE statement, checked inside an open transaction. Throws the pqxx::sql_error
+  // PostgreSQL raised when it fails; returns true when the check was only WEAK.
+  //
+  // DDL is executed for real -- the caller rolls it back -- because that is the
+  // one check that proves a later step can see what an earlier one made. A
+  // query is PLANNED, never executed: EXPLAIN (GENERIC_PLAN) on PG16+, which
+  // plans $1/$2 without binding values, and PREPARE as the fallback.
+  //
+  // GENERIC_PLAN is unavailable on a Citus table at any server version, and it
+  // fails in more than one way -- "EXPLAIN GENERIC_PLAN is currently not
+  // supported for Citus tables" (XX000), "could not create distributed plan"
+  // (0A000), and for an explicitly cast parameter "no value found for parameter
+  // 1" (42704). Matching those strings was the first attempt and was brittle by
+  // construction: the third was found only when a new kind emitted a cast. So
+  // GENERIC_PLAN's failure is never itself reported. PREPARE decides: if it
+  // fails, ITS error is the real one; if it succeeds, the statement is well
+  // formed and plannable and the only thing lost is the stronger check.
+  //
+  // That loss is reported, not hidden. Measured on Citus 13: PREPARE accepts a
+  // multi-shard SELECT ... FOR UPDATE that EXECUTE then refuses, because Citus
+  // plans at execution time. An earlier version called such a step verified --
+  // a false success, which is worse than a false failure because the dry run
+  // exists to be believed.
+  //
+  // The SAVEPOINT is required rather than tidy: a failed statement aborts the
+  // transaction, and without one the fallback would fail with 25P02.
+  //
+  // `execute` overrides the classification for a step whose statements CHANGE
+  // THE SCHEMA through a SELECT -- Citus's create_distributed_table and
+  // create_reference_table are function calls. Classified by their first word
+  // they were planned and never run, so no dry run ever distributed anything,
+  // and a later specification colocating with the table was refused for
+  // colocating with something "not distributed". The planner marks such a step
+  // (detail rehearse_by = "execution"); this does not guess from function names.
+  static bool verify_statement(pqxx::work& txn, const std::string& stmt,
+                               int server_version, bool execute = false) {
+    const auto head = stmt.substr(0, stmt.find_first_of(" \n"));
+    const bool is_query =
+        !execute &&
+        (stmt.rfind("WITH", 0) == 0 || head == "UPDATE" || head == "INSERT" ||
+         head == "SELECT" || head == "DELETE" || head == "MERGE");
+    if (!is_query) {
+      txn.exec(stmt);  // real DDL; the caller rolls it back
+      return false;
     }
+    if (server_version >= 160000) {
+      txn.exec("SAVEPOINT laswell_generic_plan");
+      try {
+        txn.exec("EXPLAIN (GENERIC_PLAN, FORMAT JSON) " + stmt);
+        txn.exec("RELEASE SAVEPOINT laswell_generic_plan");
+        return false;
+      } catch (const pqxx::sql_error&) {
+        txn.exec("ROLLBACK TO SAVEPOINT laswell_generic_plan");
+        txn.exec("RELEASE SAVEPOINT laswell_generic_plan");
+      }
+    }
+    txn.exec("PREPARE laswell_dry AS " + stmt);
+    txn.exec("DEALLOCATE laswell_dry");
+    return true;
+  }
 
-    out.ran = true;
-    // Once a step has been skipped, anything after it may depend on what that
-    // step would have created -- a partitioned index recipe attaches the child
-    // indexes its skipped concurrent builds would have made. A failure after a
-    // skip is therefore a gap the DRY RUN created, not a defect in the plan,
-    // and reporting it as a problem would send someone hunting for a fault
-    // that is not there.
-    bool skipped_any = false;
+  // How a rehearsal of one plan's steps ended. Rollback is the CALLER's choice:
+  // a single-plan dry run discards everything; a chained rehearsal discards only
+  // the failing specification, back to its savepoint, and keeps going.
+  enum class Rehearsal { kOk, kFailed, kTimedOut, kGap };
+
+  // Every step of one plan, in order, inside `txn`. Records what happened in
+  // `out`; never rolls back.
+  //
+  // `skipped_any` is the caller's so it can outlive one plan. Once a step has
+  // been skipped -- a CREATE INDEX CONCURRENTLY cannot run in a transaction --
+  // anything after it may depend on what that step would have made, so a
+  // failure after a skip is a gap the REHEARSAL created, not a defect, and is
+  // reported as unverified rather than as a problem.
+  static Rehearsal rehearse_steps(
+      pqxx::work& txn,
+      const std::vector<std::pair<int, std::vector<std::string>>>& steps,
+      const std::vector<bool>& txn_forbidden, int server_version,
+      const std::vector<json>& copy_payloads, DryRun& out, bool& skipped_any,
+      const std::vector<bool>& execute = {}) {
+    const auto note_unverified = [&out](int ordinal) {
+      if (std::find(out.unverified_steps.begin(), out.unverified_steps.end(),
+                    ordinal) == out.unverified_steps.end()) {
+        out.unverified_steps.push_back(ordinal);
+      }
+    };
     for (std::size_t i = 0; i < steps.size(); ++i) {
       if (txn_forbidden[i]) {
-        out.unverified_steps.push_back(steps[i].first);
+        note_unverified(steps[i].first);
         skipped_any = true;
         continue;
       }
       if (i < copy_payloads.size() && copy_payloads[i].is_object()) {
         try {
           long long sent = 0;
-          stream_copy(session, copy_payloads[i], sent);
+          stream_copy(txn, copy_payloads[i], sent);
         } catch (const pqxx::sql_error& e) {
           out.problems.push_back(Problem{steps[i].first, e.sqlstate(),
                                         server_message(e.what()),
                                         "COPY into " +
-                                            copy_payloads[i].value("qualified",
-                                                                   "?")});
-          break;
+                                            copy_payloads[i].value("qualified", "?")});
+          return Rehearsal::kFailed;
         }
         continue;
       }
       for (const auto& raw : steps[i].second) {
         const auto stmt = detail::strip_trailing_semicolon(raw);
         if (stmt.empty()) continue;
-        const auto head = stmt.substr(0, stmt.find_first_of(" \n"));
-        const bool is_query =
-            stmt.rfind("WITH", 0) == 0 || head == "UPDATE" || head == "INSERT" ||
-            head == "SELECT" || head == "DELETE" || head == "MERGE";
         try {
-          if (is_query) {
-            // GENERIC_PLAN (PG16+) plans a statement with $1/$2 placeholders
-            // without binding values. On older servers PREPARE catches the
-            // same class of error. Never ANALYZE: EXPLAIN must not execute the
-            // thing being planned.
-            //
-            // GENERIC_PLAN is ALSO unavailable on a Citus table, at any server
-            // version. Measured on Citus 13: "EXPLAIN GENERIC_PLAN is currently
-            // not supported for Citus tables" (XX000) for a reference table, and
-            // "could not create distributed plan" (0A000) for a distributed one.
-            //
-            // That is a limit of the CHECK, not a fault in the statement. A
-            // paced walk over a reference table executes correctly -- measured,
-            // 10 batches, 500 rows, nothing left -- and reporting it as a failed
-            // plan told the author their specification was wrong when it was
-            // not. PREPARE reaches the same class of error and Citus supports
-            // it, so fall back to it rather than call a working statement
-            // broken.
-            //
-            // The attempt runs inside a SAVEPOINT because a failed statement
-            // aborts the whole transaction: without one, the fallback and every
-            // later step would fail with 25P02 instead of being checked.
-            // GENERIC_PLAN first, PREPARE as the fallback, and the FALLBACK'S
-            // error is the one reported.
-            //
-            // GENERIC_PLAN is unavailable on a Citus table at any server
-            // version, and it fails in more than one way: "EXPLAIN GENERIC_PLAN
-            // is currently not supported for Citus tables" (XX000), "could not
-            // create distributed plan" (0A000), and -- for a statement carrying
-            // an explicitly cast parameter -- "no value found for parameter 1"
-            // (42704). Matching those strings was the first attempt and it was
-            // brittle by construction: the third one was found only because a
-            // new kind emitted a cast, and it was reported as a failing
-            // statement when the statement was fine.
-            //
-            // So GENERIC_PLAN's failure is not itself reported. PREPARE decides:
-            // it reaches parse errors and planning errors alike, so if it
-            // succeeds the statement is well formed and plannable and the only
-            // thing lost is the stronger check; if it fails, ITS error is the
-            // real one and is what surfaces.
-            //
-            // The savepoint is required rather than tidy: a failed statement
-            // aborts the transaction, so without one the fallback and every
-            // later step would fail with 25P02 instead of being checked.
-            bool verified = false;
-            if (server_version >= 160000) {
-              session.txn().exec("SAVEPOINT laswell_generic_plan");
-              try {
-                session.txn().exec("EXPLAIN (GENERIC_PLAN, FORMAT JSON) " + stmt);
-                session.txn().exec("RELEASE SAVEPOINT laswell_generic_plan");
-                verified = true;
-              } catch (const pqxx::sql_error&) {
-                session.txn().exec("ROLLBACK TO SAVEPOINT laswell_generic_plan");
-                session.txn().exec("RELEASE SAVEPOINT laswell_generic_plan");
-              }
+          const bool run_it = i < execute.size() && execute[i];
+          if (verify_statement(txn, stmt, server_version, run_it)) {
+            note_unverified(steps[i].first);
+            if (out.weak_verification.empty()) {
+              out.weak_verification =
+                  "a statement was checked by PREPARE rather than by EXPLAIN "
+                  "(GENERIC_PLAN), which this server does not support for these "
+                  "tables -- Citus among them. PREPARE catches a malformed "
+                  "statement and not one the extension will refuse to route, "
+                  "because Citus plans at execution time. Those steps are listed "
+                  "as unverified rather than claimed as checked.";
             }
-            if (!verified) {
-              session.txn().exec("PREPARE laswell_dry AS " + stmt);
-              session.txn().exec("DEALLOCATE laswell_dry");
-              // PREPARE is a WEAKER check and saying so is the point.
-              //
-              // Measured on Citus 13: PREPARE accepts a multi-shard
-              // SELECT ... FOR UPDATE that EXECUTE then refuses with "could not
-              // run distributed query with FOR UPDATE/SHARE commands". Citus
-              // defers its planning to execution, so a statement it cannot route
-              // passes PREPARE.
-              //
-              // An earlier version reported such a step as verified, trading a
-              // false failure for a false success -- the worse of the two,
-              // because the dry run exists to be believed. The step is named
-              // unverified instead, and the real check for these lives in
-              // cpp/test/citus-tests.sh where the statement is executed against
-              // a cluster.
-              //
-              // Once per STEP, not once per statement: a multi-statement batch
-              // takes this path more than once and listed its ordinal each time.
-              if (std::find(out.unverified_steps.begin(),
-                            out.unverified_steps.end(),
-                            steps[i].first) == out.unverified_steps.end()) {
-                out.unverified_steps.push_back(steps[i].first);
-              }
-              if (out.weak_verification.empty()) {
-                out.weak_verification =
-                    "a statement was checked by PREPARE rather than by "
-                    "EXPLAIN (GENERIC_PLAN), which this server does not support "
-                    "for these tables -- Citus among them. PREPARE catches a "
-                    "malformed statement and not one the extension will refuse "
-                    "to route, because Citus plans at execution time. Those "
-                    "steps are listed as unverified rather than claimed as "
-                    "checked.";
-              }
-            }
-          } else {
-            session.txn().exec(stmt);  // real DDL, rolled back below
           }
         } catch (const pqxx::sql_error& e) {
-          // A statement timeout is not a defect in the plan -- it means this
-          // step does real work that a dry run declines to finish. Everything
-          // from here on is simply unverified, and saying so beats reporting a
-          // problem that does not exist.
+          // A statement timeout is not a defect in the plan: the step does real
+          // work that a rehearsal declines to finish. Everything from here on
+          // is unverified, and saying so beats reporting a problem that is not.
           if (std::string(e.sqlstate()) == "57014") {
             out.timed_out_at = steps[i].first;
             for (std::size_t k = i; k < steps.size(); ++k) {
-              out.unverified_steps.push_back(steps[k].first);
+              note_unverified(steps[k].first);
             }
-            session.rollback();
-            return out;
+            return Rehearsal::kTimedOut;
           }
           if (skipped_any) {
-            out.unverified_steps.push_back(steps[i].first);
+            note_unverified(steps[i].first);
             out.depends_on_skipped = true;
-            session.rollback();
-            return out;
+            return Rehearsal::kGap;
           }
           out.problems.push_back(Problem{steps[i].first, e.sqlstate(),
                                         server_message(e.what()), stmt});
-          session.rollback();
-          return out;
+          return Rehearsal::kFailed;
         }
       }
     }
+    return Rehearsal::kOk;
+  }
+
+  // A dry run must never queue, and must never hold its locks for the length of
+  // a scan: a planning call that blocks the application is worse than one that
+  // declines to check.
+  ConnConfig rehearsal_config() const {
+    ConnConfig probe = cfg_;
+    probe.executor.lock_timeout_ms = kObservationLockTimeoutMs;
+    probe.statement_timeout_ms = cfg_.executor.dry_run_statement_timeout_ms;
+    return probe;
+  }
+
+  // Proves ONE plan works, in a transaction that never commits.
+  DryRun dry_run(const std::vector<std::pair<int, std::vector<std::string>>>& steps,
+                 const std::vector<bool>& txn_forbidden, int server_version,
+                 const std::vector<json>& copy_payloads = {},
+                 const std::vector<bool>& execute = {}) {
+    DryRun out;
+    WriteSession session(rehearsal_config());
+    try {
+      session.begin("pg_laswell/dry-run (rolled back)");
+    } catch (const std::exception& e) {
+      out.skipped_reason = std::string("could not open a dry-run transaction: ") + e.what();
+      return out;
+    }
+    out.ran = true;
+    bool skipped_any = false;
+    rehearse_steps(session.txn(), steps, txn_forbidden, server_version,
+                   copy_payloads, out, skipped_any, execute);
     // Always. Nothing a dry run does is ever committed.
     session.rollback();
     return out;

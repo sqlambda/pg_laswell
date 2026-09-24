@@ -184,9 +184,11 @@ inline void plan_citus_distribute_table(const Intent& in, const Observations& ob
     //
     // Only when both types are READ. A target distributed earlier in this same
     // specification is a projection with no column types, and a table created
-    // earlier in it may be too; the dry run executes create_distributed_table
-    // for real inside the transaction it rolls back, so that case is still
-    // caught before anything commits -- just by PostgreSQL rather than here.
+    // earlier in it may be too. The dry run executes create_distributed_table
+    // inside the transaction it rolls back (rehearse_by = "execution"), so that
+    // case is still caught before anything commits -- by Citus rather than here.
+    // Until that flag existed this comment claimed the same and it was false:
+    // the call was only ever planned.
     const auto want_oid = other.value("distribution_type_oid", 0LL);
     const auto have_oid =
         columns.value(column, json::object()).value("type_oid", 0LL);
@@ -281,6 +283,14 @@ inline void plan_citus_distribute_table(const Intent& in, const Observations& ob
   // CREATE INDEX CONCURRENTLY -- and the executor already knows what that
   // class means.
   step.txn_class = concurrent ? TxnClass::kForbidden : TxnClass::kRequired;
+  // Rehearsed by EXECUTION. Every Citus call here is a function invoked through
+  // SELECT, and a dry run classifying statements by their first word planned it
+  // and never ran it -- so no dry run ever distributed anything, and a later
+  // specification colocating with this table was refused for colocating with
+  // something "not distributed". Executed inside the rolled-back transaction, a
+  // dry run now proves the call succeeds; on a large table it is bounded by
+  // dry_run_statement_timeout_ms like any other DDL that does real work.
+  step.detail["rehearse_by"] = "execution";
   step.action = Action::kApply;
   step.lock = concurrent
                   ? "ShareUpdateExclusiveLock on " + qualified +
@@ -373,6 +383,8 @@ inline void plan_citus_create_reference_table(const Intent& in, const Observatio
 
   step.action = Action::kApply;
   step.txn_class = TxnClass::kRequired;
+  // Rehearsed by execution: see plan_citus_distribute_table.
+  step.detail["rehearse_by"] = "execution";
   step.lock = "AccessExclusiveLock on " + qualified +
               " (the whole table is copied to every node)";
   step.why = "a reference table is replicated in full to every node, so reads "
@@ -574,6 +586,8 @@ inline void plan_citus_distribute_function(const Intent& in, const Observations&
 
   step.action = Action::kApply;
   step.txn_class = TxnClass::kRequired;
+  // Rehearsed by execution: see plan_citus_distribute_table.
+  step.detail["rehearse_by"] = "execution";
   step.lock = "no table lock: this records routing metadata";
   step.why = colocated
                  ? "routes on " + dist_arg + " to the shards of " + with +

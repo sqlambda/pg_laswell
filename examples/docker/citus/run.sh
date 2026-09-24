@@ -55,13 +55,22 @@ sign_dir "$here/migrations" "$here/keys/citus.key.pem" "$kid"
 say "3. What is pending"
 run "$PG_LASWELL" --repo "$here/migrations" --status
 
-say "4. Apply"
+say "4. Rehearse the whole chain, then roll it back"
+echo "  A plain --dry-run plans each specification against the database as it is"
+echo "  NOW: here, 0030 would be refused because 0010 has not created accounts yet."
+echo "  The chain rehearses them in order, each on top of the last -- including the"
+echo "  Citus calls, which are executed, not merely planned -- and commits nothing."
+run "$PG_LASWELL" --repo "$here/migrations" --dry-run=chain
+psql -X -t -A -c "SELECT count(*) || ' distributed tables after the rehearsal'
+                    FROM pg_dist_partition" "$DATABASE_URL" | sed 's/^/  /'
+
+say "5. Apply"
 echo "  Citus refusals are checked before anything runs -- a unique key that"
 echo "  does not include the distribution column, a colocation target of another"
 echo "  type -- because each is an error Citus would raise halfway through."
 run "$PG_LASWELL" --repo "$here/migrations"
 
-say "5. What Citus now records"
+say "6. What Citus now records"
 psql -X -q -c "\pset border 2" -c \
   "SELECT logicalrelid::text AS table,
           CASE partmethod WHEN 'h' THEN 'distributed' WHEN 'n' THEN 'reference' END AS kind,
@@ -69,5 +78,5 @@ psql -X -q -c "\pset border 2" -c \
      FROM pg_dist_partition ORDER BY 1" \
   "$DATABASE_URL"
 
-say "6. Run it again: nothing to do"
+say "7. Run it again: nothing to do"
 run "$PG_LASWELL" --repo "$here/migrations"

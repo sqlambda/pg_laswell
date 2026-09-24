@@ -11746,6 +11746,21 @@ class DeployTest : public RepoTest {
     return {result, out.str()};
   }
 
+  // --dry-run=chain. Separate from deploy() so no existing call gains a flag it
+  // did not ask for.
+  std::pair<pglaswell::DeployResult, std::string> deploy_chain() {
+    std::ostringstream out;
+    pglaswell::DeployOptions opts;
+    opts.repo = dir_;
+    opts.dry_run = true;
+    opts.chain = true;
+    opts.poll_ms = 50;
+    opts.out = &out;
+    pglaswell::Deployment run(*ctx_, opts);
+    const auto result = run.run();
+    return {result, out.str()};
+  }
+
   int column_count(const std::string& table, const std::string& column) {
     pglaswell::ReadSession r(cfg());
     return pglaswell::pqxx_exec(
@@ -12506,6 +12521,90 @@ TEST_F(DeployTest, AFailedMigrationIsRetriedAndResumesWhereItStopped) {
   const auto from = resumed[0][0].as<std::string>();
   EXPECT_GT(from, std::string("k0000")) << from;
   EXPECT_LE(from, std::string("k0200")) << from;
+}
+
+namespace {
+json create_table_spec(const std::string& id, const std::string& table,
+                       const std::vector<std::string>& deps = {}) {
+  json d{{"laswell_spec_version", 1},
+         {"id", id},
+         {"description", "creates " + table},
+         {"intents", json::array({json{
+             {"kind", "create_table"}, {"schema", "shop"}, {"table", table},
+             {"columns", json::array({json{{"name", "id"}, {"type", "bigint"},
+                                           {"nullable", false},
+                                           {"comment", "Key."}}})},
+             {"primary_key", json::array({"id"})},
+             {"comment", "A table the chain creates."}}})}};
+  if (!deps.empty()) d["depends_on"] = deps;
+  return d;
+}
+}  // namespace
+
+TEST_F(DeployTest, AChainRehearsesWhatAPlainDryRunCannot) {
+  // Reported by a lab converting schemas to specifications: a plain dry run
+  // plans each specification against the database as it is NOW, so in a
+  // repository nobody has applied yet the second is refused for a table only
+  // the first would have created. "Does this repository build its schema?" had
+  // no answer short of applying it.
+  exec("DROP SCHEMA IF EXISTS shop CASCADE");
+  exec("CREATE SCHEMA shop");
+  write_spec("0001.json", create_table_spec("0001-create", "chained"));
+  write_spec("0002.json", add_column_spec("0002-extend", "chained", "note",
+                                          {"0001-create"}));
+
+  const auto [plain, plain_text] = deploy(/*dry_run=*/true);
+  EXPECT_EQ(plain, pglaswell::DeployResult::kRefused) << plain_text;
+  EXPECT_NE(plain_text.find("does not exist"), std::string::npos) << plain_text;
+
+  const auto [chain, chain_text] = deploy_chain();
+  EXPECT_EQ(chain, pglaswell::DeployResult::kOk) << chain_text;
+  EXPECT_NE(chain_text.find("0001-create: rehearsed"), std::string::npos) << chain_text;
+  EXPECT_NE(chain_text.find("0002-extend: rehearsed"), std::string::npos) << chain_text;
+
+  // And NOTHING of it survives: no table, no ledger row.
+  pglaswell::ReadSession r(cfg());
+  EXPECT_EQ(r.txn().exec("SELECT count(*) FROM pg_tables WHERE schemaname = 'shop'"
+                         " AND tablename = 'chained'")[0][0].as<int>(), 0)
+      << "a rehearsal committed DDL";
+  EXPECT_EQ(r.txn().exec("SELECT count(*) FROM laswell.migration"
+                         " WHERE spec_id IN ('0001-create','0002-extend')")[0][0].as<int>(), 0)
+      << "a rehearsal wrote the ledger";
+}
+
+TEST_F(DeployTest, AChainReportsEveryIndependentFailureAndNamesWhatItBlocks) {
+  // One pass, every independent problem: a failing specification is rolled back
+  // to its savepoint and the chain goes on. What depends on it is NOT
+  // rehearsed -- that would report a missing column the failure explains, and
+  // send someone to debug the wrong file -- and it is named, with the cause.
+  exec("DROP SCHEMA IF EXISTS shop CASCADE");
+  exec("CREATE SCHEMA shop");
+  write_spec("0001.json", create_table_spec("0001-create", "chained"));
+  // Valid to parse and plan, refused by PostgreSQL: no such function.
+  json broken = add_column_spec("0002-broken", "chained", "note", {"0001-create"});
+  broken["intents"][0]["default"] = "laswell_no_such_function()";
+  write_spec("0002.json", broken);
+  write_spec("0003.json", add_column_spec("0003-after", "chained", "later",
+                                          {"0002-broken"}));
+  write_spec("0004.json", create_table_spec("0004-independent", "elsewhere"));
+
+  const auto [result, text] = deploy_chain();
+  EXPECT_EQ(result, pglaswell::DeployResult::kRefused) << text;
+  EXPECT_NE(text.find("0001-create: rehearsed"), std::string::npos) << text;
+  EXPECT_NE(text.find("0002-broken"), std::string::npos) << text;
+  EXPECT_NE(text.find("laswell_no_such_function"), std::string::npos)
+      << "the server's own answer must reach the reader:\n" << text;
+  EXPECT_NE(text.find("0003-after: not rehearsed -- depends on 0002-broken"),
+            std::string::npos) << text;
+  EXPECT_NE(text.find("0004-independent: rehearsed"), std::string::npos)
+      << "an independent specification after the failure was not rehearsed:\n"
+      << text;
+  EXPECT_NE(text.find("nothing was committed"), std::string::npos) << text;
+
+  pglaswell::ReadSession r(cfg());
+  EXPECT_EQ(r.txn().exec("SELECT count(*) FROM pg_tables WHERE schemaname = 'shop'")[0][0]
+                .as<int>(), 0)
+      << "a rehearsal committed DDL";
 }
 
 TEST_F(DeployTest, HeldAndNotForHereAreReportedAndAreNotFailures) {

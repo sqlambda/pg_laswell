@@ -264,6 +264,88 @@ inline json validate_spec(ToolContext& ctx, const json& args) {
 // Measures, plans, and executes NOTHING. planMigration and startMigration share
 // this entire path, so what startMigration runs is byte-identically what this
 // showed -- asserted by comparing planDigest.
+namespace detail {
+
+// Both trust gates, or null when both pass: this machine's [trust] policy, then
+// the target database's laswell.trusted_key. Shared by every path that plans, so
+// a rehearsal refuses exactly what a plan refuses.
+inline json trust_gates(ToolContext& ctx, const Spec& spec, const ConnConfig& cfg) {
+  const auto gate1 = verify_against_policy(ctx.registry.trust(),
+                                           spec.canonical_bytes, spec.signatures);
+  if (!gate1.verified && !gate1.not_configured) {
+    return json{{"error", "the spec is not accepted by this machine: " + gate1.reason},
+                {"hint",
+                 "Add the key to [trust] accept in laswell.ini, or pass "
+                 "skipTrustChecks to plan an unsigned draft. A plan produced "
+                 "with skipTrustChecks can never be executed."}};
+  }
+  Ledger ledger(cfg, ctx.cache);
+  const auto gate2 = ledger.verify_signer(spec);
+  if (!gate2.verified) {
+    return json{{"error", "the target database does not accept this spec: " + gate2.reason},
+                {"hint",
+                 "Trust is granted in laswell.trusted_key by a privileged "
+                 "role. Call validateSpec for the full picture."}};
+  }
+  return json(nullptr);
+}
+
+// What a spec must have observed before it can be planned.
+// Observe only the tables the spec names. Nothing else is measured, so the
+// reading cannot be blamed on a table the change does not touch.
+// What to measure comes from conflict_keys(), the same function the
+// repository groups by and the executor locks on.
+//
+// Deriving it from in.table() alone was wrong, and wrong silently: an intent
+// that names a second relation somewhere other than "table" -- the candidate
+// in attach_partition, the view in replace_view, the referenced table in
+// add_foreign_key -- never had that relation observed, so the planner saw it
+// as absent. attach_partition refused every time it was used for real; the
+// end-to-end test had passed the child explicitly and hidden it.
+inline void observation_targets(const Spec& spec, std::vector<std::string>& schemas,
+                                std::vector<std::string>& tables,
+                                std::vector<std::string>& object_keys) {
+  std::set<std::string> seen;
+  for (const auto& in : spec.intents) {
+    for (const auto& key : conflict_keys(in)) {
+      if (!seen.insert(key).second) continue;
+      const auto colon = key.find(':');
+      if (colon != std::string::npos) {
+        object_keys.push_back(key);   // "type:...", "function:...", and so on
+        continue;
+      }
+      const auto dot = key.find('.');
+      if (dot == std::string::npos) continue;
+      schemas.push_back(key.substr(0, dot));
+      tables.push_back(key.substr(dot + 1));
+    }
+  }
+}
+
+// What a rehearsal runs for a plan: every APPLY step's statements, whether each
+// can run inside a transaction at all, and the COPY payload for a copy_rows step.
+struct RehearsalInputs {
+  std::vector<std::pair<int, std::vector<std::string>>> steps;
+  std::vector<bool> forbidden;
+  std::vector<json> copy_payloads;
+  // A step whose statements change the schema through a SELECT, and so must be
+  // EXECUTED to be rehearsed. See Catalog::verify_statement.
+  std::vector<bool> execute;
+};
+inline RehearsalInputs rehearsal_inputs(const Plan& plan) {
+  RehearsalInputs r;
+  for (const auto& step : plan.steps) {
+    if (step.action != Action::kApply) continue;
+    r.steps.emplace_back(step.ordinal, step.sql);
+    r.forbidden.push_back(step.txn_class == TxnClass::kForbidden);
+    r.copy_payloads.push_back(step.detail.contains("copy_rows") ? step.detail : json());
+    r.execute.push_back(step.detail.value("rehearse_by", "") == "execution");
+  }
+  return r;
+}
+
+}  // namespace detail
+
 inline json plan_migration_tool(ToolContext& ctx, const json& args) {
   if (!args.contains("spec") || !args["spec"].is_object()) {
     return json{{"error", "planMigration needs a \"spec\" object"},
@@ -280,52 +362,13 @@ inline json plan_migration_tool(ToolContext& ctx, const json& args) {
   const auto& cfg = ctx.connection(args);
   const bool skip_trust = args.value("skipTrustChecks", false);
   if (!skip_trust) {
-    const auto gate1 = verify_against_policy(ctx.registry.trust(),
-                                             spec.canonical_bytes, spec.signatures);
-    if (!gate1.verified && !gate1.not_configured) {
-      return json{{"error", "the spec is not accepted by this machine: " + gate1.reason},
-                  {"hint",
-                   "Add the key to [trust] accept in laswell.ini, or pass "
-                   "skipTrustChecks to plan an unsigned draft. A plan produced "
-                   "with skipTrustChecks can never be executed."}};
-    }
-    Ledger ledger(cfg, ctx.cache);
-    const auto gate2 = ledger.verify_signer(spec);
-    if (!gate2.verified) {
-      return json{{"error", "the target database does not accept this spec: " + gate2.reason},
-                  {"hint",
-                   "Trust is granted in laswell.trusted_key by a privileged "
-                   "role. Call validateSpec for the full picture."}};
-    }
+    auto refused = detail::trust_gates(ctx, spec, cfg);
+    if (!refused.is_null()) return refused;
   }
 
-  // Observe only the tables the spec names. Nothing else is measured, so the
-  // reading cannot be blamed on a table the change does not touch.
-  // What to measure comes from conflict_keys(), the same function the
-  // repository groups by and the executor locks on.
-  //
-  // Deriving it from in.table() alone was wrong, and wrong silently: an intent
-  // that names a second relation somewhere other than "table" -- the candidate
-  // in attach_partition, the view in replace_view, the referenced table in
-  // add_foreign_key -- never had that relation observed, so the planner saw it
-  // as absent. attach_partition refused every time it was used for real; the
-  // end-to-end test had passed the child explicitly and hidden it.
+  // What to observe: see detail::observation_targets.
   std::vector<std::string> schemas, tables, object_keys;
-  std::set<std::string> seen;
-  for (const auto& in : spec.intents) {
-    for (const auto& key : conflict_keys(in)) {
-      if (!seen.insert(key).second) continue;
-      const auto colon = key.find(':');
-      if (colon != std::string::npos) {
-        object_keys.push_back(key);   // "type:...", "function:...", and so on
-        continue;
-      }
-      const auto dot = key.find('.');
-      if (dot == std::string::npos) continue;
-      schemas.push_back(key.substr(0, dot));
-      tables.push_back(key.substr(dot + 1));
-    }
-  }
+  detail::observation_targets(spec, schemas, tables, object_keys);
   Catalog cat(cfg, ctx.cache);
   const auto obs = cat.observe(schemas, tables, object_keys);
   const auto plan = plan_migration(spec, obs, cfg.executor);
@@ -337,20 +380,9 @@ inline json plan_migration_tool(ToolContext& ctx, const json& args) {
   // the whole project rests on: PostgreSQL DDL is transactional, so a plan can
   // be tried before it is trusted.
   if (plan.ok && args.value("dryRun", true)) {
-    std::vector<std::pair<int, std::vector<std::string>>> steps;
-    // Parallel to `steps`: the COPY payload for a copy_rows step, null
-    // otherwise. See Catalog::dry_run.
-    std::vector<json> copy_payloads;
-    std::vector<bool> forbidden;
-    for (const auto& step : plan.steps) {
-      if (step.action != Action::kApply) continue;
-      steps.emplace_back(step.ordinal, step.sql);
-      forbidden.push_back(step.txn_class == TxnClass::kForbidden);
-      copy_payloads.push_back(step.detail.contains("copy_rows") ? step.detail
-                                                               : json());
-    }
-    const auto dry = cat.dry_run(steps, forbidden, obs.server_version,
-                                 copy_payloads);
+    const auto inputs = detail::rehearsal_inputs(plan);
+    const auto dry = cat.dry_run(inputs.steps, inputs.forbidden, obs.server_version,
+                                 inputs.copy_payloads, inputs.execute);
     json d{{"ran", dry.ran},
            {"unverifiedSteps", dry.unverified_steps},
            {"note",
@@ -451,6 +483,174 @@ inline json plan_migration_tool(ToolContext& ctx, const json& args) {
 // Returns immediately with a job id. The work outlives the call, because the
 // stdio loop must stay answerable while a migration runs -- that is the whole
 // reason the job registry exists.
+// A CHAINED REHEARSAL: every pending specification, in dependency order, each
+// planned against the schema the ones before it produced -- in transactions that
+// are all rolled back at the end.
+//
+// Why it exists. A plain dry run plans each specification against the database
+// as it is NOW, so in a repository nobody has applied yet, the second
+// specification is refused for a table the first one only would have created.
+// That is the dry run telling the truth about what it can see, and it made the
+// commonest question about a new or regenerated repository -- "does this build
+// the schema it claims?" -- unanswerable without applying it for real.
+//
+// How. One transaction per connection, a SAVEPOINT per specification. Each
+// specification is OBSERVED THROUGH THAT TRANSACTION, so the reading includes the
+// uncommitted DDL of everything before it, then planned and rehearsed step by
+// step. A specification that fails is rolled back to its savepoint and reported;
+// the chain goes on, so one pass reports every independent problem rather than
+// the first.
+//
+// What it costs, and why it is a separate mode. Every lock every specification
+// takes is held until the final rollback -- a repository's worth of
+// AccessExclusiveLocks. Against production that blocks the application for the
+// whole run, the precise opposite of what this tool is for. So --dry-run keeps
+// its meaning (per specification, safe anywhere, shallow), and this is
+// --dry-run=chain, for an empty database or a restored copy.
+//
+// What it cannot check: a step that cannot run in a transaction at all --
+// CREATE INDEX CONCURRENTLY, a subscription -- is skipped and listed as
+// unverified, and a later failure that may depend on what it would have made is
+// reported as a gap in the rehearsal rather than a defect.
+class ChainRehearsal {
+ public:
+  explicit ChainRehearsal(ToolContext& ctx) : ctx_(ctx) {}
+  ~ChainRehearsal() { end(); }
+  ChainRehearsal(const ChainRehearsal&) = delete;
+  ChainRehearsal& operator=(const ChainRehearsal&) = delete;
+
+  // Rehearse ONE specification on top of every specification rehearsed before it
+  // on the same connection. Returns the plan, with `rehearsal` saying what ran,
+  // or an error payload in the shape planMigration uses.
+  json rehearse(const json& doc, const std::string& connection) {
+    Spec spec;
+    try {
+      spec = parse_spec(doc);
+    } catch (const SpecError& e) {
+      return detail::spec_error_payload(e);
+    }
+    json args{{"spec", doc}};
+    if (!connection.empty()) args["connection"] = connection;
+    const auto& cfg = ctx_.connection(args);
+    auto refused = detail::trust_gates(ctx_, spec, cfg);
+    if (!refused.is_null()) return refused;
+
+    auto& link = link_for(cfg);
+    auto& txn = link.session->txn();
+    txn.exec("SAVEPOINT laswell_chain_spec");
+    const auto undo = [&txn] {
+      txn.exec("ROLLBACK TO SAVEPOINT laswell_chain_spec");
+      txn.exec("RELEASE SAVEPOINT laswell_chain_spec");
+    };
+    try {
+      std::vector<std::string> schemas, tables, object_keys;
+      detail::observation_targets(spec, schemas, tables, object_keys);
+      Catalog cat(cfg, ctx_.cache);
+      const auto obs =
+          cat.observe_in(txn, link.server_version, schemas, tables, object_keys);
+      const auto plan = plan_migration(spec, obs, cfg.executor);
+      json out = plan.to_json();
+      if (!plan.ok) {
+        undo();
+        return out;
+      }
+      const auto inputs = detail::rehearsal_inputs(plan);
+      Catalog::DryRun dry;
+      dry.ran = true;
+      const auto result = Catalog::rehearse_steps(
+          txn, inputs.steps, inputs.forbidden, link.server_version,
+          inputs.copy_payloads, dry, link.skipped_any, inputs.execute);
+
+      json r{{"unverifiedSteps", dry.unverified_steps}};
+      if (!dry.weak_verification.empty()) r["weakVerification"] = dry.weak_verification;
+      if (result == Catalog::Rehearsal::kOk) {
+        // KEPT: the next specification plans against what this one made.
+        txn.exec("RELEASE SAVEPOINT laswell_chain_spec");
+        r["outcome"] = "rehearsed";
+      } else {
+        // A failed statement aborts the transaction, so every non-clean ending
+        // rolls back to the savepoint -- and this specification's effects are
+        // then absent for anything after it, which the caller reports.
+        undo();
+        if (result == Catalog::Rehearsal::kFailed) {
+          r["outcome"] = "failed";
+          json problems = json::array();
+          for (const auto& prob : dry.problems) {
+            problems.push_back(json{{"step", prob.step},
+                                    {"sqlstate", prob.sqlstate},
+                                    {"message", prob.message},
+                                    {"statement", prob.statement}});
+          }
+          r["problemDetail"] = problems;
+          out["ok"] = false;
+          out["error"] =
+              "the plan failed when applied on top of the specifications "
+              "rehearsed before it";
+        } else {
+          r["outcome"] = "incomplete";
+          r["reason"] =
+              result == Catalog::Rehearsal::kTimedOut
+                  ? "a step does real work the rehearsal declined to finish "
+                    "(dry_run_statement_timeout_ms)"
+                  : "a step failed after one that cannot run in a transaction "
+                    "was skipped, so it may depend on what that step would have "
+                    "made";
+        }
+      }
+      out["rehearsal"] = r;
+      return out;
+    } catch (const std::exception& e) {
+      undo();
+      return json{{"error", std::string("the rehearsal could not plan this "
+                                        "specification: ") + e.what()},
+                  {"hint", "Nothing is committed: the whole rehearsal is rolled "
+                           "back at the end."}};
+    }
+  }
+
+  // Rolls back every connection's transaction. Nothing a rehearsal does is ever
+  // committed -- including when it ends by an exception.
+  void end() {
+    for (auto& [name, link] : links_) {
+      if (link.session) {
+        try {
+          link.session->rollback();
+        } catch (...) {
+        }
+        link.session.reset();
+      }
+    }
+    links_.clear();
+  }
+
+ private:
+  struct Link {
+    std::unique_ptr<WriteSession> session;
+    int server_version = 0;
+    bool skipped_any = false;  // across every specification on this connection
+  };
+
+  Link& link_for(const ConnConfig& cfg) {
+    auto it = links_.find(cfg.name);
+    if (it != links_.end()) return it->second;
+    ConnConfig c = Catalog(cfg, ctx_.cache).rehearsal_config();
+    // The self-guard is idle_in_transaction_session_timeout = commit_interval_ms
+    // * 3, three seconds by default. A rehearsal is not paced; its idle gaps are
+    // the deployment reading the next file and verifying its signature on
+    // another connection, and a guard firing in one of them would abort every
+    // specification rehearsed so far. A minute still tears down a hung process.
+    c.executor.commit_interval_ms = std::max(c.executor.commit_interval_ms, 20000);
+    Link link;
+    link.session = std::make_unique<WriteSession>(c);
+    link.session->begin("pg_laswell/dry-run chain (rolled back)");
+    link.server_version = link.session->server_version();
+    return links_.emplace(cfg.name, std::move(link)).first->second;
+  }
+
+  ToolContext& ctx_;
+  std::map<std::string, Link> links_;
+};
+
 inline json start_migration(ToolContext& ctx, const json& args) {
   if (ctx.jobs == nullptr) {
     return json{{"error", "this server has no job registry"},

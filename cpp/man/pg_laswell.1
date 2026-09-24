@@ -8,7 +8,7 @@
 .Nm
 .Fl -repo Ar directory
 .Op Fl -repo Ar directory ...
-.Op Fl -status | Fl -dry-run
+.Op Fl -status | Fl -dry-run | Fl -dry-run=chain
 .Op Fl c Ar file
 .Op Ar conninfo
 .Nm
@@ -91,6 +91,23 @@ Changes nothing.
 Plan every pending migration and apply none.
 Each plan is tried against the real schema in a transaction that is rolled
 back, so a refusal here is a refusal that would have happened.
+Each is planned against the database as it is
+.Em now ,
+so in a repository not yet applied, one that needs what an earlier pending
+migration creates is refused; use
+.Fl -dry-run=chain
+for that.
+.It Fl -dry-run=chain
+Rehearse every pending migration in dependency order, each planned and applied
+on top of the ones before it, then roll all of it back.
+A migration that fails is reported and the chain continues; what depends on it
+is reported as not rehearsed.
+It holds every lock until the end, so it is for an empty database or a restored
+copy, not production.
+See the
+.Em DRY RUN
+section of
+.Xr pg_laswell_mcp 1 .
 .It Fl c Ar file , Fl -config Ar file
 Configuration file.
 Also read from
