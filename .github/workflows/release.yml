@@ -201,15 +201,28 @@ jobs:
             exit 1
           }
 
+      # TWO VARIANTS from one tree: pg-laswell, PostgreSQL only, and
+      # pg-laswell-citus, the same binaries built with the Citus module. The
+      # package name follows the module set (see cpp/CMakeLists.txt), so each
+      # build directory packages as its own variant. The artifact names follow
+      # the same rule: pg_laswell-... and pg_laswell-citus-...
+      - name: Variant artifact names
+        run: |
+          echo "CITUS_ARTIFACT=$(echo '${{ matrix.artifact }}' | sed 's/^pg_laswell/pg_laswell-citus/')" >> $GITHUB_ENV
+
       - name: Build
         run: |
           cmake -S cpp -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+          cmake -S cpp -B build-citus -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
+                -DPGLASWELL_MODULES=citus
           # BOTH binaries. The install rules name both, so a tree with only one
           # built either fails packaging or -- worse -- produces a package that
           # installs and has nothing to deploy with, which nobody would discover
           # until a release night.
-          cmake --build build --target pg_laswell pg_laswell_mcp
-          strip build/pg_laswell build/pg_laswell_mcp
+          for d in build build-citus; do
+            cmake --build $d --target pg_laswell pg_laswell_mcp
+            strip $d/pg_laswell $d/pg_laswell_mcp
+          done
 
       # Static libpqxx is the entire point of the source build above, and a
       # silent fall back to the platform's shared copy would produce a package
@@ -224,13 +237,14 @@ jobs:
           # picks `sh -e` for the Debian container, and a bash-ism there is a
           # syntax error that kills the step before it checks anything --
           # which is how a check can be both present and useless.
-          for b in pg_laswell pg_laswell_mcp; do
+          for b in build/pg_laswell build/pg_laswell_mcp \
+                   build-citus/pg_laswell build-citus/pg_laswell_mcp; do
             if [ "${{ matrix.distro }}" = "macos" ]; then
-              otool -L "build/$b"
-              LINKED=$(otool -L "build/$b")
+              otool -L "$b"
+              LINKED=$(otool -L "$b")
             else
-              objdump -p "build/$b" | grep NEEDED
-              LINKED=$(objdump -p "build/$b")
+              objdump -p "$b" | grep NEEDED
+              LINKED=$(objdump -p "$b")
             fi
             if printf '%s\n' "$LINKED" | grep -q 'pqxx'; then
               echo "::error::libpqxx was linked dynamically into $b; the source build did not take effect"
@@ -252,23 +266,29 @@ jobs:
           cmake --install build --prefix "$PWD/stage"
           tar -czf ${{ matrix.artifact }}.tar.gz -C stage bin share
           tar -tzf ${{ matrix.artifact }}.tar.gz | sort
+          rm -rf stage
+          cmake --install build-citus --prefix "$PWD/stage"
+          tar -czf $CITUS_ARTIFACT.tar.gz -C stage bin share
+          tar -tzf $CITUS_ARTIFACT.tar.gz | sort
 
       - name: Package (deb)
         if: matrix.extension == 'deb'
         run: |
-          cd build && cpack -G DEB
-          dpkg-deb -f ./*.deb Depends
+          (cd build && cpack -G DEB && dpkg-deb -f ./*.deb Package Depends)
+          (cd build-citus && cpack -G DEB && dpkg-deb -f ./*.deb Package Depends Conflicts Provides)
           # CPack names every package "-Linux" regardless of architecture, so
           # x86_64 and arm64 would arrive at the release as the same filename
           # and one would silently overwrite the other.
-          mv pg-laswell-*.deb ../${{ matrix.artifact }}.deb
+          mv build/pg-laswell-*.deb ${{ matrix.artifact }}.deb
+          mv build-citus/pg-laswell-citus-*.deb $CITUS_ARTIFACT.deb
 
       - name: Package (rpm)
         if: matrix.extension == 'rpm'
         run: |
-          cd build && cpack -G RPM
-          rpm -qp --requires ./*.rpm | grep -vE 'rpmlib|GLIBC|CXXABI|GLIBCXX|GCC_'
-          mv pg-laswell-*.rpm ../${{ matrix.artifact }}.rpm
+          (cd build && cpack -G RPM && rpm -qp --requires ./*.rpm | grep -vE 'rpmlib|GLIBC|CXXABI|GLIBCXX|GCC_')
+          (cd build-citus && cpack -G RPM && rpm -qp --conflicts --provides ./*.rpm)
+          mv build/pg-laswell-*.rpm ${{ matrix.artifact }}.rpm
+          mv build-citus/pg-laswell-citus-*.rpm $CITUS_ARTIFACT.rpm
 
       # The listing is captured ONCE and then grepped, rather than piped into
       # `grep -q` three times. `grep -q` exits at the first match and closes the
@@ -278,37 +298,46 @@ jobs:
       # set pipefail. Capturing first makes the check quiet, and makes pipefail
       # safe to turn on, which is what catches a listing command that fails
       # outright rather than merely matching nothing.
-      - name: The package must carry both binaries, both manuals and bootstrap.sql
+      - name: Each package must carry both binaries, its manuals and bootstrap.sql
         shell: bash
         run: |
           set -euo pipefail
-          case "${{ matrix.extension }}" in
-            deb)
-              LIST=$(dpkg-deb -c ${{ matrix.artifact }}.deb)
-              DEPS=$(dpkg-deb -f ${{ matrix.artifact }}.deb Depends) ;;
-            rpm)
-              # rpmbuild gzips man pages, so the shipped name ends .1.gz --
-              # which the substring below still matches.
-              LIST=$(rpm -qlp ${{ matrix.artifact }}.rpm)
-              DEPS=$(rpm -qp --requires ${{ matrix.artifact }}.rpm) ;;
-            tar.gz)
-              LIST=$(tar tzf ${{ matrix.artifact }}.tar.gz)
-              DEPS="" ;;
-          esac
-          for want in bin/pg_laswell bin/pg_laswell_mcp \
-                      man1/pg_laswell.1 man1/pg_laswell_mcp.1 \
-                      share/pg_laswell/bootstrap.sql; do
-            printf '%s\n' "$LIST" | grep -q "$want" || {
-              echo "::error::$want is missing from the package"; exit 1; }
+          for art in ${{ matrix.artifact }} $CITUS_ARTIFACT; do
+            case "${{ matrix.extension }}" in
+              deb)
+                LIST=$(dpkg-deb -c $art.${{ matrix.extension }})
+                DEPS=$(dpkg-deb -f $art.${{ matrix.extension }} Depends) ;;
+              rpm)
+                # rpmbuild gzips man pages, so the shipped name ends .1.gz --
+                # which the substring below still matches.
+                LIST=$(rpm -qlp $art.${{ matrix.extension }})
+                DEPS=$(rpm -qp --requires $art.${{ matrix.extension }}) ;;
+              tar.gz)
+                LIST=$(tar tzf $art.${{ matrix.extension }})
+                DEPS="" ;;
+            esac
+            WANT="bin/pg_laswell bin/pg_laswell_mcp man1/pg_laswell.1 man1/pg_laswell_mcp.1 share/pg_laswell/bootstrap.sql"
+            # The variant carries its module's page, and the core package must
+            # NOT: a page documenting kinds the binary refuses sends a reader to
+            # write a specification that cannot run.
+            if [ "$art" = "$CITUS_ARTIFACT" ]; then
+              WANT="$WANT man7/pg_laswell_citus.7"
+            elif printf '%s\n' "$LIST" | grep -q 'pg_laswell_citus.7'; then
+              echo "::error::$art carries the Citus page without the module"; exit 1
+            fi
+            for want in $WANT; do
+              printf '%s\n' "$LIST" | grep -q "$want" || {
+                echo "::error::$want is missing from $art"; exit 1; }
+            done
+            # Dependencies are derived, so this asserts that generation RAN, not
+            # what it produced: pinning the exact list here would be the same
+            # mistake as pinning it in CMakeLists.
+            case "${{ matrix.extension }}" in
+              deb) printf '%s\n' "$DEPS" | grep -q 'libpq5'     || { echo "::error::no derived Depends in $art"; exit 1; } ;;
+              rpm) printf '%s\n' "$DEPS" | grep -q 'libpq.so.5' || { echo "::error::no derived Requires in $art"; exit 1; } ;;
+            esac
+            echo "$LIST"
           done
-          # Dependencies are derived, so this asserts that generation RAN, not
-          # what it produced: pinning the exact list here would be the same
-          # mistake as pinning it in CMakeLists.
-          case "${{ matrix.extension }}" in
-            deb) printf '%s\n' "$DEPS" | grep -q 'libpq5'     || { echo "::error::no derived Depends"; exit 1; } ;;
-            rpm) printf '%s\n' "$DEPS" | grep -q 'libpq.so.5' || { echo "::error::no derived Requires"; exit 1; } ;;
-          esac
-          echo "$LIST"
 
       # Inspecting metadata is not evidence that a package works.
       #
@@ -318,40 +347,62 @@ jobs:
       # the string it was grepped for. So install it and run it. getSpecDigest
       # is the right probe: it needs no database, and it still exercises
       # loading, the canonicaliser and OpenSSL.
-      - name: Install the package and run the binary
+      - name: Install each package and run the binary
         run: |
           SPEC='{"spec":{"laswell_spec_version":1,"id":"x","description":"d","intents":[{"kind":"add_column","schema":"s","table":"t","column":"c","type":"text","nullable":true,"comment":"c"}]}}'
+          # check <server> <deploy> <modules>: the binaries load, answer, and
+          # carry exactly the module set this variant is named after.
+          check() {
+            "$1" --version
+            OUT=$("$1" --call getSpecDigest --args "$SPEC")
+            printf '%s\n' "$OUT" | grep -q '"digest"' || {
+              echo "::error::the installed binary did not answer: $OUT"; exit 1; }
+            MODS=$("$1" --version | sed -n 's/^modules: //p')
+            [ "$MODS" = "$3" ] || {
+              echo "::error::$1 carries modules '$MODS', expected '$3'"; exit 1; }
+            # The deployment binary too. --version is the right probe for it for
+            # the same reason getSpecDigest is for the server: it needs no
+            # database, and it still proves the thing loads and its dynamic
+            # dependencies resolve.
+            "$2" --version
+            # And that it refuses correctly rather than merely starting: no
+            # --repo is a configuration problem, which is exit 3.
+            set +e; "$2" >/dev/null 2>&1; rc=$?; set -e
+            [ "$rc" = "3" ] || {
+              echo "::error::pg_laswell with no --repo exited $rc, expected 3"; exit 1; }
+          }
+          # Core first, then the variant installed OVER it, exactly as someone
+          # switching would: the variant conflicts with and replaces pg-laswell,
+          # so the package manager has to swap them rather than refuse.
           case "${{ matrix.extension }}" in
             deb) apt-get install -y --no-install-recommends ./${{ matrix.artifact }}.deb
-                 BIN=pg_laswell_mcp; DEPLOY=pg_laswell ;;
+                 check pg_laswell_mcp pg_laswell ""
+                 apt-get install -y --no-install-recommends ./$CITUS_ARTIFACT.deb
+                 check pg_laswell_mcp pg_laswell citus
+                 dpkg -s pg-laswell >/dev/null 2>&1 && {
+                   echo "::error::pg-laswell is still installed beside pg-laswell-citus"; exit 1; } ;;
             rpm) dnf install -y ./${{ matrix.artifact }}.rpm
-                 BIN=pg_laswell_mcp; DEPLOY=pg_laswell ;;
+                 check pg_laswell_mcp pg_laswell ""
+                 dnf install -y --allowerasing ./$CITUS_ARTIFACT.rpm
+                 check pg_laswell_mcp pg_laswell citus
+                 rpm -q pg-laswell >/dev/null 2>&1 && {
+                   echo "::error::pg-laswell is still installed beside pg-laswell-citus"; exit 1; } ;;
             tar.gz)
-                 rm -rf verify && mkdir verify
-                 tar xzf ${{ matrix.artifact }}.tar.gz -C verify
-                 BIN="$PWD/verify/bin/pg_laswell_mcp"
-                 DEPLOY="$PWD/verify/bin/pg_laswell" ;;
+                 for art in ${{ matrix.artifact }} $CITUS_ARTIFACT; do
+                   rm -rf verify && mkdir verify
+                   tar xzf $art.tar.gz -C verify
+                   if [ "$art" = "$CITUS_ARTIFACT" ]; then want=citus; else want=""; fi
+                   check "$PWD/verify/bin/pg_laswell_mcp" "$PWD/verify/bin/pg_laswell" "$want"
+                 done ;;
           esac
-          "$BIN" --version
-          OUT=$("$BIN" --call getSpecDigest --args "$SPEC")
-          printf '%s\n' "$OUT" | grep -q '"digest"' || {
-            echo "::error::the installed binary did not answer: $OUT"; exit 1; }
-          # The deployment binary too. --version is the right probe for it for
-          # the same reason getSpecDigest is for the server: it needs no
-          # database, and it still proves the thing loads and its dynamic
-          # dependencies resolve.
-          "$DEPLOY" --version
-          # And that it refuses correctly rather than merely starting: no
-          # --repo is a configuration problem, which is exit 3.
-          set +e; "$DEPLOY" >/dev/null 2>&1; rc=$?; set -e
-          [ "$rc" = "3" ] || {
-            echo "::error::pg_laswell with no --repo exited $rc, expected 3"; exit 1; }
-          echo "both binaries unpacked from the release artifact, and answered"
+          echo "both variants unpacked from the release artifacts, and answered"
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}.${{ matrix.extension }}
+          path: |
+            ${{ matrix.artifact }}.${{ matrix.extension }}
+            ${{ env.CITUS_ARTIFACT }}.${{ matrix.extension }}
           if-no-files-found: error
 
   # The published site: the landing page, the generated reference, and both man
@@ -447,17 +498,21 @@ jobs:
       # failure does not cancel the others, which means a partial release is
       # exactly what would otherwise get published -- silently, and looking
       # complete.
-      - name: All seven artifacts must be present
+      - name: All fourteen artifacts must be present
         run: |
           missing=0
-          for f in pg_laswell-linux-x86_64.tar.gz \
-                   pg_laswell-linux-arm64.tar.gz \
-                   pg_laswell-linux-x86_64-debian13.deb \
-                   pg_laswell-linux-arm64-debian13.deb \
-                   pg_laswell-linux-x86_64-rocky9.rpm \
-                   pg_laswell-linux-arm64-rocky9.rpm \
-                   pg_laswell-macos-arm64.tar.gz; do
-            [ -f "dist/$f" ] || { echo "::error::missing artifact $f"; missing=1; }
+          # Seven targets, two variants each: pg_laswell-* is PostgreSQL only,
+          # pg_laswell-citus-* carries the Citus module.
+          for v in pg_laswell pg_laswell-citus; do
+            for f in $v-linux-x86_64.tar.gz \
+                     $v-linux-arm64.tar.gz \
+                     $v-linux-x86_64-debian13.deb \
+                     $v-linux-arm64-debian13.deb \
+                     $v-linux-x86_64-rocky9.rpm \
+                     $v-linux-arm64-rocky9.rpm \
+                     $v-macos-arm64.tar.gz; do
+              [ -f "dist/$f" ] || { echo "::error::missing artifact $f"; missing=1; }
+            done
           done
           ls -l dist
           exit $missing

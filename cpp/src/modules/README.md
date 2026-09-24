@@ -34,14 +34,24 @@ binary is exactly what it was before modules existed.
 
 ## What a module must provide
 
-A directory `modules/<name>/` containing:
+A directory `modules/<name>/`. CMake finds each file by name; the first five are
+required, and a build naming the module fails at configure time without them.
 
-| File | Purpose |
-|---|---|
-| `kinds.inc` | One `PGLASWELL_KIND(...)` line per intent kind. The X-macro that keeps the enum CLOSED. |
-| `parse.h` | `parse_<kind>()` per kind, using `reject_unknown_keys` like core does |
-| `plan.h` | `plan_<kind>()` per kind. **Must be pure** -- no pqxx, no clock, no connection |
-| `observe.h` | catalog readings, gathered into `Observations::extensions["<name>"]` |
+| File | Required | Purpose |
+|---|---|---|
+| `kinds.inc` | yes | One `PGLASWELL_KIND(...)` line per intent kind. The X-macro that keeps the enum CLOSED. |
+| `module.h` | yes | Includes the parse surface (`parse.h`, `observer.h`); `spec.h` pulls it in. |
+| `parse.h` | yes | `parse_<kind>()` per kind, using `reject_unknown_keys` like core does |
+| `plan.h` | yes | `plan_<kind>()` per kind. **Must be pure** -- no pqxx, no clock, no connection |
+| `observe.h` | yes | `k<name>PresentSql` and `k<name>ObservationSql`: one query, gathered into `Observations::extensions["<name>"]` |
+| `../../man/pg_laswell_<name>.7` | yes | The module's own page: its kinds are absent from a stock build, so the core page cannot list them |
+| `keys.inc` | no | Object keys and conflict edges for kinds that plan against something other than a table |
+| `project.h` + `project.inc` | no | What a step leaves for later steps in the same plan -- written into the module's OWN slot only |
+| `guard.h` | no | `<name>_plan_refusals(spec, obs, refuse)`: refusals true of the whole topology |
+| `confine.h` | no | `<name>_required_confinement(obs, table)`: the one reading core's paced walks consult |
+| `observer.h` | no | Where contention is visible when it is not in `pg_locks` (Citus: on the workers) |
+| `tests.inc` | no, in practice yes | Deferred-case reasons and one representative body per kind, for core's coverage tests |
+| `tests_planner.inc` | no, in practice yes | The module's planner tests, compiled into the test binary only when it is enabled |
 
 ### The enum stays closed, deliberately
 
@@ -204,6 +214,89 @@ is the one that matters:
   the receipt.
 - **opaque slot** -- `Observations::extensions["<name>"]`, which core never
   inspects. Absent is not zero, and that distinction falls out for free.
+
+## Writing one: the Citus module as the worked example
+
+The Citus module is meant to be read as a template. Everything a second module
+needs has a working instance in `modules/citus/`, and the steps below point at
+it. Say the vendor is called `acme`.
+
+1. **Measure before writing anything.** Every Citus planner cites a behaviour
+   observed on a real cluster -- `rebalance_table_shards` keeping a move after
+   ROLLBACK, `alter_distributed_table` silently dropping a foreign key -- and
+   most refusals exist because a measurement contradicted what the documentation
+   implied. Record what you ran and what came back in the comment above the
+   code that relies on it.
+
+2. **Declare the kinds** in `acme/kinds.inc`, each prefixed `acme_`. The line
+   is the only declaration: enum, name table and both dispatches are generated.
+
+3. **Parse** in `acme/parse.h`. Refuse every key you do not list; refuse at
+   parse time anything the vendor refuses unconditionally (Citus: `shard_count`
+   with `colocate_with`), so the author learns it without a database.
+
+4. **Read** in `acme/observe.h`. One query building one JSON object, gated on a
+   presence probe so that an absent extension is an absent key rather than an
+   empty one. A reading must never raise on a healthy but unusual server: the
+   Citus rebalance plan is wrapped in a `CASE` because the function raises when
+   no node may hold shards, and an error there would fail every plan.
+
+5. **Plan** in `acme/plan.h`, as a pure function. Each kind decides three things
+   from the reading: is it already done (`kSatisfied` -- re-running a
+   specification must be a no-op, and several vendor calls ERROR when asked to
+   do what is already done), is it refused (`kConflict`, with the vendor's own
+   error quoted and what to do instead), or what exactly runs (`kApply`).
+   Then classify it honestly:
+   - `TxnClass::kRequired` plus `detail["rehearse_by"] = "execution"` when the
+     call is a `SELECT` that changes the catalog and rolls back cleanly --
+     measured, not assumed. The dry run then executes it and rolls it back.
+   - `TxnClass::kForbidden` when it does NOT roll back. The dry run skips it and
+     lists it as unverified, and the executor runs it outside a transaction.
+     Give it `detail["on_failure"]`: what a failure leaves behind.
+
+6. **Project** in `acme/project.h` when a later intent in the same
+   specification must see this one's effect. The function receives only the
+   module's own slot, so it cannot change how a core kind plans.
+
+7. **Inform core, never write its SQL.** When a core kind must behave
+   differently on the vendor's server, the module answers a question core asks
+   (`confine.h`) and core emits its own statements. See THE RULE above: for a
+   table the module has nothing to say about, both builds must plan identically,
+   and a test proves it.
+
+8. **Test** at three levels, and prove each test by breaking the code it
+   guards: planner tests against hand-written readings in `tests_planner.inc`;
+   live cases against a real server in a script like `cpp/test/citus-tests.sh`,
+   which checks that the vendor accepts the emitted SQL; and a CI job that
+   starts the vendor's server, like the `citus` job in `tests.yml`.
+
+9. **Document** in `man/pg_laswell_acme.7`. `tools/check-manual.py` fails until
+   every kind in `kinds.inc` has a section there.
+
+## Shipping a variant
+
+One source tree, one package per configuration. A build is named after its
+modules, so
+
+    cmake -S cpp -B build                          # package: pg-laswell
+    cmake -S cpp -B build -DPGLASWELL_MODULES=citus  # package: pg-laswell-citus
+
+produce two packages that install the same two binaries. Each variant declares
+that it conflicts with, replaces and provides `pg-laswell`: one binary is
+installed at a time, and anything that depends on `pg-laswell` is satisfied by
+either. The variant also installs its man7 page, and `--version` prints the
+module set, so what is installed is always visible.
+
+This is how one configuration serves several targets. A repository whose
+specifications use only core kinds runs unchanged on a developer's PostgreSQL
+and on a Citus staging cluster: on Citus, core consults the module (`confine.h`)
+and walks each shard separately where a plain walk would be refused.
+Specifications that use `citus_*` kinds are refused as a whole by a core-only
+binary, so a target that needs them has to run the variant, and nothing is
+skipped without anyone noticing. A server needing a different vendor gets its own
+module and its own variant: `-DPGLASWELL_MODULES=acme` builds `pg-laswell-acme`.
+Modules can be combined (`"citus;acme"` builds `pg-laswell-citus-acme`) as long as
+their kind names do not collide, which the naming rule above guarantees.
 
 ## Scope
 
