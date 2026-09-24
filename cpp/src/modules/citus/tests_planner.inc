@@ -1125,3 +1125,186 @@ TEST(CitusPlanner, TruncatingLocalDataOfATableCitusDoesNotDistributeIsRefused) {
   EXPECT_FALSE(p.ok);
   EXPECT_TRUE(conflicts_mention(p, "only rows")) << first_conflict(p);
 }
+
+// --- Phase 3 ----------------------------------------------------------------
+
+namespace {
+json node(const char* name, int group, bool shards, long long placements,
+          bool active = true) {
+  return json{{"nodename", name}, {"nodeport", 5432}, {"groupid", group},
+              {"nodeid", group + 1}, {"isactive", active}, {"noderole", "primary"},
+              {"shouldhaveshards", shards}, {"placements", placements}};
+}
+// Coordinator plus two workers, balanced, workers at wal_level logical.
+json cluster(json nodes = nullptr, json moves = json::array(),
+             const char* wal = "logical") {
+  json c = citus_obs();
+  c["nodes"] = nodes.is_null()
+                   ? json::array({node("coordinator", 0, false, 0),
+                                  node("worker1", 1, true, 32),
+                                  node("worker2", 2, true, 32)})
+                   : nodes;
+  c["rebalance_moves"] = std::move(moves);
+  c["worker_wal_level"] = json{{"worker1:5432", wal}, {"worker2:5432", wal}};
+  return c;
+}
+pglaswell::Plan plan_topology(const json& intent, json c) {
+  return plan_citus(intent, citus_observations(std::move(c), json::object()));
+}
+}  // namespace
+
+TEST(CitusPlanner, AddingANodeThatIsThereIsSatisfied) {
+  const json in{{"kind", "citus_add_node"}, {"host", "worker2"}};
+  const auto p = plan_topology(in, cluster());
+  ASSERT_TRUE(p.ok) << first_conflict(p);
+  EXPECT_EQ(p.steps[0].action, pglaswell::Action::kSatisfied);
+
+  const auto fresh = plan_topology(
+      json{{"kind", "citus_add_node"}, {"host", "worker3"}, {"port", 5433},
+           {"should_have_shards", false}},
+      cluster());
+  ASSERT_TRUE(fresh.ok) << first_conflict(fresh);
+  ASSERT_EQ(fresh.steps[0].sql.size(), 2u);
+  EXPECT_EQ(fresh.steps[0].sql[0], "SELECT citus_add_node('worker3', 5433);");
+  EXPECT_EQ(fresh.steps[0].sql[1],
+            "SELECT citus_set_node_property('worker3', 5433, 'shouldhaveshards', false);");
+  // Measured: it connects as it runs, so executing it in the dry run finds an
+  // unreachable host before the migration does.
+  EXPECT_EQ(fresh.steps[0].detail.value("rehearse_by", ""), "execution");
+}
+
+TEST(CitusPlanner, RemovingANodeThatHoldsShardsIsRefusedWithWhatToDoFirst) {
+  const json in{{"kind", "citus_remove_node"}, {"host", "worker2"}};
+  const auto refused = plan_topology(in, cluster());
+  EXPECT_FALSE(refused.ok);
+  EXPECT_TRUE(conflicts_mention(refused, "citus_drain_node")) << first_conflict(refused);
+  EXPECT_TRUE(conflicts_mention(refused, "32")) << first_conflict(refused);
+
+  const auto drained = plan_topology(
+      in, cluster(json::array({node("coordinator", 0, false, 0),
+                               node("worker1", 1, true, 64),
+                               node("worker2", 2, false, 0)})));
+  ASSERT_TRUE(drained.ok) << first_conflict(drained);
+  EXPECT_EQ(drained.steps[0].sql[0], "SELECT citus_remove_node('worker2', 5432);");
+
+  const auto gone = plan_topology(
+      json{{"kind", "citus_remove_node"}, {"host", "worker9"}}, cluster());
+  ASSERT_TRUE(gone.ok);
+  EXPECT_EQ(gone.steps[0].action, pglaswell::Action::kSatisfied);
+
+  const auto coordinator = plan_topology(
+      json{{"kind", "citus_remove_node"}, {"host", "coordinator"}}, cluster());
+  EXPECT_FALSE(coordinator.ok);
+  EXPECT_TRUE(conflicts_mention(coordinator, "citus_set_coordinator_host"));
+}
+
+TEST(CitusPlanner, TheCoordinatorHostIsReadFromGroupZero) {
+  const auto same = plan_topology(
+      json{{"kind", "citus_set_coordinator_host"}, {"host", "coordinator"}}, cluster());
+  ASSERT_TRUE(same.ok);
+  EXPECT_EQ(same.steps[0].action, pglaswell::Action::kSatisfied);
+  // worker1 is a node, but not group 0: not the coordinator.
+  const auto other = plan_topology(
+      json{{"kind", "citus_set_coordinator_host"}, {"host", "worker1"}}, cluster());
+  ASSERT_TRUE(other.ok);
+  EXPECT_EQ(other.steps[0].action, pglaswell::Action::kApply);
+}
+
+TEST(CitusPlanner, ANodePropertyAlreadyAsAskedIsSatisfied) {
+  const json off{{"kind", "citus_set_node_property"}, {"host", "worker2"},
+                 {"should_have_shards", false}};
+  const auto p = plan_topology(off, cluster());
+  ASSERT_TRUE(p.ok);
+  EXPECT_EQ(p.steps[0].action, pglaswell::Action::kApply);
+  const auto done = plan_topology(
+      off, cluster(json::array({node("worker2", 2, false, 0)})));
+  EXPECT_EQ(done.steps[0].action, pglaswell::Action::kSatisfied);
+  const auto absent = plan_topology(
+      json{{"kind", "citus_set_node_property"}, {"host", "worker9"},
+           {"should_have_shards", true}}, cluster());
+  EXPECT_FALSE(absent.ok);
+}
+
+TEST(CitusPlanner, ADrainRunsOutsideATransactionAndIsNeverRehearsed) {
+  // Measured: drain marks the node on a connection of its own, and the mark
+  // survived a ROLLBACK even when the drain failed. Executing it in a dry run
+  // would change the cluster.
+  const json in{{"kind", "citus_drain_node"}, {"host", "worker2"}};
+  const auto p = plan_topology(in, cluster());
+  ASSERT_TRUE(p.ok) << first_conflict(p);
+  EXPECT_EQ(p.steps[0].txn_class, pglaswell::TxnClass::kForbidden);
+  EXPECT_FALSE(p.steps[0].detail.contains("rehearse_by"));
+  EXPECT_EQ(p.steps[0].sql[0],
+            "SELECT citus_drain_node('worker2', 5432, shard_transfer_mode := 'auto');");
+  EXPECT_FALSE(p.steps[0].detail.value("on_failure", "").empty());
+
+  const auto done = plan_topology(
+      in, cluster(json::array({node("worker1", 1, true, 64),
+                               node("worker2", 2, false, 0)})));
+  EXPECT_EQ(done.steps[0].action, pglaswell::Action::kSatisfied);
+  // Empty but still taking shards is not drained: a rebalance would fill it.
+  const auto empty_open = plan_topology(
+      in, cluster(json::array({node("worker1", 1, true, 64),
+                               node("worker2", 2, true, 0)})));
+  EXPECT_EQ(empty_open.steps[0].action, pglaswell::Action::kApply);
+
+  const auto nowhere = plan_topology(
+      in, cluster(json::array({node("coordinator", 0, false, 0),
+                               node("worker2", 2, true, 32)})));
+  EXPECT_FALSE(nowhere.ok);
+  EXPECT_TRUE(conflicts_mention(nowhere, "nowhere to go")) << first_conflict(nowhere);
+}
+
+TEST(CitusPlanner, AMoveThatNeedsLogicalReplicationIsRefusedWithoutIt) {
+  // Measured: on workers at wal_level = replica the default mode failed at the
+  // first shard -- after the node had been marked.
+  const auto rep = cluster(nullptr, json::array({json{{"shardid", 1}}}), "replica");
+  const auto drain = plan_topology(
+      json{{"kind", "citus_drain_node"}, {"host", "worker2"}}, rep);
+  EXPECT_FALSE(drain.ok);
+  EXPECT_TRUE(conflicts_mention(drain, "wal_level")) << first_conflict(drain);
+  const auto rebalance = plan_topology(json{{"kind", "citus_rebalance_shards"}}, rep);
+  EXPECT_FALSE(rebalance.ok);
+  EXPECT_TRUE(conflicts_mention(rebalance, "block_writes")) << first_conflict(rebalance);
+
+  const auto blocking = plan_topology(
+      json{{"kind", "citus_rebalance_shards"}, {"transfer_mode", "block_writes"}}, rep);
+  EXPECT_TRUE(blocking.ok) << first_conflict(blocking);
+}
+
+TEST(CitusPlanner, ARebalanceIsSatisfiedWhenCitusHasNoMovesToMake) {
+  const json in{{"kind", "citus_rebalance_shards"}};
+  const auto balanced = plan_topology(in, cluster());
+  ASSERT_TRUE(balanced.ok);
+  EXPECT_EQ(balanced.steps[0].action, pglaswell::Action::kSatisfied);
+
+  const auto uneven = plan_topology(
+      in, cluster(nullptr, json::array({json{{"table", "public.a"}, {"shardid", 7},
+                                             {"from", "worker1:5432"},
+                                             {"to", "worker2:5432"}}})));
+  ASSERT_TRUE(uneven.ok) << first_conflict(uneven);
+  EXPECT_EQ(uneven.steps[0].txn_class, pglaswell::TxnClass::kForbidden);
+  EXPECT_EQ(uneven.steps[0].detail.value("moves", 0), 1);
+  EXPECT_EQ(uneven.steps[0].sql[0],
+            "SELECT rebalance_table_shards(shard_transfer_mode := 'auto');");
+
+  // Citus could not be asked: fewer shard-holding nodes than the replication
+  // factor, where the call raises.
+  const auto unaskable = plan_topology(in, cluster(nullptr, json(nullptr)));
+  EXPECT_FALSE(unaskable.ok);
+  EXPECT_TRUE(conflicts_mention(unaskable, "replication")) << first_conflict(unaskable);
+}
+
+TEST(CitusPlanner, TopologyArgumentsAreCheckedAtParse) {
+  EXPECT_ANY_THROW(pglaswell::parse_spec(citus_spec(
+      json{{"kind", "citus_set_node_property"}, {"host", "w"}})));
+  EXPECT_ANY_THROW(pglaswell::parse_spec(citus_spec(
+      json{{"kind", "citus_add_node"}, {"host", "w"}, {"port", 70000}})));
+  EXPECT_ANY_THROW(pglaswell::parse_spec(citus_spec(
+      json{{"kind", "citus_drain_node"}, {"host", "w"}, {"transfer_mode", "fast"}})));
+  EXPECT_ANY_THROW(pglaswell::parse_spec(citus_spec(
+      json{{"kind", "citus_add_node"}, {"host", "w'; DROP"}})));
+  // No kind names a shard by id: they differ per cluster.
+  EXPECT_ANY_THROW(pglaswell::parse_spec(citus_spec(
+      json{{"kind", "citus_move_shard_placement"}, {"shard_id", 102141}})));
+}

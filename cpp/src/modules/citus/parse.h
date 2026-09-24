@@ -234,3 +234,94 @@ inline void parse_citus_truncate_local_data(Intent& in) {
   detail::require_identifier(detail::require_string(in.body, "table", at),
                              "table", in.ordinal);
 }
+
+// --- Phase 3: the cluster itself --------------------------------------------
+//
+// These name NODES, and a node is a fact of one cluster: worker1:5432 on
+// staging is not a host on the developer's single PostgreSQL. A specification
+// using them describes a topology, not a schema, and is bound to the clusters
+// that topology exists on. citus_rebalance_shards names nothing and is the
+// portable one.
+//
+// No kind moves or splits a shard by id. Shard ids come from a sequence in
+// each database -- measured, the same table built by the same specifications
+// starts at shard 102140 in one database and 102107 in another on the same
+// cluster -- so a signed specification naming one would mean a different
+// shard, or none, on every other target. Rebalancing and draining say what is wanted and let
+// Citus pick the shards.
+
+inline void citus_parse_node(const Intent& in, const std::string& at) {
+  const auto host = detail::require_string(in.body, "host", at);
+  if (host.empty() || host.find_first_of(" \t\n'\"") != std::string::npos) {
+    detail::fail(at + ".host must be a host name or address", "");
+  }
+  if (in.body.contains("port") &&
+      (!in.body["port"].is_number_integer() || in.body["port"].get<int>() <= 0 ||
+       in.body["port"].get<int>() > 65535)) {
+    detail::fail(at + ".port must be an integer between 1 and 65535", "");
+  }
+}
+
+// block_writes, force_logical or auto -- Citus's own words, and the ones the
+// man page explains. auto uses logical replication wherever it can, which
+// needs wal_level = logical on the workers.
+inline void citus_parse_transfer_mode(const Intent& in, const std::string& at) {
+  if (!in.body.contains("transfer_mode")) return;
+  const auto m = in.body.value("transfer_mode", "");
+  if (m != "auto" && m != "force_logical" && m != "block_writes") {
+    detail::fail(at + ".transfer_mode must be auto, force_logical or block_writes",
+                 "auto and force_logical copy a shard while writes continue, "
+                 "through logical replication; block_writes holds writes to "
+                 "each shard while it is copied and needs no replication.");
+  }
+}
+
+inline void parse_citus_add_node(Intent& in) {
+  const auto at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(
+      in.body, {"kind", "host", "port", "should_have_shards", "comment"}, at);
+  citus_parse_node(in, at);
+  if (in.body.contains("should_have_shards") &&
+      !in.body["should_have_shards"].is_boolean()) {
+    detail::fail(at + ".should_have_shards must be a boolean", "");
+  }
+}
+
+inline void parse_citus_remove_node(Intent& in) {
+  const auto at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(in.body, {"kind", "host", "port", "comment"}, at);
+  citus_parse_node(in, at);
+}
+
+inline void parse_citus_set_coordinator_host(Intent& in) {
+  const auto at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(in.body, {"kind", "host", "port", "comment"}, at);
+  citus_parse_node(in, at);
+}
+
+inline void parse_citus_set_node_property(Intent& in) {
+  const auto at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(
+      in.body, {"kind", "host", "port", "should_have_shards", "comment"}, at);
+  citus_parse_node(in, at);
+  // The only property Citus has. Required, so the kind cannot be a no-op.
+  if (!in.body.contains("should_have_shards") ||
+      !in.body["should_have_shards"].is_boolean()) {
+    detail::fail(at + ".should_have_shards is required, and must be a boolean",
+                 "It is the only node property Citus lets you set.");
+  }
+}
+
+inline void parse_citus_drain_node(Intent& in) {
+  const auto at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(
+      in.body, {"kind", "host", "port", "transfer_mode", "comment"}, at);
+  citus_parse_node(in, at);
+  citus_parse_transfer_mode(in, at);
+}
+
+inline void parse_citus_rebalance_shards(Intent& in) {
+  const auto at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(in.body, {"kind", "transfer_mode", "comment"}, at);
+  citus_parse_transfer_mode(in, at);
+}

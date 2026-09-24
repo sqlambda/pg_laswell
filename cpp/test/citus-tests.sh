@@ -458,6 +458,122 @@ else
   bad "retry did not resume (first=$first second=$second resumedFrom=${resumed:-none} left=$still n<>1=$twice)" "$out"
 fi
 
+# THE CLUSTER KINDS. Two of them cannot be rehearsed at all -- measured,
+# citus_drain_node marks the node on a connection of its own and the mark
+# survived a ROLLBACK, and rebalance_table_shards inside BEGIN ... ROLLBACK
+# moved a shard and kept it moved -- so the case that matters most here is
+# that a dry run leaves the cluster exactly as it was.
+echo "citus: the cluster kinds"
+
+sign_spec() {  # sign_spec <file> -- signs in place with the suite's key
+  local f=$1 b s
+  b=$("$MCP" --call getSpecDigest --args "{\"spec\":$(cat "$f")}" "$CITUS_URL" 2>/dev/null \
+      | python3 -c 'import json,sys;print(json.load(sys.stdin)["canonicalBytes"],end="")')
+  printf '%s' "$b" > "$f.bytes"
+  s=$(openssl pkeyutl -sign -inkey "$key_dir/k.pem" -rawin -in "$f.bytes" 2>/dev/null | base64 -w0)
+  rm -f "$f.bytes"
+  python3 - "$f" "$kid" "$s" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d["signatures"] = [{"key_id": sys.argv[2], "algorithm": "ed25519", "signature": sys.argv[3]}]
+json.dump(d, open(sys.argv[1], "w"), indent=2)
+PY
+}
+# Placements of DISTRIBUTED shards on a node; reference placements stay put.
+shards_on() {
+  q "SELECT count(*) FROM pg_dist_placement pl
+       JOIN pg_dist_node n ON n.groupid = pl.groupid
+       JOIN pg_dist_shard s USING (shardid)
+       JOIN pg_dist_partition p USING (logicalrelid)
+      WHERE n.nodename = '$1' AND p.partmethod <> 'n'"
+}
+may_hold() { q "SELECT shouldhaveshards FROM pg_dist_node WHERE nodename = '$1'"; }
+
+satisfied "adding a node that is already there" \
+  '{"kind":"citus_add_node","host":"worker1","port":5432}'
+# Measured: citus_add_node connects as it runs. Executed in the dry run, an
+# unreachable host is a problem found before the migration, not during it.
+out=$(intent_plan '{"kind":"citus_add_node","host":"laswell-no-such-host","port":5432}')
+if echo "$out" | grep -q '"problems"' && echo "$out" | grep -q 'laswell-no-such-host'; then
+  ok "an unreachable node is found by the dry run"
+else
+  bad "the dry run should report the unreachable node" "$out"
+fi
+expect_form "removing a node that holds shards" refuse "citus_drain_node" \
+  '{"kind":"citus_remove_node","host":"worker2","port":5432}'
+clean_apply "letting worker2 hold no new shards" \
+  '{"kind":"citus_set_node_property","host":"worker2","port":5432,"should_have_shards":false}'
+if [ "$(may_hold worker2)" = t ]; then ok "and the rehearsal of it was rolled back"
+else bad "the node property rehearsal leaked" "$(may_hold worker2)"; fi
+
+wal=$(q "SELECT result FROM run_command_on_workers('SHOW wal_level') LIMIT 1")
+if [ "$wal" != logical ]; then
+  expect_form "a drain by logical replication at wal_level $wal" refuse "wal_level" \
+    '{"kind":"citus_drain_node","host":"worker2","port":5432}'
+fi
+
+# THE TRAP. Planned and dry-run, a drain must not touch the cluster.
+out=$(intent_plan '{"kind":"citus_drain_node","host":"worker2","port":5432,"transfer_mode":"block_writes"}')
+if echo "$out" | grep -q '"ok":true' && echo "$out" | grep -q '"txnClass":"txn_forbidden"' \
+   && [ "$(may_hold worker2)" = t ]; then
+  ok "a drain's dry run plans it and leaves worker2 exactly as it was"
+else
+  bad "the drain's dry run changed the cluster or did not plan (may_hold=$(may_hold worker2))" "$out"
+fi
+
+# And for real, through the executor: drain worker2, then let it hold shards
+# again and rebalance. Separate specifications, because an intent reads the
+# topology as it was when its specification was planned -- and the drain is run
+# on its own first so the drained state can be seen.
+drain_repo=$(mktemp -d); topo_repo=$(mktemp -d)
+cat > "$drain_repo/9992-ct-drain.json" <<'JSON'
+{"laswell_spec_version":1,"id":"9992-ct-drain","description":"Drain worker2.",
+ "intents":[{"kind":"citus_drain_node","host":"worker2","port":5432,
+             "transfer_mode":"block_writes"}]}
+JSON
+cat > "$topo_repo/9993-ct-allow.json" <<'JSON'
+{"laswell_spec_version":1,"id":"9993-ct-allow","description":"Let worker2 hold shards.",
+ "depends_on":["9992-ct-drain"],
+ "intents":[{"kind":"citus_set_node_property","host":"worker2","port":5432,
+             "should_have_shards":true}]}
+JSON
+cat > "$topo_repo/9994-ct-rebalance.json" <<'JSON'
+{"laswell_spec_version":1,"id":"9994-ct-rebalance","description":"Rebalance.",
+ "depends_on":["9993-ct-allow"],
+ "intents":[{"kind":"citus_rebalance_shards","transfer_mode":"block_writes"}]}
+JSON
+for f in "$drain_repo"/*.json "$topo_repo"/*.json; do sign_spec "$f"; done
+base_repos=(--repo "$walk_repo" --repo "$repo"
+            --repo "$(dirname "$0")/../../examples/docker/citus/migrations")
+
+before=$(shards_on worker2)
+out=$("$BIN" --repo "$drain_repo" "${base_repos[@]}" "$CITUS_URL" 2>&1); rc=$?
+if [ "$rc" = 0 ] && [ "$before" -gt 0 ] && [ "$(shards_on worker2)" = 0 ] \
+   && [ "$(may_hold worker2)" = f ]; then
+  ok "drained through the executor: worker2 went from $before distributed placements to 0"
+else
+  bad "the drain did not finish (rc=$rc before=$before after=$(shards_on worker2))" "$out"
+fi
+out=$("$BIN" --repo "$topo_repo" --repo "$drain_repo" "${base_repos[@]}" "$CITUS_URL" 2>&1); rc=$?
+moves=$(q "SELECT count(*) FROM get_rebalance_table_shards_plan()")
+if [ "$rc" = 0 ] && [ "$(shards_on worker2)" -gt 0 ] && [ "$moves" = 0 ]; then
+  ok "rebalanced through the executor: worker2 holds $(shards_on worker2) again, no moves left"
+else
+  bad "the rebalance did not finish (rc=$rc on worker2=$(shards_on worker2) moves=$moves)" "$out"
+fi
+# Whatever happened above, leave the cluster able to place shards on worker2.
+q "SELECT citus_set_node_property('worker2', 5432, 'shouldhaveshards', true)" >/dev/null
+rm -rf "$drain_repo" "$topo_repo"
+for id in 9992-ct-drain 9993-ct-allow 9994-ct-rebalance; do
+  cleanup_sql="
+DELETE FROM laswell.step WHERE job_id IN (
+  SELECT job_id FROM laswell.job WHERE migration_id IN (
+    SELECT migration_id FROM laswell.migration WHERE spec_id = '$id'));
+DELETE FROM laswell.job WHERE migration_id IN (
+  SELECT migration_id FROM laswell.migration WHERE spec_id = '$id');
+DELETE FROM laswell.migration WHERE spec_id = '$id';$cleanup_sql"
+done
+
 rm -rf "$walk_repo"
 cleanup_sql="$cleanup_sql
 DELETE FROM laswell.backfill_cursor WHERE job_id IN (

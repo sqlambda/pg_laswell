@@ -303,6 +303,128 @@ rows deleted: a local table referencing a reference table was emptied.
 The plan is refused while any such table references it.
 A distributed table referencing it is allowed: only the coordinator's stale copy
 of it is truncated, and Citus still served every row.
+.Ss Cluster kinds
+The kinds below change the cluster, not a table.
+They name nodes, and a node exists on one cluster only:
+.Li worker1:5432
+on staging is not a host anywhere else.
+A specification that uses them describes that topology and is bound to the
+clusters it exists on.
+.Cm citus_rebalance_shards
+names nothing and runs on any cluster.
+.Pp
+Each takes
+.Va host
+and an optional
+.Va port
+(default 5432).
+An intent reads the topology as it was when its specification was planned, so a
+node added or drained in one specification is seen only by the next: order them
+with
+.Va depends_on .
+.Pp
+No kind moves or splits a single shard.
+Shard ids come from a sequence in each database, so they depend on everything
+created there before \(em measured, the same table built by the same
+specifications starts at shard 102140 in one database and 102107 in another on
+the same cluster.
+A signed specification naming a shard would mean a different shard, or none, on
+every other target.
+Draining and rebalancing say what is wanted and leave the choice of shards to
+Citus.
+.Ss Cm citus_add_node
+Add a worker.
+Like every kind that names a node, it is bound to the clusters where that host
+exists; see
+.Sx Cluster kinds .
+Optional:
+.Va should_have_shards
+(boolean; false adds a node that takes no shards).
+Satisfied when the node is already registered and active; refused when it is
+registered and inactive.
+The call connects to the node while it runs, so the dry run executes it and an
+unreachable host is reported before the migration.
+A new node holds nothing until the cluster is rebalanced.
+.Ss Cm citus_remove_node
+Remove a worker.
+Satisfied when it is not registered.
+Refused for the coordinator, and for a node that still holds shards of
+distributed tables \(em Citus refuses to remove the only copy of a shard.
+Drain it first, in an earlier specification.
+.Ss Cm citus_set_coordinator_host
+Register the coordinator's address, the one the workers use to reach it.
+Satisfied when the coordinator is already registered at that address.
+.Ss Cm citus_set_node_property
+Required:
+.Va should_have_shards
+(boolean), the only property Citus lets you set.
+Satisfied when it already has that value.
+Setting it to false stops new shards arriving and moves none; the plan says how
+many the node keeps.
+.Ss Cm citus_drain_node
+Move every shard of a distributed table off a node, and mark it as taking no new
+ones.
+Optional:
+.Va transfer_mode .
+Satisfied when the node holds no such shards and takes no new ones.
+Refused when no other node may hold shards.
+Reference-table placements stay on the node; a drain does not move them.
+.Pp
+Not atomic: the node is marked as taking no shards before anything moves, and
+each move commits on its own, so the step runs outside a transaction and a dry
+run does not execute it.
+A failed drain keeps what it moved, and running the specification again
+finishes it.
+See
+.Sx Moving shards .
+.Ss Cm citus_rebalance_shards
+Move shards until Citus's own rebalancer has nothing left to do.
+Optional:
+.Va transfer_mode .
+Satisfied when the plan from
+.Fn get_rebalance_table_shards_plan
+is empty; otherwise the plan lists how many moves there are and the first
+twenty.
+Runs
+.Fn rebalance_table_shards ,
+which returns only when the rebalance is finished, so
+.Qq applied
+in the ledger means balanced.
+The background form,
+.Fn citus_rebalance_start ,
+would leave a job the ledger knows nothing about.
+.Pp
+Not atomic: each move commits on its own, so the step runs outside a
+transaction and a dry run does not execute it.
+A failed rebalance keeps what it moved, and running the specification again
+finishes it.
+See
+.Sx Moving shards .
+.Ss Moving shards
+.Bl -tag -width Ds
+.It Va transfer_mode
+.Cm auto
+(the default) or
+.Cm force_logical
+copy each shard by logical replication while writes continue; they need
+.Li wal_level = logical
+on every worker, which the plan reads from the workers themselves and refuses
+without.
+.Cm block_writes
+holds writes to each shard while it is copied, and needs no replication.
+.It Neither drain nor rebalance is atomic.
+Measured: inside a transaction that was then rolled back,
+.Fn rebalance_table_shards
+moved a shard and kept it moved, and
+.Fn citus_drain_node
+marked the node as taking no shards, and kept that mark, even when the drain
+itself then failed.
+Every move commits on its own.
+So both run outside a transaction and the dry run does not execute them: it lists
+them as unverified.
+A failed drain or rebalance keeps the moves it made, and running the
+specification again carries on from there.
+.El
 .\" END CITUS KIND LIST
 .Sh READINGS
 With the module built in, every plan against a database where the
@@ -483,6 +605,16 @@ Undistributing, or adding to metadata, one end of a foreign key without
 .Va cascade_via_foreign_keys .
 .It
 Truncating local data that would cascade into a table's real rows.
+.It
+Removing a node that holds shards, or the coordinator.
+.It
+Draining a node when no other node may hold shards.
+.It
+Moving shards by logical replication when a worker is not at
+.Li wal_level = logical .
+.It
+Rebalancing when fewer nodes may hold shards than the replication factor
+requires, where Citus cannot compute a plan at all.
 .El
 .Sh EXAMPLES
 Distribute a parent, then colocate a child with it, in one specification.

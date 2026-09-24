@@ -18,13 +18,61 @@ SELECT JSONB_BUILD_OBJECT(
   'version', (SELECT extversion FROM pg_extension WHERE extname = 'citus'),
   -- Node inventory. The worker count is what the connection budget has to be
   -- multiplied by, and shouldhaveshards decides where a rebalance may place.
+  --
+  -- placements counts shards of DISTRIBUTED tables only. A drained node keeps
+  -- its reference-table placements -- a drain moves distributed shards and
+  -- nothing else -- so counting those would make a finished drain look
+  -- unfinished forever.
   'nodes', COALESCE((
      SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
-              'nodename', nodename, 'nodeport', nodeport,
-              'isactive', isactive, 'noderole', noderole,
-              'shouldhaveshards', shouldhaveshards)
-            ORDER BY nodename, nodeport)
-       FROM pg_dist_node), '[]'::jsonb),
+              'nodename', n.nodename, 'nodeport', n.nodeport,
+              'nodeid', n.nodeid, 'groupid', n.groupid,
+              'isactive', n.isactive, 'noderole', n.noderole,
+              'shouldhaveshards', n.shouldhaveshards,
+              'placements', (SELECT count(*) FROM pg_dist_placement pl
+                               JOIN pg_dist_shard s USING (shardid)
+                               JOIN pg_dist_partition p USING (logicalrelid)
+                              WHERE pl.groupid = n.groupid AND p.partmethod <> 'n'))
+            ORDER BY n.nodename, n.nodeport)
+       FROM pg_dist_node n), '[]'::jsonb),
+  -- The moves Citus's own rebalancer would make now, from the call it
+  -- provides for exactly this question. An empty list is what "balanced"
+  -- means; it is Citus's definition rather than a second one made up here.
+  --
+  -- NULL when it cannot be asked. Measured: with fewer nodes allowed to hold
+  -- shards than the replication factor, the call RAISES ("Shard replication
+  -- factor (1) cannot be greater than number of nodes with
+  -- should_have_shards=true (0)"), and an error here would fail every reading
+  -- of the cluster, not only a rebalance. The CASE is what stops that: its
+  -- branch is not evaluated when the guard is false (measured on a coordinator
+  -- with no workers).
+  --
+  -- It asks the workers for shard sizes. Measured, 64ms on the three-node
+  -- example cluster.
+  'rebalance_moves',
+     CASE WHEN (SELECT count(*) FROM pg_dist_node
+                 WHERE shouldhaveshards AND isactive AND noderole = 'primary')
+               >= COALESCE(NULLIF(current_setting('citus.shard_replication_factor',
+                                                  true), '')::int, 1)
+          THEN COALESCE((
+            SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
+                     'table', m.table_name::text, 'shardid', m.shardid,
+                     'from', m.sourcename || ':' || m.sourceport,
+                     'to', m.targetname || ':' || m.targetport)
+                   ORDER BY m.shardid)
+              FROM get_rebalance_table_shards_plan() m), '[]'::jsonb)
+     END,
+  -- Each worker's wal_level, because moving a shard while writes continue
+  -- uses logical replication. Measured: on workers at wal_level = replica, a
+  -- drain in the default transfer mode failed at its first shard -- "logical
+  -- decoding requires wal_level >= logical" -- AFTER it had already marked the
+  -- node as holding no shards. The coordinator's own setting says nothing
+  -- about the workers', so it is asked on them. A worker that does not answer
+  -- is recorded as null and does not fail the reading.
+  'worker_wal_level', COALESCE((
+     SELECT JSONB_OBJECT_AGG(w.nodename || ':' || w.nodeport,
+                             CASE WHEN w.success THEN w.result END)
+       FROM run_command_on_workers('SHOW wal_level') w), '{}'::jsonb),
   'worker_count', (SELECT count(*) FROM pg_dist_node
                     WHERE noderole = 'primary' AND isactive
                       AND NOT (nodename = COALESCE(

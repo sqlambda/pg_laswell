@@ -45,4 +45,13 @@ PGLASWELL_CONFLICT_KEYS(kCitusAlterDistributedTable, {
 PGLASWELL_CONFLICT_KEYS(kCitusUndistributeTable, {
   add("colocation:" + in.body.value("schema", "") + "." + in.body.value("table", ""));
 })
+// The cluster kinds all touch the one topology every shard lives on: two of
+// them at once -- a drain while a rebalance runs -- are Citus's own conflict
+// to resolve, and the repository should not start them together.
+PGLASWELL_CONFLICT_KEYS(kCitusAddNode, { add("citus:topology"); })
+PGLASWELL_CONFLICT_KEYS(kCitusRemoveNode, { add("citus:topology"); })
+PGLASWELL_CONFLICT_KEYS(kCitusSetCoordinatorHost, { add("citus:topology"); })
+PGLASWELL_CONFLICT_KEYS(kCitusSetNodeProperty, { add("citus:topology"); })
+PGLASWELL_CONFLICT_KEYS(kCitusDrainNode, { add("citus:topology"); })
+PGLASWELL_CONFLICT_KEYS(kCitusRebalanceShards, { add("citus:topology"); })
 #endif

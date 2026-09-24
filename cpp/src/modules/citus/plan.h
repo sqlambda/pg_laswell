@@ -31,13 +31,10 @@ inline const json& citus_table(const json& citus, const std::string& qualified) 
   return it == tables->end() ? kEmpty : *it;
 }
 
-// Shared preamble: is Citus here at all, does the table exist, is it already
-// distributed. Returns false when the step is finished and the caller should
-// stop.
-inline bool citus_precondition(const Intent& in, const Observations& obs,
-                               Step& step, Plan& plan, const json& citus,
-                               const std::string& qualified,
-                               bool& already_distributed) {
+// Is Citus here at all. Returns false, having refused and named the
+// prerequisite, when it is not.
+inline bool citus_present(const Intent& in, Step& step, Plan& plan,
+                          const json& citus) {
   if (citus.empty()) {
     step.action = Action::kConflict;
     step.why = "the citus extension is not installed in this database, so " +
@@ -52,6 +49,17 @@ inline bool citus_precondition(const Intent& in, const Observations& obs,
         {"blocking", true}});
     return false;
   }
+  return true;
+}
+
+// Shared preamble: is Citus here at all, does the table exist, is it already
+// distributed. Returns false when the step is finished and the caller should
+// stop.
+inline bool citus_precondition(const Intent& in, const Observations& obs,
+                               Step& step, Plan& plan, const json& citus,
+                               const std::string& qualified,
+                               bool& already_distributed) {
+  if (!citus_present(in, step, plan, citus)) return false;
   const auto& t = obs.table(qualified);
   if (!t.value("exists", false)) {
     step.action = Action::kConflict;
@@ -1121,4 +1129,403 @@ inline void plan_citus_truncate_local_data(const Intent& in, const Observations&
       "This TRUNCATEs the coordinator's local copy of " + qualified +
       ". The rows Citus serves live in the shards and are untouched; the local "
       "copy cannot be recovered afterwards other than by undistributing.");
+}
+
+// --- Phase 3: the cluster itself --------------------------------------------
+
+inline std::string citus_node_name(const Intent& in) {
+  return in.body.value("host", "") + ":" + std::to_string(in.body.value("port", 5432));
+}
+
+// The node the intent names, as read, or an empty object.
+inline const json& citus_node(const json& citus, const Intent& in) {
+  static const json kEmpty = json::object();
+  const auto host = in.body.value("host", "");
+  const int port = in.body.value("port", 5432);
+  const auto nodes = citus.find("nodes");
+  if (nodes == citus.end() || !nodes->is_array()) return kEmpty;
+  for (const auto& n : *nodes) {
+    if (n.value("nodename", "") == host && n.value("nodeport", 0) == port) return n;
+  }
+  return kEmpty;
+}
+
+// The SQL spelling of the node the intent names: 'host', port.
+inline std::string citus_node_args(const Intent& in) {
+  return detail::quote_literal(in.body.value("host", "")) + ", " +
+         std::to_string(in.body.value("port", 5432));
+}
+
+inline void citus_refuse_absent_node(const Intent& in, Step& step, Plan& plan) {
+  step.action = Action::kConflict;
+  step.why = citus_node_name(in) + " is not a node of this cluster";
+  plan.conflicts.push_back(
+      step.why + ". Add it with citus_add_node first -- in an earlier "
+      "specification: nodes added in this one are not read by the intents after "
+      "it.");
+}
+
+// A shard move needs logical replication unless it blocks writes. Refused
+// before anything runs, because the measured failure is not clean: a drain
+// failed at its first shard having already marked the node as holding none.
+inline bool citus_transfer_mode_possible(const Intent& in, const json& citus,
+                                         Step& step, Plan& plan) {
+  const auto mode = in.body.value("transfer_mode", "auto");
+  if (mode == "block_writes") return true;
+  std::vector<std::string> not_logical;
+  const auto levels = citus.value("worker_wal_level", json::object());
+  for (auto it = levels.begin(); it != levels.end(); ++it) {
+    if (it.value().is_string() && it.value().get<std::string>() != "logical") {
+      not_logical.push_back(it.key() + " (" + it.value().get<std::string>() + ")");
+    }
+  }
+  if (not_logical.empty()) return true;
+  step.action = Action::kConflict;
+  step.why = "transfer_mode " + mode + " moves shards by logical replication, and " +
+             detail::join(not_logical, ", ") + " not at wal_level = logical";
+  plan.conflicts.push_back(
+      step.why + ". Measured: the move fails at its first shard (\"logical "
+      "decoding requires wal_level >= logical\"). Set wal_level = logical on the "
+      "workers and restart them, or write transfer_mode: block_writes -- writes to "
+      "each shard then wait while it is copied.");
+  return false;
+}
+
+inline void plan_citus_add_node(const Intent& in, const Observations& obs,
+                                const ExecutorConfig& cfg, Plan& plan,
+                                std::vector<Step>& out) {
+  (void)cfg;
+  Step step;
+  step.kind = in.kind_name;
+  struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
+  const auto& citus = obs.extension("citus");
+  if (!citus_present(in, step, plan, citus)) return;
+
+  const auto name = citus_node_name(in);
+  const auto& node = citus_node(citus, in);
+  const bool want_shards = in.body.value("should_have_shards", true);
+  if (!node.empty()) {
+    if (!node.value("isactive", true)) {
+      step.action = Action::kConflict;
+      step.why = name + " is registered and inactive";
+      plan.conflicts.push_back(
+          step.why + ". Adding it again does not activate it; that is "
+          "citus_activate_node, and a node that was disabled usually was for a "
+          "reason someone should read first.");
+      return;
+    }
+    if (!in.body.contains("should_have_shards") ||
+        node.value("shouldhaveshards", true) == want_shards) {
+      step.action = Action::kSatisfied;
+      step.why = name + " is already a node of this cluster";
+      return;
+    }
+  }
+
+  step.action = Action::kApply;
+  step.txn_class = TxnClass::kRequired;
+  // Rehearsed by execution. Measured: citus_add_node runs in a transaction and
+  // a ROLLBACK removes the node again -- and it connects to the node as it
+  // runs, so a host that cannot be reached is found by the dry run ("could not
+  // translate host name") rather than by the migration.
+  step.detail["rehearse_by"] = "execution";
+  step.detail["node"] = name;
+  step.lock = "no table lock: cluster metadata, propagated to every node";
+  if (node.empty()) {
+    step.why = name + " joins the cluster";
+    step.sql.push_back("SELECT citus_add_node(" + citus_node_args(in) + ");");
+    plan.warnings.push_back(
+        name + " holds no shards when it joins. Existing shards move onto it only "
+        "when the cluster is rebalanced -- citus_rebalance_shards, in a later "
+        "specification.");
+  } else {
+    step.why = name + " is already a node; only whether it may hold shards changes";
+  }
+  if (in.body.contains("should_have_shards") &&
+      (node.empty() ? !want_shards
+                    : node.value("shouldhaveshards", true) != want_shards)) {
+    step.sql.push_back("SELECT citus_set_node_property(" + citus_node_args(in) +
+                       ", 'shouldhaveshards', " + (want_shards ? "true" : "false") +
+                       ");");
+  }
+}
+
+inline void plan_citus_remove_node(const Intent& in, const Observations& obs,
+                                   const ExecutorConfig& cfg, Plan& plan,
+                                   std::vector<Step>& out) {
+  (void)cfg;
+  Step step;
+  step.kind = in.kind_name;
+  struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
+  const auto& citus = obs.extension("citus");
+  if (!citus_present(in, step, plan, citus)) return;
+
+  const auto name = citus_node_name(in);
+  const auto& node = citus_node(citus, in);
+  // Measured: removing a node that is not there is an error, "node at ... does
+  // not exist". Gone is what was asked for.
+  if (node.empty()) {
+    step.action = Action::kSatisfied;
+    step.why = name + " is not a node of this cluster";
+    return;
+  }
+  if (node.value("groupid", -1) == 0) {
+    step.action = Action::kConflict;
+    step.why = name + " is the coordinator";
+    plan.conflicts.push_back(
+        step.why + ". Removing it from the metadata strands every reference and "
+        "Citus-managed local table's coordinator placement. Change its address "
+        "with citus_set_coordinator_host instead.");
+    return;
+  }
+  // Measured: "cannot remove or disable the node ... because it contains the
+  // only shard placement for shard ...". The count is in the reading, so the
+  // author learns it before, with what to do about it.
+  const auto placements = node.value("placements", 0LL);
+  if (placements > 0) {
+    step.action = Action::kConflict;
+    step.why = name + " holds " + std::to_string(placements) +
+               " shard placements of distributed tables";
+    plan.conflicts.push_back(
+        step.why + ", and Citus refuses to remove a node holding the only copy of "
+        "a shard. Drain it first with citus_drain_node, in an earlier "
+        "specification.");
+    return;
+  }
+
+  step.action = Action::kApply;
+  step.txn_class = TxnClass::kRequired;
+  // Rehearsed by execution: measured, citus_remove_node rolls back cleanly.
+  step.detail["rehearse_by"] = "execution";
+  step.detail["node"] = name;
+  step.lock = "no table lock: cluster metadata, propagated to every node";
+  step.why = name + " holds no distributed shards and leaves the cluster";
+  step.sql.push_back("SELECT citus_remove_node(" + citus_node_args(in) + ");");
+}
+
+inline void plan_citus_set_coordinator_host(const Intent& in,
+                                            const Observations& obs,
+                                            const ExecutorConfig& cfg, Plan& plan,
+                                            std::vector<Step>& out) {
+  (void)cfg;
+  Step step;
+  step.kind = in.kind_name;
+  struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
+  const auto& citus = obs.extension("citus");
+  if (!citus_present(in, step, plan, citus)) return;
+
+  const auto name = citus_node_name(in);
+  std::string current;
+  for (const auto& n : citus.value("nodes", json::array())) {
+    if (n.value("groupid", -1) == 0) {
+      current = n.value("nodename", "") + ":" + std::to_string(n.value("nodeport", 0));
+    }
+  }
+  if (current == name) {
+    step.action = Action::kSatisfied;
+    step.why = "the coordinator is already registered as " + name;
+    return;
+  }
+  step.action = Action::kApply;
+  step.txn_class = TxnClass::kRequired;
+  // Rehearsed by execution: measured, a changed coordinator host rolls back.
+  step.detail["rehearse_by"] = "execution";
+  step.detail["node"] = name;
+  step.lock = "no table lock: cluster metadata, propagated to every node";
+  step.why = current.empty()
+                 ? "the coordinator is registered as " + name +
+                       ", so the workers can reach it"
+                 : "the coordinator's registered address changes from " + current +
+                       " to " + name;
+  step.sql.push_back("SELECT citus_set_coordinator_host(" + citus_node_args(in) +
+                     ");");
+  if (!current.empty()) {
+    plan.warnings.push_back(
+        "The workers reach the coordinator at " + name +
+        " from now on. If that address does not resolve from them, queries that "
+        "touch reference or Citus-managed local tables fail.");
+  }
+}
+
+inline void plan_citus_set_node_property(const Intent& in, const Observations& obs,
+                                         const ExecutorConfig& cfg, Plan& plan,
+                                         std::vector<Step>& out) {
+  (void)cfg;
+  Step step;
+  step.kind = in.kind_name;
+  struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
+  const auto& citus = obs.extension("citus");
+  if (!citus_present(in, step, plan, citus)) return;
+
+  const auto name = citus_node_name(in);
+  const auto& node = citus_node(citus, in);
+  if (node.empty()) {
+    citus_refuse_absent_node(in, step, plan);
+    return;
+  }
+  const bool want = in.body.value("should_have_shards", true);
+  if (node.value("shouldhaveshards", !want) == want) {
+    step.action = Action::kSatisfied;
+    step.why = name + (want ? " already may" : " already may not") + " hold shards";
+    return;
+  }
+  step.action = Action::kApply;
+  step.txn_class = TxnClass::kRequired;
+  // Rehearsed by execution: measured, the property change rolls back.
+  step.detail["rehearse_by"] = "execution";
+  step.detail["node"] = name;
+  step.lock = "no table lock: cluster metadata, propagated to every node";
+  step.why = name + (want ? " may hold shards" : " may no longer hold new shards");
+  step.sql.push_back("SELECT citus_set_node_property(" + citus_node_args(in) +
+                     ", 'shouldhaveshards', " + (want ? "true" : "false") + ");");
+  const auto placements = node.value("placements", 0LL);
+  if (!want && placements > 0) {
+    plan.warnings.push_back(
+        name + " keeps the " + std::to_string(placements) +
+        " placements it holds: this only stops new shards arriving. "
+        "citus_drain_node moves the existing ones.");
+  }
+}
+
+inline void plan_citus_drain_node(const Intent& in, const Observations& obs,
+                                  const ExecutorConfig& cfg, Plan& plan,
+                                  std::vector<Step>& out) {
+  (void)cfg;
+  Step step;
+  step.kind = in.kind_name;
+  struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
+  const auto& citus = obs.extension("citus");
+  if (!citus_present(in, step, plan, citus)) return;
+
+  const auto name = citus_node_name(in);
+  const auto& node = citus_node(citus, in);
+  if (node.empty()) {
+    citus_refuse_absent_node(in, step, plan);
+    return;
+  }
+  const auto placements = node.value("placements", 0LL);
+  if (placements == 0 && !node.value("shouldhaveshards", true)) {
+    step.action = Action::kSatisfied;
+    step.why = name + " holds no distributed shards and takes no new ones";
+    return;
+  }
+  // Somewhere for the shards to go.
+  int elsewhere = 0;
+  for (const auto& n : citus.value("nodes", json::array())) {
+    if (n.value("nodename", "") == node.value("nodename", "") &&
+        n.value("nodeport", 0) == node.value("nodeport", 0)) {
+      continue;
+    }
+    if (n.value("shouldhaveshards", false) && n.value("isactive", false) &&
+        n.value("noderole", "") == "primary") {
+      ++elsewhere;
+    }
+  }
+  if (elsewhere == 0 && placements > 0) {
+    step.action = Action::kConflict;
+    step.why = "no other node may hold shards, so " + name + "'s " +
+               std::to_string(placements) + " placements have nowhere to go";
+    plan.conflicts.push_back(
+        step.why + ". Add a node, or let one hold shards with "
+        "citus_set_node_property, in an earlier specification.");
+    return;
+  }
+  if (!citus_transfer_mode_possible(in, citus, step, plan)) return;
+
+  const auto mode = in.body.value("transfer_mode", "auto");
+  step.action = Action::kApply;
+  // OUTSIDE a transaction, and not rehearsed. Measured: citus_drain_node marks
+  // the node shouldhaveshards = false on a connection of its own, and that
+  // survives the caller's ROLLBACK -- even when the drain itself then fails. A
+  // dry run that executed it would change the cluster; one that wrapped it in
+  // a transaction would claim an atomicity Citus does not give. kForbidden
+  // says both: the dry run lists the step as unverified, and the executor
+  // runs it on its own.
+  step.txn_class = TxnClass::kForbidden;
+  step.detail["node"] = name;
+  step.detail["placements"] = placements;
+  step.detail["transfer_mode"] = mode;
+  step.detail["on_failure"] =
+      "a failed drain keeps the shards it had already moved, and leaves " + name +
+      " marked as taking no new shards. Nothing needs undoing: running the "
+      "specification again drains the rest.";
+  step.lock = mode == "block_writes"
+                  ? "writes to each shard wait while that shard is copied"
+                  : "each shard is copied by logical replication; writes wait "
+                    "only for the final switch";
+  step.why = std::to_string(placements) + " placements move off " + name +
+             ", and it takes no new shards";
+  step.sql.push_back("SELECT citus_drain_node(" + citus_node_args(in) +
+                     ", shard_transfer_mode := " + detail::quote_literal(mode) +
+                     ");");
+  plan.warnings.push_back(
+      "citus_drain_node is not atomic. It marks " + name +
+      " as taking no shards before it moves any -- measured, that mark stays even "
+      "when the drain then fails -- and each shard move commits on its own. A "
+      "failed drain leaves some shards moved; running the specification again "
+      "carries on from there.");
+}
+
+inline void plan_citus_rebalance_shards(const Intent& in, const Observations& obs,
+                                        const ExecutorConfig& cfg, Plan& plan,
+                                        std::vector<Step>& out) {
+  (void)cfg;
+  Step step;
+  step.kind = in.kind_name;
+  struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
+  const auto& citus = obs.extension("citus");
+  if (!citus_present(in, step, plan, citus)) return;
+
+  const auto moves = citus.value("rebalance_moves", json(nullptr));
+  if (!moves.is_array()) {
+    step.action = Action::kConflict;
+    step.why = "Citus cannot plan a rebalance here: fewer nodes may hold shards "
+               "than citus.shard_replication_factor requires";
+    plan.conflicts.push_back(
+        step.why + ". Measured, Citus raises \"Shard replication factor cannot "
+        "be greater than number of nodes with should_have_shards=true\". Add a "
+        "node, or let one hold shards, in an earlier specification.");
+    return;
+  }
+  // Balanced by Citus's own definition: the rebalancer's plan is empty.
+  if (moves.empty()) {
+    step.action = Action::kSatisfied;
+    step.why = "the cluster is balanced: Citus's rebalance plan has no moves";
+    return;
+  }
+  if (!citus_transfer_mode_possible(in, citus, step, plan)) return;
+
+  const auto mode = in.body.value("transfer_mode", "auto");
+  step.action = Action::kApply;
+  // OUTSIDE a transaction, and not rehearsed. Measured: inside BEGIN ...
+  // ROLLBACK, rebalance_table_shards MOVED A SHARD AND KEPT IT MOVED -- every
+  // move runs and commits on connections of its own. See plan_citus_drain_node.
+  step.txn_class = TxnClass::kForbidden;
+  step.detail["moves"] = moves.size();
+  json shown = json::array();
+  for (std::size_t i = 0; i < moves.size() && i < 20; ++i) shown.push_back(moves[i]);
+  step.detail["first_moves"] = shown;
+  step.detail["transfer_mode"] = mode;
+  step.detail["on_failure"] =
+      "a failed rebalance keeps the moves it had already made. Nothing needs "
+      "undoing: running the specification again re-reads Citus's plan and makes "
+      "the rest.";
+  step.lock = mode == "block_writes"
+                  ? "writes to each shard wait while that shard is copied"
+                  : "each shard is copied by logical replication; writes wait "
+                    "only for the final switch";
+  step.why = std::to_string(moves.size()) +
+             " shard moves, as Citus's own rebalance plan lists them now";
+  // Synchronous: the step finishes when the rebalance does, so the ledger's
+  // "applied" means balanced. citus_rebalance_start returns at once and leaves
+  // a background job the ledger would know nothing about.
+  step.sql.push_back("SELECT rebalance_table_shards(shard_transfer_mode := " +
+                     detail::quote_literal(mode) + ");");
+  plan.warnings.push_back(
+      "rebalance_table_shards is not atomic: each of the " +
+      std::to_string(moves.size()) +
+      " moves commits on its own, and a failure leaves the ones before it done. "
+      "Running the specification again re-reads the plan and carries on. The "
+      "moves listed are the plan at the time of reading; Citus decides again "
+      "when it runs.");
 }

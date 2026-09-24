@@ -582,13 +582,29 @@ class Executor {
             });
       });
     } catch (const pqxx::sql_error& e) {
-      record_step(ordinal, step, "failed", 0,
-                  json{{"sqlstate", e.sqlstate()},
-                       {"error", e.what()},
-                       {"note",
-                        "a failed CREATE INDEX CONCURRENTLY leaves an INVALID "
-                        "index that still appears in pg_indexes. Re-planning "
-                        "will emit DROP INDEX CONCURRENTLY before rebuilding."}});
+      json failed{{"sqlstate", e.sqlstate()}, {"error", e.what()}};
+      // What a failure here leaves behind depends on what failed. The note
+      // used to be about CREATE INDEX CONCURRENTLY whatever the step was, and
+      // told the reader of a failed shard rebalance to look for an invalid
+      // index. A step that knows its own aftermath says it in on_failure.
+      const auto own = step.value("detail", json::object()).value("on_failure", "");
+      bool concurrent_build = false;
+      for (const auto& raw : step.value("sql", json::array())) {
+        const auto sql = raw.get<std::string>();
+        if (sql.rfind("CREATE INDEX CONCURRENTLY", 0) == 0 ||
+            sql.rfind("CREATE UNIQUE INDEX CONCURRENTLY", 0) == 0) {
+          concurrent_build = true;
+        }
+      }
+      if (!own.empty()) {
+        failed["note"] = own;
+      } else if (concurrent_build) {
+        failed["note"] =
+            "a failed CREATE INDEX CONCURRENTLY leaves an INVALID index that "
+            "still appears in pg_indexes. Re-planning will emit DROP INDEX "
+            "CONCURRENTLY before rebuilding.";
+      }
+      record_step(ordinal, step, "failed", 0, failed);
       throw;
     }
     record_step(ordinal, step, "succeeded", 0,
