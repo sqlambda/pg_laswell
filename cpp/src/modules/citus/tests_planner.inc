@@ -756,3 +756,88 @@ TEST(CitusPlanner, TheBudgetNamesTheModifyModeItsFanOutDependsOn) {
   EXPECT_NE(basis.find("plain COMMIT"), std::string::npos) << basis;
   EXPECT_NE(basis.find("(1min)"), std::string::npos) << basis;
 }
+
+// --- against a live cluster ---------------------------------------------------
+//
+// Skipped without CITUS_URL, loudly. These prove SQL a fixed reading cannot.
+
+TEST(CitusLive, AWorkerSideWaitHasAnAgeTheBreakerCanUse) {
+  // citus_lock_waits has no waitstart, so a wait that exists only on a worker
+  // used to report no age at all -- and max_waiter_wait_ms was inactive for
+  // exactly the contention Citus adds. The observer now reports an UPPER BOUND:
+  // the waiting statement's age on the node it waits on. Proved here with the
+  // observer's own SQL constant, so this cannot drift from what runs.
+  const char* url = std::getenv("CITUS_URL");
+  if (url == nullptr || *url == '\0') GTEST_SKIP() << "CITUS_URL is unset";
+
+  pqxx::connection setup(url);
+  {
+    pqxx::work w(setup);
+    w.exec("DROP TABLE IF EXISTS public.laswell_wait_probe");
+    w.exec("CREATE TABLE public.laswell_wait_probe (t bigint NOT NULL, id bigint NOT NULL,"
+           " v int, PRIMARY KEY (t, id))");
+    w.exec("SELECT create_distributed_table('public.laswell_wait_probe', 't')");
+    w.exec("INSERT INTO public.laswell_wait_probe VALUES (1, 1, 0)");
+    w.commit();
+  }
+
+  pqxx::connection blocker(url);
+  pqxx::work hold(blocker);
+  hold.exec("UPDATE public.laswell_wait_probe SET v = v + 1 WHERE t = 1");
+  const int blocker_pid = hold.query_value<int>("SELECT pg_backend_pid()");
+
+  // The waiter, on its own connection and thread: it blocks until `hold` ends.
+  std::thread waiter([url] {
+    try {
+      pqxx::connection c(url);
+      pqxx::work w(c);
+      w.exec("UPDATE public.laswell_wait_probe SET v = v + 10 WHERE t = 1");
+      w.commit();
+    } catch (...) {
+    }
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+
+  // Whatever happens below, the waiter is released and joined: a std::thread
+  // destroyed while joinable calls std::terminate, and the first version of this
+  // test took the whole binary down when the reading came back without an age.
+  struct Release {
+    pqxx::work& hold;
+    std::thread& waiter;
+    ~Release() {
+      try { hold.abort(); } catch (...) {}
+      if (waiter.joinable()) waiter.join();
+    }
+  } release{hold, waiter};
+
+  long long age = -1;
+  json reading;
+  try {
+    pqxx::connection obs(url);
+    pqxx::work r(obs);
+    const auto res = pglaswell::pqxx_exec(
+        r, pglaswell::kcitusObserverSql,
+        pqxx::params{"{" + std::to_string(blocker_pid) + "}"});
+    reading = json::parse(res[0][0].as<std::string>());
+  } catch (const std::exception& e) {
+    ADD_FAILURE() << "the observer's SQL failed against Citus: " << e.what();
+  }
+  const auto mine = reading.is_object()
+                        ? reading.value(std::to_string(blocker_pid), json::object())
+                        : json::object();
+  EXPECT_GE(mine.value("direct", 0), 1) << reading.dump();
+  const auto a = mine.value("oldestWaitUpperBoundMs", json(nullptr));
+  if (a.is_number()) age = a.get<long long>();
+  hold.abort();
+  waiter.join();
+  {
+    pqxx::work w(setup);
+    w.exec("DROP TABLE public.laswell_wait_probe");
+    w.commit();
+  }
+
+  // Waited about 1500ms. An upper bound may read higher, never meaningfully
+  // lower -- lower would be the unsafe direction for the breaker.
+  EXPECT_GE(age, 1300) << "the worker-side wait's age is missing or understated";
+  EXPECT_LT(age, 10000) << "the bound is too loose to be useful";
+}

@@ -564,6 +564,18 @@ class Observer {
               !c["blockingWaiterNode"].is_null()) {
             reading["blockingWaiterNode"] = c["blockingWaiterNode"];
           }
+          // The age, merged the same way the counts are: the larger wins, so a
+          // cluster reading can only RAISE it. The cluster's is an upper bound
+          // (the waiting statement's age, not the wait's), which can only make
+          // the max_waiter_wait_ms breaker fire sooner -- the safe direction
+          // for a breaker that bounds how long other sessions wait.
+          if (c.contains("oldestWaitUpperBoundMs") &&
+              c["oldestWaitUpperBoundMs"].is_number()) {
+            reading["oldestWaitMs"] =
+                std::max(reading.value("oldestWaitMs", 0LL),
+                         c["oldestWaitUpperBoundMs"].get<long long>());
+            reading["oldestWaitBasis"] = "cluster upper bound";
+          }
           reading["topology"] = topology_;
         }
         if (reading.empty() ||

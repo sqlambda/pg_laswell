@@ -18,12 +18,18 @@
 // backend pids, so they are mapped through citus_stat_activity, which carries
 // both.
 //
-// WHAT IT CANNOT ANSWER, said rather than defaulted: citus_lock_waits has no
-// waitstart, so a worker-side wait has no measurable age. Returning 0 would be
-// read as "nobody has been waiting long" and would silently disable the
-// max_waiter_wait_ms breaker. The counts come from the cluster; the timings stay
-// with the local reading, and a wait that only exists on a worker reports its
-// age as absent.
+// A WAIT'S AGE, AS AN UPPER BOUND. citus_lock_waits has no waitstart, so this
+// used to report a worker-side wait's age as absent -- honest, and it left the
+// max_waiter_wait_ms breaker inactive for exactly the contention Citus adds.
+//
+// citus_stat_activity has the waiting statement's query_start on the node
+// where it waits, and a statement that begins and then blocks has waited about
+// as long as it has run. Measured on Citus 13: a waiter that started 2500ms
+// earlier read 2545ms. It is an UPPER bound -- a statement that ran for a while
+// before blocking reads older than its wait -- and that errs in the safe
+// direction for this breaker, whose job is to bound how long OTHER sessions
+// wait: it cancels our batch sooner, never later. Named oldestWaitUpperBoundMs
+// so no reader mistakes it for pg_locks.waitstart.
 
 // Is this database part of a Citus cluster with workers? Not just "is the
 // extension installed": a single-node Citus has no worker to be blind to, and
@@ -66,7 +72,8 @@ SELECT COALESCE(JSONB_OBJECT_AGG(x.worker::text, JSONB_BUILD_OBJECT(
          -- The node the nearest waiter is on. Recorded because "a waiter
          -- appeared" and "a waiter appeared ON A WORKER" are different facts,
          -- and the second is the one a coordinator-only reading could not see.
-         'blockingWaiterNode', x.waiter_node)), '{}'::jsonb)
+         'blockingWaiterNode', x.waiter_node,
+         'oldestWaitUpperBoundMs', x.oldest_ms)), '{}'::jsonb)
   FROM (
     SELECT m.worker,
            (SELECT count(DISTINCT w.waiting_gpid) FROM citus_lock_waits w
@@ -74,6 +81,12 @@ SELECT COALESCE(JSONB_OBJECT_AGG(x.worker::text, JSONB_BUILD_OBJECT(
            (SELECT count(DISTINCT c.gpid) FROM chain c
              WHERE c.worker = m.worker AND c.depth > 0) AS transitive,
            (SELECT w.waiting_nodeid FROM citus_lock_waits w
-             WHERE w.blocking_gpid = m.gpid LIMIT 1) AS waiter_node
+             WHERE w.blocking_gpid = m.gpid LIMIT 1) AS waiter_node,
+           -- The oldest DIRECT waiter's statement age on the node it waits on.
+           (SELECT max((extract(epoch FROM now() - a.query_start) * 1000)::bigint)
+              FROM citus_lock_waits w
+              JOIN citus_stat_activity a
+                ON a.global_pid = w.waiting_gpid AND a.nodeid = w.waiting_nodeid
+             WHERE w.blocking_gpid = m.gpid) AS oldest_ms
       FROM mine m) AS x
 )SQL";

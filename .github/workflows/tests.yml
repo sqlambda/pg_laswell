@@ -702,7 +702,14 @@ jobs:
       - name: The module against Citus
         env:
           CITUS_URL: postgresql://postgres:laswell@127.0.0.1:55440/citus_example
-        run: ctest --test-dir build -R citus_tests --output-on-failure
+        run: |
+          ctest --test-dir build -R citus_tests --output-on-failure
+          # The suite's own live cases -- the observer's SQL against a real wait,
+          # which no fixed reading can prove. They skip without CITUS_URL, so the
+          # no-database run above cannot have covered them.
+          ./build/pg_laswell_mcp_test --gtest_filter='CitusLive.*'
+          ./build/pg_laswell_mcp_test --gtest_filter='CitusLive.*' | grep -q 'PASSED.*1 test' \
+            || { echo "::error::a CitusLive test was skipped or failed"; exit 1; }
       - name: Stop the cluster
         if: always()
         run: docker compose -f examples/docker/citus/compose.yml down -v
