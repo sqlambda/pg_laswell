@@ -75,18 +75,18 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
 <p class="purpose"><strong>A citus module kind.</strong> Known only to a binary built with <code>-DPGLASWELL_MODULES=citus</code> -- <code>--version</code> then prints <code>modules: citus</code>. A PostgreSQL-only build refuses it as an unknown kind, and with it the whole specification. See <code>pg_laswell_citus(7)</code>.</p>
 <h2>Synopsis</h2><pre>{
   &quot;kind&quot;: &quot;citus_drain_node&quot;,
-  &quot;host&quot;: &lt;optional&gt;,
+  &quot;host&quot;: &lt;required&gt;,
   &quot;port&quot;: &lt;optional&gt;,
-  &quot;transfer_mode&quot;: &lt;optional&gt;,
+  &quot;transfer_mode&quot;: &quot;auto&quot; | &quot;force_logical&quot; | &quot;block_writes&quot;,
   &quot;comment&quot;: &lt;optional&gt;
 }</pre>
 <h2>Parameters</h2><dl class="params">
-<dt>host<span class="tag opt">optional</span></dt>
+<dt>host<span class="tag req">required</span></dt>
 <dd>&nbsp;</dd>
 <dt>port<span class="tag opt">optional</span></dt>
 <dd>&nbsp;</dd>
 <dt>transfer_mode<span class="tag opt">optional</span></dt>
-<dd>&nbsp;</dd>
+<dd>One of <code>auto</code>, <code>force_logical</code>, <code>block_writes</code>. auto and force_logical copy a shard while writes continue, through logical replication; block_writes holds writes to each shard while it is copied and needs no replication.</dd>
 <dt>comment<span class="tag opt">optional</span></dt>
 <dd>&nbsp;</dd>
 </dl>

@@ -95,19 +95,19 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
 <dt>table<span class="tag req">required</span></dt>
 <dd>&nbsp;</dd>
 <dt>key<span class="tag req">required</span></dt>
-<dd>&nbsp;</dd>
+<dd>The key has to be one of the values each row supplies, so every row must carry it.</dd>
 <dt>columns<span class="tag opt">optional</span></dt>
 <dd>Name the key and the columns being set, in the order each row supplies them — the select form needs it for the same reason as the values form: to know which returned column is which.</dd>
 <dt>values<span class="tag opt">optional</span></dt>
-<dd>&nbsp;</dd>
+<dd>&quot;columns&quot; names what each row&#x27;s entries are, in order. Positional rows with no column list would make a spec that reads correctly and writes the wrong column the moment the table gains one.</dd>
 <dt>select<span class="tag opt">optional</span></dt>
-<dd>&nbsp;</dd>
+<dd>A select&#x27;s row count cannot be measured without running it, so these are always paced, and a paced walk needs a key column that the select returns. Add &quot;key&quot;, and make sure the select produces it.</dd>
 <dt>paced<span class="tag opt">optional</span></dt>
-<dd>&nbsp;</dd>
+<dd>true paces the change into short transactions; false runs it in one, which is what a small seed usually wants. Omit it and the planner chooses on the measured row count and says so.</dd>
 <dt>verify_remaining<span class="tag opt">optional</span></dt>
 <dd>&nbsp;</dd>
 <dt>preserve<span class="tag opt">optional</span></dt>
-<dd>&nbsp;</dd>
+<dd>The pre-image has to go somewhere else, or the change would overwrite the record of what it changed.</dd>
 <dt>assert_invariants<span class="tag opt">optional</span></dt>
 <dd>&nbsp;</dd>
 </dl>

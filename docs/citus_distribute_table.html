@@ -79,7 +79,7 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
   &quot;table&quot;: &lt;required&gt;,
   &quot;distribution_column&quot;: &lt;required&gt;,
   &quot;shard_method&quot;: &lt;optional&gt;,
-  &quot;colocate_with&quot;: &lt;optional&gt;,
+  &quot;colocate_with&quot;: &quot;schema.table&quot; | &quot;none&quot; | &quot;default&quot;,
   &quot;shard_count&quot;: &lt;optional&gt;,
   &quot;concurrently&quot;: &lt;optional&gt;,
   &quot;comment&quot;: &lt;optional&gt;
@@ -94,7 +94,7 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
 <dt>shard_method<span class="tag opt">optional</span></dt>
 <dd>hash is the default and the only one Citus recommends for new work; append and range are legacy.</dd>
 <dt>colocate_with<span class="tag opt">optional</span></dt>
-<dd>&nbsp;</dd>
+<dd>One of <code>schema.table</code>, <code>none</code>, <code>default</code>. An unqualified name is ambiguous with those two sentinels, so a table genuinely called &quot;none&quot; has to be written &quot;public.none&quot;.</dd>
 <dt>shard_count<span class="tag opt">optional</span></dt>
 <dd>&nbsp;</dd>
 <dt>concurrently<span class="tag opt">optional</span></dt>

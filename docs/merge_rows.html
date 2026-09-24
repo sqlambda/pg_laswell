@@ -103,13 +103,13 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
 <dt>table<span class="tag req">required</span></dt>
 <dd>&nbsp;</dd>
 <dt>key<span class="tag req">required</span></dt>
-<dd>&nbsp;</dd>
+<dd>The key has to be one of the values each row supplies, so every row must carry it.</dd>
 <dt>columns<span class="tag opt">optional</span></dt>
 <dd>Name the key and the columns the source carries, in order. MERGE needs them to build both the INSERT and the UPDATE.</dd>
 <dt>values<span class="tag opt">optional</span></dt>
-<dd>&nbsp;</dd>
+<dd>&quot;columns&quot; names what each row&#x27;s entries are, in order. Positional rows with no column list would make a spec that reads correctly and writes the wrong column the moment the table gains one.</dd>
 <dt>select<span class="tag opt">optional</span></dt>
-<dd>&nbsp;</dd>
+<dd>A select&#x27;s row count cannot be measured without running it, so these are always paced, and a paced walk needs a key column that the select returns. Add &quot;key&quot;, and make sure the select produces it.</dd>
 <dt>when_matched<span class="tag opt">optional</span></dt>
 <dd>One of <code>update</code>, <code>delete</code>, <code>nothing</code>. What to do with a source row that already has a match in the target. &quot;update&quot; is the default.</dd>
 <dt>update_columns<span class="tag opt">optional</span></dt>
@@ -119,11 +119,11 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
 <dt>when_not_matched_by_source<span class="tag opt">optional</span></dt>
 <dd>One of <code>nothing</code>, <code>delete</code>. &quot;delete&quot; removes every target row the source does not mention, which turns this from an upsert into a full replacement of the table&#x27;s contents.</dd>
 <dt>paced<span class="tag opt">optional</span></dt>
-<dd>&nbsp;</dd>
+<dd>true paces the change into short transactions; false runs it in one, which is what a small seed usually wants. Omit it and the planner chooses on the measured row count and says so.</dd>
 <dt>verify_remaining<span class="tag opt">optional</span></dt>
 <dd>&nbsp;</dd>
 <dt>preserve<span class="tag opt">optional</span></dt>
-<dd>&nbsp;</dd>
+<dd>The pre-image has to go somewhere else, or the change would overwrite the record of what it changed.</dd>
 <dt>assert_invariants<span class="tag opt">optional</span></dt>
 <dd>&nbsp;</dd>
 </dl>

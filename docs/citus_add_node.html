@@ -75,13 +75,13 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
 <p class="purpose"><strong>A citus module kind.</strong> Known only to a binary built with <code>-DPGLASWELL_MODULES=citus</code> -- <code>--version</code> then prints <code>modules: citus</code>. A PostgreSQL-only build refuses it as an unknown kind, and with it the whole specification. See <code>pg_laswell_citus(7)</code>.</p>
 <h2>Synopsis</h2><pre>{
   &quot;kind&quot;: &quot;citus_add_node&quot;,
-  &quot;host&quot;: &lt;optional&gt;,
+  &quot;host&quot;: &lt;required&gt;,
   &quot;port&quot;: &lt;optional&gt;,
   &quot;should_have_shards&quot;: &lt;optional&gt;,
   &quot;comment&quot;: &lt;optional&gt;
 }</pre>
 <h2>Parameters</h2><dl class="params">
-<dt>host<span class="tag opt">optional</span></dt>
+<dt>host<span class="tag req">required</span></dt>
 <dd>&nbsp;</dd>
 <dt>port<span class="tag opt">optional</span></dt>
 <dd>&nbsp;</dd>

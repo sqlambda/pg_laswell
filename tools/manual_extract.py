@@ -98,9 +98,40 @@ def _string_list(text):
     return re.findall(r'"([a-z_0-9]+)"', text)
 
 
+def _with_helpers(spec, fn, body, depth=2):
+    """The parse function's body followed by the bodies of the helpers it hands
+    the intent to.
+
+    A parser may check its keys in a shared helper -- the Citus node kinds call
+    citus_parse_node(in, at), which is where `host` is required -- and reading
+    only the parse function's own body documented `host` as optional, sending a
+    reader looking for a default that does not exist. A call passing `in` to a
+    function defined in the same source is inlined, to a fixed depth.
+    """
+    seen, extra = {fn}, ''
+    frontier = [body]
+    for _ in range(depth):
+        nxt = []
+        for text in frontier:
+            for m in re.finditer(r'\b(\w+)\(\s*in\s*,', text):
+                name = m.group(1)
+                if name in seen:
+                    continue
+                seen.add(name)
+                helper = _body(spec, name)
+                if helper:
+                    extra += '\n' + helper
+                    nxt.append(helper)
+        frontier = nxt
+    return body + extra
+
+
 def options(spec, fn, arg=None):
     """Accepted keys, which are required, and any enumerated values."""
-    body = _join_literals(_body(spec, fn))
+    own = _body(spec, fn)
+    body = _join_literals(_with_helpers(spec, fn, own) if own else own)
+    own = _join_literals(own)
+    helpers = body[len(own):]
     if not body:
         return {'accepted': [], 'required': [], 'enums': {}, 'hints': {}, 'source': fn}
 
@@ -136,10 +167,24 @@ def options(spec, fn, arg=None):
             elif isinstance(arg, str) and arg:
                 accepted.append(arg)   # allowed.insert(what)
 
-    required = []
-    for m in re.finditer(r'require_(?:string|identifier)\([^;]*?in\.body,\s*"([a-z_0-9]+)"', body):
-        required.append(m.group(1))
-    for m in re.finditer(r'require_string\(in\.body,\s*"([a-z_0-9]+)"', body):
+    def requires(text):
+        out = []
+        for m in re.finditer(r'require_(?:string|identifier)\([^;]*?in\.body,\s*"([a-z_0-9]+)"', text):
+            out.append(m.group(1))
+        for m in re.finditer(r'require_string\(in\.body,\s*"([a-z_0-9]+)"', text):
+            out.append(m.group(1))
+        return out
+
+    required = requires(own)
+    # From a HELPER, a require_* on a key the helper also tests for presence is
+    # a TYPE check inside a branch, not a requirement: the shared row parser
+    # checks "select" only `if (has_select)`, where it is one alternative to
+    # "values". Without this, reading helpers documented select as required.
+    required += [r for r in requires(helpers)
+                 if 'in.body.contains("%s")' % r not in helpers]
+    # A key required by an explicit check rather than a require_* call says so
+    # in its error: ".should_have_shards is required".
+    for m in re.finditer(r'\.([a-z_0-9]+) is required', body):
         required.append(m.group(1))
     if isinstance(arg, str) and arg and re.search(r'in\.body,\s*what\b', body):
         required.append(arg)
@@ -149,7 +194,7 @@ def options(spec, fn, arg=None):
 
     enums = {}
     for m in re.finditer(r'\.([a-z_0-9]+) must be ([^\n]*)', body):
-        vals = re.findall(r'\\"([a-z_ ]+)\\"', m.group(2))
+        vals = re.findall(r'\\"([a-z_. ]+)\\"', m.group(2))
         if vals:
             cur = enums.setdefault(m.group(1), [])
             cur += [v for v in vals if v not in cur]

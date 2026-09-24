@@ -269,7 +269,8 @@ inline void citus_parse_transfer_mode(const Intent& in, const std::string& at) {
   if (!in.body.contains("transfer_mode")) return;
   const auto m = in.body.value("transfer_mode", "");
   if (m != "auto" && m != "force_logical" && m != "block_writes") {
-    detail::fail(at + ".transfer_mode must be auto, force_logical or block_writes",
+    detail::fail(at + ".transfer_mode must be \"auto\", \"force_logical\" or "
+                      "\"block_writes\"",
                  "auto and force_logical copy a shard while writes continue, "
                  "through logical replication; block_writes holds writes to "
                  "each shard while it is copied and needs no replication.");

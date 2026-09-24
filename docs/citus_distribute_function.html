@@ -79,7 +79,7 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
   &quot;name&quot;: &lt;required&gt;,
   &quot;arguments&quot;: &lt;required&gt;,
   &quot;distribution_argument&quot;: &lt;optional&gt;,
-  &quot;colocate_with&quot;: &lt;optional&gt;,
+  &quot;colocate_with&quot;: &quot;schema.table&quot; | &quot;none&quot; | &quot;default&quot;,
   &quot;force_delegation&quot;: &lt;optional&gt;,
   &quot;comment&quot;: &lt;optional&gt;
 }</pre>
@@ -93,7 +93,7 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
 <dt>distribution_argument<span class="tag opt">optional</span></dt>
 <dd>&nbsp;</dd>
 <dt>colocate_with<span class="tag opt">optional</span></dt>
-<dd>&nbsp;</dd>
+<dd>One of <code>schema.table</code>, <code>none</code>, <code>default</code>. An unqualified name is ambiguous with those two sentinels, so a table genuinely called &quot;none&quot; has to be written &quot;public.none&quot;.</dd>
 <dt>force_delegation<span class="tag opt">optional</span></dt>
 <dd>&nbsp;</dd>
 <dt>comment<span class="tag opt">optional</span></dt>
