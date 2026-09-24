@@ -2192,6 +2192,27 @@ TEST(Planner, TheRenderedPlanIsStableAcrossRuns) {
             pglaswell::plan_migration(spec, obs, {}).render());
 }
 
+TEST_F(DatabaseTest, AServerErrorInTheConnectionClassIsAProblemNotACrash) {
+  // libpqxx raises broken_connection for EVERY server error in SQLSTATE class
+  // 08, broken connection or not. Citus raises one on a healthy connection when
+  // citus_add_node cannot reach the node it names, and the dry run escaped as a
+  // tool error instead of reporting what it had found. RAISE reproduces the
+  // class on plain PostgreSQL.
+  pglaswell::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = url_;
+  pglaswell::Catalog cat(cfg);
+  const std::string stmt =
+      "DO $$ BEGIN RAISE EXCEPTION 'the remote node could not be reached' "
+      "USING ERRCODE = '08006'; END $$";
+  pglaswell::Catalog::DryRun dry;
+  ASSERT_NO_THROW(dry = cat.dry_run({{0, {stmt}}}, {false}, 180000));
+  ASSERT_EQ(dry.problems.size(), 1u);
+  EXPECT_EQ(dry.problems[0].sqlstate, "08000");
+  EXPECT_NE(dry.problems[0].message.find("could not be reached"), std::string::npos)
+      << dry.problems[0].message;
+}
+
 // --- catalog: observation against a live server ---------------------------
 
 TEST_F(DatabaseTest, ObservesStructureSizeAndLockStateOfARealTable) {

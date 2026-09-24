@@ -1007,6 +1007,18 @@ class Catalog {
           out.problems.push_back(Problem{steps[i].first, e.sqlstate(),
                                         server_message(e.what()), stmt});
           return Rehearsal::kFailed;
+        } catch (const pqxx::broken_connection& e) {
+          // libpqxx raises broken_connection for ANY server error in SQLSTATE
+          // class 08, whether or not this connection is broken. Measured:
+          // citus_add_node on a host that does not resolve fails with a class-08
+          // error about the NODE -- "connection to the remote node ... failed"
+          // -- on a connection that is perfectly healthy, and the dry run
+          // escaped as a tool error instead of reporting the problem it had
+          // found. It carries no SQLSTATE, so the class is all that can be said.
+          if (!txn.conn().is_open()) throw;
+          out.problems.push_back(Problem{steps[i].first, "08000",
+                                        server_message(e.what()), stmt});
+          return Rehearsal::kFailed;
         }
       }
     }
