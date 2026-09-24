@@ -21,13 +21,12 @@ PGLASWELL_PROJECT(kCitusUndistributeTable, citus_project_undistribute_table)
 PGLASWELL_PROJECT(kCitusAddLocalTableToMetadata, citus_project_local_table)
 // The coordinator's stale copy is not something a later step reads.
 PGLASWELL_PROJECT(kCitusTruncateLocalData, citus_project_nothing)
-// The cluster kinds name no table, so they never reach this switch at runtime
-// (the table projection returns first). A later intent in the same
-// specification reads the topology as it was, which their refusals say.
-PGLASWELL_PROJECT(kCitusAddNode, citus_project_nothing)
-PGLASWELL_PROJECT(kCitusRemoveNode, citus_project_nothing)
-PGLASWELL_PROJECT(kCitusSetCoordinatorHost, citus_project_nothing)
-PGLASWELL_PROJECT(kCitusSetNodeProperty, citus_project_nothing)
-PGLASWELL_PROJECT(kCitusDrainNode, citus_project_nothing)
-PGLASWELL_PROJECT(kCitusRebalanceShards, citus_project_nothing)
-PGLASWELL_PROJECT(kCitusEnsureWorkers, citus_project_nothing)
+// The cluster kinds name no table; core dispatches them before its tables
+// guard, and each projects the node list a later intent reads.
+PGLASWELL_PROJECT(kCitusAddNode, citus_project_add_node)
+PGLASWELL_PROJECT(kCitusRemoveNode, citus_project_remove_node)
+PGLASWELL_PROJECT(kCitusSetCoordinatorHost, citus_project_coordinator_host)
+PGLASWELL_PROJECT(kCitusSetNodeProperty, citus_project_node_property)
+PGLASWELL_PROJECT(kCitusDrainNode, citus_project_drain_node)
+PGLASWELL_PROJECT(kCitusRebalanceShards, citus_project_rebalance)
+PGLASWELL_PROJECT(kCitusEnsureWorkers, citus_project_ensure_workers)

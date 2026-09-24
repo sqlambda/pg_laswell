@@ -302,6 +302,29 @@ inline void project(const Intent& in, const Step& step, Observations& projected)
     }
   }
   const auto qualified = in.qualified_table();
+
+  // A module kind that names no table -- a Citus node kind, which changes the
+  // cluster rather than a relation -- projects too, into its module's own slot
+  // like any other module projection. The tables guard below would return
+  // before it for every one of them, and did: an intent registering the
+  // coordinator and the next one setting its property were planned against
+  // the cluster as it was, so the second refused a node the first had just
+  // added. Core's rule -- order intents correctly and later ones see earlier
+  // ones -- has to hold for module kinds as well.
+  if (in.table().empty()) {
+    switch (in.kind) {
+#define PGLASWELL_PROJECT(enum_id, project_fn)                                 \
+      case IntentKind::enum_id:                                                \
+        static_assert(is_module_kind(IntentKind::enum_id),                     \
+                      "a module may only project for kinds IT declared");      \
+        project_fn(in, qualified, step,                                        \
+                   projected.extensions[PGLASWELL_MODULE_SLOT]);               \
+        return;
+#include "modules/enabled_project.inc"
+#undef PGLASWELL_PROJECT
+      default: return;
+    }
+  }
   if (!projected.tables.contains(qualified)) return;
 
   switch (in.kind) {

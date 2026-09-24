@@ -1416,3 +1416,91 @@ TEST(CitusPlanner, TheGlobIsStarAndQuestionMarkOnly) {
   EXPECT_TRUE(pglaswell::citus_glob("worker*", "worker12"));
   EXPECT_FALSE(pglaswell::citus_glob("worker*", "aworker1"));
 }
+
+// --- Node membership projects, so one specification can build a cluster -----
+
+namespace {
+pglaswell::Plan plan_topology_many(const json& intents, json c,
+                                   const std::string& workers = "") {
+  const auto spec = pglaswell::parse_spec(citus_spec_many(intents));
+  pglaswell::ExecutorConfig cfg;
+  if (!workers.empty()) cfg.module_settings["citus.workers"] = workers;
+  return pglaswell::plan_migration(spec, citus_observations(std::move(c), json::object()),
+                                   cfg);
+}
+}  // namespace
+
+TEST(CitusPlanner, OneSpecificationCanRegisterACluster) {
+  // Reported from pgshard, exactly this specification: the second intent was
+  // refused -- "not a node of this cluster" -- for a node the first adds.
+  const auto p = plan_topology_many(
+      json::array({json{{"kind", "citus_set_coordinator_host"}, {"host", "10.0.0.50"}},
+                   json{{"kind", "citus_set_node_property"}, {"host", "10.0.0.50"},
+                        {"should_have_shards", false}},
+                   json{{"kind", "citus_ensure_workers"}, {"hosts_matching", "10.0.0.*"}}}),
+      cluster(json::array(), json::array()), "10.0.0.51, 10.0.0.52");
+  ASSERT_TRUE(p.ok) << first_conflict(p);
+  ASSERT_EQ(p.steps.size(), 3u);
+  EXPECT_EQ(p.steps[0].action, pglaswell::Action::kApply);
+  // Citus registers the coordinator taking no shards, which is what was asked.
+  EXPECT_EQ(p.steps[1].action, pglaswell::Action::kSatisfied) << p.steps[1].why;
+  EXPECT_EQ(p.steps[2].sql.size(), 2u);
+}
+
+TEST(CitusPlanner, ALaterIntentSeesANodeAnEarlierOneAdds) {
+  const auto p = plan_topology_many(
+      json::array({json{{"kind", "citus_add_node"}, {"host", "worker3"}},
+                   json{{"kind", "citus_set_node_property"}, {"host", "worker3"},
+                        {"should_have_shards", false}}}),
+      cluster());
+  ASSERT_TRUE(p.ok) << first_conflict(p);
+  EXPECT_EQ(p.steps[1].action, pglaswell::Action::kApply);
+  EXPECT_EQ(p.steps[1].sql[0],
+            "SELECT citus_set_node_property('worker3', 5432, 'shouldhaveshards', false);");
+}
+
+TEST(CitusPlanner, ARebalanceAfterAMembershipChangeRunsRatherThanReadingAStalePlan) {
+  // The rebalance plan was read for the cluster before the new workers joined:
+  // "no moves" then is not "balanced" afterwards.
+  const auto p = plan_topology_many(
+      json::array({json{{"kind", "citus_ensure_workers"}},
+                   json{{"kind", "citus_rebalance_shards"}}}),
+      cluster(), "worker1, worker2, worker3");
+  ASSERT_TRUE(p.ok) << first_conflict(p);
+  ASSERT_EQ(p.steps.size(), 2u);
+  EXPECT_EQ(p.steps[1].action, pglaswell::Action::kApply) << p.steps[1].why;
+  EXPECT_EQ(p.steps[1].txn_class, pglaswell::TxnClass::kForbidden);
+
+  // Nothing changed membership: the reading still decides.
+  const auto alone = plan_topology_many(
+      json::array({json{{"kind", "citus_rebalance_shards"}}}), cluster());
+  EXPECT_EQ(alone.steps[0].action, pglaswell::Action::kSatisfied);
+}
+
+TEST(CitusPlanner, ANodeDrainedEarlierInTheSpecificationCanBeRemoved) {
+  const auto p = plan_topology_many(
+      json::array({json{{"kind", "citus_drain_node"}, {"host", "worker2"}},
+                   json{{"kind", "citus_remove_node"}, {"host", "worker2"}}}),
+      cluster());
+  ASSERT_TRUE(p.ok) << first_conflict(p);
+  EXPECT_EQ(p.steps[1].sql[0], "SELECT citus_remove_node('worker2', 5432);");
+
+  // And a removed node is gone for what follows.
+  const auto gone = plan_topology_many(
+      json::array({json{{"kind", "citus_drain_node"}, {"host", "worker2"}},
+                   json{{"kind", "citus_remove_node"}, {"host", "worker2"}},
+                   json{{"kind", "citus_set_node_property"}, {"host", "worker2"},
+                        {"should_have_shards", true}}}),
+      cluster());
+  EXPECT_FALSE(gone.ok);
+}
+
+TEST(CitusPlanner, AWorkerEnsureWorkersAddsIsSeenByTheNextIntent) {
+  const auto p = plan_topology_many(
+      json::array({json{{"kind", "citus_ensure_workers"}},
+                   json{{"kind", "citus_set_node_property"}, {"host", "worker3"},
+                        {"should_have_shards", false}}}),
+      cluster(), "worker1, worker2, worker3");
+  ASSERT_TRUE(p.ok) << first_conflict(p);
+  EXPECT_EQ(p.steps[1].action, pglaswell::Action::kApply) << p.steps[1].why;
+}

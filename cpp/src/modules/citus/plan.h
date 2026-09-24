@@ -1160,9 +1160,9 @@ inline void citus_refuse_absent_node(const Intent& in, Step& step, Plan& plan) {
   step.action = Action::kConflict;
   step.why = citus_node_name(in) + " is not a node of this cluster";
   plan.conflicts.push_back(
-      step.why + ". Add it with citus_add_node first -- in an earlier "
-      "specification: nodes added in this one are not read by the intents after "
-      "it.");
+      step.why + ". Add it first -- with citus_add_node or citus_ensure_workers "
+      "in an earlier intent of this specification, or in an earlier "
+      "specification.");
 }
 
 // A shard move needs logical replication unless it blocks writes. Refused
@@ -1288,7 +1288,7 @@ inline void plan_citus_remove_node(const Intent& in, const Observations& obs,
                " shard placements of distributed tables";
     plan.conflicts.push_back(
         step.why + ", and Citus refuses to remove a node holding the only copy of "
-        "a shard. Drain it first with citus_drain_node, in an earlier "
+        "a shard. Drain it first with citus_drain_node, in an earlier intent or "
         "specification.");
     return;
   }
@@ -1427,7 +1427,7 @@ inline void plan_citus_drain_node(const Intent& in, const Observations& obs,
                std::to_string(placements) + " placements have nowhere to go";
     plan.conflicts.push_back(
         step.why + ". Add a node, or let one hold shards with "
-        "citus_set_node_property, in an earlier specification.");
+        "citus_set_node_property, in an earlier intent or specification.");
     return;
   }
   if (!citus_transfer_mode_possible(in, citus, step, plan)) return;
@@ -1476,6 +1476,37 @@ inline void plan_citus_rebalance_shards(const Intent& in, const Observations& ob
   const auto& citus = obs.extension("citus");
   if (!citus_present(in, step, plan, citus)) return;
 
+  // STALE when an earlier intent of this specification changed membership:
+  // the plan Citus gave was for the cluster before it. Then the rebalance runs
+  // unconditionally -- Citus plans again when it runs, and a rebalance with
+  // nothing to move does nothing -- rather than reading an old "balanced".
+  if (citus.contains("rebalance_moves_stale_after_step")) {
+    if (!citus_transfer_mode_possible(in, citus, step, plan)) return;
+    const auto mode = in.body.value("transfer_mode", "auto");
+    const int after = citus.value("rebalance_moves_stale_after_step", 0);
+    step.action = Action::kApply;
+    step.txn_class = TxnClass::kForbidden;
+    step.detail["transfer_mode"] = mode;
+    step.detail["moves"] = "unknown: step " + std::to_string(after) +
+                           " of this plan changes the cluster's nodes first";
+    step.detail["on_failure"] =
+        "a failed rebalance keeps the moves it had already made. Nothing needs "
+        "undoing: running the specification again re-reads Citus's plan and "
+        "makes the rest.";
+    step.lock = mode == "block_writes"
+                    ? "writes to each shard wait while that shard is copied"
+                    : "each shard is copied by logical replication; writes wait "
+                      "only for the final switch";
+    step.why = "an earlier intent changes the cluster's nodes, so the moves are "
+               "decided by Citus when this runs";
+    step.sql.push_back("SELECT rebalance_table_shards(shard_transfer_mode := " +
+                       detail::quote_literal(mode) + ");");
+    plan.warnings.push_back(
+        "The rebalance follows a change of the cluster's nodes in this same "
+        "specification, so how many shards move is not known when planning. "
+        "Each move commits on its own; a failure keeps the ones before it.");
+    return;
+  }
   const auto moves = citus.value("rebalance_moves", json(nullptr));
   if (!moves.is_array()) {
     step.action = Action::kConflict;
@@ -1484,7 +1515,7 @@ inline void plan_citus_rebalance_shards(const Intent& in, const Observations& ob
     plan.conflicts.push_back(
         step.why + ". Measured, Citus raises \"Shard replication factor cannot "
         "be greater than number of nodes with should_have_shards=true\". Add a "
-        "node, or let one hold shards, in an earlier specification.");
+        "node, or let one hold shards, in an earlier intent or specification.");
     return;
   }
   // Balanced by Citus's own definition: the rebalancer's plan is empty.
@@ -1704,7 +1735,7 @@ inline void plan_citus_ensure_workers(const Intent& in, const Observations& obs,
         refuse(name + " is not in citus.workers and holds " +
                    std::to_string(placements) + " shard placements",
                "unlisted: remove takes out only a worker that holds no shards. "
-               "Drain it first with citus_drain_node, in an earlier "
+               "Drain it first with citus_drain_node, in an earlier intent or "
                "specification.");
         return;
       }
@@ -1754,8 +1785,7 @@ inline void plan_citus_ensure_workers(const Intent& in, const Observations& obs,
   for (const auto& q : remove_sql) step.sql.push_back(q);
   if (!adding.empty()) {
     plan.warnings.push_back(
-        "New workers hold no shards until the cluster is rebalanced -- "
-        "citus_rebalance_shards, in a LATER specification: this one's reading "
-        "was taken before they joined.");
+        "New workers hold no shards until the cluster is rebalanced: a "
+        "citus_rebalance_shards after this intent does it.");
   }
 }

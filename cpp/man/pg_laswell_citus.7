@@ -320,10 +320,17 @@ Each takes
 and an optional
 .Va port
 (default 5432).
-An intent reads the topology as it was when its specification was planned, so a
-node added or drained in one specification is seen only by the next: order them
-with
-.Va depends_on .
+Node membership is projected the way table state is: an intent sees the nodes an
+earlier intent of the same specification adds, removes, drains or changes, so
+registering the coordinator, setting its property and adding the workers can be
+one specification, in that order.
+The planner does not reorder intents.
+One thing cannot be projected: how many shards a rebalance will move after
+membership changes, since Citus decides that when it runs.
+A
+.Cm citus_rebalance_shards
+after such a change is therefore always applied, and its plan says the number
+is unknown.
 .Pp
 No kind moves or splits a single shard.
 Shard ids come from a sequence in each database, so they depend on everything
@@ -399,8 +406,9 @@ which connects to it, and the dry run executes the call, so an unreachable
 configured host is reported before the migration.
 Refused when the list names the coordinator, a host twice, or a worker that is
 registered and inactive.
-New workers hold no shards until the cluster is rebalanced, in a later
-specification.
+New workers hold no shards until the cluster is rebalanced, which a
+.Cm citus_rebalance_shards
+later in the same specification does.
 .Ss Cm citus_add_node
 Add a worker.
 Like every kind that names a node, it is bound to the clusters where that host
@@ -419,7 +427,7 @@ Remove a worker.
 Satisfied when it is not registered.
 Refused for the coordinator, and for a node that still holds shards of
 distributed tables \(em Citus refuses to remove the only copy of a shard.
-Drain it first, in an earlier specification.
+Drain it first, in an earlier intent or specification.
 .Ss Cm citus_set_coordinator_host
 Register the coordinator's address, the one the workers use to reach it.
 Satisfied when the coordinator is already registered at that address.

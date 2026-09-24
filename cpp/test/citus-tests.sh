@@ -567,6 +567,43 @@ else
   bad "a dry run left a node registered" "$(q "SELECT nodename FROM pg_dist_node")"
 fi
 
+# ONE SPECIFICATION REGISTERS A CLUSTER. Reported from pgshard: setting the
+# coordinator host and then its property was refused -- "not a node of this
+# cluster" -- because node membership was not projected. On a fresh database,
+# where nothing is registered, the dry run EXECUTES all three intents in one
+# rolled-back transaction, so a clean one proves each saw the one before it.
+reg_db=laswell_register_probe
+reg_base=$(python3 -c 'import sys,urllib.parse as u; p=u.urlparse(sys.argv[1]); print(f"{p.scheme}://{p.username}:{p.password}@{p.hostname}")' "$CITUS_URL")
+reg_ports="$(python3 -c 'import sys,urllib.parse as u; print(u.urlparse(sys.argv[1]).port or 5432)' "$CITUS_URL") ${WORKER1_PORT:-55441} ${WORKER2_PORT:-55442}"
+for p in $reg_ports; do
+  psql -X -q "$reg_base:$p/postgres" -c "DROP DATABASE IF EXISTS $reg_db" -c "CREATE DATABASE $reg_db" >/dev/null 2>&1
+  psql -X -q "$reg_base:$p/$reg_db" -c "CREATE EXTENSION citus" >/dev/null 2>&1
+done
+reg_url="$reg_base:${reg_ports%% *}/$reg_db"
+reg_ini=$(mktemp); chmod 600 "$reg_ini"
+python3 - "$reg_url" > "$reg_ini" <<'PY'
+import sys, urllib.parse as u
+p = u.urlparse(sys.argv[1])
+print(f"[fresh]\nhost = {p.hostname}\nport = {p.port}\ndbname = {p.path.lstrip('/')}\n"
+      f"user = {p.username}\npassword = {p.password}\ncitus.workers = worker1, worker2")
+PY
+out=$("$MCP" --config "$reg_ini" --call planMigration --args '{"spec":{"laswell_spec_version":1,
+  "id":"ct-register","description":"register a cluster in one specification","intents":[
+  {"kind":"citus_set_coordinator_host","host":"coordinator","port":5432},
+  {"kind":"citus_set_node_property","host":"coordinator","port":5432,"should_have_shards":false},
+  {"kind":"citus_ensure_workers","hosts_matching":"worker*"}]},"skipTrustChecks":true}' 2>&1)
+left=$(psql -X -qAt "$reg_url" -c "SELECT count(*) FROM pg_dist_node" 2>&1)
+if echo "$out" | grep -q '"ok":true' && echo "$out" | grep -q '"unverifiedSteps":\[\]' \
+   && ! echo "$out" | grep -q '"problems"' && [ "$left" = 0 ]; then
+  ok "one specification registers the coordinator, its property and the workers, and the dry run ran all three"
+else
+  bad "a cluster should be registrable from one specification (nodes left: $left)" "$out"
+fi
+rm -f "$reg_ini"
+for p in $reg_ports; do
+  psql -X -q "$reg_base:$p/postgres" -c "DROP DATABASE IF EXISTS $reg_db WITH (FORCE)" >/dev/null 2>&1
+done
+
 # And for real, through the executor: drain worker2, then let it hold shards
 # again and rebalance. Separate specifications, because an intent reads the
 # topology as it was when its specification was planned -- and the drain is run
