@@ -841,3 +841,287 @@ TEST(CitusLive, AWorkerSideWaitHasAnAgeTheBreakerCanUse) {
   EXPECT_GE(age, 1300) << "the worker-side wait's age is missing or understated";
   EXPECT_LT(age, 10000) << "the bound is too loose to be useful";
 }
+
+// --- Phase 2 ----------------------------------------------------------------
+
+namespace {
+json distributed(const char* column, long long group, int shards = 32) {
+  return json{{"partmethod", "h"}, {"repmodel", "s"},
+              {"distribution_column", column}, {"colocationid", group},
+              {"shard_count", shards}};
+}
+json reference_table() {
+  return json{{"partmethod", "n"}, {"repmodel", "t"},
+              {"distribution_column", ""}, {"colocationid", 1}};
+}
+json managed_local() {
+  return json{{"partmethod", "n"}, {"repmodel", "s"},
+              {"distribution_column", ""}, {"colocationid", 0}};
+}
+json alter_intent(json extra) {
+  json in{{"kind", "citus_alter_distributed_table"},
+          {"schema", "public"}, {"table", "a"}};
+  in.update(extra);
+  return in;
+}
+std::string first_conflict(const pglaswell::Plan& p) {
+  return p.conflicts.empty() ? "none" : p.conflicts[0];
+}
+}  // namespace
+
+TEST(CitusPlanner, AnAlterThatChangesNothingIsSatisfiedAndNotCalled) {
+  // Measured: Citus raises "this call doesn't change any properties of the
+  // table" -- so without reading it as done, re-running would FAIL.
+  const auto obs = citus_observations(
+      citus_obs(json{{"public.a", distributed("id", 5, 32)}}),
+      json{{"public.a", table_with_pk({"id"})}});
+  const auto p = plan_citus(
+      alter_intent(json{{"shard_count", 32}, {"distribution_column", "id"}}), obs);
+  ASSERT_TRUE(p.ok) << first_conflict(p);
+  ASSERT_EQ(p.steps.size(), 1u);
+  EXPECT_EQ(p.steps[0].action, pglaswell::Action::kSatisfied);
+  EXPECT_TRUE(p.steps[0].sql.empty());
+}
+
+TEST(CitusPlanner, AnAlterEmitsOnlyWhatChanges) {
+  const auto obs = citus_observations(
+      citus_obs(json{{"public.a", distributed("id", 5, 32)}}),
+      json{{"public.a", table_with_pk({"id"}, 1234)}});
+  const auto p = plan_citus(
+      alter_intent(json{{"shard_count", 64}, {"distribution_column", "id"}}), obs);
+  ASSERT_TRUE(p.ok) << first_conflict(p);
+  ASSERT_EQ(p.steps.size(), 1u);
+  EXPECT_EQ(p.steps[0].sql[0],
+            "SELECT alter_distributed_table('public.a', shard_count := 64);");
+  EXPECT_EQ(p.steps[0].detail.value("rehearse_by", ""), "execution");
+  EXPECT_EQ(p.steps[0].txn_class, pglaswell::TxnClass::kRequired);
+  EXPECT_NE(p.steps[0].lock.find("rewritten"), std::string::npos) << p.steps[0].lock;
+}
+
+TEST(CitusPlanner, AShardCountChangeInASharedGroupHasToSayWhatHappensToTheOthers) {
+  const auto obs = citus_observations(
+      citus_obs(json{{"public.a", distributed("id", 5)},
+                     {"public.b", distributed("id", 5)}}),
+      json{{"public.a", table_with_pk({"id"})}});
+  const auto refused = plan_citus(alter_intent(json{{"shard_count", 8}}), obs);
+  EXPECT_FALSE(refused.ok);
+  EXPECT_TRUE(conflicts_mention(refused, "cascade_to_colocated"))
+      << first_conflict(refused);
+  EXPECT_TRUE(conflicts_mention(refused, "public.b")) << first_conflict(refused);
+
+  const auto p = plan_citus(
+      alter_intent(json{{"shard_count", 8}, {"cascade_to_colocated", true}}), obs);
+  ASSERT_TRUE(p.ok) << first_conflict(p);
+  EXPECT_NE(p.steps[0].sql[0].find("cascade_to_colocated := true"), std::string::npos)
+      << p.steps[0].sql[0];
+  EXPECT_EQ(p.steps[0].detail.value("cascades_to", json::array()),
+            json::array({"public.b"}));
+  // The group stays together, so a later step reads it as unchanged.
+  EXPECT_EQ(p.steps[0].detail.value("colocation_group", -1LL), 5);
+}
+
+TEST(CitusPlanner, AnAlterThatWouldSilentlyDropAForeignKeyIsRefused) {
+  // Measured: moving a table out of its group while a colocated distributed
+  // table references it SUCCEEDS with a warning, and the key is gone.
+  json a = table_with_pk({"id"});
+  a["referenced_by"] = json::array({"b_fk on b"});  // regclass text: public dropped
+  const auto obs = citus_observations(
+      citus_obs(json{{"public.a", distributed("id", 5)},
+                     {"public.b", distributed("id", 5)}}),
+      json{{"public.a", a}});
+  const auto p = plan_citus(alter_intent(json{{"colocate_with", "none"}}), obs);
+  EXPECT_FALSE(p.ok);
+  EXPECT_TRUE(conflicts_mention(p, "b_fk")) << first_conflict(p);
+  EXPECT_TRUE(conflicts_mention(p, "would be dropped")) << first_conflict(p);
+
+  // Leaving the group on its own, said out loud, is still the same drop.
+  const auto alone = plan_citus(
+      alter_intent(json{{"shard_count", 8}, {"cascade_to_colocated", false}}), obs);
+  EXPECT_FALSE(alone.ok);
+  EXPECT_TRUE(conflicts_mention(alone, "would be dropped")) << first_conflict(alone);
+
+  // Cascading keeps the group, and its keys, together: measured, re-created.
+  const auto kept = plan_citus(
+      alter_intent(json{{"shard_count", 8}, {"cascade_to_colocated", true}}), obs);
+  EXPECT_TRUE(kept.ok) << first_conflict(kept);
+}
+
+TEST(CitusPlanner, AForeignKeyToAReferenceTableDoesNotStopAnAlter) {
+  // Measured: a key to a reference table survives the rewrite.
+  json a = table_with_pk({"id"});
+  a["constraints"]["a_r_fkey"] = json{{"type", "f"}, {"references", "public.r"}};
+  const auto obs = citus_observations(
+      citus_obs(json{{"public.a", distributed("id", 5)},
+                     {"public.r", reference_table()}}),
+      json{{"public.a", a}});
+  const auto p = plan_citus(alter_intent(json{{"shard_count", 8}}), obs);
+  EXPECT_TRUE(p.ok) << first_conflict(p);
+}
+
+TEST(CitusPlanner, AlreadyAloneIsWhatColocateWithNoneAsksFor) {
+  // Measured: Citus rewrites a table already alone into a new group rather than
+  // refusing -- a whole copy for nothing, which reading it as done avoids.
+  const auto obs = citus_observations(
+      citus_obs(json{{"public.a", distributed("id", 5)}}),
+      json{{"public.a", table_with_pk({"id"})}});
+  const auto p = plan_citus(alter_intent(json{{"colocate_with", "none"}}), obs);
+  ASSERT_TRUE(p.ok) << first_conflict(p);
+  EXPECT_EQ(p.steps[0].action, pglaswell::Action::kSatisfied);
+}
+
+TEST(CitusPlanner, AnAlterOntoAColumnTheKeyOmitsIsRefusedBeforeTheRewrite) {
+  // Measured: Citus copies the data and only then fails re-adding the key.
+  json a = table_with_pk({"id"});
+  a["columns"]["t"] = json{{"type", "bigint"}};
+  const auto obs = citus_observations(
+      citus_obs(json{{"public.a", distributed("id", 5)}}), json{{"public.a", a}});
+  const auto p = plan_citus(alter_intent(json{{"distribution_column", "t"}}), obs);
+  EXPECT_FALSE(p.ok);
+  EXPECT_TRUE(conflicts_mention(p, "does not include the new distribution column"))
+      << first_conflict(p);
+}
+
+TEST(CitusPlanner, AlteringATableThatIsNotDistributedNamesTheRightKind) {
+  const auto obs = citus_observations(
+      citus_obs(json{{"public.a", reference_table()}}),
+      json{{"public.a", table_with_pk({"id"})}});
+  const auto p = plan_citus(alter_intent(json{{"shard_count", 8}}), obs);
+  EXPECT_FALSE(p.ok);
+  EXPECT_TRUE(conflicts_mention(p, "reference")) << first_conflict(p);
+  EXPECT_TRUE(conflicts_mention(p, "citus_distribute_table")) << first_conflict(p);
+}
+
+TEST(CitusPlanner, AlterArgumentsCitusRefusesAreRefusedAtParse) {
+  // Each is a measured Citus error, or a question the plan could not answer.
+  EXPECT_ANY_THROW(pglaswell::parse_spec(citus_spec(alter_intent(json::object()))));
+  EXPECT_ANY_THROW(pglaswell::parse_spec(citus_spec(
+      alter_intent(json{{"shard_count", 8}, {"colocate_with", "public.c"}}))));
+  EXPECT_ANY_THROW(pglaswell::parse_spec(citus_spec(alter_intent(
+      json{{"distribution_column", "t"}, {"cascade_to_colocated", true}}))));
+  EXPECT_ANY_THROW(pglaswell::parse_spec(citus_spec(
+      alter_intent(json{{"colocate_with", "default"}}))));
+  EXPECT_NO_THROW(pglaswell::parse_spec(citus_spec(
+      alter_intent(json{{"shard_count", 8}, {"colocate_with", "none"}}))));
+}
+
+TEST(CitusPlanner, UndistributingWhatCitusDoesNotRecordIsDone) {
+  // Measured: "cannot undistribute table because the table is not distributed".
+  const auto obs = citus_observations(
+      citus_obs(), json{{"public.a", table_with_pk({"id"})}});
+  const auto p = plan_citus(json{{"kind", "citus_undistribute_table"},
+                                 {"schema", "public"}, {"table", "a"}}, obs);
+  ASSERT_TRUE(p.ok) << first_conflict(p);
+  EXPECT_EQ(p.steps[0].action, pglaswell::Action::kSatisfied);
+}
+
+TEST(CitusPlanner, UndistributingOneEndOfAKeyNeedsTheCascadeWrittenDown) {
+  json a = table_with_pk({"id"});
+  a["referenced_by"] = json::array({"b_fk on public.b"});
+  const auto obs = citus_observations(
+      citus_obs(json{{"public.a", distributed("id", 5)},
+                     {"public.b", distributed("id", 5)}}),
+      json{{"public.a", a}});
+  json in{{"kind", "citus_undistribute_table"}, {"schema", "public"}, {"table", "a"}};
+  const auto refused = plan_citus(in, obs);
+  EXPECT_FALSE(refused.ok);
+  EXPECT_TRUE(conflicts_mention(refused, "cascade_via_foreign_keys"))
+      << first_conflict(refused);
+  in["cascade_via_foreign_keys"] = true;
+  const auto p = plan_citus(in, obs);
+  ASSERT_TRUE(p.ok) << first_conflict(p);
+  EXPECT_EQ(p.steps[0].sql[0],
+            "SELECT undistribute_table('public.a', cascade_via_foreign_keys := true);");
+  EXPECT_EQ(p.steps[0].detail.value("cascades_to", json::array()),
+            json::array({"public.b"}));
+}
+
+TEST(CitusPlanner, AnUndistributedTableCanBeDistributedAgainInTheSamePlan) {
+  // The projection has to forget it, or the second intent reads "already
+  // distributed" and does nothing.
+  const auto obs = citus_observations(
+      citus_obs(json{{"public.a", distributed("id", 5)}}),
+      json{{"public.a", table_with_pk({"id"})}});
+  const auto p = plan_citus_many(
+      json::array({json{{"kind", "citus_undistribute_table"},
+                        {"schema", "public"}, {"table", "a"}},
+                   json{{"kind", "citus_distribute_table"}, {"schema", "public"},
+                        {"table", "a"}, {"distribution_column", "id"}}}),
+      obs);
+  ASSERT_TRUE(p.ok) << first_conflict(p);
+  ASSERT_EQ(p.steps.size(), 2u);
+  EXPECT_EQ(p.steps[1].action, pglaswell::Action::kApply);
+}
+
+TEST(CitusPlanner, AddingALocalTableToMetadataReadsWhatCitusAlreadyHolds) {
+  json in{{"kind", "citus_add_local_table_to_metadata"},
+          {"schema", "public"}, {"table", "l"}};
+  const auto tables = json{{"public.l", table_with_pk({"id"})}};
+
+  const auto done = plan_citus(in, citus_observations(
+      citus_obs(json{{"public.l", managed_local()}}), tables));
+  ASSERT_TRUE(done.ok);
+  EXPECT_EQ(done.steps[0].action, pglaswell::Action::kSatisfied);
+
+  // Measured: "table is already distributed" -- for a reference table too.
+  const auto ref = plan_citus(in, citus_observations(
+      citus_obs(json{{"public.l", reference_table()}}), tables));
+  EXPECT_FALSE(ref.ok);
+  EXPECT_TRUE(conflicts_mention(ref, "already a reference table"))
+      << first_conflict(ref);
+
+  const auto fresh = plan_citus(in, citus_observations(citus_obs(), tables));
+  ASSERT_TRUE(fresh.ok) << first_conflict(fresh);
+  EXPECT_EQ(fresh.steps[0].sql[0],
+            "SELECT citus_add_local_table_to_metadata('public.l');");
+}
+
+TEST(CitusPlanner, AddingALocalTableKeyedToAPlainTableNeedsTheCascade) {
+  // Measured: "relation is involved in a foreign key relationship with another
+  // table". A key to a reference table is the point of the kind, and needs none.
+  json l = table_with_pk({"id"});
+  l["constraints"]["l_p_fkey"] = json{{"type", "f"}, {"references", "p"}};
+  json in{{"kind", "citus_add_local_table_to_metadata"},
+          {"schema", "public"}, {"table", "l"}};
+  const auto refused = plan_citus(
+      in, citus_observations(citus_obs(), json{{"public.l", l}}));
+  EXPECT_FALSE(refused.ok);
+  EXPECT_TRUE(conflicts_mention(refused, "public.p")) << first_conflict(refused);
+
+  const auto to_ref = plan_citus(
+      in, citus_observations(citus_obs(json{{"public.p", reference_table()}}),
+                             json{{"public.l", l}}));
+  EXPECT_TRUE(to_ref.ok) << first_conflict(to_ref);
+}
+
+TEST(CitusPlanner, TruncatingLocalDataRefusesToCascadeIntoRealRows) {
+  // Measured: the call truncates with CASCADE, and a local table referencing a
+  // reference table was emptied -- its only copy of its rows.
+  json r = table_with_pk({"id"});
+  r["referenced_by"] = json::array({"lref_fkey on public.lref"});
+  json in{{"kind", "citus_truncate_local_data"}, {"schema", "public"}, {"table", "r"}};
+  const auto refused = plan_citus(
+      in, citus_observations(citus_obs(json{{"public.r", reference_table()}}),
+                             json{{"public.r", r}}));
+  EXPECT_FALSE(refused.ok);
+  EXPECT_TRUE(conflicts_mention(refused, "public.lref")) << first_conflict(refused);
+
+  // Into a distributed table it reaches only the coordinator's stale copy --
+  // measured, Citus still served every row.
+  const auto ok = plan_citus(
+      in, citus_observations(citus_obs(json{{"public.r", reference_table()},
+                                            {"public.lref", distributed("id", 5)}}),
+                             json{{"public.r", r}}));
+  ASSERT_TRUE(ok.ok) << first_conflict(ok);
+  EXPECT_EQ(ok.steps[0].sql[0],
+            "SELECT truncate_local_data_after_distributing_table('public.r');");
+}
+
+TEST(CitusPlanner, TruncatingLocalDataOfATableCitusDoesNotDistributeIsRefused) {
+  // Measured: "supplied parameter is not a distributed relation".
+  json in{{"kind", "citus_truncate_local_data"}, {"schema", "public"}, {"table", "l"}};
+  const auto p = plan_citus(in, citus_observations(
+      citus_obs(json{{"public.l", managed_local()}}),
+      json{{"public.l", table_with_pk({"id"})}}));
+  EXPECT_FALSE(p.ok);
+  EXPECT_TRUE(conflicts_mention(p, "only rows")) << first_conflict(p);
+}

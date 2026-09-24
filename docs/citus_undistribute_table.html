@@ -1,6 +1,6 @@
 <!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>citus_create_reference_table — pg_laswell</title>
+<title>citus_undistribute_table — pg_laswell</title>
 <style>
 :root{--fg:#333;--bg:#fff;--muted:#666;--rule:#ddd;--link:#0066a4;
       --code-bg:#f7f7f7;--code-rule:#e0e0e0;--req:#a33;--accent:#0e6ba8;
@@ -70,26 +70,32 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
  --dd:#c2c2c2;--req-bg:#3a2526;--req-rule:#573537;--opt-bg:#1d2a33;
  --opt-rule:#2b3f4d;--note-bg:#1a2126;--warn-bg:#2a2119}
 </style></head><body><div class="wrap">
-<nav class="crumb"><div class="l"><a href="index.html">Intent kinds</a><span>Module: citus</span></div><div class="r"><a href="citus_distribute_table.html">← citus_distribute_table</a><a href="citus_distribute_function.html">citus_distribute_function →</a></div></nav>
-<h1><code>citus_create_reference_table</code></h1>
+<nav class="crumb"><div class="l"><a href="index.html">Intent kinds</a><span>Module: citus</span></div><div class="r"><a href="citus_alter_distributed_table.html">← citus_alter_distributed_table</a><a href="citus_add_local_table_to_metadata.html">citus_add_local_table_to_metadata →</a></div></nav>
+<h1><code>citus_undistribute_table</code></h1>
 <p class="purpose"><strong>A citus module kind.</strong> Known only to a binary built with <code>-DPGLASWELL_MODULES=citus</code> -- <code>--version</code> then prints <code>modules: citus</code>. A PostgreSQL-only build refuses it as an unknown kind, and with it the whole specification. See <code>pg_laswell_citus(7)</code>.</p>
+<p class="purpose">Turn a Citus table back into an ordinary one: its data is gathered back onto the coordinator.</p>
 <h2>Synopsis</h2><pre>{
-  &quot;kind&quot;: &quot;citus_create_reference_table&quot;,
+  &quot;kind&quot;: &quot;citus_undistribute_table&quot;,
   &quot;schema&quot;: &lt;required&gt;,
   &quot;table&quot;: &lt;required&gt;,
+  &quot;cascade_via_foreign_keys&quot;: &lt;optional&gt;,
   &quot;comment&quot;: &lt;optional&gt;
 }</pre>
+<h2>Description</h2>
+<p>Turn a Citus table back into an ordinary one: its data is gathered back onto the coordinator.</p>
 <h2>Parameters</h2><dl class="params">
 <dt>schema<span class="tag req">required</span></dt>
 <dd>&nbsp;</dd>
 <dt>table<span class="tag req">required</span></dt>
+<dd>&nbsp;</dd>
+<dt>cascade_via_foreign_keys<span class="tag opt">optional</span></dt>
 <dd>&nbsp;</dd>
 <dt>comment<span class="tag opt">optional</span></dt>
 <dd>&nbsp;</dd>
 </dl>
 <div class="note">Any key not listed here is <strong>refused</strong>, not ignored: a key this binary skips and a newer one honours would be a silent difference between what was reviewed and what ran.</div>
 <h2>Examples</h2>
-<div class="note warn">No single-database example: needs a Citus cluster: a reference table is replicated to every node, and one node cannot show that. This kind is covered by <code>cpp/test/replication-tests.sh</code>, which builds two clusters.</div>
-<h2>See also</h2><p><a href="citus_distribute_table.html"><code>citus_distribute_table</code></a>, <a href="citus_distribute_function.html"><code>citus_distribute_function</code></a>, <a href="citus_alter_distributed_table.html"><code>citus_alter_distributed_table</code></a>, <a href="citus_undistribute_table.html"><code>citus_undistribute_table</code></a>, <a href="citus_add_local_table_to_metadata.html"><code>citus_add_local_table_to_metadata</code></a>, <a href="citus_truncate_local_data.html"><code>citus_truncate_local_data</code></a></p>
+<div class="note warn">No single-database example: needs a Citus cluster with a distributed table to gather back. This kind is covered by <code>cpp/test/replication-tests.sh</code>, which builds two clusters.</div>
+<h2>See also</h2><p><a href="citus_distribute_table.html"><code>citus_distribute_table</code></a>, <a href="citus_create_reference_table.html"><code>citus_create_reference_table</code></a>, <a href="citus_distribute_function.html"><code>citus_distribute_function</code></a>, <a href="citus_alter_distributed_table.html"><code>citus_alter_distributed_table</code></a>, <a href="citus_add_local_table_to_metadata.html"><code>citus_add_local_table_to_metadata</code></a>, <a href="citus_truncate_local_data.html"><code>citus_truncate_local_data</code></a></p>
 <footer>Generated from <code>cpp/src/spec.h</code> and <code>cpp/src/conformance.inc</code> by <code>tools/gen-manual.py</code>. The manual page <code>pg_laswell_mcp(1)</code> remains the authoritative reference for everything that is not a per-kind option.</footer>
 </div></body></html>

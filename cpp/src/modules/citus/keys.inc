@@ -32,4 +32,17 @@ PGLASWELL_CONFLICT_KEYS(kCitusDistributeFunction, {
     add("colocation:" + with);
   }
 })
+// Altering a distribution moves every shard of the table, and with
+// cascade_to_colocated every member of its group -- so it conflicts with
+// anything keyed on its own group as well as on the group it joins.
+PGLASWELL_CONFLICT_KEYS(kCitusAlterDistributedTable, {
+  add("colocation:" + in.body.value("schema", "") + "." + in.body.value("table", ""));
+  const auto with = in.body.value("colocate_with", "");
+  if (!with.empty() && with != "none" && with != "default") {
+    add("colocation:" + with);
+  }
+})
+PGLASWELL_CONFLICT_KEYS(kCitusUndistributeTable, {
+  add("colocation:" + in.body.value("schema", "") + "." + in.body.value("table", ""));
+})
 #endif

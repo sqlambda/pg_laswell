@@ -1,4 +1,4 @@
-.Dd September 21, 2026
+.Dd September 24, 2026
 .Dt PG_LASWELL_CITUS 7
 .Os
 .Sh NAME
@@ -42,15 +42,19 @@ gives the rules a module works under, and what it is forbidden to do.
 .Sh INTENT KINDS
 .\" BEGIN CITUS KIND LIST -- checked by tools/check-manual.py against
 .\" cpp/src/modules/citus/kinds.inc.
+Every kind accepts an optional
+.Va comment :
+a note for whoever reads the specification.
+None of these kinds creates an object, so it is not written to the catalog.
 .Ss Cm citus_distribute_table
 Hash-distribute a table across the cluster's worker nodes.
 .Pp
 Required:
 .Va schema ,
 .Va table ,
-.Va distribution_column ,
-.Va comment .
+.Va distribution_column .
 Optional:
+.Va comment ,
 .Va shard_method ,
 .Va colocate_with ,
 .Va shard_count ,
@@ -118,7 +122,8 @@ Replicate a table in full to every node, so reads join against it locally.
 .Pp
 Required:
 .Va schema ,
-.Va table ,
+.Va table .
+Optional:
 .Va comment .
 No other keys are accepted.
 .Pp
@@ -133,9 +138,9 @@ its definition to every node.
 Required:
 .Va schema ,
 .Va name ,
-.Va arguments ,
-.Va comment .
+.Va arguments .
 Optional:
+.Va comment ,
 .Va distribution_argument ,
 .Va colocate_with ,
 .Va force_delegation .
@@ -160,6 +165,144 @@ has to be propagated too or the copies diverge.
 The function must already exist; create it in an earlier specification and order
 the two with
 .Va depends_on .
+.Ss Cm citus_alter_distributed_table
+Change how a distributed table is distributed: its column, its shard count, or
+the group it is colocated with.
+.Pp
+Required:
+.Va schema ,
+.Va table ,
+and at least one of
+.Va distribution_column ,
+.Va shard_count
+and
+.Va colocate_with .
+Optional:
+.Va cascade_to_colocated ,
+.Va comment .
+.Pp
+Citus rewrites the table: it creates a new one, copies every row, drops the old
+one and renames.
+That is a full copy under an exclusive lock, with no concurrent form, and the
+plan always warns with the estimated row count.
+.Pp
+Each property is compared with the reading, and only what differs is passed to
+Citus.
+When nothing differs, the step is
+.Em satisfied
+and no call is made.
+Citus refuses a call that changes nothing
+.Pq Qq this call doesn't change any properties of the table ,
+so without this check a specification whose change had already happened would
+fail when run again.
+.Bl -tag -width Ds
+.It Va distribution_column
+Every unique key must include the new column, as for
+.Cm citus_distribute_table .
+Citus checks this only after it has copied the data.
+Cannot be combined with
+.Va cascade_to_colocated : Cm true ;
+Citus cascades only the shard count.
+.It Va shard_count
+When other tables share the group,
+.Va cascade_to_colocated
+must be written.
+.Cm true
+rewrites every member with the new count and keeps the group, and its foreign
+keys, together;
+.Cm false
+moves this table out of the group on its own.
+Cannot be combined with a real
+.Va colocate_with :
+joining a group adopts its count.
+.It Va colocate_with
+.Qq schema.table
+to join that table's group, which must be distributed on a column of exactly the
+same type, or
+.Cm none
+for a group of its own.
+A table that is already alone is satisfied for
+.Cm none .
+Citus would otherwise rewrite it into a new group for nothing.
+.Cm default
+is refused: whether a table is already in Citus's default group cannot be read
+beforehand.
+.El
+.Pp
+.Sy Foreign keys that would be dropped are refused.
+Moving a table out of its colocation group while a foreign key joins it to
+another distributed table
+.Em succeeds
+in Citus, with only a warning, and the constraint is gone.
+The plan refuses any change that breaks colocation while such a key exists.
+Keys to and from reference tables survive the rewrite and are not refused.
+.Ss Cm citus_undistribute_table
+Turn a distributed, reference or Citus-managed local table back into an ordinary
+table on the coordinator.
+.Pp
+Required:
+.Va schema ,
+.Va table .
+Optional:
+.Va cascade_via_foreign_keys ,
+.Va comment .
+.Pp
+Every row is copied onto the coordinator under an exclusive lock.
+The coordinator needs the disk space for all of it, and the plan warns with the
+estimated row count.
+A table Citus does not record is
+.Em satisfied .
+.Pp
+When a foreign key joins the table to another table Citus records, in either
+direction, Citus refuses to undistribute one end alone.
+.Va cascade_via_foreign_keys : Cm true
+undistributes every table the keys connect, and the plan names them; without it
+the plan is refused.
+.Pp
+There is no kind that reverses
+.Cm citus_distribute_function :
+Citus has no call that does.
+.Ss Cm citus_add_local_table_to_metadata
+Record a local table in Citus metadata without distributing it.
+Its rows stay on the coordinator, and it can then hold foreign keys to and from
+reference tables and join with them.
+.Pp
+Required:
+.Va schema ,
+.Va table .
+Optional:
+.Va cascade_via_foreign_keys ,
+.Va comment .
+.Pp
+Satisfied when the table is already a Citus-managed local table.
+Refused when it is distributed or a reference table, which Citus rejects as
+.Qq already distributed .
+A foreign key to a table Citus does not record needs
+.Va cascade_via_foreign_keys : Cm true ,
+which adds the connected tables as well.
+A key to a reference table is what this kind is for, and needs no cascade.
+.Ss Cm citus_truncate_local_data
+Delete the coordinator's own copy of a distributed or reference table's rows.
+.Fn create_distributed_table
+leaves that copy in place after copying the rows to the shards.
+.Pp
+Required:
+.Va schema ,
+.Va table .
+Optional:
+.Va comment .
+.Pp
+Calls
+.Fn truncate_local_data_after_distributing_table .
+The rows Citus serves are in the shards and are not touched.
+.Pp
+.Sy The call truncates with CASCADE.
+A table that references this one and is not distributed has its
+.Em own
+rows deleted: a local table referencing a reference table was emptied.
+The plan is refused while any such table references it.
+A distributed table referencing it is allowed: only the coordinator's stale copy
+of it is truncated, and Citus still served every row.
 .\" END CITUS KIND LIST
 .Sh READINGS
 With the module built in, every plan against a database where the
@@ -331,6 +474,15 @@ or
 .Va distribution_argument
 without
 .Va colocate_with .
+.It
+An alter that changes a shard count in a shared group without
+.Va cascade_to_colocated ,
+or that would silently drop a foreign key to another distributed table.
+.It
+Undistributing, or adding to metadata, one end of a foreign key without
+.Va cascade_via_foreign_keys .
+.It
+Truncating local data that would cascade into a table's real rows.
 .El
 .Sh EXAMPLES
 Distribute a parent, then colocate a child with it, in one specification.
@@ -374,7 +526,7 @@ For a specification a binary can plan at all the module set does not change a
 single statement, and one it cannot plan is refused outright -- so hashing it
 would change every existing digest while protecting nothing.
 .Pp
-Distributing a table is not reversible by re-running a specification.
-Retiring one means
-.Fn undistribute_table
-by hand, which is outside what a signed specification describes.
+A distribution is reversed with
+.Cm citus_undistribute_table
+in a later specification, not by reverting one.
+Like any kind that moves data, the plan says what it copies and where.

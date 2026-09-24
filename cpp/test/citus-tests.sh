@@ -261,6 +261,79 @@ expect_form "a distribution argument the function does not have" refuse "is not 
 expect_form "a text argument on a bigint group" refuse "every call" \
   "$(fn_intent fn_text text tid)"
 
+# THE LIFECYCLE OF A DISTRIBUTED TABLE. Each case plans through planMigration,
+# whose dry run EXECUTES the Citus call and rolls it back -- so an "ok" with no
+# problems proves Citus accepted the emitted statement, not only that the
+# planner liked it.
+echo "citus: the lifecycle kinds"
+
+q "CREATE TABLE ct.la (id bigint PRIMARY KEY, t bigint NOT NULL)" >/dev/null
+q "SELECT create_distributed_table('ct.la','id', shard_count => 4, colocate_with => 'none')" >/dev/null
+q "CREATE TABLE ct.lb (id bigint PRIMARY KEY REFERENCES ct.la(id))" >/dev/null
+q "SELECT create_distributed_table('ct.lb','id', colocate_with => 'ct.la')" >/dev/null
+q "CREATE TABLE ct.lr (id bigint PRIMARY KEY)" >/dev/null
+q "SELECT create_reference_table('ct.lr')" >/dev/null
+q "INSERT INTO ct.lr VALUES (1)" >/dev/null
+# A local table referencing the reference table: Citus quietly adds it to its
+# metadata, and its rows are its only rows.
+q "CREATE TABLE ct.ll (id bigint PRIMARY KEY, r bigint REFERENCES ct.lr(id))" >/dev/null
+q "INSERT INTO ct.ll VALUES (1, 1)" >/dev/null
+q "CREATE TABLE ct.lp (id bigint PRIMARY KEY)" >/dev/null
+
+clean_apply() {  # clean_apply <label> <intent>
+  local out; out=$(intent_plan "$2")
+  if echo "$out" | grep -q '"ok":true' && echo "$out" | grep -q '"action":"apply"' \
+     && ! echo "$out" | grep -q '"problems"'; then
+    ok "$1 plans, and its dry run ran the call cleanly"
+  else
+    bad "$1 should plan an apply with a clean dry run" "$out"
+  fi
+}
+satisfied() {  # satisfied <label> <intent>
+  local out; out=$(intent_plan "$2")
+  if echo "$out" | grep -q '"ok":true' && echo "$out" | grep -q '"action":"satisfied"' \
+     && ! echo "$out" | grep -q '"action":"apply"'; then
+    ok "$1 is satisfied, and no call is made"
+  else
+    bad "$1 should be satisfied" "$out"
+  fi
+}
+alter() { echo "{\"kind\":\"citus_alter_distributed_table\",\"schema\":\"ct\",\"table\":\"la\"$1}"; }
+
+expect_form "a shard count change in a shared group, cascade unsaid" refuse "cascade_to_colocated" \
+  "$(alter ',"shard_count":8')"
+clean_apply "a cascaded shard count change" "$(alter ',"shard_count":8,"cascade_to_colocated":true')"
+# Measured, and the reason this is refused rather than warned: Citus succeeds,
+# warns, and the key is gone.
+expect_form "leaving the group while lb references la" refuse "would be dropped" \
+  "$(alter ',"colocate_with":"none"')"
+satisfied "an alter asking for the shard count la already has" "$(alter ',"shard_count":4')"
+
+satisfied "undistributing a table Citus does not record" \
+  '{"kind":"citus_undistribute_table","schema":"ct","table":"lp"}'
+expect_form "undistributing one end of a key" refuse "cascade_via_foreign_keys" \
+  '{"kind":"citus_undistribute_table","schema":"ct","table":"la"}'
+clean_apply "undistributing both ends of a key" \
+  '{"kind":"citus_undistribute_table","schema":"ct","table":"la","cascade_via_foreign_keys":true}'
+
+clean_apply "adding a plain local table to metadata" \
+  '{"kind":"citus_add_local_table_to_metadata","schema":"ct","table":"lp"}'
+satisfied "adding a table Citus already manages as local" \
+  '{"kind":"citus_add_local_table_to_metadata","schema":"ct","table":"ll"}'
+expect_form "adding a reference table to metadata as local" refuse "already a reference table" \
+  '{"kind":"citus_add_local_table_to_metadata","schema":"ct","table":"lr"}'
+
+# Measured: the call truncates with CASCADE, and ct.ll's own rows went with it.
+expect_form "truncating local data that would cascade into ct.ll" refuse "ct.ll" \
+  '{"kind":"citus_truncate_local_data","schema":"ct","table":"lr"}'
+clean_apply "truncating the local copy under a distributed table" \
+  '{"kind":"citus_truncate_local_data","schema":"ct","table":"la"}'
+if [ "$(q "SELECT count(*) FROM ct.ll")" = 1 ]; then
+  ok "ct.ll still has its row: nothing above committed"
+else
+  bad "ct.ll lost its row" "$(q "SELECT count(*) FROM ct.ll")"
+fi
+
 # THE GROUPED WALK, through plain `backfill`.
 #
 # The author writes backfill whatever the server runs. Core asks the Citus

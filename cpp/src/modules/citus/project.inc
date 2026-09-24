@@ -16,3 +16,8 @@ PGLASWELL_PROJECT(kCitusCreateReferenceTable, citus_project_reference_table)
 // Nothing to project: a specification distributing the same function twice is
 // a duplicate for the author to fix, not a state a later step reads.
 PGLASWELL_PROJECT(kCitusDistributeFunction, citus_project_nothing)
+PGLASWELL_PROJECT(kCitusAlterDistributedTable, citus_project_alter_distributed_table)
+PGLASWELL_PROJECT(kCitusUndistributeTable, citus_project_undistribute_table)
+PGLASWELL_PROJECT(kCitusAddLocalTableToMetadata, citus_project_local_table)
+// The coordinator's stale copy is not something a later step reads.
+PGLASWELL_PROJECT(kCitusTruncateLocalData, citus_project_nothing)

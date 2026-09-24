@@ -619,3 +619,506 @@ inline void plan_citus_distribute_function(const Intent& in, const Observations&
         "propagated too or the copies diverge.");
   }
 }
+
+// --- Phase 2: the lifecycle of a distributed table --------------------------
+
+// What Citus records a table as: "distributed", "reference", "local" (a
+// Citus-managed local table, partmethod 'n' with repmodel 's'), or "" when
+// Citus does not record it at all. The same distinction guard.h draws.
+inline std::string citus_kind_of(const json& citus, const std::string& qualified) {
+  const auto& d = citus_table(citus, qualified);
+  if (d.empty()) return {};
+  if (d.value("partmethod", "") != "n") return "distributed";
+  return d.value("repmodel", "") == "t" ? "reference" : "local";
+}
+
+// The catalog names a related table by regclass::text, which drops the schema
+// when it is on the search_path. Every table the Citus reading is keyed by is
+// schema.table, so an unqualified name is read as public -- the only schema on
+// the default search_path that holds tables.
+inline std::string citus_qualify(const std::string& name) {
+  return name.find('.') == std::string::npos ? "public." + name : name;
+}
+
+// Every table a foreign key joins to `t`, in either direction, as
+// schema.table. `referenced_by` entries read "conname on table".
+struct CitusForeignKey {
+  std::string name;
+  std::string other;
+  bool outgoing;
+};
+inline std::vector<CitusForeignKey> citus_foreign_keys(const json& t) {
+  std::vector<CitusForeignKey> out;
+  const json constraints = t.value("constraints", json::object());
+  for (auto it = constraints.begin(); it != constraints.end(); ++it) {
+    if (it.value().value("type", "") != "f") continue;
+    const auto ref = it.value().value("references", json(nullptr));
+    if (!ref.is_string()) continue;
+    out.push_back({it.key(), citus_qualify(ref.get<std::string>()), true});
+  }
+  for (const auto& e : t.value("referenced_by", json::array())) {
+    if (!e.is_string()) continue;
+    const auto s = e.get<std::string>();
+    const auto on = s.find(" on ");
+    if (on == std::string::npos) continue;
+    out.push_back({s.substr(0, on), citus_qualify(s.substr(on + 4)), false});
+  }
+  return out;
+}
+
+// The other members of a table's colocation group, by reading.
+inline std::vector<std::string> citus_colocated_with(const json& citus,
+                                                     const std::string& qualified) {
+  std::vector<std::string> out;
+  const auto group = citus_table(citus, qualified).value("colocationid", -1LL);
+  if (group <= 0) return out;
+  const auto tables = citus.value("tables", json::object());
+  for (auto it = tables.begin(); it != tables.end(); ++it) {
+    if (it.key() == qualified) continue;
+    if (it.value().value("colocationid", -2LL) == group) out.push_back(it.key());
+  }
+  return out;
+}
+
+inline void plan_citus_alter_distributed_table(const Intent& in,
+                                               const Observations& obs,
+                                               const ExecutorConfig& cfg,
+                                               Plan& plan, std::vector<Step>& out) {
+  (void)cfg;
+  Step step;
+  step.kind = in.kind_name;
+  struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
+
+  const auto qualified = in.qualified_table();
+  const auto& citus = obs.extension("citus");
+  bool already = false;
+  if (!citus_precondition(in, obs, step, plan, citus, qualified, already)) return;
+
+  // Measured: "cannot alter table because the table is not distributed" -- a
+  // reference table included.
+  if (citus_kind_of(citus, qualified) != "distributed") {
+    step.action = Action::kConflict;
+    step.why = qualified + " is not a distributed table" +
+               (already ? " (Citus records it as a " +
+                              citus_kind_of(citus, qualified) + " table)"
+                        : std::string());
+    plan.conflicts.push_back(
+        step.why + ". alter_distributed_table changes how a table is "
+        "distributed; to distribute it in the first place, use "
+        "citus_distribute_table.");
+    return;
+  }
+
+  const auto& t = obs.table(qualified);
+  const auto& d = citus_table(citus, qualified);
+  const json columns = t.value("columns", json::object());
+  const auto current_col = d.value("distribution_column", "");
+  const auto current_group = d.value("colocationid", -1LL);
+  const auto members = citus_colocated_with(citus, qualified);
+
+  // WHAT CHANGES. Each property is compared against the reading, and a call
+  // that would change nothing is not made -- measured, Citus raises "this call
+  // doesn't change any properties of the table" for it, so re-running a
+  // specification whose change already happened would FAIL rather than be a
+  // no-op without this.
+  std::vector<std::string> changes;
+  bool breaks_colocation = false;
+  const auto col = in.body.value("distribution_column", "");
+  const bool col_changes = !col.empty() && col != current_col;
+  if (col_changes) {
+    if (!columns.contains(col)) {
+      step.action = Action::kConflict;
+      step.why = qualified + " has no column " + col + " to distribute on";
+      plan.conflicts.push_back(step.why);
+      return;
+    }
+    // Measured: the rewrite gets as far as re-adding the primary key and then
+    // fails -- "Distributed relations cannot have UNIQUE ... constraints that
+    // do not include the partition column" -- after the data was copied.
+    std::string offender, offender_columns;
+    if (!citus_unique_keys_include(t, col, offender, offender_columns)) {
+      step.action = Action::kConflict;
+      step.why = offender + " on " + qualified + " covers (" + offender_columns +
+                 "), which does not include the new distribution column " + col;
+      plan.conflicts.push_back(
+          step.why + ". Citus rewrites the table and then fails re-adding the "
+          "key. Add " + col + " to that key first, in an earlier specification.");
+      return;
+    }
+    changes.push_back("distribution column " + current_col + " -> " + col);
+    breaks_colocation = !members.empty();
+  }
+
+  const bool cascade = in.body.value("cascade_to_colocated", false);
+  if (in.body.contains("shard_count")) {
+    const int want = in.body["shard_count"].get<int>();
+    const int have = d.value("shard_count", 0);
+    if (want != have) {
+      // Measured: "cascade_to_colocated parameter is necessary" when the group
+      // has other members. Refused here with the same choice spelled out, since
+      // either answer is a decision about tables this intent does not name.
+      if (!members.empty() && !in.body.contains("cascade_to_colocated")) {
+        step.action = Action::kConflict;
+        step.why = qualified + " shares colocation group " +
+                   std::to_string(current_group) + " with " +
+                   detail::join(members, ", ") +
+                   ", and changing its shard count has to say what happens to them";
+        plan.conflicts.push_back(
+            step.why + ". Write cascade_to_colocated: true to change them all "
+            "(each is rewritten too), or false to move " + qualified +
+            " out of the group on its own.");
+        return;
+      }
+      changes.push_back("shard count " + std::to_string(have) + " -> " +
+                        std::to_string(want));
+      if (!cascade) breaks_colocation = breaks_colocation || !members.empty();
+    }
+  }
+
+  const auto with = in.body.value("colocate_with", "");
+  long long target_group = -1;
+  if (with == "none") {
+    // "A group of its own". Measured, Citus rewrites a table that is already
+    // alone into a NEW group rather than refusing, so alone is read as done.
+    if (!members.empty()) {
+      changes.push_back("leaves colocation group " + std::to_string(current_group));
+      breaks_colocation = true;
+    }
+  } else if (!with.empty()) {
+    const auto& other = citus_table(citus, with);
+    if (citus_kind_of(citus, with) != "distributed") {
+      step.action = Action::kConflict;
+      step.why = "colocate_with names " + with +
+                 ", which this database does not record as distributed";
+      plan.conflicts.push_back(
+          step.why + ". A table can only join a colocation group that exists.");
+      return;
+    }
+    target_group = other.value("colocationid", -1LL);
+    if (target_group != current_group) {
+      // Same exact-type rule as distributing: checked against the column the
+      // table WILL be distributed on.
+      const auto on = col.empty() ? current_col : col;
+      const auto want_oid = other.value("distribution_type_oid", 0LL);
+      const auto have_oid =
+          columns.value(on, json::object()).value("type_oid", 0LL);
+      if (want_oid != 0 && have_oid != 0 && want_oid != have_oid) {
+        step.action = Action::kConflict;
+        step.why = qualified + "." + on + " is " +
+                   columns.value(on, json::object()).value("type", "?") + ", and " +
+                   with + " is distributed on a " +
+                   other.value("distribution_type", "?") + " column";
+        plan.conflicts.push_back(
+            step.why + ". Citus colocates only tables whose distribution "
+            "columns are the same type exactly (\"Distribution column types "
+            "don't match\").");
+        return;
+      }
+      changes.push_back("joins colocation group " + std::to_string(target_group) +
+                        " of " + with + ", adopting its " +
+                        std::to_string(other.value("shard_count", 0)) + " shards");
+      breaks_colocation = breaks_colocation || !members.empty();
+      step.detail["colocation_group"] = target_group;
+    }
+  }
+
+  if (changes.empty()) {
+    step.action = Action::kSatisfied;
+    step.why = qualified + " is already distributed as asked (on " + current_col +
+               ", " + std::to_string(d.value("shard_count", 0)) +
+               " shards, colocation group " + std::to_string(current_group) + ")";
+    return;
+  }
+
+  // FOREIGN KEYS THAT WOULD BE DROPPED. The finding that decided this check:
+  // moving a table out of its group while a distributed table holds a foreign
+  // key to it SUCCEEDS, with a WARNING -- "foreign key b_fk will be dropped" --
+  // and the constraint is gone. Nothing fails, so nothing downstream would
+  // notice. A key to or from a REFERENCE table survives (measured), and a
+  // cascaded shard-count change keeps the group together and re-creates its
+  // keys (measured), so only a key to another distributed table across a
+  // change that breaks colocation is refused.
+  if (breaks_colocation || col_changes) {
+    for (const auto& fk : citus_foreign_keys(t)) {
+      if (citus_kind_of(citus, fk.other) != "distributed") continue;
+      if (fk.other == qualified) continue;
+      step.action = Action::kConflict;
+      step.why = "foreign key " + fk.name + (fk.outgoing ? " from " : " to ") +
+                 qualified + (fk.outgoing ? " to " : " from ") + fk.other +
+                 " would be dropped";
+      plan.conflicts.push_back(
+          step.why + ". This change moves " + qualified + " out of the colocation "
+          "group it shares with " + fk.other + ", and Citus drops the key with a "
+          "warning rather than failing -- measured, the call succeeds and the "
+          "constraint is gone. Drop the key in an earlier intent and re-add it "
+          "once both tables are colocated again, or change the whole group with "
+          "cascade_to_colocated: true.");
+      return;
+    }
+  }
+
+  // The group the table ends up in, for the projection: the target's, the
+  // current one when the change keeps the group together, or 0 -- "a group not
+  // read yet" -- when it leaves for a new one.
+  if (!step.detail.contains("colocation_group")) {
+    step.detail["colocation_group"] =
+        (breaks_colocation || col_changes || with == "none") ? 0LL : current_group;
+  }
+
+  std::string args = detail::quote_literal(qualified);
+  if (col_changes) args += ", distribution_column := " + detail::quote_literal(col);
+  if (in.body.contains("shard_count") &&
+      in.body["shard_count"].get<int>() != d.value("shard_count", 0)) {
+    args += ", shard_count := " + std::to_string(in.body["shard_count"].get<int>());
+  }
+  if (with == "none" && !members.empty()) {
+    args += ", colocate_with := 'none'";
+  } else if (!with.empty() && with != "none" && target_group != current_group) {
+    args += ", colocate_with := " + detail::quote_literal(with);
+  }
+  if (in.body.contains("cascade_to_colocated")) {
+    args += std::string(", cascade_to_colocated := ") + (cascade ? "true" : "false");
+  }
+  step.sql.push_back("SELECT alter_distributed_table(" + args + ");");
+
+  const long long rows = t.value("reltuples", 0LL);
+  step.action = Action::kApply;
+  step.txn_class = TxnClass::kRequired;
+  // Rehearsed by execution: see plan_citus_distribute_table.
+  step.detail["rehearse_by"] = "execution";
+  step.detail["changes"] = changes;
+  step.detail["rows_estimated"] = rows;
+  step.why = detail::join(changes, "; ");
+  // Measured: Citus creates a new table, moves the data, drops the old one and
+  // renames -- a full copy under an exclusive lock, with no concurrent form.
+  std::vector<std::string> rewritten{qualified};
+  if (cascade && !members.empty()) {
+    rewritten.insert(rewritten.end(), members.begin(), members.end());
+    step.detail["cascades_to"] = members;
+  }
+  step.lock = "AccessExclusiveLock on " + detail::join(rewritten, ", ") +
+              " (each is rewritten: new table, data copied, old one dropped)";
+  plan.warnings.push_back(
+      "alter_distributed_table rewrites " + detail::join(rewritten, ", ") +
+      " in full -- " + std::to_string(rows) + " estimated rows for " + qualified +
+      " -- under an exclusive lock, with no concurrent form. Reads and writes "
+      "wait for the whole copy.");
+}
+
+inline void plan_citus_undistribute_table(const Intent& in, const Observations& obs,
+                                          const ExecutorConfig& cfg, Plan& plan,
+                                          std::vector<Step>& out) {
+  (void)cfg;
+  Step step;
+  step.kind = in.kind_name;
+  struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
+
+  const auto qualified = in.qualified_table();
+  const auto& citus = obs.extension("citus");
+  bool already = false;
+  if (!citus_precondition(in, obs, step, plan, citus, qualified, already)) return;
+
+  // Measured: "cannot undistribute table because the table is not
+  // distributed", so a re-run needs this to be read as done.
+  if (!already) {
+    step.action = Action::kSatisfied;
+    step.why = qualified + " is not a Citus table";
+    return;
+  }
+
+  // Measured: a foreign key in EITHER direction to another table stops it --
+  // "cannot complete operation because table a is referenced by a foreign key"
+  // -- unless cascade_via_foreign_keys, which undistributes every table the
+  // keys connect. That is a decision about other tables, so it is written down
+  // or refused.
+  const auto& t = obs.table(qualified);
+  const bool cascade = in.body.value("cascade_via_foreign_keys", false);
+  std::vector<std::string> connected;
+  for (const auto& fk : citus_foreign_keys(t)) {
+    if (fk.other == qualified) continue;
+    if (citus_kind_of(citus, fk.other).empty()) continue;
+    if (std::find(connected.begin(), connected.end(), fk.other) == connected.end()) {
+      connected.push_back(fk.other);
+    }
+  }
+  if (!connected.empty() && !cascade) {
+    step.action = Action::kConflict;
+    step.why = qualified + " is joined by foreign keys to " +
+               detail::join(connected, ", ");
+    plan.conflicts.push_back(
+        step.why + ", which Citus also records. Citus refuses to undistribute "
+        "one end of a key alone. Write cascade_via_foreign_keys: true to "
+        "undistribute every table the keys connect -- they are rewritten too.");
+    return;
+  }
+
+  const auto kind = citus_kind_of(citus, qualified);
+  const long long rows = t.value("reltuples", 0LL);
+  step.action = Action::kApply;
+  step.txn_class = TxnClass::kRequired;
+  // Rehearsed by execution: see plan_citus_distribute_table.
+  step.detail["rehearse_by"] = "execution";
+  step.detail["was"] = kind;
+  step.detail["rows_estimated"] = rows;
+  std::vector<std::string> rewritten{qualified};
+  if (cascade && !connected.empty()) {
+    rewritten.insert(rewritten.end(), connected.begin(), connected.end());
+    step.detail["cascades_to"] = connected;
+  }
+  step.lock = "AccessExclusiveLock on " + detail::join(rewritten, ", ") +
+              " (each is rewritten onto the coordinator)";
+  step.why = qualified + " is a " + kind +
+             " table; its rows are gathered back into an ordinary table on the "
+             "coordinator";
+  std::string call = "SELECT undistribute_table(" + detail::quote_literal(qualified);
+  if (in.body.contains("cascade_via_foreign_keys")) {
+    call += std::string(", cascade_via_foreign_keys := ") + (cascade ? "true" : "false");
+  }
+  step.sql.push_back(call + ");");
+  plan.warnings.push_back(
+      "undistribute_table copies every row of " + detail::join(rewritten, ", ") +
+      " onto the coordinator -- " + std::to_string(rows) + " estimated rows for " +
+      qualified + " -- under an exclusive lock. The coordinator needs the disk "
+      "for all of it, and queries lose the workers' parallelism from then on.");
+}
+
+inline void plan_citus_add_local_table_to_metadata(const Intent& in,
+                                                   const Observations& obs,
+                                                   const ExecutorConfig& cfg,
+                                                   Plan& plan,
+                                                   std::vector<Step>& out) {
+  (void)cfg;
+  Step step;
+  step.kind = in.kind_name;
+  struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
+
+  const auto qualified = in.qualified_table();
+  const auto& citus = obs.extension("citus");
+  bool already = false;
+  if (!citus_precondition(in, obs, step, plan, citus, qualified, already)) return;
+
+  const auto kind = citus_kind_of(citus, qualified);
+  // Measured: a second call on a managed local table is silent, so reading it
+  // as done changes nothing but the plan's honesty. On a distributed or
+  // reference table Citus refuses -- "table is already distributed".
+  if (kind == "local") {
+    step.action = Action::kSatisfied;
+    step.why = qualified + " is already in Citus metadata as a local table";
+    return;
+  }
+  if (!kind.empty()) {
+    step.action = Action::kConflict;
+    step.why = qualified + " is already a " + kind + " table";
+    plan.conflicts.push_back(
+        step.why + ", and Citus refuses to add it again as a local one. "
+        "Undistribute it first, which moves its data back, if that is the "
+        "intent.");
+    return;
+  }
+
+  // Measured: a foreign key to any other table stops it -- "relation is
+  // involved in a foreign key relationship with another table" -- unless
+  // cascade_via_foreign_keys adds every connected table too. A key to a table
+  // Citus already records is the case this kind exists for and does not need
+  // the cascade; one to a plain local table does.
+  const auto& t = obs.table(qualified);
+  const bool cascade = in.body.value("cascade_via_foreign_keys", false);
+  std::vector<std::string> plain;
+  for (const auto& fk : citus_foreign_keys(t)) {
+    if (fk.other == qualified) continue;
+    if (!citus_kind_of(citus, fk.other).empty()) continue;
+    if (std::find(plain.begin(), plain.end(), fk.other) == plain.end()) {
+      plain.push_back(fk.other);
+    }
+  }
+  if (!plain.empty() && !cascade) {
+    step.action = Action::kConflict;
+    step.why = qualified + " is joined by foreign keys to " +
+               detail::join(plain, ", ") + ", which Citus does not record";
+    plan.conflicts.push_back(
+        step.why + ". Citus adds a table to its metadata only together with "
+        "the tables its keys connect. Write cascade_via_foreign_keys: true to "
+        "add them all.");
+    return;
+  }
+
+  step.action = Action::kApply;
+  step.txn_class = TxnClass::kRequired;
+  // Rehearsed by execution: see plan_citus_distribute_table.
+  step.detail["rehearse_by"] = "execution";
+  if (cascade && !plain.empty()) step.detail["cascades_to"] = plain;
+  step.lock = "AccessExclusiveLock on " + qualified +
+              " (metadata only: the rows stay where they are)";
+  step.why = qualified +
+             " stays on the coordinator and becomes visible to Citus, so it can "
+             "hold foreign keys with reference tables and join with them";
+  std::string call = "SELECT citus_add_local_table_to_metadata(" +
+                     detail::quote_literal(qualified);
+  if (in.body.contains("cascade_via_foreign_keys")) {
+    call += std::string(", cascade_via_foreign_keys := ") + (cascade ? "true" : "false");
+  }
+  step.sql.push_back(call + ");");
+}
+
+inline void plan_citus_truncate_local_data(const Intent& in, const Observations& obs,
+                                           const ExecutorConfig& cfg, Plan& plan,
+                                           std::vector<Step>& out) {
+  (void)cfg;
+  Step step;
+  step.kind = in.kind_name;
+  struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
+
+  const auto qualified = in.qualified_table();
+  const auto& citus = obs.extension("citus");
+  bool already = false;
+  if (!citus_precondition(in, obs, step, plan, citus, qualified, already)) return;
+
+  // Measured: on a table Citus does not distribute, "supplied parameter is not
+  // a distributed relation". A reference table is accepted.
+  const auto kind = citus_kind_of(citus, qualified);
+  if (kind != "distributed" && kind != "reference") {
+    step.action = Action::kConflict;
+    step.why = qualified + " is not a distributed or reference table" +
+               (kind.empty() ? std::string() : " (it is a Citus-managed local one)");
+    plan.conflicts.push_back(
+        step.why + ", so its local rows are its only rows. Nothing here would be "
+        "left behind by a distribution.");
+    return;
+  }
+
+  // THE CASCADE. Measured: the call truncates with CASCADE, and a local table
+  // holding a foreign key to this one was emptied -- "truncate cascades to table
+  // lref" -- and that table's rows were its real, only rows. Cascading into a
+  // DISTRIBUTED table is harmless (measured: it reached the coordinator's stale
+  // copy and Citus still served every row), so only other referencing tables
+  // are refused.
+  const auto& t = obs.table(qualified);
+  for (const auto& fk : citus_foreign_keys(t)) {
+    if (fk.outgoing || fk.other == qualified) continue;
+    if (citus_kind_of(citus, fk.other) == "distributed") continue;
+    step.action = Action::kConflict;
+    step.why = fk.other + " holds foreign key " + fk.name + " to " + qualified +
+               ", and is not distributed";
+    plan.conflicts.push_back(
+        step.why + ". This call truncates with CASCADE, so " + fk.other +
+        "'s own rows -- not a stale copy -- would be deleted too. Measured: a "
+        "local table referencing a reference table was emptied. Drop the key "
+        "first, or distribute " + fk.other + ".");
+    return;
+  }
+
+  step.action = Action::kApply;
+  step.txn_class = TxnClass::kRequired;
+  // Rehearsed by execution: see plan_citus_distribute_table.
+  step.detail["rehearse_by"] = "execution";
+  step.lock = "AccessExclusiveLock on " + qualified + " (a TRUNCATE of the "
+              "coordinator's copy; the shards are not touched)";
+  step.why = "create_distributed_table leaves the coordinator's rows in place "
+             "after copying them to the shards; this frees that space";
+  step.sql.push_back("SELECT truncate_local_data_after_distributing_table(" +
+                     detail::quote_literal(qualified) + ");");
+  plan.warnings.push_back(
+      "This TRUNCATEs the coordinator's local copy of " + qualified +
+      ". The rows Citus serves live in the shards and are untouched; the local "
+      "copy cannot be recovered afterwards other than by undistributing.");
+}

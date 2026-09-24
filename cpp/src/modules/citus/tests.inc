@@ -25,6 +25,14 @@ PGLASWELL_DEFERRED_CASE("citus_create_reference_table",
     "one node cannot show that")
 PGLASWELL_DEFERRED_CASE("citus_distribute_function",
     "needs a Citus cluster and a distributed table to colocate against")
+PGLASWELL_DEFERRED_CASE("citus_alter_distributed_table",
+    "needs a Citus cluster with a distributed table to rewrite")
+PGLASWELL_DEFERRED_CASE("citus_undistribute_table",
+    "needs a Citus cluster with a distributed table to gather back")
+PGLASWELL_DEFERRED_CASE("citus_add_local_table_to_metadata",
+    "needs a Citus coordinator registered in its own metadata")
+PGLASWELL_DEFERRED_CASE("citus_truncate_local_data",
+    "needs a Citus cluster with a distributed table whose local copy remains")
 #endif
 
 #ifdef PGLASWELL_KIND_BODY
@@ -40,4 +48,13 @@ PGLASWELL_KIND_BODY("citus_create_reference_table",
 PGLASWELL_KIND_BODY("citus_distribute_function",
   R"({"kind":"citus_distribute_function","schema":"s","name":"f",
       "arguments":"integer"})")
+PGLASWELL_KIND_BODY("citus_alter_distributed_table",
+  R"({"kind":"citus_alter_distributed_table","schema":"s","table":"t",
+      "shard_count":8})")
+PGLASWELL_KIND_BODY("citus_undistribute_table",
+  R"({"kind":"citus_undistribute_table","schema":"s","table":"t"})")
+PGLASWELL_KIND_BODY("citus_add_local_table_to_metadata",
+  R"({"kind":"citus_add_local_table_to_metadata","schema":"s","table":"t"})")
+PGLASWELL_KIND_BODY("citus_truncate_local_data",
+  R"({"kind":"citus_truncate_local_data","schema":"s","table":"t"})")
 #endif

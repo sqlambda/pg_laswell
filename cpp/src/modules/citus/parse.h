@@ -122,3 +122,115 @@ inline void parse_citus_distribute_function(Intent& in) {
     detail::fail(at + ".force_delegation must be a boolean", "");
   }
 }
+
+// --- Phase 2: the lifecycle of a distributed table --------------------------
+
+// Change how a distributed table is distributed: its column, its shard count,
+// or the group it is colocated with. At least one, because a call that changes
+// nothing is an ERROR in Citus -- measured: "this call doesn't change any
+// properties of the table".
+inline void parse_citus_alter_distributed_table(Intent& in) {
+  const auto at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(
+      in.body,
+      {"kind", "schema", "table", "distribution_column", "shard_count",
+       "colocate_with", "cascade_to_colocated", "comment"},
+      at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at),
+                             "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at),
+                             "table", in.ordinal);
+  const bool col = in.body.contains("distribution_column");
+  const bool count = in.body.contains("shard_count");
+  const bool with = in.body.contains("colocate_with");
+  if (!col && !count && !with) {
+    detail::fail(at + " changes nothing",
+                 "Give at least one of distribution_column, shard_count and "
+                 "colocate_with. Citus refuses a call that changes no property.");
+  }
+  if (col) {
+    detail::require_identifier(
+        detail::require_string(in.body, "distribution_column", at),
+        "distribution_column", in.ordinal);
+  }
+  if (count && (!in.body["shard_count"].is_number_integer() ||
+                in.body["shard_count"].get<int>() <= 0)) {
+    detail::fail(at + ".shard_count must be a positive integer", "");
+  }
+  if (with) {
+    citus_check_colocate_with(in, at);
+    // "default" has no reading to compare against: the default group is
+    // Citus's choice at call time, so whether the table is already in it
+    // cannot be decided beforehand. Measured, the call rewrites the table
+    // regardless -- on a table already alone it moved to a new group.
+    if (in.body.value("colocate_with", "") == "default") {
+      detail::fail(at + ".colocate_with cannot be \"default\" here",
+                   "Name the table to colocate with, or \"none\" for a group of "
+                   "its own. Whether a table is already in Citus's default group "
+                   "cannot be read beforehand, so the plan could not say whether "
+                   "the rewrite is needed.");
+    }
+    // Measured: "shard_count cannot be different than the shard count of the
+    // table in colocate_with". Joining a group adopts its count.
+    if (count && !citus_is_colocation_sentinel(in.body.value("colocate_with", ""))) {
+      detail::fail(at + " names both colocate_with and shard_count",
+                   "Joining a colocation group adopts its shard count, and Citus "
+                   "refuses any other. Drop shard_count.");
+    }
+  }
+  // Measured: "distribution_column cannot be cascaded to colocated tables".
+  if (col && in.body.value("cascade_to_colocated", false)) {
+    detail::fail(at + " cascades a distribution column change",
+                 "Citus cascades only shard_count to a colocation group. Change "
+                 "each table's column in its own intent.");
+  }
+  if (in.body.contains("cascade_to_colocated") &&
+      !in.body["cascade_to_colocated"].is_boolean()) {
+    detail::fail(at + ".cascade_to_colocated must be a boolean", "");
+  }
+}
+
+// Turn a Citus table back into an ordinary one: its data is gathered back onto
+// the coordinator.
+inline void parse_citus_undistribute_table(Intent& in) {
+  const auto at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(
+      in.body, {"kind", "schema", "table", "cascade_via_foreign_keys", "comment"},
+      at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at),
+                             "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at),
+                             "table", in.ordinal);
+  if (in.body.contains("cascade_via_foreign_keys") &&
+      !in.body["cascade_via_foreign_keys"].is_boolean()) {
+    detail::fail(at + ".cascade_via_foreign_keys must be a boolean", "");
+  }
+}
+
+// Add a local table to Citus metadata without distributing it, so it can take
+// part in foreign keys with reference tables and be queried alongside them.
+inline void parse_citus_add_local_table_to_metadata(Intent& in) {
+  const auto at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(
+      in.body, {"kind", "schema", "table", "cascade_via_foreign_keys", "comment"},
+      at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at),
+                             "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at),
+                             "table", in.ordinal);
+  if (in.body.contains("cascade_via_foreign_keys") &&
+      !in.body["cascade_via_foreign_keys"].is_boolean()) {
+    detail::fail(at + ".cascade_via_foreign_keys must be a boolean", "");
+  }
+}
+
+// Remove the coordinator's local copy of a table's rows once the table has been
+// distributed. create_distributed_table leaves them in place.
+inline void parse_citus_truncate_local_data(Intent& in) {
+  const auto at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(in.body, {"kind", "schema", "table", "comment"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at),
+                             "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at),
+                             "table", in.ordinal);
+}
