@@ -963,7 +963,7 @@ class Catalog {
           long long sent = 0;
           stream_copy(txn, copy_payloads[i], sent);
         } catch (const pqxx::sql_error& e) {
-          out.problems.push_back(Problem{steps[i].first, e.sqlstate(),
+          out.problems.push_back(Problem{steps[i].first, std::string(e.sqlstate()),
                                         server_message(e.what()),
                                         "COPY into " +
                                             copy_payloads[i].value("qualified", "?")});
@@ -1004,7 +1004,7 @@ class Catalog {
             out.depends_on_skipped = true;
             return Rehearsal::kGap;
           }
-          out.problems.push_back(Problem{steps[i].first, e.sqlstate(),
+          out.problems.push_back(Problem{steps[i].first, std::string(e.sqlstate()),
                                         server_message(e.what()), stmt});
           return Rehearsal::kFailed;
         } catch (const pqxx::broken_connection& e) {
