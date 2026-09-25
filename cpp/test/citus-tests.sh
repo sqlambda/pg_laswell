@@ -466,8 +466,10 @@ paced_ini=$(mktemp); chmod 600 "$paced_ini"
 python3 - "$CITUS_URL" > "$paced_ini" <<'PY'
 import sys, urllib.parse as u
 p = u.urlparse(sys.argv[1])
-print("[executor]\nbatch_rows = 25\nbatch_cap_rows = 25\n"
-      "commit_interval_ms = 1\nobserver_tick_ms = 1\n")
+# batch_cap_rows forces the commit per batch. Not commit_interval_ms = 1: the
+# executor sets idle_in_transaction_session_timeout to three times it, and 3 ms
+# is shorter than a slow machine takes between a batch's selection and apply.
+print("[executor]\nbatch_rows = 25\nbatch_cap_rows = 25\n")
 print("[citus]")
 print(f"host = {p.hostname}\nport = {p.port or 5432}\n"
       f"dbname = {p.path.lstrip('/')}\nuser = {p.username}")

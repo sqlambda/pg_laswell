@@ -12519,12 +12519,17 @@ TEST_F(DeployTest, AFailedMigrationIsRetriedAndResumesWhereItStopped) {
   exec("ALTER TABLE shop.tk ADD CONSTRAINT tk_block CHECK (NOT (k > 'k0200' AND flag))");
 
   // A commit per batch, or the whole walk is one transaction and the failure
-  // rolls every row back -- correct, and not the case under test.
+  // rolls every row back -- correct, and not the case under test. batch_cap_rows
+  // is what forces it: each 25-row batch reaches the cap and commits.
+  //
+  // NOT commit_interval_ms = 1, which this first used. The executor sets
+  // idle_in_transaction_session_timeout to three times it, so 1 ms made it 3 ms,
+  // and under valgrind the gap between a batch's selection and its apply is
+  // longer than that: the server terminated the connection, as the self-guard
+  // asks it to, and the test failed with "Lost connection" in CI's valgrind job.
   auto& e = ctx_->registry.mutable_get(ctx_->registry.default_name()).executor;
   e.batch_rows = 25;
   e.batch_cap_rows = 25;
-  e.commit_interval_ms = 1;
-  e.observer_tick_ms = 1;
 
   write_spec("0001.json",
              json{{"laswell_spec_version", 1},
