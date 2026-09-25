@@ -30,12 +30,28 @@ struct Observations {
   // droppable, `depended_on_by`.
   json objects = json::object();
   json server = json::object();   // max_connections, headroom, activity
+  // Vendor extension readings, keyed by module name. Core never inspects the
+  // contents -- only a module knows what its own catalog means.
+  //
+  // ABSENT IS NOT ZERO, and that distinction is the whole reason this is a map
+  // rather than a struct with default-initialised members. A planner that
+  // cannot tell "Citus is not installed" from "Citus is installed with nothing
+  // distributed yet" refuses the wrong things in both directions.
+  json extensions = json::object();
   json gathered_at = json();
 
   const json& table(const std::string& qualified) const {
     static const json kEmpty = json::object();
     const auto it = tables.find(qualified);
     return it == tables.end() ? kEmpty : *it;
+  }
+  // Empty object when the extension is absent, so a module can write
+  //     if (citus.empty()) { ...not installed... }
+  // and never confuse that with an installed extension reporting nothing.
+  const json& extension(const std::string& name) const {
+    static const json kEmpty = json::object();
+    const auto it = extensions.find(name);
+    return it == extensions.end() ? kEmpty : *it;
   }
   const json& object(const std::string& key) const {
     static const json kEmpty = json::object();

@@ -39,6 +39,7 @@ prints the server version it found.
 | `rolling-baseline/` | A new base backup retires a lineage without unsaying that it ran. |
 | `sharded-fleet/` | Three databases all called `app`, on three servers, migrating concurrently. |
 | `publisher-subscriber/` | A dependency that crosses databases: the subscription waits for the publication. |
+| `citus/` | One repository for plain PostgreSQL and a Citus cluster, told apart by epoch: the cluster registered from a signed specification, tables distributed and colocated, procedures routed to their shard. Borrowed from the banking/journal variant of pgshard, a lab that benchmarks the same schema on plain PostgreSQL and on Citus clusters of one to six workers. Needs its own coordinator and two workers: `docker compose -f examples/docker/citus/compose.yml up -d`, then `./examples/docker/citus/run.sh`. Not part of `run-all.sh`; CI runs it in the `citus` job. |
 
 Two arrangements on the page have no directory of their own, deliberately. *A
 large estate, decoupled* is `dba-and-app/` with more teams — the same mechanism,

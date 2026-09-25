@@ -123,6 +123,7 @@ struct Plan {
                 {"warnings", warnings},
                 {"conflicts", conflicts},
                 {"prerequisites", prerequisites},
+                {"modules", modules()},
                 {"budget", budget}};
   }
 
@@ -161,9 +162,52 @@ struct Plan {
   static constexpr const char* kObservedDetailKeys[] = {"estimated_from",
                                                         "lock_waiters"};
 
+  // Which vendor modules the binary that produced this plan was built with.
+  // "" is a PostgreSQL-only build.
+  //
+  // RECORDED, so `laswell.job.plan` says which capabilities applied a
+  // migration -- otherwise "what ran" is under-specified in the one place this
+  // project treats as authoritative.
+  //
+  // NOT HASHED, and the reason is specific rather than convenient. A module can
+  // change a plan in exactly two ways, and neither needs the set in the digest:
+  //
+  //   - by refusing it, or by not knowing a kind (a fatal refusal of the whole
+  //     file). Then there is no plan to digest.
+  //   - through a READING core interprets -- today, which column row-locking
+  //     batches on a table must be confined to. Then core emits different
+  //     statements, so the digest differs already, and the step names the
+  //     reading (`confined_by`).
+  //
+  // Everything else plans identically with or without the module, and that is
+  // tested. Hashing the set would change every existing digest and make two
+  // builds disagree about specs they handle statement-for-statement the same,
+  // while telling a reader nothing the statements do not.
+  //
+  // This used to say "the module set does not change a single statement". It
+  // stopped being true on 2026-09-22, when core's backfill began reading
+  // confinement from a module so that one repository could run on plain
+  // PostgreSQL and on Citus alike -- see modules/README.md, THE RULE.
+  static json modules() {
+#ifdef PGLASWELL_MODULE_SET
+    const std::string set = PGLASWELL_MODULE_SET;
+#else
+    const std::string set;
+#endif
+    json out = json::array();
+    std::string cur;
+    for (const char c : set) {
+      if (c == ',') { if (!cur.empty()) out.push_back(cur); cur.clear(); }
+      else cur += c;
+    }
+    if (!cur.empty()) out.push_back(cur);
+    return out;
+  }
+
   std::string digest() const {
     json d = to_json();
     d.erase("budget");
+    d.erase("modules");
     if (d.contains("steps")) {
       for (auto& step : d["steps"]) {
         if (!step.contains("detail") || !step["detail"].is_object()) continue;
@@ -278,6 +322,87 @@ inline json compute_budget(const Observations& obs, const ExecutorConfig& cfg) {
          {"appPoolSize", cfg.app_pool_size},
          {"appStatementTimeoutMs", cfg.app_statement_timeout_ms},
          {"safetyPercent", cfg.safety_percent}};
+
+  // A distributed topology makes this arithmetic wrong in a direction that
+  // matters: the coordinator's headroom is not the cluster's. One coordinator
+  // session fans out to every worker, up to the adaptive pool size EACH, so the
+  // real ceiling is a worker's max_connections divided by that fan-out -- and
+  // the coordinator cannot see a worker's max_connections at all.
+  //
+  // Stated rather than computed, which is the whole rule this file is written
+  // under: a number that looks derived and is not is worse than an admission.
+  // The budget is outside planDigest, so saying this changes no receipt.
+  const auto& citus = obs.extension("citus");
+  if (!citus.empty()) {
+    const int workers = citus.value("worker_count", 0);
+    const auto settings = citus.value("settings", json::object());
+    const auto pool = settings.value("max_adaptive_executor_pool_size", "");
+    // citus.multi_shard_modify_mode, READ rather than inherited unremarked: a
+    // plan whose connection use depends on a session setting it never names is
+    // not a function of the specification and the reading. Measured on Citus 13
+    // with a multi-shard UPDATE, counting one session's connections on ONE
+    // worker (pool size 16):
+    //
+    //   parallel,   fast shard tasks   1   -- the adaptive executor's slow start
+    //                                         opens more only when tasks linger
+    //   parallel,   slow shard tasks   6
+    //   sequential, either             1
+    //
+    // So "sequential" is a guaranteed 1 and "parallel" is an upper bound that
+    // depends on how long each shard's work takes -- which is why this states
+    // the bound and the mode rather than computing a single number.
+    const auto mode = settings.value("multi_shard_modify_mode", "");
+    b["topology"] = "citus";
+    b["workerCount"] = workers;
+    b["multiShardModifyMode"] = mode.empty() ? json() : json(mode);
+    if (mode == "sequential") {
+      b["workerFanOutPerSession"] = 1;
+      b["workerFanOutBasis"] =
+          "citus.multi_shard_modify_mode is sequential: one connection per "
+          "worker, whatever the pool size";
+    } else {
+      b["workerFanOutPerSession"] = pool.empty() ? json() : json(pool);
+      b["workerFanOutBasis"] =
+          "an UPPER BOUND under multi_shard_modify_mode " +
+          (mode.empty() ? std::string("(not readable)") : mode) +
+          ": the adaptive executor opens further connections only while shard "
+          "tasks run long -- measured, 1 per worker for fast tasks and 6 of a "
+          "possible 16 for slow ones";
+    }
+    // PACING ON A DISTRIBUTED TABLE, stated rather than silently reused. The
+    // constants -- batch_rows, commit_interval_ms, batch_cap_rows -- were
+    // derived on single-node PostgreSQL. What changes on Citus is the COMMIT,
+    // and it is not the same for every batch. Measured with
+    // citus.log_remote_commands:
+    //
+    //   a batch confined to one shard (every grouped walk)  plain COMMIT
+    //   a batch spanning shards                             PREPARE TRANSACTION
+    //                                                       + COMMIT PREPARED
+    //
+    // So a grouped walk paces exactly as it does on one node. A batch spanning
+    // shards -- update_rows, insert_rows or delete_rows by values on a
+    // distributed table -- is a two-phase commit, and if this process dies
+    // between the phases, the prepared transactions keep their locks on the
+    // workers until Citus's own recovery resolves them.
+    const auto recover = settings.value("recover_2pc_interval", "");
+    b["pacingBasis"] =
+        "batch_rows, commit_interval_ms and batch_cap_rows were derived on "
+        "single-node PostgreSQL. A grouped walk commits on one worker (measured: "
+        "plain COMMIT), so it paces the same here. A batch spanning shards commits "
+        "in two phases across workers (measured: PREPARE TRANSACTION), which the "
+        "constants were not measured against; if pg_laswell dies between the "
+        "phases, the prepared transactions hold their locks on the workers until "
+        "Citus resolves them, every citus.recover_2pc_interval (" +
+        (recover.empty() ? std::string("not readable") : recover) + ").";
+    b["caveatTopology"] =
+        "This headroom is the COORDINATOR's. On Citus one session opens up to "
+        "citus.max_adaptive_executor_pool_size connections to each of " +
+        std::to_string(workers) +
+        " workers, so the binding limit is a worker's own max_connections "
+        "divided by that fan-out -- and a worker's max_connections is not "
+        "readable from here. Treat the number below as an upper bound on what "
+        "the coordinator will allow, not on what the cluster will survive.";
+  }
 
   if (cfg.app_pool_size > 0) {
     b["effectiveHeadroom"] = std::min(server_headroom, cfg.app_pool_size);

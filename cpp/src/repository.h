@@ -247,9 +247,7 @@ class RelationAnalyzer {
     const auto dot = rel.find('.');
     if (dot == std::string::npos) return;
     try {
-      const auto r = pqxx_exec(
-          s.txn(),
-          "SELECT DISTINCT n.nspname || '.' || c.relname"
+      const auto r = s.txn().exec("SELECT DISTINCT n.nspname || '.' || c.relname"
           "  FROM pg_constraint k"
           "  JOIN pg_class c ON c.oid = CASE WHEN k.conrelid = $1::regclass"
           "                                  THEN k.confrelid ELSE k.conrelid END"
@@ -267,9 +265,7 @@ class RelationAnalyzer {
   void add_trigger_warning(ReadSession& s, const std::string& rel,
                            RelationSet& out) {
     try {
-      const auto r = pqxx_exec(
-          s.txn(),
-          "SELECT string_agg(t.tgname || ' -> ' || p.proname || '()', ', ')"
+      const auto r = s.txn().exec("SELECT string_agg(t.tgname || ' -> ' || p.proname || '()', ', ')"
           "  FROM pg_trigger t JOIN pg_proc p ON p.oid = t.tgfoid"
           " WHERE t.tgrelid = $1::regclass AND NOT t.tgisinternal",
           pqxx::params{rel});

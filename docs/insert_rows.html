@@ -100,11 +100,11 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
 <dt>table<span class="tag req">required</span></dt>
 <dd>&nbsp;</dd>
 <dt>key<span class="tag opt">optional</span></dt>
-<dd>&nbsp;</dd>
+<dd>The key has to be one of the values each row supplies, so every row must carry it.</dd>
 <dt>columns<span class="tag opt">optional</span></dt>
-<dd>&nbsp;</dd>
+<dd>Each column may appear once. Two entries for one column have no meaning and PostgreSQL would refuse the statement anyway.</dd>
 <dt>values<span class="tag opt">optional</span></dt>
-<dd>&nbsp;</dd>
+<dd>&quot;columns&quot; names what each row&#x27;s entries are, in order. Positional rows with no column list would make a spec that reads correctly and writes the wrong column the moment the table gains one.</dd>
 <dt>select<span class="tag opt">optional</span></dt>
 <dd>INSERT ... SELECT with no column list binds by position, so adding a column to the table would silently shift every value. Name the target columns, in the order the select returns them.</dd>
 <dt>on_conflict<span class="tag opt">optional</span></dt>
@@ -118,7 +118,7 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
 <dt>overriding<span class="tag opt">optional</span></dt>
 <dd>One of <code>system</code>, <code>user</code>. &quot;system&quot; emits OVERRIDING SYSTEM VALUE, which is the only way to write an explicit value into a GENERATED ALWAYS identity column; &quot;user&quot; emits OVERRIDING USER VALUE, which discards the value supplied and lets the sequence decide.</dd>
 <dt>paced<span class="tag opt">optional</span></dt>
-<dd>&nbsp;</dd>
+<dd>true paces the change into short transactions; false runs it in one, which is what a small seed usually wants. Omit it and the planner chooses on the measured row count and says so.</dd>
 <dt>verify_remaining<span class="tag opt">optional</span></dt>
 <dd>&nbsp;</dd>
 <dt>assert_invariants<span class="tag opt">optional</span></dt>

@@ -201,9 +201,17 @@ jobs:
             exit 1
           }
 
+      # ONE package with every module compiled in. A module only adds kinds
+      # (prefixed with its vendor's name) and readings taken when its extension
+      # is present, and it changes nothing for a server without that extension
+      # -- tests.yml proves that by building with and without it. So the
+      # shipped binary carries all of them, and nobody has to choose a
+      # variant. Separate packages, or shared libraries, wait until two modules
+      # actually conflict (see cpp/src/modules/README.md).
       - name: Build
         run: |
-          cmake -S cpp -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+          cmake -S cpp -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
+                -DPGLASWELL_MODULES=citus
           # BOTH binaries. The install rules name both, so a tree with only one
           # built either fails packaging or -- worse -- produces a package that
           # installs and has nothing to deploy with, which nobody would discover
@@ -297,6 +305,7 @@ jobs:
           esac
           for want in bin/pg_laswell bin/pg_laswell_mcp \
                       man1/pg_laswell.1 man1/pg_laswell_mcp.1 \
+                      man7/pg_laswell_citus.7 \
                       share/pg_laswell/bootstrap.sql; do
             printf '%s\n' "$LIST" | grep -q "$want" || {
               echo "::error::$want is missing from the package"; exit 1; }
@@ -333,6 +342,10 @@ jobs:
                  DEPLOY="$PWD/verify/bin/pg_laswell" ;;
           esac
           "$BIN" --version
+          # The modules the package promises. A release built without them
+          # would install, answer, and refuse every citus_* specification.
+          "$BIN" --version | grep -qx 'modules: citus' || {
+            echo "::error::the installed binary does not carry the citus module"; exit 1; }
           OUT=$("$BIN" --call getSpecDigest --args "$SPEC")
           printf '%s\n' "$OUT" | grep -q '"digest"' || {
             echo "::error::the installed binary did not answer: $OUT"; exit 1; }
@@ -388,6 +401,11 @@ jobs:
           python3 tools/gen-site.py _site
           mandoc -T html cpp/man/pg_laswell.1     > _site/pg_laswell.1.html
           mandoc -T html cpp/man/pg_laswell_mcp.1 > _site/pg_laswell_mcp.1.html
+          # Every module's page too: the released package carries them, and the
+          # landing page links them.
+          for m in cpp/man/pg_laswell_*.7; do
+            mandoc -T html "$m" > "_site/$(basename "$m").html"
+          done
           # The diagrams are the point of the landing page, so a syntax error in
           # one is a build failure rather than an empty box on a live site.
           python3 tools/check-mermaid.py site/index.html

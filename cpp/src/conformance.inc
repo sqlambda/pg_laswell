@@ -33,6 +33,17 @@ struct Case {
 
 // Kinds that cannot be proved against a single database, with the reason.
 // Each is covered by cpp/test/replication-tests.sh, which builds two clusters.
+// Kinds an enabled vendor module defers, with the same discipline: a reason,
+// not an omission. Empty when no module is enabled.
+inline const std::map<std::string, const char*>& deferred_by_modules() {
+  static const std::map<std::string, const char*> kDeferred = {
+#define PGLASWELL_DEFERRED_CASE(kind, reason) {kind, reason},
+#include "modules/enabled_tests.inc"
+#undef PGLASWELL_DEFERRED_CASE
+  };
+  return kDeferred;
+}
+
 inline const std::map<std::string, const char*>& deferred_to_two_clusters() {
   static const std::map<std::string, const char*> kDeferred = {
       {"create_subscription", "needs a publisher to connect to"},
@@ -110,6 +121,57 @@ inline std::vector<Case> cases() {
      "SELECT indisvalid::text FROM pg_index WHERE indexrelid='cf.t_amount_idx'::regclass",
      "true"},
 
+    // The forms require_identifier used to refuse. Each reads pg_get_indexdef
+    // back rather than merely checking the index exists: what is being proved
+    // is that the DIRECTION, the OPERATOR CLASS and the EXPRESSION survived
+    // into the index PostgreSQL actually built, and an existence check would
+    // pass just as happily on an ascending index of the same columns.
+    {"create_index_descending", {},
+     json{{"kind","create_index"},{"schema","cf"},{"table","t"},
+          {"name","t_desc_idx"},
+          {"columns",json::array({"amount",
+                                  json{{"name","code"},{"direction","desc"}}})},
+          {"comment","Newest first."}},
+     "SELECT (pg_get_indexdef('cf.t_desc_idx'::regclass)"
+     " LIKE '%code DESC%')::text",
+     "true"},
+
+    {"create_index_expression", {},
+     json{{"kind","create_index"},{"schema","cf"},{"table","t"},
+          {"name","t_lower_idx"},
+          {"columns",json::array({json{{"expression","lower(code)"}}})},
+          {"comment","Case-insensitive lookup."}},
+     "SELECT (pg_get_indexdef('cf.t_lower_idx'::regclass)"
+     " LIKE '%lower(code)%')::text",
+     "true"},
+
+    {"create_index_opclass", {},
+     json{{"kind","create_index"},{"schema","cf"},{"table","t"},
+          {"name","t_pattern_idx"},
+          {"columns",json::array({json{{"name","code"},
+                                       {"opclass","text_pattern_ops"}}})},
+          {"comment","LIKE prefix lookup."}},
+     "SELECT (pg_get_indexdef('cf.t_pattern_idx'::regclass)"
+     " LIKE '%text_pattern_ops%')::text", "true"},
+
+    {"create_index_include", {},
+     json{{"kind","create_index"},{"schema","cf"},{"table","t"},
+          {"name","t_cover_idx"},{"columns",json::array({"code"})},
+          {"include",json::array({"amount"})},{"comment","Covering."}},
+     "SELECT (indnkeyatts = 1 AND indnatts = 2)::text FROM pg_index"
+     " WHERE indexrelid='cf.t_cover_idx'::regclass", "true"},
+
+    {"create_table_options",
+     {},
+     json{{"kind","create_table"},{"schema","cf"},{"table","with_options"},
+          {"columns",json::array({json{{"name","id"},{"type","bigint"},
+                                       {"nullable",false},{"comment","Key."}}})},
+          {"primary_key",json::array({"id"})},
+          {"options",json{{"fillfactor","90"}}},
+          {"comment","Storage options at creation."}},
+     "SELECT reloptions::text FROM pg_class WHERE oid='cf.with_options'::regclass",
+     "{fillfactor=90}"},
+
     {"add_unique_constraint", {},
      json{{"kind","add_unique_constraint"},{"schema","cf"},{"table","t"},
           {"name","t_code_uq"},{"columns",json::array({"code"})}},
@@ -161,6 +223,30 @@ inline std::vector<Case> cases() {
      json{{"kind","backfill"},{"schema","cf"},{"table","t"},{"key","id"},
           {"set",json{{"note","'filled'"}}},{"where","note IS NULL OR note = 'x'"}},
      "SELECT count(*)::text FROM cf.t WHERE note='filled'", "50"},
+
+    // A tenant table: its only proof of uniqueness is the primary key
+    // (tenant_id, id), so `id` is unique only within a tenant. Refused on every
+    // server before; now walked one tenant at a time, and this proves that walk
+    // RUNS on plain PostgreSQL and touches every row exactly once.
+    //
+    // What it does not prove, and why: that the grouping was chosen. Mutating
+    // the planner to walk `id` across the whole table still passes here, because
+    // the apply matches keys by VALUE -- a batch boundary inside a run of equal
+    // ids still updates the whole run, and the next batch starts past it. So a
+    // non-unique key costs the batch its BOUND (one statement touched 1002 rows
+    // against a limit of 1000 when this was tried), not its completeness. The
+    // choice of walk is asserted by the planner tests; three tenants of 500
+    // rows here make the walk cross group boundaries mid-run.
+    {"backfill_grouped",
+     {"CREATE TABLE cf.tenanted (tenant_id bigint NOT NULL, id bigint NOT NULL,"
+      " n int NOT NULL DEFAULT 0, PRIMARY KEY (tenant_id, id))",
+      "INSERT INTO cf.tenanted SELECT t, g, 0"
+      " FROM generate_series(1,3) t, generate_series(1,500) g"},
+     json{{"kind","backfill"},{"schema","cf"},{"table","tenanted"},{"key","id"},
+          {"set",json{{"n","tenanted.n + 1"}}},{"where","n = 0"}},
+     // Exactly once, which a counter proves and a boolean cannot.
+     "SELECT (count(*) FILTER (WHERE n = 1) = 1500 AND count(*) = 1500)::text"
+     " FROM cf.tenanted", "true"},
 
     {"delete_rows", {},
      json{{"kind","delete_rows"},{"schema","cf"},{"table","t"},{"key","id"},

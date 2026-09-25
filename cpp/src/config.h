@@ -40,6 +40,12 @@ struct ExecutorConfig {
   int batch_rows = 1000;
   int commit_interval_ms = 1000;
   int batch_cap_rows = 10000;  // backstop against pathological row widths
+  // How much KEY MATERIAL one batch may accumulate before it is applied, in
+  // bytes. batch_rows bounds the row count; this bounds the memory the executor
+  // holds and the size of the array literal it sends. They are different limits
+  // because a bigint key is 8 bytes of value and a composite text key can be
+  // hundreds: 1000 rows is a rounding error for one and megabytes for the other.
+  int batch_bytes = 1 << 20;  // 1 MiB of keys
 
   // Where a row-level DML intent stops being a seed and starts being a
   // migration that has to be paced.
@@ -122,6 +128,15 @@ struct ExecutorConfig {
   int app_pool_size = 0;
   int app_statement_timeout_ms = 0;
   int safety_percent = 25;  // use at most this share of the budget
+
+  // Settings a MODULE reads, from a connection section: `citus.workers = ...`
+  // arrives here as {"citus.workers", "..."}. Per connection, because what they
+  // describe -- which machines are this cluster's workers -- is a fact of one
+  // target, and the whole point is that the SIGNED specification does not name
+  // it: the same bytes then add three workers on staging and twelve in
+  // production. Core never interprets these; the module that owns the prefix
+  // does, and the config parser refuses a prefix no compiled-in module owns.
+  std::map<std::string, std::string> module_settings;
 };
 
 struct ConnConfig {
@@ -181,6 +196,26 @@ inline std::string trim(const std::string& s) {
 inline std::string strip_comment(const std::string& s) {
   const auto p = s.find_first_of(";#");
   return p == std::string::npos ? s : s.substr(0, p);
+}
+
+// Whether a module of this name is compiled in. PGLASWELL_MODULE_SET is the
+// comma-separated list CMake writes, "" for a PostgreSQL-only build.
+#ifndef PGLASWELL_MODULE_SET
+#define PGLASWELL_MODULE_SET ""
+#endif
+inline bool module_compiled_in(const std::string& mod) {
+  const std::string set = PGLASWELL_MODULE_SET;
+  std::size_t start = 0;
+  while (start <= set.size()) {
+    const auto comma = set.find(',', start);
+    const auto item = set.substr(start, comma == std::string::npos
+                                            ? std::string::npos
+                                            : comma - start);
+    if (!item.empty() && item == mod) return true;
+    if (comma == std::string::npos) break;
+    start = comma + 1;
+  }
+  return false;
 }
 
 inline std::string where(const std::string& path, std::size_t lineno) {
@@ -323,6 +358,7 @@ inline std::string with_application_name(const std::string& url,
 inline bool apply_executor_key(ExecutorConfig& e, const std::string& key,
                                const std::string& value, const std::string& w) {
   if (key == "batch_rows") { e.batch_rows = detail::positive_int(value, key, w); return true; }
+  if (key == "batch_bytes") { e.batch_bytes = detail::positive_int(value, key, w); return true; }
   if (key == "commit_interval_ms") { e.commit_interval_ms = detail::positive_int(value, key, w); return true; }
   if (key == "batch_cap_rows") { e.batch_cap_rows = detail::positive_int(value, key, w); return true; }
   if (key == "max_concurrent_operations") { e.max_concurrent_operations = detail::non_negative_int(value, key, w); return true; }
@@ -692,6 +728,25 @@ class Registry {
         continue;
       }
       if (apply_executor_key(c.executor, k, v, w)) continue;
+
+      // `<module>.<key>`: a module's setting for THIS connection. A dotted key
+      // is never a libpq parameter, so without this it would reach the
+      // conninfo and fail at connect time -- and a prefix naming a module this
+      // binary lacks is refused now, loudly, rather than carried and ignored.
+      if (const auto dot = k.find('.'); dot != std::string::npos) {
+        const auto mod = k.substr(0, dot);
+        if (!detail::module_compiled_in(mod)) {
+          throw std::runtime_error(
+              w + ": [" + name + "] sets " + k + ", but this binary has no " +
+              mod + " module" +
+              (std::string(PGLASWELL_MODULE_SET).empty()
+                   ? std::string(" (it was built with none)")
+                   : " (it has: " + std::string(PGLASWELL_MODULE_SET) + ")") +
+              ". A setting nothing reads would look configured and do nothing.");
+        }
+        c.executor.module_settings[k] = v;
+        continue;
+      }
 
       if (k == "options") {
         // PgBouncer rejects `options` as an unsupported startup parameter, and

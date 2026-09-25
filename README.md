@@ -14,12 +14,16 @@ contention rather than on a schedule. It refuses what it can prove wrong, and
 says so plainly where it can prove nothing. It converges databases that have
 drifted. And it never states a number it cannot derive.
 
-**Status: pre-0.1.0, and a work in progress.** The whole path works —
-repository, signing, planning, dry run, paced execution, ledger — with 355 tests
-green on GCC and Clang, under AddressSanitizer/UBSan and ThreadSanitizer.
-Packages build for seven targets — deb, rpm and tarball, x86_64 and arm64, plus
-macOS arm64 — each installed and run inside the platform it targets before
-upload. The manual is the authoritative reference. Not yet published anywhere.
+**Status: 0.1.2, young and moving.** The whole path works — repository,
+signing, planning, dry run, paced execution, ledger — with 506 tests green on
+GCC and Clang, under AddressSanitizer/UBSan and ThreadSanitizer, plus 55 live
+cases against a Citus coordinator and two workers. 100 intent kinds: 83 core,
+and 17 from the Citus module. Packages build for seven targets — deb, rpm and
+tarball, x86_64 and arm64, plus macOS arm64 — each with the Citus module
+compiled in, and each installed and run inside the platform it targets before
+upload. Releases are on
+[GitHub](https://github.com/sqlambda/pg_laswell/releases); the manual is the
+authoritative reference.
 
 **Everything here is measured against PostgreSQL 18, and the suite runs against
 15 through 18.** One kind does not reach as far back as the rest: `merge_rows`
@@ -28,7 +32,9 @@ emits `WHEN NOT MATCHED BY SOURCE`, both PostgreSQL 17+. The planner refuses
 them below 17 and names the reading, rather than emitting SQL the server cannot
 parse — and refuses rather than silently running unpaced, because that would
 turn a bounded change into one long transaction. The unpaced merge, and every
-other kind, runs from 15.
+other kind, runs from 15. **The Citus module is measured against Citus 13.2 on
+PostgreSQL 17**; it reads which Citus calls exist rather than assuming a version
+([pg_laswell_citus(7)](cpp/man/pg_laswell_citus.7)).
 
 ## Why
 
@@ -211,14 +217,25 @@ it is worth doing. Maintenance is not migration.
 
 ## Building
 
-PostgreSQL 14+ headers, libpqxx, nlohmann/json, OpenSSL and GoogleTest, all
-from system packages. See [BUILD.md](BUILD.md).
+PostgreSQL 14+ headers, nlohmann/json, OpenSSL and GoogleTest from system
+packages, and libpqxx **8.0.2** exactly, built from source the way CI builds it:
+CMake refuses any other version. See [BUILD.md](BUILD.md).
+
+```bash
+sh .github/scripts/build-libpqxx.sh 8.0.2 <PQXX_SHA256 from .github/workflows/tests.yml> \
+   $HOME/.local/opt/libpqxx-8.0.2
+export CMAKE_PREFIX_PATH=$HOME/.local/opt/libpqxx-8.0.2
+```
 
 ```bash
 cmake -S cpp -B cpp/build
 cmake --build cpp/build
 ctest --test-dir cpp/build
 ```
+
+`-DPGLASWELL_MODULES=citus` builds what the release ships. How a module is
+written, and why there is one package, is in
+[cpp/src/modules/README.md](cpp/src/modules/README.md).
 
 ## Poolers
 

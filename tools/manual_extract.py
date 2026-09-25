@@ -98,9 +98,40 @@ def _string_list(text):
     return re.findall(r'"([a-z_0-9]+)"', text)
 
 
+def _with_helpers(spec, fn, body, depth=2):
+    """The parse function's body followed by the bodies of the helpers it hands
+    the intent to.
+
+    A parser may check its keys in a shared helper -- the Citus node kinds call
+    citus_parse_node(in, at), which is where `host` is required -- and reading
+    only the parse function's own body documented `host` as optional, sending a
+    reader looking for a default that does not exist. A call passing `in` to a
+    function defined in the same source is inlined, to a fixed depth.
+    """
+    seen, extra = {fn}, ''
+    frontier = [body]
+    for _ in range(depth):
+        nxt = []
+        for text in frontier:
+            for m in re.finditer(r'\b(\w+)\(\s*in\s*,', text):
+                name = m.group(1)
+                if name in seen:
+                    continue
+                seen.add(name)
+                helper = _body(spec, name)
+                if helper:
+                    extra += '\n' + helper
+                    nxt.append(helper)
+        frontier = nxt
+    return body + extra
+
+
 def options(spec, fn, arg=None):
     """Accepted keys, which are required, and any enumerated values."""
-    body = _join_literals(_body(spec, fn))
+    own = _body(spec, fn)
+    body = _join_literals(_with_helpers(spec, fn, own) if own else own)
+    own = _join_literals(own)
+    helpers = body[len(own):]
     if not body:
         return {'accepted': [], 'required': [], 'enums': {}, 'hints': {}, 'source': fn}
 
@@ -136,10 +167,24 @@ def options(spec, fn, arg=None):
             elif isinstance(arg, str) and arg:
                 accepted.append(arg)   # allowed.insert(what)
 
-    required = []
-    for m in re.finditer(r'require_(?:string|identifier)\([^;]*?in\.body,\s*"([a-z_0-9]+)"', body):
-        required.append(m.group(1))
-    for m in re.finditer(r'require_string\(in\.body,\s*"([a-z_0-9]+)"', body):
+    def requires(text):
+        out = []
+        for m in re.finditer(r'require_(?:string|identifier)\([^;]*?in\.body,\s*"([a-z_0-9]+)"', text):
+            out.append(m.group(1))
+        for m in re.finditer(r'require_string\(in\.body,\s*"([a-z_0-9]+)"', text):
+            out.append(m.group(1))
+        return out
+
+    required = requires(own)
+    # From a HELPER, a require_* on a key the helper also tests for presence is
+    # a TYPE check inside a branch, not a requirement: the shared row parser
+    # checks "select" only `if (has_select)`, where it is one alternative to
+    # "values". Without this, reading helpers documented select as required.
+    required += [r for r in requires(helpers)
+                 if 'in.body.contains("%s")' % r not in helpers]
+    # A key required by an explicit check rather than a require_* call says so
+    # in its error: ".should_have_shards is required".
+    for m in re.finditer(r'\.([a-z_0-9]+) is required', body):
         required.append(m.group(1))
     if isinstance(arg, str) and arg and re.search(r'in\.body,\s*what\b', body):
         required.append(arg)
@@ -149,7 +194,7 @@ def options(spec, fn, arg=None):
 
     enums = {}
     for m in re.finditer(r'\.([a-z_0-9]+) must be ([^\n]*)', body):
-        vals = re.findall(r'\\"([a-z_ ]+)\\"', m.group(2))
+        vals = re.findall(r'\\"([a-z_. ]+)\\"', m.group(2))
         if vals:
             cur = enums.setdefault(m.group(1), [])
             cur += [v for v in vals if v not in cur]
@@ -273,6 +318,65 @@ def deferred(conf):
     return out
 
 
+def module_kinds():
+    """[(module, kind, parse_fn, parse_text, plan_text, deferred_reason)] for every
+    module in the source tree, enabled or not.
+
+    Read from the module's OWN kinds.inc, parse.h and plan.h, the same way core's
+    kinds are read from spec.h, so a module kind's options come from the
+    reject_unknown_keys its parser actually enforces. Every module, not just the
+    ones a particular build enabled: the reference documents what exists, and
+    each page says which build it needs.
+    """
+    mods_dir = os.path.join(SRC, 'modules')
+    out = []
+    if not os.path.isdir(mods_dir):
+        return out
+    for mod in sorted(os.listdir(mods_dir)):
+        kinds_inc = os.path.join(mods_dir, mod, 'kinds.inc')
+        if not os.path.isfile(kinds_inc):
+            continue
+        rd = lambda f: (open(os.path.join(mods_dir, mod, f)).read()
+                        if os.path.isfile(os.path.join(mods_dir, mod, f)) else '')
+        parse_text, plan_text, tests = rd('parse.h'), rd('plan.h'), rd('tests.inc')
+        reasons = {}
+        for m in re.finditer(
+                r'PGLASWELL_DEFERRED_CASE\(\s*"([a-z_0-9]+)"\s*,\s*((?:"(?:[^"\\]|\\.)*"\s*)+)\)',
+                tests):
+            reasons[m.group(1)] = _cstr(m.group(2))
+        for m in re.finditer(r'^PGLASWELL_KIND\(\s*(\w+)\s*,\s*(\w+)\s*,\s*(\w+)\s*,',
+                             open(kinds_inc).read(), re.M):
+            out.append((mod, m.group(1), m.group(3), parse_text, plan_text,
+                        reasons.get(m.group(1))))
+    return out
+
+
+def module_examples(mod):
+    """kind -> the first intent of that kind in examples/docker/<mod>/migrations.
+
+    A module's kinds cannot be proved on a single plain PostgreSQL, so they have
+    no conformance case to take an example from. The docker example's
+    specifications are the next best thing and just as honest: CI applies them
+    to a real cluster on every run (the module's own job runs run.sh), so an
+    example taken from them is one that is known to plan and apply.
+    """
+    import json as _json
+    out = {}
+    d = os.path.join(ROOT, 'examples', 'docker', mod, 'migrations')
+    if not os.path.isdir(d):
+        return out
+    for name in sorted(os.listdir(d)):
+        if not name.endswith('.json'):
+            continue
+        spec = _json.load(open(os.path.join(d, name)))
+        for intent in spec.get('intents', []):
+            k = intent.get('kind', '')
+            if k and k not in out:
+                out[k] = {'intent': intent, 'spec': spec.get('id', name),
+                          'path': 'examples/docker/%s/migrations/%s' % (mod, name)}
+    return out
+
+
 def collect():
     spec, conf = _read('spec.h'), _read('conformance.inc')
     disp, ex, defer = dispatch(spec), examples(conf), deferred(conf)
@@ -283,6 +387,15 @@ def collect():
              else {'accepted': [], 'required': [], 'enums': {}, 'hints': {},
                    'source': None})
         o.update(kind=name, enum=enum, example=ex.get(name), deferred=defer.get(name))
+        out.append(o)
+    mod_examples = {}
+    for mod, name, fn, parse_text, plan_text, reason in module_kinds():
+        if mod not in mod_examples:
+            mod_examples[mod] = module_examples(mod)
+        o = options(parse_text, fn)
+        o.update(kind=name, enum=None, example=None, deferred=reason, module=mod,
+                 module_parse=parse_text, module_plan=plan_text,
+                 module_example=mod_examples[mod].get(name))
         out.append(o)
     return out
 

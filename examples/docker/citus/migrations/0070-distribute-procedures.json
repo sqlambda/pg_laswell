@@ -1,0 +1,49 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0070-distribute-procedures",
+  "description": "Route each procedure to the shard that owns its account.",
+  "rationale": "Without delegation every CALL is a distributed transaction from the coordinator; with it, a single-account procedure runs entirely on one worker. That difference is a large part of what these variants exist to measure.",
+  "target": {
+    "epoch": "citus"
+  },
+  "depends_on": [
+    "0030-procedures",
+    "0060-distribute-account-transactions"
+  ],
+  "intents": [
+    {
+      "kind": "citus_distribute_function",
+      "schema": "public",
+      "name": "account_transfer",
+      "arguments": "integer, integer, numeric",
+      "distribution_argument": "account_from",
+      "colocate_with": "public.account_transactions",
+      "comment": "Routed to the shard owning account_from."
+    },
+    {
+      "kind": "citus_distribute_function",
+      "schema": "public",
+      "name": "account_deposit",
+      "arguments": "integer, numeric",
+      "distribution_argument": "deposit_account",
+      "colocate_with": "public.account_transactions",
+      "comment": "Routed to the shard owning deposit_account."
+    },
+    {
+      "kind": "citus_distribute_function",
+      "schema": "public",
+      "name": "account_withdrawal",
+      "arguments": "integer, numeric",
+      "distribution_argument": "withdrawal_account",
+      "colocate_with": "public.account_transactions",
+      "comment": "Routed to the shard owning withdrawal_account."
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:0a1ed85ee9747a3a",
+      "algorithm": "ed25519",
+      "signature": "DMbwHtWs86kRFLXtkEgfAA8Sy2G61jTMmPPJx11NBiEbhjXIVNc/li83FmnfmagDv4+Ru7//wKBOARUZeOgyDA=="
+    }
+  ]
+}

@@ -71,6 +71,250 @@ inline std::string strip_semicolon(const std::string& s) {
 
 }  // namespace detail
 
+// ONE BATCH of a paced step, and the only implementation of it.
+//
+// The executor calls this, and so do the tests. That is deliberate: the
+// conformance harness already carried the comment "a batch statement that only
+// works inside the executor is a batch statement nobody can check", and it had
+// its own copy of the loop to say so. Two copies became three when a batch grew
+// a second statement, and two of them broke. One function cannot drift from
+// itself.
+struct BatchOutcome {
+  // True when a batch only advanced past finished groups without doing work. The
+  // walk is NOT over: reading considered == 0 as "finished" here would stop at
+  // the first run of 64 empty tenants and report success.
+  bool skipped_only = false;
+  // Rows CONSIDERED, not rows changed. The walk ends when a batch considers
+  // nothing; a batch that considered rows and changed none is still progress,
+  // and reading it as "finished" is how a merge that matched nothing reported
+  // success having merged nothing.
+  long long considered = 0;
+  std::string cursor;
+};
+
+// WHERE a grouped walk has got to: which value of the group column, and how far
+// into it. JSON rather than a delimiter, because a delimiter has to be a byte no
+// key contains and there is no such byte -- and because `last_key` is read by
+// people looking at a stuck job, so ["3","5571"] beats an escaped blob.
+//
+// An empty string means "not started". A group with an empty key means "this
+// group, from the beginning", which is what advancing to the next group leaves
+// behind.
+struct GroupCursor {
+  std::string group;
+  std::string key;
+
+  std::string encode() const {
+    return json::array({group, key}).dump();
+  }
+
+  // Tolerant on purpose: a cursor that cannot be parsed must not be read as
+  // "start of some group", because that would silently redo or skip a group and
+  // look like success. Anything unparseable is reported as such by the caller.
+  static bool decode(const std::string& text, GroupCursor& out) {
+    // "0" is resume_cursor's sentinel for "nothing to resume from", and also
+    // what it returns when it rejects a stale cursor. An encoded group cursor is
+    // always a JSON array, so the two cannot be confused -- which is why this
+    // accepts the sentinel by name and still refuses anything else it cannot
+    // read. Refusing is the point: a cursor read as "the start of some group"
+    // when it means something else would silently redo or skip a whole group.
+    if (text.empty() || text == "0") return true;  // not started
+    json j;
+    try {
+      j = json::parse(text);
+    } catch (const std::exception&) {
+      return false;
+    }
+    if (!j.is_array() || j.size() != 2 || !j[0].is_string() || !j[1].is_string()) {
+      return false;
+    }
+    out.group = j[0].get<std::string>();
+    out.key = j[1].get<std::string>();
+    return true;
+  }
+};
+
+// `apply_sql` empty means the one-statement form, where the mutation's own
+// RETURNING both applies and advances. Otherwise `select_sql` selects and LOCKS
+// the batch's keys and `apply_sql` names exactly those keys -- the form Citus
+// can route, and the only form that can bound a batch by bytes as well as rows,
+// because the keys must be in hand before the mutation is sent.
+inline BatchOutcome run_paced_batch(pqxx::work& txn,
+                                    const std::string& select_sql,
+                                    const std::string& apply_sql,
+                                    const std::string& cursor, int batch,
+                                    long long batch_bytes) {
+  BatchOutcome out;
+  out.cursor = cursor;
+  if (apply_sql.empty()) {
+    const auto r = txn.exec(select_sql, pqxx::params{cursor, batch});
+    out.considered = static_cast<long long>(r.size());
+    for (const auto& row : r) out.cursor = row[0].as<std::string>();
+    return out;
+  }
+
+  // The lock taken here is what makes the two statements safe as one: nothing
+  // can change these rows before the apply below, because both run in this
+  // transaction.
+  const auto sel = txn.exec(select_sql, pqxx::params{cursor, batch});
+  std::vector<std::string> keys;
+  keys.reserve(static_cast<std::size_t>(sel.size()));
+  long long bytes = 0;
+  for (const auto& row : sel) {
+    auto v = row[0].as<std::string>();
+    // Stop between keys rather than mid-array, so an applied batch is always
+    // one that both the planner's LIMIT and this budget allowed. Never zero
+    // keys: a single oversized key still makes progress, where stopping at zero
+    // would spin forever on it.
+    if (!keys.empty() && bytes + static_cast<long long>(v.size()) > batch_bytes) {
+      break;
+    }
+    bytes += static_cast<long long>(v.size());
+    keys.push_back(std::move(v));
+  }
+  if (keys.empty()) return out;
+
+  // A PostgreSQL array literal, quoted element by element so a text key
+  // containing a comma, a brace or a quote survives. Paired with the
+  // ::<keytype>[] cast the planner emitted.
+  std::string literal = "{";
+  for (std::size_t i = 0; i < keys.size(); ++i) {
+    if (i != 0) literal += ',';
+    literal += '"';
+    for (const char c : keys[i]) {
+      if (c == '"' || c == '\\') literal += '\\';
+      literal += c;
+    }
+    literal += '"';
+  }
+  literal += "}";
+
+  const auto r = txn.exec(apply_sql, pqxx::params{literal});
+  // The cursor advances over what was CONSIDERED -- the selection -- not over
+  // what the mutation returned.
+  out.cursor = keys.back();
+  out.considered = static_cast<long long>(r.size());
+  if (out.considered == 0) out.considered = static_cast<long long>(keys.size());
+  return out;
+}
+
+// An empty position is a real NULL, not an empty string: the parameter takes the
+// column's own type and '' is not a bigint.
+inline std::optional<std::string> maybe(const std::string& v) {
+  if (v.empty()) return std::nullopt;
+  return v;
+}
+
+// ONE BATCH of a grouped walk, and the only implementation of it.
+//
+// A grouped walk iterates the values of one column and keyset-walks the key
+// inside each. Three statements, and the order is the algorithm: which group
+// values remain, which keys remain inside one of them, and the change to exactly
+// those keys, still restricted to that group.
+//
+// Two reasons a table is walked this way, and core does not need to know which:
+//
+//   - its only proof of uniqueness is a unique index on (group, key), so the key
+//     is unique WITHIN a group and not across the table -- the primary key of any
+//     table whose tenant column comes first, on plain PostgreSQL as much as
+//     anywhere;
+//   - a module's reading says row-locking batches on this table must be confined
+//     to one value of a column. Citus is the case that exists: FOR UPDATE on a
+//     distributed table is refused unless an equality on the distribution column
+//     makes the query single-shard.
+//
+// Returns considered == 0 only when no group with work in it remains, which is
+// the walk's one end condition. See BatchOutcome::skipped_only for the other way
+// a batch can do no work.
+inline BatchOutcome run_grouped_batch(pqxx::work& txn,
+                                             const std::string& groups_sql,
+                                             const std::string& select_sql,
+                                             const std::string& apply_sql,
+                                             const GroupCursor& from, int batch,
+                                             long long batch_bytes) {
+  BatchOutcome out;
+  GroupCursor at = from;
+  out.cursor = at.encode();
+
+  // Up to this many groups are looked at in one batch before giving up the
+  // transaction. A group whose rows are all done contributes no work, and a
+  // cluster can hold many such groups, so a batch that could only skip ONE
+  // would take a transaction per finished tenant.
+  constexpr int kGroupsPerBatch = 64;
+
+  for (int looked = 0; looked < kGroupsPerBatch; ++looked) {
+    if (at.group.empty()) {
+      // `groups_sql` carries the predicate too, so a distribution value with no
+      // matching rows never becomes a group at all.
+      const auto g = txn.exec(groups_sql,
+                               pqxx::params{maybe(at.group), 1});
+      if (g.empty()) {  // no values left: the walk is finished
+        out.cursor = at.encode();
+        return out;
+      }
+      at.group = g[0][0].as<std::string>();
+      at.key.clear();
+    }
+
+    const auto sel = txn.exec(select_sql,
+                               pqxx::params{at.group, maybe(at.key), batch});
+    if (sel.empty()) {
+      // This group is done. Advance past it and look at the next one: `groups_sql`
+      // is keyset-walked on the group, so an empty key with a group set means
+      // "everything in this group is done", and the next iteration asks for the
+      // next group after it.
+      const auto g = txn.exec(groups_sql,
+                               pqxx::params{maybe(at.group), 1});
+      if (g.empty()) {
+        out.cursor = at.encode();
+        return out;  // finished
+      }
+      at.group = g[0][0].as<std::string>();
+      at.key.clear();
+      continue;
+    }
+
+    std::vector<std::string> keys;
+    keys.reserve(static_cast<std::size_t>(sel.size()));
+    long long bytes = 0;
+    for (const auto& row : sel) {
+      auto v = row[0].as<std::string>();
+      if (!keys.empty() && bytes + static_cast<long long>(v.size()) > batch_bytes) {
+        break;
+      }
+      bytes += static_cast<long long>(v.size());
+      keys.push_back(std::move(v));
+    }
+
+    std::string literal = "{";
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+      if (i != 0) literal += ',';
+      literal += '"';
+      for (const char c : keys[i]) {
+        if (c == '"' || c == '\\') literal += '\\';
+        literal += c;
+      }
+      literal += '"';
+    }
+    literal += "}";
+
+    const auto r = txn.exec(apply_sql, pqxx::params{at.group, literal});
+    at.key = keys.back();
+    out.cursor = at.encode();
+    out.considered = static_cast<long long>(r.size());
+    if (out.considered == 0) out.considered = static_cast<long long>(keys.size());
+    return out;
+  }
+
+  // Ran out of group-skipping budget without finding work. Not finished -- the
+  // cursor moved, so the next batch resumes from where this one stopped rather
+  // than starting over.
+  out.considered = 0;
+  out.cursor = at.encode();
+  out.skipped_only = true;
+  return out;
+}
+
 class Executor {
  public:
   Executor(ConnConfig cfg, std::shared_ptr<Job> job, Ledger* ledger,
@@ -275,8 +519,10 @@ class Executor {
   // because "what ran" for a COPY is genuinely two things.
   //
   // pqxx::stream_to is the only sanctioned way to send COPY data through
-  // libpqxx 7.10; connection::raw_connection() and write_copy_line() are
-  // private, reachable only through internal gate classes. It builds the
+  // libpqxx 8.0.2, the pinned version: connection::raw_connection() and
+  // write_copy_line() are private, reachable only through internal gate
+  // classes, and release_raw_connection() gives up the whole connection, so it
+  // cannot serve a COPY inside a transaction. It builds the
   // statement itself, which is why the planner emits exactly the form probed
   // out of it -- COPY t(cols) FROM STDIN, no WITH clause -- and why spec.h
   // refuses ON_ERROR and friends rather than accepting keys that cannot travel.
@@ -338,13 +584,29 @@ class Executor {
             });
       });
     } catch (const pqxx::sql_error& e) {
-      record_step(ordinal, step, "failed", 0,
-                  json{{"sqlstate", e.sqlstate()},
-                       {"error", e.what()},
-                       {"note",
-                        "a failed CREATE INDEX CONCURRENTLY leaves an INVALID "
-                        "index that still appears in pg_indexes. Re-planning "
-                        "will emit DROP INDEX CONCURRENTLY before rebuilding."}});
+      json failed{{"sqlstate", e.sqlstate()}, {"error", e.what()}};
+      // What a failure here leaves behind depends on what failed. The note
+      // used to be about CREATE INDEX CONCURRENTLY whatever the step was, and
+      // told the reader of a failed shard rebalance to look for an invalid
+      // index. A step that knows its own aftermath says it in on_failure.
+      const auto own = step.value("detail", json::object()).value("on_failure", "");
+      bool concurrent_build = false;
+      for (const auto& raw : step.value("sql", json::array())) {
+        const auto sql = raw.get<std::string>();
+        if (sql.rfind("CREATE INDEX CONCURRENTLY", 0) == 0 ||
+            sql.rfind("CREATE UNIQUE INDEX CONCURRENTLY", 0) == 0) {
+          concurrent_build = true;
+        }
+      }
+      if (!own.empty()) {
+        failed["note"] = own;
+      } else if (concurrent_build) {
+        failed["note"] =
+            "a failed CREATE INDEX CONCURRENTLY leaves an INVALID index that "
+            "still appears in pg_indexes. Re-planning will emit DROP INDEX "
+            "CONCURRENTLY before rebuilding.";
+      }
+      record_step(ordinal, step, "failed", 0, failed);
       throw;
     }
     record_step(ordinal, step, "succeeded", 0,
@@ -365,9 +627,7 @@ class Executor {
       return;
     }
     w.begin(app_name(ordinal));
-    const auto r = pqxx_exec(
-        w.txn(),
-        "SELECT i.indisvalid, i.indisready FROM pg_index i"
+    const auto r = w.txn().exec("SELECT i.indisvalid, i.indisready FROM pg_index i"
         "  JOIN pg_class c ON c.oid = i.indexrelid"
         "  JOIN pg_namespace n ON n.oid = c.relnamespace"
         " WHERE c.relname = $1 AND n.nspname = $2",
@@ -413,12 +673,41 @@ class Executor {
     const auto& e = cfg_.executor;
     const auto detail_json = step.value("detail", json::object());
     const auto sql = detail::strip_semicolon(step["sql"][0].get<std::string>());
+    // Two statements: select and lock the batch's keys, then apply to exactly
+    // those keys. The CTE form could not be routed by Citus, and a single
+    // statement's LIMIT can only bound a batch by rows -- accumulating to a byte
+    // budget needs the keys in hand before the mutation is sent.
+    const auto batch_mode = detail_json.value("batch_mode", "");
+    const bool two_statement =
+        batch_mode == "two_statement" && step["sql"].size() > 1;
+    // A grouped walk: three statements, and a cursor that is a pair. The
+    // a module's kind asks for it, but the loop is core's -- a module declares
+    // the mode, it does not bring its own executor.
+    const bool grouped =
+        batch_mode == "grouped" && step["sql"].size() > 2;
+    const auto apply_sql =
+        (two_statement || grouped)
+            ? detail::strip_semicolon(
+                  step["sql"][grouped ? 2 : 1].get<std::string>())
+            : std::string();
+    const auto confined_select_sql =
+        grouped ? detail::strip_semicolon(step["sql"][1].get<std::string>())
+                       : std::string();
     const auto key_column = detail_json.value("key", "id");
 
     resume_qualified_ = detail_json.value("qualified", "");
     resume_key_ = key_column;
     resume_where_ = step["detail"].value("where", "");
+    // Non-empty only for a grouped walk, whose cursor is a pair and whose
+    // staleness check therefore has a different shape. See cursor_is_stale.
+    resume_group_ = detail_json.value("group_column", "");
     std::string cursor = resume_cursor(ordinal);
+    // Recorded so a resume is VISIBLE. Without it a retry that resumed and one
+    // that silently started over were indistinguishable -- the predicate hides
+    // rows already done, so both finish with the same count -- and that is
+    // exactly how a staleness check that could not read its own cursor went
+    // unnoticed: every grouped retry restarted from the top.
+    const std::string resumed_from = cursor;
     long long rows_done = 0;      // includes the open transaction
     long long rows_committed = 0; // survives a crash
     int commits = 0;
@@ -468,6 +757,7 @@ class Executor {
       const auto txn_started = detail::steady_ms();
       long long rows_this_txn = 0;
       CommitReason reason = CommitReason::kInterval;
+      bool skipped_groups_only = false;
 
       while (true) {
         // batch_rows bounds how long ONE STATEMENT runs, and therefore
@@ -479,10 +769,41 @@ class Executor {
                               : e.batch_rows;
         long long affected = 0;
         try {
-          const auto r = pqxx_exec(w.txn(), sql, pqxx::params{cursor, batch});
-          affected = static_cast<long long>(r.size());
-          for (const auto& row : r) {
-            cursor = row[0].as<std::string>();
+          BatchOutcome outcome;
+          if (grouped) {
+            GroupCursor at;
+            if (!GroupCursor::decode(cursor, at)) {
+              // A cursor that will not parse must stop the step, not be read as
+              // the start of some group: that would silently redo or skip a
+              // whole group and look like success.
+              record_step(ordinal, step, "failed", rows_done,
+                          json{{"error",
+                                "the recorded cursor \"" + cursor +
+                                    "\" is not a grouped-walk cursor, so where "
+                                    "this walk had got to cannot be known"},
+                               {"hint",
+                                "Cancel the job and start a new one; the rows "
+                                "already done are still done, and the predicate "
+                                "excludes them."}});
+              w.rollback();
+              throw std::runtime_error(
+                  "a grouped walk could not read its own cursor: \"" +
+                  cursor + "\"");
+            }
+            outcome = run_grouped_batch(w.txn(), sql, confined_select_sql,
+                                               apply_sql, at, batch,
+                                               e.batch_bytes);
+          } else {
+            outcome = run_paced_batch(w.txn(), sql, apply_sql, cursor, batch,
+                                      e.batch_bytes);
+          }
+          affected = outcome.considered;
+          cursor = outcome.cursor;
+          // A batch that only advanced past finished groups did no work and is
+          // not the end of the walk. Treated as progress so the loop continues,
+          // and not counted as rows.
+          if (affected == 0 && outcome.skipped_only) {
+            skipped_groups_only = true;
           }
         } catch (const pqxx::sql_error& ex) {
           if (detail::is_query_canceled(ex) &&
@@ -511,9 +832,17 @@ class Executor {
         // throughout -- indistinguishable from a stuck job.
         publish_backfill(ordinal, rows_done, rows_committed, commits, cursor,
                          reasons, detail_json, "in_flight");
-        if (affected == 0) {
+        if (affected == 0 && !skipped_groups_only) {
           done = true;
           reason = CommitReason::kFinal;
+          break;
+        }
+        if (skipped_groups_only) {
+          // Groups were skipped, none had work, and the walk is NOT over. Commit
+          // what the cursor now says and come back: treating this as finished
+          // would stop at the first run of finished tenants and report success.
+          skipped_groups_only = false;
+          reason = CommitReason::kInterval;
           break;
         }
 
@@ -538,8 +867,7 @@ class Executor {
         // step rows are written by the coordination connection: cursor and data
         // must be atomically consistent, or a crash produces re-applied or
         // skipped rows.
-        pqxx_exec(w.txn(),
-                  "INSERT INTO laswell.backfill_cursor"
+        w.txn().exec("INSERT INTO laswell.backfill_cursor"
                   "  (job_id, ordinal, last_key, rows_done, commits)"
                   "  VALUES ($1::uuid, $2, $3, $4, 1)"
                   "  ON CONFLICT (job_id, ordinal) DO UPDATE"
@@ -563,6 +891,7 @@ class Executor {
            {"commits", commits},
            {"commitReasons", reasons},
            {"finalCursor", cursor},
+           {"resumedFrom", resumed_from == "0" ? json(nullptr) : json(resumed_from)},
            {"key", key_column}};
     // What this step DID, and deliberately not what bloat resulted.
     //
@@ -683,14 +1012,42 @@ class Executor {
   std::string resume_qualified_;
   std::string resume_key_;
   std::string resume_where_;
+  std::string resume_group_;
 
   bool cursor_is_stale(ReadSession& r, const std::string& from) {
     if (resume_qualified_.empty() || resume_where_.empty()) return false;
     try {
+      // A grouped cursor is a pair, so "everything at or below it is
+      // done" means: every earlier distribution value, and within the current
+      // one every key up to the recorded one. The check asks whether any row in
+      // that region still matches the predicate -- the same question as below,
+      // over a region with two edges instead of one.
+      if (!resume_group_.empty()) {
+        GroupCursor at;
+        if (!GroupCursor::decode(from, at)) return true;  // unreadable: start over
+        if (at.group.empty()) return false;               // nothing claimed yet
+        const auto rel = resume_qualified_;
+        const auto d = detail::quote_identifier(resume_group_);
+        const auto k = detail::quote_identifier(resume_key_);
+        if (at.key.empty()) {
+          const auto res = r.txn().exec("SELECT EXISTS (SELECT 1 FROM " + rel + " WHERE " + d +
+                  " < $1 AND (" + resume_where_ + "))",
+              pqxx::params{at.group});
+          return !res.empty() && res[0][0].as<bool>();
+        }
+        const auto res = r.txn().exec("SELECT EXISTS (SELECT 1 FROM " + rel + " WHERE (" + d + " < $1 OR (" +
+                d + " = $1 AND " + k + " <= $2)) AND (" + resume_where_ + "))",
+            pqxx::params{at.group, at.key});
+        return !res.empty() && res[0][0].as<bool>();
+      }
+      // No cast on the parameter. It was `$1::bigint`, which made the check
+      // throw for every text or uuid key -- and a check that throws is read as
+      // "stale", so a backfill keyed on anything but an integer could never
+      // resume, silently. The comparison fixes the type from the column.
       const auto q = "SELECT EXISTS (SELECT 1 FROM " + resume_qualified_ +
-                     " WHERE " + resume_key_ + " <= $1::bigint AND (" +
+                     " WHERE " + resume_key_ + " <= $1 AND (" +
                      resume_where_ + "))";
-      const auto res = pqxx_exec(r.txn(), q, pqxx::params{from});
+      const auto res = r.txn().exec(q, pqxx::params{from});
       return !res.empty() && res[0][0].as<bool>();
     } catch (const std::exception&) {
       // If the check cannot run, do not resume on a cursor we could not
@@ -716,9 +1073,7 @@ class Executor {
     // the idempotence mechanism: a re-run matches nothing and costs one scan.
     try {
       ReadSession r(cfg_, std::nullopt, nullptr, 2000);
-      const auto res = pqxx_exec(
-          r.txn(),
-          "SELECT c.last_key FROM laswell.backfill_cursor c"
+      const auto res = r.txn().exec("SELECT c.last_key FROM laswell.backfill_cursor c"
           "  JOIN laswell.job j ON j.job_id = c.job_id"
           "  JOIN laswell.migration m ON m.migration_id = j.migration_id"
           " WHERE m.spec_digest = $1 AND c.ordinal = $2"

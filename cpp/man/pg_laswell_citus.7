@@ -1,0 +1,909 @@
+.Dd September 25, 2026
+.Dt PG_LASWELL_CITUS 7
+.Os
+.Sh NAME
+.Nm pg_laswell_citus
+.Nd Citus support in pg_laswell: intent kinds, readings and refusals
+.Sh DESCRIPTION
+Citus support is a
+.Em build-time module .
+The core binary speaks PostgreSQL and nothing else; a binary that carries this
+module additionally knows the kinds below, takes an extra reading of the
+cluster's topology, and refuses several things a stock build would accept and
+then fail to execute.
+.Pp
+This page describes a binary built with the module.
+To tell whether you have one:
+.Bd -literal -offset indent
+$ pg_laswell_mcp --version
+0.1.2
+modules: citus
+.Ed
+.Pp
+A binary with no
+.Li modules
+line does not recognise any kind on this page, and will refuse a specification
+that names one -- the whole specification, not the one intent, which is the same
+rule that governs any unknown kind.
+Build one with:
+.Bd -literal -offset indent
+cmake -S cpp -B build -DPGLASWELL_MODULES=citus
+.Ed
+.Pp
+.Sy Versions.
+Everything on this page was measured on Citus 13.2 with PostgreSQL 17, on a
+coordinator and two workers.
+No Citus version is assumed: whether a call exists is read from
+.Va pg_proc ,
+so a Citus that lacks one is refused for that kind and the refusal names the
+version it found, rather than being sent SQL it cannot parse.
+Older Citus releases are not tested, and a plan against one says which calls it
+found.
+Every node must run the same Citus version in this database; see
+.Sx REFUSALS .
+.Pp
+Every kind here is prefixed
+.Cm citus_ ,
+so a specification says which vendor it needs and two vendors cannot collide on
+a name.
+The
+.Em MODULES
+section of
+.Xr pg_laswell_mcp 1
+gives the rules a module works under, and what it is forbidden to do.
+.Sh INTENT KINDS
+.\" BEGIN CITUS KIND LIST -- checked by tools/check-manual.py against
+.\" cpp/src/modules/citus/kinds.inc.
+Every kind accepts an optional
+.Va comment :
+a note for whoever reads the specification.
+None of these kinds creates an object, so it is not written to the catalog.
+.Ss Cm citus_distribute_table
+Hash-distribute a table across the cluster's worker nodes.
+.Pp
+Required:
+.Va schema ,
+.Va table ,
+.Va distribution_column .
+Optional:
+.Va comment ,
+.Va shard_method ,
+.Va colocate_with ,
+.Va shard_count ,
+.Va concurrently .
+.Bl -tag -width Ds
+.It Va distribution_column
+The column whose hash picks the shard.
+.Em Every
+unique constraint and primary key on the table must include it: Citus cannot
+enforce uniqueness across shards without it, so it refuses the distribution
+rather than the constraint.
+An intent whose table has a key not covering this column is refused, naming the
+key and the columns it does cover.
+.It Va shard_method
+.Cm hash
+(the default),
+.Cm append
+or
+.Cm range .
+Hash is the only form Citus recommends for new work; the other two are legacy.
+.It Va colocate_with
+.Qq schema.table ,
+or one of Citus's own words
+.Cm none
+and
+.Cm default .
+An unqualified name is refused as ambiguous with those sentinels, so a table
+genuinely called
+.Li none
+is written
+.Qq public.none .
+Colocating requires the named table to be distributed already -- in an earlier
+intent of the same specification, which is accounted for, or an earlier
+specification ordered by
+.Va depends_on .
+.It Va shard_count
+A positive integer.
+Mutually exclusive with a real
+.Va colocate_with :
+joining a colocation group adopts that group's shard count, so naming both asks
+for two different numbers.
+Refused at parse time rather than half-applied at execution.
+.It Va concurrently
+.Cm auto
+(the default),
+.Cm always
+or
+.Cm never .
+Under
+.Cm auto
+the planner chooses from the table's estimated size and records which reading
+decided.
+.Cm always
+requires
+.Fn create_distributed_table_concurrently ,
+and is refused, not silently downgraded, on a Citus too old to have it.
+.Pp
+The concurrent form runs outside a transaction and is not rehearsed, and a
+failure is not clean: measured, a failed one left the table registered as a
+Citus-managed local table, half converted.
+So what fails it is read first, and rules it out:
+.Li wal_level
+not
+.Cm logical
+on the coordinator or any worker (measured: the error was raised on the
+coordinator), or a nullable distribution column (a NULL in it fails the copy
+halfway, and whether one exists is not read).
+Under
+.Cm auto
+the plan then takes the blocking form and says which of these decided;
+.Cm always
+is refused.
+A table with no primary key
+.Em can
+be distributed concurrently (measured): UPDATE and DELETE on it fail until the
+copy finishes, and INSERT still works, which the plan says.
+Someone who wrote
+.Cm always
+was making a decision about a table too big to lock, and quietly locking it
+anyway is the worst available answer.
+.El
+.Pp
+A nullable distribution column is accepted by Citus, which then refuses every
+write that leaves it NULL (measured), so the plan warns.
+Identity and sequence keys need nothing special: a
+.Li bigserial ,
+.Li bigint
+or
+.Li int
+identity, as the distribution column or beside it, all distributed and generated
+values on Citus 13 (measured).
+.Pp
+Distributing is also the step that copies the reference tables to any node that
+does not hold them yet: adding a node copies none of them (measured, 20 ms
+beside 217 MB of reference data), and the next distribution copies them all.
+The plan names those nodes and the size, as it does for a rebalance and for a
+new reference table.
+.Ss Cm citus_create_reference_table
+Replicate a table in full to every node, so reads join against it locally.
+.Pp
+Required:
+.Va schema ,
+.Va table .
+Optional:
+.Va comment .
+No other keys are accepted.
+.Pp
+Always warns: every write to a reference table becomes a two-phase commit across
+all nodes.
+Reference tables are for small, rarely written lookups; a busy one is a
+cluster-wide bottleneck.
+.Ss Cm citus_distribute_function
+Route calls of a function to the node holding the relevant shard, or replicate
+its definition to every node.
+.Pp
+Required:
+.Va schema ,
+.Va name ,
+.Va arguments .
+Optional:
+.Va comment ,
+.Va distribution_argument ,
+.Va colocate_with ,
+.Va force_delegation .
+.Bl -tag -width Ds
+.It Va arguments
+The argument type list that identifies the overload, as PostgreSQL writes it.
+.It Va distribution_argument Ns / Ns Va colocate_with
+These travel together and either both appear or neither does.
+The argument says which parameter routes the call; the colocation target says
+which table's shards it routes to.
+One without the other cannot be acted on, and is refused.
+.It Va force_delegation
+Boolean.
+.El
+.Pp
+With neither colocation key, the function is replicated to every node rather
+than routed, and the plan warns: every node gets a copy of the definition, and a
+later
+.Ic CREATE OR REPLACE
+has to be propagated too or the copies diverge.
+.Pp
+The function must already exist; create it in an earlier specification and order
+the two with
+.Va depends_on .
+.Ss Cm citus_alter_distributed_table
+Change how a distributed table is distributed: its column, its shard count, or
+the group it is colocated with.
+.Pp
+Required:
+.Va schema ,
+.Va table ,
+and at least one of
+.Va distribution_column ,
+.Va shard_count
+and
+.Va colocate_with .
+Optional:
+.Va cascade_to_colocated ,
+.Va comment .
+.Pp
+Citus rewrites the table: it creates a new one, copies every row, drops the old
+one and renames.
+That is a full copy under an exclusive lock, with no concurrent form, and the
+plan always warns with the estimated row count.
+.Pp
+Each property is compared with the reading, and only what differs is passed to
+Citus.
+When nothing differs, the step is
+.Em satisfied
+and no call is made.
+Citus refuses a call that changes nothing
+.Pq Qq this call doesn't change any properties of the table ,
+so without this check a specification whose change had already happened would
+fail when run again.
+.Bl -tag -width Ds
+.It Va distribution_column
+Every unique key must include the new column, as for
+.Cm citus_distribute_table .
+Citus checks this only after it has copied the data.
+Cannot be combined with
+.Va cascade_to_colocated : Cm true ;
+Citus cascades only the shard count.
+.It Va shard_count
+When other tables share the group,
+.Va cascade_to_colocated
+must be written.
+.Cm true
+rewrites every member with the new count and keeps the group, and its foreign
+keys, together;
+.Cm false
+moves this table out of the group on its own.
+Cannot be combined with a real
+.Va colocate_with :
+joining a group adopts its count.
+.It Va colocate_with
+.Qq schema.table
+to join that table's group, which must be distributed on a column of exactly the
+same type, or
+.Cm none
+for a group of its own.
+A table that is already alone is satisfied for
+.Cm none .
+Citus would otherwise rewrite it into a new group for nothing.
+.Cm default
+is refused: whether a table is already in Citus's default group cannot be read
+beforehand.
+.El
+.Pp
+.Sy Foreign keys that would be dropped are refused.
+Moving a table out of its colocation group while a foreign key joins it to
+another distributed table
+.Em succeeds
+in Citus, with only a warning, and the constraint is gone.
+The plan refuses any change that breaks colocation while such a key exists.
+Keys to and from reference tables survive the rewrite and are not refused.
+.Ss Cm citus_undistribute_table
+Turn a distributed, reference or Citus-managed local table back into an ordinary
+table on the coordinator.
+.Pp
+Required:
+.Va schema ,
+.Va table .
+Optional:
+.Va cascade_via_foreign_keys ,
+.Va comment .
+.Pp
+Every row is copied onto the coordinator under an exclusive lock.
+The coordinator needs the disk space for all of it, and the plan warns with the
+estimated row count.
+A table Citus does not record is
+.Em satisfied .
+.Pp
+When a foreign key joins the table to another table Citus records, in either
+direction, Citus refuses to undistribute one end alone.
+.Va cascade_via_foreign_keys : Cm true
+undistributes every table the keys connect, and the plan names them; without it
+the plan is refused.
+.Pp
+There is no kind that reverses
+.Cm citus_distribute_function :
+Citus has no call that does.
+.Ss Cm citus_add_local_table_to_metadata
+Record a local table in Citus metadata without distributing it.
+Its rows stay on the coordinator, and it can then hold foreign keys to and from
+reference tables and join with them.
+.Pp
+Required:
+.Va schema ,
+.Va table .
+Optional:
+.Va cascade_via_foreign_keys ,
+.Va comment .
+.Pp
+Satisfied when the table is already a Citus-managed local table.
+Refused when it is distributed or a reference table, which Citus rejects as
+.Qq already distributed .
+A foreign key to a table Citus does not record needs
+.Va cascade_via_foreign_keys : Cm true ,
+which adds the connected tables as well.
+A key to a reference table is what this kind is for, and needs no cascade.
+.Ss Cm citus_truncate_local_data
+Delete the coordinator's own copy of a distributed or reference table's rows.
+.Fn create_distributed_table
+leaves that copy in place after copying the rows to the shards.
+.Pp
+Required:
+.Va schema ,
+.Va table .
+Optional:
+.Va comment .
+.Pp
+Calls
+.Fn truncate_local_data_after_distributing_table .
+The rows Citus serves are in the shards and are not touched.
+.Pp
+.Sy The call truncates with CASCADE.
+A table that references this one and is not distributed has its
+.Em own
+rows deleted: a local table referencing a reference table was emptied.
+The plan is refused while any such table references it.
+A distributed table referencing it is allowed: only the coordinator's stale copy
+of it is truncated, and Citus still served every row.
+.Ss Cm citus_update_table_statistics
+Record each shard's current size in Citus metadata.
+Required:
+.Va schema ,
+.Va table ;
+the table must be distributed or a reference table (Citus refuses anything
+else).
+.Pp
+Measured: it writes the sizes into
+.Va pg_dist_placement.shardlength
+(0 before, 3.4 to 3.9 MB after, on a four-shard table), took 5 ms for 32 shards,
+and rolls back cleanly.
+No reading tells a current size from a stale one, so it is always applied, and
+repeating it is harmless.
+It is maintenance rather than a change of schema: a specification that runs it
+runs it once, when applied.
+.Ss Cluster kinds
+The kinds below change the cluster, not a table.
+They name nodes, and a node exists on one cluster only:
+.Li worker1:5432
+on staging is not a host anywhere else.
+A specification that uses them describes that topology and is bound to the
+clusters it exists on.
+.Cm citus_ensure_workers
+takes its hosts from the configuration instead, and
+.Cm citus_rebalance_shards
+names nothing: both run on any cluster.
+.Pp
+Each takes
+.Va host
+and an optional
+.Va port
+(default 5432).
+Node membership is projected the way table state is: an intent sees the nodes an
+earlier intent of the same specification adds, removes, drains or changes, so
+registering the coordinator, setting its property and adding the workers can be
+one specification, in that order.
+The planner does not reorder intents.
+One thing cannot be projected: how many shards a rebalance will move after
+membership changes, since Citus decides that when it runs.
+A
+.Cm citus_rebalance_shards
+after such a change is therefore always applied, and its plan says the number
+is unknown.
+.Pp
+No kind moves or splits a single shard.
+Shard ids come from a sequence in each database, so they depend on everything
+created there before \(em measured, the same table built by the same
+specifications starts at shard 102140 in one database and 102107 in another on
+the same cluster.
+A signed specification naming a shard would mean a different shard, or none, on
+every other target.
+Draining and rebalancing say what is wanted and leave the choice of shards to
+Citus.
+.Ss Cm citus_ensure_workers
+Make the cluster's workers the ones this connection's configuration lists, so a
+specification says
+.Em what
+the cluster should be and names no host.
+The same signed file then adds three workers on a staging cluster and twelve in
+production:
+.Bd -literal -offset indent
+{ "kind": "citus_ensure_workers",
+  "hosts_matching": "*.citus.internal",
+  "min_workers": 2 }
+.Ed
+.Pp
+The list comes from
+.Va citus.workers
+in the connection's section of the configuration file, a comma-separated list of
+.Ar host
+or
+.Ar host : Ns Ar port
+(port 5432 by default); see
+.Sx CONFIGURATION
+in
+.Xr pg_laswell_mcp 1 .
+A connection with none is refused, saying where to put it.
+.Pp
+Optional:
+.Va hosts_matching ,
+.Va min_workers ,
+.Va max_workers ,
+.Va unlisted ,
+.Va comment .
+.Bl -tag -width Ds
+.It Va hosts_matching
+A glob that every configured host must match, with
+.Ql *
+for any run of characters and
+.Ql \&?
+for one, and nothing else.
+.It Va min_workers Ns / Ns Va max_workers
+Bounds on how many workers the configuration may list.
+.It Va unlisted
+What happens to a registered worker the configuration does not list:
+.Cm keep
+(the default) leaves it and warns,
+.Cm refuse
+stops the plan, and
+.Cm remove
+removes it, which is refused while it still holds shards of a distributed table.
+.El
+.Pp
+.Sy The bounds are the reason to sign this kind rather than trust the file.
+The configuration is not signed, and a worker receives shards of the data, so
+without them whoever can edit the configuration decides which machines hold it.
+A configured host outside
+.Va hosts_matching ,
+or a count outside the bounds, is refused, not warned.
+.Pp
+Satisfied when every configured worker is registered and active and nothing is
+to be removed.
+Each worker is added with
+.Fn citus_add_node ,
+which connects to it, and the dry run executes the call, so an unreachable
+configured host is reported before the migration.
+Refused when the list names the coordinator, a host twice, or a worker that is
+registered and inactive.
+New workers hold no shards until the cluster is rebalanced, which a
+.Cm citus_rebalance_shards
+later in the same specification does.
+.Ss Cm citus_add_node
+Add a worker.
+Like every kind that names a node, it is bound to the clusters where that host
+exists; see
+.Sx Cluster kinds .
+Optional:
+.Va should_have_shards
+(boolean; false adds a node that takes no shards).
+Satisfied when the node is already registered and active; refused when it is
+registered and inactive.
+The call connects to the node while it runs, so the dry run executes it and an
+unreachable host is reported before the migration.
+A new node holds nothing until the cluster is rebalanced.
+.Ss Cm citus_remove_node
+Remove a worker.
+Satisfied when it is not registered.
+Refused for the coordinator, and for a node that still holds shards of
+distributed tables \(em Citus refuses to remove the only copy of a shard.
+Drain it first, in an earlier intent or specification.
+.Ss Cm citus_set_coordinator_host
+Register the coordinator's address, the one the workers use to reach it.
+Satisfied when the coordinator is already registered at that address.
+.Ss Cm citus_set_node_property
+Required:
+.Va should_have_shards
+(boolean), the only property Citus lets you set.
+Satisfied when it already has that value.
+Setting it to false stops new shards arriving and moves none; the plan says how
+many the node keeps.
+.Ss Cm citus_disable_node
+Take a worker out of service without removing it: it stays registered and keeps
+its copies of the reference tables, and Citus stops sending it work.
+Satisfied when it is already disabled.
+Refused for the coordinator (Citus refuses it), and for a worker still holding
+shards of a distributed table (Citus refuses that too, as for removal), so drain
+it first.
+.Pp
+Always emitted with
+.Li synchronous => true .
+Measured: the asynchronous default leaves the workers' metadata out of sync for
+a while, and a
+.Cm citus_activate_node
+or
+.Cm citus_remove_node
+straight after it failed
+.Pq Qq is a metadata node, but is out of sync .
+Synchronous, both ran at once, in the same transaction too.
+It rolls back cleanly, so the dry run executes it.
+.Ss Cm citus_activate_node
+Put a disabled worker back into service.
+Satisfied when it is already active; refused for a node that is not registered.
+.Cm citus_add_node
+does not do this: on a disabled node it returns the node and leaves it disabled
+(measured), which is why that kind refuses an inactive node and names this one.
+.Ss Cm citus_drain_node
+Move every shard of a distributed table off a node, and mark it as taking no new
+ones.
+Optional:
+.Va transfer_mode .
+Satisfied when the node holds no such shards and takes no new ones.
+Refused when no other node may hold shards.
+Reference-table placements stay on the node; a drain does not move them.
+.Pp
+Not atomic: the node is marked as taking no shards before anything moves, and
+each move commits on its own, so the step runs outside a transaction and a dry
+run does not execute it.
+A failed drain keeps what it moved, and running the specification again
+finishes it.
+See
+.Sx Moving shards .
+.Ss Cm citus_rebalance_shards
+Move shards until Citus's own rebalancer has nothing left to do.
+Optional:
+.Va transfer_mode .
+Satisfied when the plan from
+.Fn get_rebalance_table_shards_plan
+is empty; otherwise the plan lists how many moves there are and the first
+twenty.
+Runs
+.Fn rebalance_table_shards ,
+which returns only when the rebalance is finished, so
+.Qq applied
+in the ledger means balanced.
+The background form,
+.Fn citus_rebalance_start ,
+would leave a job the ledger knows nothing about.
+.Pp
+Not atomic: each move commits on its own, so the step runs outside a
+transaction and a dry run does not execute it.
+A failed rebalance keeps what it moved, and running the specification again
+finishes it.
+See
+.Sx Moving shards .
+.Ss Moving shards
+.Bl -tag -width Ds
+.It Va transfer_mode
+.Cm auto
+(the default) or
+.Cm force_logical
+copy each shard by logical replication while writes continue; they need
+.Li wal_level = logical
+on every worker, which the plan reads from the workers themselves and refuses
+without.
+.Cm block_writes
+holds writes to each shard while it is copied, and needs no replication.
+.It Neither drain nor rebalance is atomic.
+Measured: inside a transaction that was then rolled back,
+.Fn rebalance_table_shards
+moved a shard and kept it moved, and
+.Fn citus_drain_node
+marked the node as taking no shards, and kept that mark, even when the drain
+itself then failed.
+Every move commits on its own.
+So both run outside a transaction and the dry run does not execute them: it lists
+them as unverified.
+A failed drain or rebalance keeps the moves it made, and running the
+specification again carries on from there.
+.El
+.\" END CITUS KIND LIST
+.Sh READINGS
+With the module built in, every plan against a database where the
+.Li citus
+extension is installed carries an extra reading under
+.Va extensions.citus :
+the extension version, the worker count, which distributed tables exist with
+their distribution column and colocation group, which functions are distributed,
+whether this Citus has
+.Fn create_distributed_table_concurrently ,
+and the values of
+.Va citus.enable_ddl_propagation
+and
+.Va citus.max_adaptive_executor_pool_size .
+.Pp
+An absent reading is not a zero reading.
+A database with no Citus installed produces no
+.Va extensions.citus
+at all, and every kind on this page is refused there with that as the reason,
+rather than planned against defaults.
+.Pp
+Contention is read differently too.
+On a coordinator,
+.Va pg_locks
+shows the coordinator's own waits and not a worker's, so a shard-level wait is
+invisible where a single-node reading would find it.
+Where the module applies, waiters come from
+.Va citus_lock_waits
+and activity from
+.Va citus_stat_activity ,
+which see the whole cluster.
+.Sh WRITES ON A DISTRIBUTED TABLE
+A specification does not name its vendor to do an ordinary thing.
+The same
+.Cm backfill
+runs on plain PostgreSQL in development and on a distributed table in staging;
+the binary adapts per target through what it reads.
+Measured on Citus 13, preparing and executing each statement against a
+distributed table:
+.Bl -column "delete_rows by predicate" "grouped walk" -offset indent
+.It Sy form Ta Sy outcome
+.It Cm insert_rows Ta runs
+.It Cm copy_rows Ta runs Pq Citus routes COPY itself
+.It Cm update_rows Ta runs
+.It Cm delete_rows No by values Ta runs
+.It Cm backfill Ta grouped walk
+.It Cm delete_rows No by predicate Ta grouped walk
+.It Cm merge_rows Ta refused
+.El
+.Pp
+The first four take their rows from the specification and join to them; they
+take no row locks, so nothing about them is distributed-specific.
+.Pp
+The two walks select each batch
+.Ic FOR UPDATE ,
+which stops the keyset cursor selecting the same rows twice, and Citus refuses
+that on a multi-shard query.
+So core asks this module one question -- must row-locking batches on this table
+be confined to single values of a column, and which? -- and for a distributed
+table the answer is its distribution column.
+Core then walks one value at a time: which values remain, which keys remain
+inside one, and the change to exactly those keys, each confined by an equality on
+the distribution column.
+That is the only confinement Citus pushes down; a hash-range predicate is not,
+reads every shard, and is refused the same way.
+The write comes back
+.Li Task Count: 1 .
+.Pp
+The step records
+.Va batch_mode
+as
+.Cm grouped
+and
+.Va confined_by
+as
+.Cm citus ,
+and its reason says the Citus reading decided.
+The cursor records both positions, as
+.Ql ["3","800"] ,
+and a walk that fails on one value resumes after the last committed batch --
+verified by failing one tenant partway and retrying.
+.Pp
+For
+.Cm backfill
+the key must be unique
+.Em within
+one distribution value, which a unique index on
+.Pq Va distribution column , Va key
+in that order proves.
+A unique index on the key alone cannot exist on a distributed table: Citus
+refuses one that does not contain the distribution column.
+.Pp
+The gain is not speed.
+A shard-ordered walk measured about 16% better per row than a key-ordered one,
+not the eightfold a first measurement suggested.
+The reason to have it is that on a distributed table the alternative is not a
+slower walk, it is no walk at all.
+.Ss citus.multi_shard_modify_mode
+A write spanning several shards runs under this setting:
+.Cm parallel
+opens up to
+.Va citus.max_adaptive_executor_pool_size
+connections per worker (measured: one for fast shard tasks, six of sixteen for
+slow ones), and
+.Cm sequential
+one.
+The plan reads it and states it, with the connection bound it implies, in its
+.Va budget .
+It does not set it.
+Setting it would mean the module writing a
+.Ic SET LOCAL
+into statements core emits for core kinds, which is the one thing a module may
+not do (see
+.Sx MODULES
+in
+.Xr pg_laswell_mcp 1 ) .
+The paced walks are unaffected either way: each of their batches is confined to
+one distribution value and so to one shard.
+To run a migration sequentially, set it for the migrating role:
+.Dl ALTER ROLE laswell_runner SET citus.multi_shard_modify_mode = 'sequential';
+and the plan will say so.
+.Sh REFUSALS
+These are the reason the module exists: each is a Citus error that would
+otherwise surface at execution, partway through a migration, on a cluster, with
+earlier work already committed.
+All of them are derivable from the readings above beforehand.
+.Ss Topology-wide
+.Bl -tag -width Ds
+.It Va citus.enable_ddl_propagation Li is off
+Refused for
+.Em every
+kind, core kinds included -- a plain
+.Cm create_table
+on a Citus cluster is propagated DDL too.
+With propagation off, DDL runs on the coordinator and not on the workers, and
+the two catalogs diverge
+.Em silently :
+every reading pg_laswell takes, including the check that catches drift, is taken
+on the coordinator.
+The ledger would record the migration as fully applied, the coordinator would
+agree, and the shards would not have it.
+A warning would be a false reassurance; refusing is recoverable in one
+statement.
+.It Cm merge_rows No on a distributed table
+Refused, for a reason that has nothing to do with pacing: Citus restricts MERGE
+against a distributed target.
+.Bd -literal -offset indent
+ERROR: non-IMMUTABLE functions are not yet supported in MERGE sql
+       with distributed tables
+.Ed
+.Pp
+Express the change as
+.Cm update_rows
+and
+.Cm insert_rows ,
+which both run.
+.It Workers on another Citus version
+Refused for every kind.
+Each worker is asked which Citus version is installed in this database; one that
+differs from the coordinator's, or has none, fails distributed work partway,
+after the coordinator's half has run.
+A worker that does not answer is not judged.
+.It Prepared transactions nobody is resolving
+Refused for every kind, when a prepared transaction on the coordinator or a
+worker is older than twice
+.Va citus.recover_2pc_interval
+(and at least 120 seconds).
+A multi-shard write killed between PREPARE and COMMIT leaves one behind, and it
+holds its locks (measured: an INSERT waited on one indefinitely) and pins the
+node's xmin horizon, so VACUUM there reclaims nothing.
+Citus resolves its own within that interval, so one older than it is not being
+resolved; the refusal says how to find it.
+.It A walk whose key is the distribution column
+.Cm backfill
+and
+.Cm delete_rows
+by predicate walk a distributed table one distribution value at a time (see
+.Sx WRITES ON A DISTRIBUTED TABLE ) .
+When the distribution column is the walk key, every value holds one row and every
+batch would be a single row, so the walk is refused and the refusal names what
+runs instead.
+.El
+.Ss Per kind
+.Bl -bullet -compact
+.It
+The
+.Li citus
+extension is not installed in this database.
+.It
+A unique constraint or primary key does not include the distribution column.
+.It
+The distribution column does not exist on the table.
+.It
+.Va colocate_with
+names a table this database does not record as distributed.
+.It
+.Va concurrently : Cm always
+was asked for and this Citus has no concurrent form.
+.It
+.Va concurrently : Cm always
+where the coordinator or a worker is not at
+.Li wal_level = logical ,
+or the distribution column is nullable.
+.It
+Distributing, making a reference table, or adding a table to metadata when no
+node is registered at all.
+Measured: each call succeeds by registering the coordinator as
+.Li localhost ,
+a distributed table's shards all land on it, and every
+.Fn citus_add_node
+afterwards is refused.
+Registering the coordinator and workers earlier in the same specification is
+enough.
+.It
+Distributing when no node may hold shards.
+.It
+Adding a worker while the coordinator is registered as
+.Li localhost ,
+which Citus refuses.
+.It
+A function named for distribution does not exist.
+.It
+.Va shard_count
+together with a real
+.Va colocate_with ,
+or
+.Va distribution_argument
+without
+.Va colocate_with .
+.It
+An alter that changes a shard count in a shared group without
+.Va cascade_to_colocated ,
+or that would silently drop a foreign key to another distributed table.
+.It
+Undistributing, or adding to metadata, one end of a foreign key without
+.Va cascade_via_foreign_keys .
+.It
+Truncating local data that would cascade into a table's real rows.
+.It
+Removing a node that holds shards, or the coordinator.
+.It
+Configured workers outside the specification's
+.Va hosts_matching ,
+.Va min_workers
+or
+.Va max_workers ,
+or a connection with no
+.Va citus.workers
+at all.
+.It
+Draining a node when no other node may hold shards.
+.It
+Moving shards by logical replication when a worker is not at
+.Li wal_level = logical .
+.It
+Rebalancing when fewer nodes may hold shards than the replication factor
+requires, where Citus cannot compute a plan at all.
+.El
+.Sh EXAMPLES
+Distribute a parent, then colocate a child with it, in one specification.
+The second intent is planned against the state the first will have produced, so
+it does not need a separate deployment:
+.Bd -literal -offset indent
+{
+  "laswell_spec_version": 1,
+  "id": "0030-distribute",
+  "description": "Distribute accounts and colocate its ledger.",
+  "intents": [
+    { "kind": "citus_distribute_table",
+      "schema": "public", "table": "accounts",
+      "distribution_column": "id",
+      "comment": "Hash distributed on id." },
+    { "kind": "citus_distribute_table",
+      "schema": "public", "table": "account_transactions",
+      "distribution_column": "account_id",
+      "colocate_with": "public.accounts",
+      "comment": "Colocated with accounts." }
+  ]
+}
+.Ed
+.Pp
+.Pa examples/docker/citus
+in the source is a runnable coordinator and two workers, and a repository
+borrowed from a benchmarking lab that applies to plain PostgreSQL and to Citus
+alike.
+Specifications that name no epoch create the tables and procedures everywhere.
+Those in epoch
+.Cm citus
+register the cluster from
+.Va citus.workers ,
+distribute and colocate the tables, and route each procedure to the shard that
+owns its account.
+The one in epoch
+.Cm plain
+adds the foreign key straight after the tables, where Citus needs it after
+distribution.
+Each database opens the epoch it is.
+.Sh SEE ALSO
+.Xr pg_laswell 1 ,
+.Xr pg_laswell_mcp 1
+.Pp
+.Xr pg_laswell_mcp 1
+is the authoritative reference for the specification format, pacing, trust and
+the ledger; this page covers only what the Citus module adds.
+.Sh AUTHORS
+.An Daniel Cristian Cruz
+.Sh CAVEATS
+The module set is not hashed into
+.Va planDigest .
+For a specification a binary can plan at all the module set does not change a
+single statement, and one it cannot plan is refused outright -- so hashing it
+would change every existing digest while protecting nothing.
+.Pp
+A distribution is reversed with
+.Cm citus_undistribute_table
+in a later specification, not by reverting one.
+Like any kind that moves data, the plan says what it copies and where.

@@ -47,17 +47,27 @@ jobs:
           # everywhere, so a disagreement is a build failure rather than a
           # warning nobody reads. pg_laswell links OpenSSL directly, which is
           # the boundary they disagree at.
+          #
+          # The two plain builds carry NO module: they are what proves core is
+          # PostgreSQL-only. The two sanitizer builds carry the Citus module,
+          # because the released package does (one package, every module), so
+          # the code that ships is the code ASan, UBSan and TSan watch. Without
+          # a cluster its live cases skip; its planner tests and every core
+          # test still run.
           - config: plain-gcc
             compiler: g++
             sanitizer: NONE
+            modules: ''
             tools: true
           - config: plain-clang
             compiler: clang++
             sanitizer: NONE
+            modules: ''
             tools: false
           - config: address-undefined
             compiler: g++
             sanitizer: ADDRESS_UNDEFINED
+            modules: citus
             tools: false
           # THREAD is a gate for this project rather than belt-and-braces: a
           # worker thread per job plus one process-wide observer against a
@@ -65,6 +75,7 @@ jobs:
           - config: thread
             compiler: g++
             sanitizer: THREAD
+            modules: citus
             tools: false
 
     steps:
@@ -85,7 +96,8 @@ jobs:
         run: |
           cmake -S cpp -B build -G Ninja \
             -DCMAKE_CXX_COMPILER=${{ matrix.compiler }} \
-            -DPGLASWELL_SANITIZER=${{ matrix.sanitizer }}
+            -DPGLASWELL_SANITIZER=${{ matrix.sanitizer }} \
+            "-DPGLASWELL_MODULES=${{ matrix.modules }}"
       - name: Build the test binary
         run: cmake --build build --target pg_laswell_mcp_test
       - name: Build the shipped binaries and the plan renderer
@@ -634,6 +646,86 @@ jobs:
         if: always()
         run: docker compose -f examples/docker/compose.yml down -v
 
+  # The Citus module, built and run against a real three-node cluster.
+  #
+  # Its own build, because a module is a compile-time choice: the plain
+  # artifacts carry no citus_* kinds and no Citus reading, so nothing downstream
+  # of `build` can exercise any of this. Two things only this job proves:
+  #
+  #   - the purity check with a module ENABLED. planner_purity_check.cpp covers
+  #     modules/*/plan.h through planner.h, but only a module the build turned
+  #     on -- and no other job turns one on.
+  #   - the module against Citus. Its refusals are unit-tested against fixed
+  #     readings, which proves the decision and nothing about whether Citus
+  #     plans and runs the SQL. That gap cost real defects: a dry run that
+  #     could not verify a reference-table walk, and citus_distribute_function
+  #     reporting every function "already distributed" while routing nothing.
+  citus:
+    name: citus
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -o DPkg::Lock::Timeout=300
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build libpq-dev nlohmann-json3-dev \
+            libgtest-dev libssl-dev mandoc postgresql-client openssl
+      - name: Build libpqxx from source, not from apt
+        uses: ./.github/actions/libpqxx
+        with:
+          version: ${{ env.PQXX_VERSION }}
+          sha256: ${{ env.PQXX_SHA256 }}
+      - name: Configure with the citus module
+        run: cmake -S cpp -B build -G Ninja -DPGLASWELL_MODULES=citus
+      - name: Build everything
+        run: cmake --build build
+      - name: The binary says which modules it carries
+        run: |
+          ./build/pg_laswell_mcp --version | tee /dev/stderr | grep -q '^modules: citus$'
+      - name: The suite that needs no database, with the module in it
+        run: ./build/pg_laswell_mcp_test
+      - name: Manuals, source checks and plan transcripts, with the module in it
+        run: ctest --test-dir build -R 'manpage_lint|manpage_kinds|no_dangling_items|plans' --output-on-failure
+      - name: Start the Citus cluster
+        run: |
+          docker compose -f examples/docker/citus/compose.yml up -d
+          for i in $(seq 1 90); do
+            ok=0
+            for c in laswell_citus_coordinator laswell_citus_worker1 laswell_citus_worker2; do
+              docker exec "$c" pg_isready -U postgres -d app -q 2>/dev/null && ok=$((ok+1))
+            done
+            [ "$ok" = 3 ] && break
+            sleep 2
+          done
+          [ "$ok" = 3 ] || { echo "::error::the Citus cluster did not come up"; exit 1; }
+      # The example first: it builds the database the tests then run in -- the
+      # extension on every node, the workers registered in THAT database
+      # (pg_dist_node is per database), the ledger, and the example's specs
+      # applied. So the example is exercised, and the tests start from a state
+      # someone following the example would actually have.
+      - name: The Citus example
+        env:
+          PG_LASWELL: ${{ github.workspace }}/build/pg_laswell
+          PG_LASWELL_MCP: ${{ github.workspace }}/build/pg_laswell_mcp
+          PGPASSWORD: laswell
+        run: ./examples/docker/citus/run.sh
+      - name: The module against Citus
+        env:
+          CITUS_URL: postgresql://postgres:laswell@127.0.0.1:55440/citus_example
+        run: |
+          ctest --test-dir build -R citus_tests --output-on-failure
+          # The suite's own live cases -- the observer's SQL against a real wait,
+          # which no fixed reading can prove. They skip without CITUS_URL, so the
+          # no-database run above cannot have covered them.
+          ./build/pg_laswell_mcp_test --gtest_filter='CitusLive.*'
+          ./build/pg_laswell_mcp_test --gtest_filter='CitusLive.*' | grep -q 'PASSED.*1 test' \
+            || { echo "::error::a CitusLive test was skipped or failed"; exit 1; }
+      - name: Stop the cluster
+        if: always()
+        run: docker compose -f examples/docker/citus/compose.yml down -v
+
   ci-ok:
     name: ci-ok
     if: always()
@@ -648,6 +740,7 @@ jobs:
       - twin_clusters
       - ledger_upgrade
       - examples
+      - citus
       - packages
     runs-on: ubuntu-latest
     timeout-minutes: 5

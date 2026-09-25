@@ -911,7 +911,7 @@ TEST(Spec, KnownKindsAreExactlyTheImplementedKinds) {
   // "s.f()", and the )" in that closes a default-delimited raw string early --
   // producing a "missing terminating \" character" error pointing at a line
   // several below the real cause.
-  const json bodies = json::parse(R"JSON({
+  json bodies = json::parse(R"JSON({
     "add_column":   {"kind":"add_column","schema":"s","table":"t","column":"c",
                      "type":"text","nullable":true,"comment":"c"},
     "backfill":     {"kind":"backfill","schema":"s","table":"t","key":"id",
@@ -1065,6 +1065,13 @@ TEST(Spec, KnownKindsAreExactlyTheImplementedKinds) {
     "copy_rows": {"kind":"copy_rows","schema":"s","table":"t",
                   "columns":["id","a"],"values":[[1,"x"]]}
   })JSON");
+  // A module's kinds have to prove the same thing: listed AND implemented.
+  // Merged in rather than written above, because the names do not exist at all
+  // in a PostgreSQL-only build.
+#define PGLASWELL_KIND_BODY(name, body_json) \
+  bodies[name] = json::parse(body_json);
+#include "modules/enabled_kind_bodies.h"
+#undef PGLASWELL_KIND_BODY
   for (const auto& [name, kind] : pglaswell::intent_kinds()) {
     (void)kind;
     ASSERT_TRUE(bodies.contains(name))
@@ -1340,6 +1347,32 @@ TEST(Config, AnUnknownExecutorKeyIsRefusedRatherThanIgnored) {
   // A typo'd safety knob that parses as "not set" is the failure this stops.
   const auto err = config_error("[executor]\nbatch_row = 10\n[a]\nhost=x\n");
   EXPECT_NE(err.find("unknown key batch_row"), std::string::npos) << err;
+}
+
+TEST(Config, AModuleSettingBelongsToItsConnectionAndNeedsItsModule) {
+  // `citus.workers` in a connection section is that connection's, so one
+  // configuration can give staging three workers and production twelve while
+  // the signed specification names none of them.
+  const std::string body =
+      "[staging]\nhost = s\ncitus.workers = w1:5432, w2\n"
+      "[prod]\nhost = p\ncitus.workers = a, b, c\n";
+  if (pglaswell::detail::module_compiled_in("citus")) {
+    TempIni ini(body);
+    const auto r = pglaswell::Registry::from_ini(ini.path(), "t");
+    EXPECT_EQ(r.get("staging").executor.module_settings.at("citus.workers"),
+              "w1:5432, w2");
+    EXPECT_EQ(r.get("prod").executor.module_settings.at("citus.workers"), "a, b, c");
+    // Never passed to libpq, which would refuse the whole string at connect.
+    EXPECT_EQ(r.get("staging").conninfo.find("citus"), std::string::npos);
+  } else {
+    // A setting nothing reads would look configured and do nothing.
+    const auto err = config_error(body);
+    EXPECT_NE(err.find("no citus module"), std::string::npos) << err;
+  }
+  // A module no build has is refused either way, naming the line's section.
+  const auto err = config_error("[a]\nhost = x\nacme.nodes = n1\n");
+  EXPECT_NE(err.find("no acme module"), std::string::npos) << err;
+  EXPECT_NE(err.find("[a]"), std::string::npos) << err;
 }
 
 TEST(Config, ATrailingCommaInAListIsATypoNotAnEmptyEntry) {
@@ -1697,6 +1730,52 @@ pglaswell::Spec spec_of(const json& intents) {
   json doc = minimal_spec();
   doc["intents"] = intents;
   return pglaswell::parse_spec(doc);
+}
+
+// Drive a paced step to completion the way the executor does, through the
+// executor's own run_paced_batch. Returns rows considered across every batch.
+//
+// Three harnesses used to keep their own copy of this loop, and each copy ran
+// every statement in the step with the cursor and batch parameters. That was
+// wrong as soon as a batch became a selection plus an apply: the apply takes one
+// parameter and got two. The loop lives in one place now, and it is the same one
+// production uses.
+inline long long drive_paced_step(const pglaswell::ConnConfig& cfg,
+                                  const pglaswell::Step& step,
+                                  const char* app_name) {
+  const auto strip = [](const std::string& q) {
+    return q.empty() || q.back() != ';' ? q : q.substr(0, q.size() - 1);
+  };
+  const auto mode = step.detail.value("batch_mode", "");
+  const bool two = mode == "two_statement" && step.sql.size() > 1;
+  const bool grouped = mode == "grouped" && step.sql.size() > 2;
+
+  std::string cursor = "0";
+  long long considered = 0;
+  for (int pass = 0; pass < 1000; ++pass) {
+    pglaswell::WriteSession b(cfg);
+    b.begin(app_name);
+    pglaswell::BatchOutcome out;
+    if (grouped) {
+      pglaswell::GroupCursor at;
+      if (!pglaswell::GroupCursor::decode(cursor, at)) {
+        ADD_FAILURE() << "unreadable grouped cursor: " << cursor;
+        return considered;
+      }
+      out = pglaswell::run_grouped_batch(b.txn(), strip(step.sql[0]),
+                                         strip(step.sql[1]), strip(step.sql[2]),
+                                         at, 1000, 1 << 20);
+    } else {
+      out = pglaswell::run_paced_batch(b.txn(), strip(step.sql[0]),
+                                       two ? strip(step.sql[1]) : std::string(),
+                                       cursor, 1000, 1 << 20);
+    }
+    b.commit();
+    cursor = out.cursor;
+    if (out.considered == 0 && !out.skipped_only) break;
+    considered += out.considered;
+  }
+  return considered;
 }
 
 std::vector<const pglaswell::Step*> steps_of(const pglaswell::Plan& p,
@@ -2137,6 +2216,27 @@ TEST(Planner, TheRenderedPlanIsStableAcrossRuns) {
   const auto spec = pglaswell::parse_spec(minimal_spec());
   EXPECT_EQ(pglaswell::plan_migration(spec, obs, {}).render(),
             pglaswell::plan_migration(spec, obs, {}).render());
+}
+
+TEST_F(DatabaseTest, AServerErrorInTheConnectionClassIsAProblemNotACrash) {
+  // libpqxx raises broken_connection for EVERY server error in SQLSTATE class
+  // 08, broken connection or not. Citus raises one on a healthy connection when
+  // citus_add_node cannot reach the node it names, and the dry run escaped as a
+  // tool error instead of reporting what it had found. RAISE reproduces the
+  // class on plain PostgreSQL.
+  pglaswell::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = url_;
+  pglaswell::Catalog cat(cfg);
+  const std::string stmt =
+      "DO $$ BEGIN RAISE EXCEPTION 'the remote node could not be reached' "
+      "USING ERRCODE = '08006'; END $$";
+  pglaswell::Catalog::DryRun dry;
+  ASSERT_NO_THROW(dry = cat.dry_run({{0, {stmt}}}, {false}, 180000));
+  ASSERT_EQ(dry.problems.size(), 1u);
+  EXPECT_EQ(dry.problems[0].sqlstate, "08000");
+  EXPECT_NE(dry.problems[0].message.find("could not be reached"), std::string::npos)
+      << dry.problems[0].message;
 }
 
 // --- catalog: observation against a live server ---------------------------
@@ -2644,9 +2744,7 @@ TEST_F(BootstrappedTest, RecordingAMigrationIsIdempotentOnTheDigest) {
   EXPECT_EQ(first, second) << "the same spec must not create two ledger rows";
 
   pglaswell::ReadSession r(cfg());
-  const auto row = pglaswell::pqxx_exec(
-      r.txn(),
-      "SELECT spec_id, encode(canonical_bytes,'escape'), signer_key_id "
+  const auto row = r.txn().exec("SELECT spec_id, encode(canonical_bytes,'escape'), signer_key_id "
       "  FROM laswell.migration WHERE migration_id = $1",
       pqxx::params{first});
   ASSERT_EQ(row.size(), 1u);
@@ -3126,6 +3224,61 @@ TEST_F(ToolTest, TheDryRunCatchesSqlThatDoesNotWorkAgainstTheRealSchema) {
             std::string::npos);
 }
 
+TEST_F(ToolTest, ARejectedStatementIsReportedWithTheServersOwnWords) {
+  // The dry run's whole value is that PostgreSQL answers before the real schema
+  // is touched. That answer used to be recorded and then dropped: a rejected
+  // statement reported "the plan failed when applied to a rolled-back
+  // transaction" and invited a defect report, with the server's explanation
+  // sitting unused one field away.
+  //
+  // Reported from a real conversion: CREATE EXTENSION citus SCHEMA public is
+  // valid SQL that Citus rejects, and the reader was sent to file a bug rather
+  // than delete one key.
+  make_shop(cfg());
+  json doc = minimal_spec();
+  doc["intents"][1]["set"] = json{{"fulfilment_region", "w.no_such_column"}};
+  const auto parsed = pglaswell::parse_spec(doc);
+  doc["signatures"] = json::array({{{"key_id", test_key().key_id},
+                                    {"algorithm", "ed25519"},
+                                    {"signature", base64(sign(parsed.canonical_bytes))}}});
+
+  const auto p = payload(call("planMigration", json{{"spec", doc}}));
+  ASSERT_FALSE(p.value("ok", true)) << p.dump(2);
+  ASSERT_TRUE(p["dryRun"].contains("problemDetail")) << p.dump(2);
+  const auto& d = p["dryRun"]["problemDetail"][0];
+
+  // The SQLSTATE, because it is the part a reader can look up. 42703 is
+  // undefined_column.
+  EXPECT_EQ(d.value("sqlstate", ""), "42703") << d.dump(2);
+  // The server's words, without pqxx's "ERROR:  " prefix or its trailing
+  // newline -- this is a field, not a line of output.
+  EXPECT_NE(d.value("message", "").find("no_such_column"), std::string::npos)
+      << d.dump(2);
+  EXPECT_EQ(d.value("message", "").rfind("ERROR", 0), std::string::npos)
+      << "the ERROR: prefix is presentation and does not belong in a field";
+  EXPECT_TRUE(d.value("message", "").empty() || d.value("message", "").back() != '\n');
+  // The statement that produced it, so the reader does not have to guess which
+  // of a multi-step plan failed.
+  EXPECT_NE(d.value("statement", "").find("no_such_column"), std::string::npos)
+      << d.dump(2);
+  EXPECT_GE(d.value("step", -1), 0);
+
+  // And the hint no longer asserts that the tool is at fault. A server error
+  // carrying a SQLSTATE means the plan was valid SQL that PostgreSQL declined,
+  // which points at the specification first.
+  const auto hint = p.value("hint", "");
+  EXPECT_NE(hint.find("specification is the first place to look"),
+            std::string::npos)
+      << hint;
+
+  // The string form stays a string, because callers read it as one, and now
+  // leads with the SQLSTATE.
+  ASSERT_TRUE(p["dryRun"].contains("problems")) << p.dump(2);
+  EXPECT_NE(p["dryRun"]["problems"][0].get<std::string>().find("42703"),
+            std::string::npos)
+      << p["dryRun"]["problems"][0];
+}
+
 TEST_F(ToolTest, AConcurrentIndexBuildIsReportedAsUnverifiedNotSilentlyPassed) {
   // CREATE INDEX CONCURRENTLY cannot run inside a transaction block, so a dry
   // run cannot cover it. Saying so is the difference between a check and a
@@ -3285,9 +3438,7 @@ TEST_F(ToolTest, CopyRowsTravelsThroughTheRealExecutorAndLandsInTheLedger) {
   }
 
   // And the ledger records the statement that ran, verbatim.
-  const auto sql = pglaswell::pqxx_exec(
-      r.txn(),
-      "SELECT s.sql FROM laswell.step s JOIN laswell.job j ON j.job_id = s.job_id"
+  const auto sql = r.txn().exec("SELECT s.sql FROM laswell.step s JOIN laswell.job j ON j.job_id = s.job_id"
       " WHERE j.job_id = $1::uuid AND s.kind = 'copy_rows' ORDER BY s.ordinal LIMIT 1",
       pqxx::params{p["jobId"].get<std::string>()});
   ASSERT_FALSE(sql.empty()) << "the COPY left no step row";
@@ -3395,9 +3546,7 @@ TEST_F(ToolTest, TheLedgerRecordsWhatRanVerbatim) {
   }));
 
   pglaswell::ReadSession r(cfg());
-  const auto rows = pglaswell::pqxx_exec(
-      r.txn(),
-      "SELECT ordinal, kind, state, sql, why FROM laswell.step"
+  const auto rows = r.txn().exec("SELECT ordinal, kind, state, sql, why FROM laswell.step"
       " WHERE job_id = $1::uuid ORDER BY ordinal",
       pqxx::params{p["jobId"].get<std::string>()});
   ASSERT_GE(rows.size(), 3u) << "the ledger has no steps";
@@ -3409,9 +3558,7 @@ TEST_F(ToolTest, TheLedgerRecordsWhatRanVerbatim) {
     EXPECT_FALSE(row[4].template as<std::string>("").empty())
         << "step " << row[0].template as<int>() << " recorded no reason";
   }
-  const auto job = pglaswell::pqxx_exec(
-      r.txn(),
-      "SELECT state, plan_digest, finished_at IS NOT NULL FROM laswell.job"
+  const auto job = r.txn().exec("SELECT state, plan_digest, finished_at IS NOT NULL FROM laswell.job"
       " WHERE job_id = $1::uuid",
       pqxx::params{p["jobId"].get<std::string>()});
   ASSERT_EQ(job.size(), 1u);
@@ -3469,15 +3616,11 @@ TEST_F(ToolTest, CancellingAJobStopsItAndLeavesTheCursorCommitted) {
 
   // Whatever it committed is consistent: the cursor and the data agree.
   pglaswell::ReadSession r(cfg());
-  const auto cur = pglaswell::pqxx_exec(
-      r.txn(),
-      "SELECT last_key FROM laswell.backfill_cursor WHERE job_id = $1::uuid",
+  const auto cur = r.txn().exec("SELECT last_key FROM laswell.backfill_cursor WHERE job_id = $1::uuid",
       pqxx::params{job_id});
   if (!cur.empty()) {
     const auto last = cur[0][0].template as<std::string>();
-    const auto beyond = pglaswell::pqxx_exec(
-        r.txn(),
-        "SELECT count(*) FROM shop.orders"
+    const auto beyond = r.txn().exec("SELECT count(*) FROM shop.orders"
         " WHERE id <= $1::bigint AND fulfilment_region IS NULL"
         "   AND warehouse_id IS NOT NULL",
         pqxx::params{last});
@@ -3686,9 +3829,7 @@ TEST_F(ToolTest, AFailedStepFailsTheJobAndTheLedgerSaysWhich) {
   })) << status_of(p["jobId"]).dump(2);
 
   pglaswell::ReadSession r(cfg());
-  const auto rows = pglaswell::pqxx_exec(
-      r.txn(),
-      "SELECT count(*) FROM laswell.step WHERE job_id = $1::uuid AND state = 'failed'",
+  const auto rows = r.txn().exec("SELECT count(*) FROM laswell.step WHERE job_id = $1::uuid AND state = 'failed'",
       pqxx::params{p["jobId"].get<std::string>()});
   EXPECT_GT(rows[0][0].template as<int>(), 0) << "no step was recorded as failed";
 }
@@ -4127,8 +4268,7 @@ class EpochTest : public RepoTest {
   void open_epoch(const std::string& name, const std::string& note = "test") {
     pglaswell::WriteSession w(cfg());
     w.begin("pg_laswell/test/epoch");
-    pglaswell::pqxx_exec(w.txn(),
-        "INSERT INTO laswell.epoch(name, note) VALUES ($1, $2)"
+    w.txn().exec("INSERT INTO laswell.epoch(name, note) VALUES ($1, $2)"
         " ON CONFLICT (name) DO NOTHING",
         pqxx::params{name, note});
     w.commit();
@@ -4136,8 +4276,7 @@ class EpochTest : public RepoTest {
   void retire_epoch(const std::string& name) {
     pglaswell::WriteSession w(cfg());
     w.begin("pg_laswell/test/epoch-retire");
-    pglaswell::pqxx_exec(w.txn(),
-        "UPDATE laswell.epoch SET retired_at = now(), retired_by = current_user"
+    w.txn().exec("UPDATE laswell.epoch SET retired_at = now(), retired_by = current_user"
         " WHERE name = $1", pqxx::params{name});
     w.commit();
   }
@@ -4939,6 +5078,13 @@ TEST(Planner, AnEquivalentIndexUnderAnotherNameIsRenamedNotRebuilt) {
       json{{"is_valid", true}, {"is_unique", false}, {"method", "btree"},
            {"predicate", "(status = 'open'::text)"}, {"has_expressions", false},
            {"columns", json::array({"fulfilment_region", "created_at"})},
+           // What a real reading carries. The matcher declines to compare an
+           // index whose ordering and operator classes it cannot see -- a
+           // missing reading is not a matching one -- so a fixture without
+           // these is a fixture of an index this tool would not touch.
+           {"key_column_count", 2},
+           {"column_order", json::array({"asc nulls last", "asc nulls last"})},
+           {"column_opclasses", json::array({"", ""})},
            {"leading_column", "fulfilment_region"}};
 
   const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(minimal_spec()), obs, {});
@@ -4972,6 +5118,13 @@ TEST(Planner, RenamingAConstraintBackedIndexIsRefused) {
            {"predicate", "(status = 'open'::text)"}, {"has_expressions", false},
            {"constraint_backed", true},
            {"columns", json::array({"fulfilment_region", "created_at"})},
+           // What a real reading carries. The matcher declines to compare an
+           // index whose ordering and operator classes it cannot see -- a
+           // missing reading is not a matching one -- so a fixture without
+           // these is a fixture of an index this tool would not touch.
+           {"key_column_count", 2},
+           {"column_order", json::array({"asc nulls last", "asc nulls last"})},
+           {"column_opclasses", json::array({"", ""})},
            {"leading_column", "fulfilment_region"}};
   const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(minimal_spec()), obs, {});
   EXPECT_FALSE(plan.ok) << plan.render();
@@ -4988,6 +5141,13 @@ TEST(Planner, OnEquivalentIndexAdoptChangesNothing) {
       json{{"is_valid", true}, {"is_unique", false}, {"method", "btree"},
            {"predicate", "(status = 'open'::text)"}, {"has_expressions", false},
            {"columns", json::array({"fulfilment_region", "created_at"})},
+           // What a real reading carries. The matcher declines to compare an
+           // index whose ordering and operator classes it cannot see -- a
+           // missing reading is not a matching one -- so a fixture without
+           // these is a fixture of an index this tool would not touch.
+           {"key_column_count", 2},
+           {"column_order", json::array({"asc nulls last", "asc nulls last"})},
+           {"column_opclasses", json::array({"", ""})},
            {"leading_column", "fulfilment_region"}};
   auto doc = minimal_spec();
   for (auto& i : doc["intents"]) {
@@ -5008,6 +5168,13 @@ TEST(Planner, OnEquivalentIndexRefuseRestoresTheConflict) {
       json{{"is_valid", true}, {"is_unique", false}, {"method", "btree"},
            {"predicate", "(status = 'open'::text)"}, {"has_expressions", false},
            {"columns", json::array({"fulfilment_region", "created_at"})},
+           // What a real reading carries. The matcher declines to compare an
+           // index whose ordering and operator classes it cannot see -- a
+           // missing reading is not a matching one -- so a fixture without
+           // these is a fixture of an index this tool would not touch.
+           {"key_column_count", 2},
+           {"column_order", json::array({"asc nulls last", "asc nulls last"})},
+           {"column_opclasses", json::array({"", ""})},
            {"leading_column", "fulfilment_region"}};
   auto doc = minimal_spec();
   for (auto& i : doc["intents"]) {
@@ -5038,6 +5205,13 @@ TEST(Planner, ADifferentPredicateWarnsRatherThanRefusing) {
       json{{"is_valid", true}, {"is_unique", false}, {"method", "btree"},
            {"predicate", "(status = 'closed'::text)"}, {"has_expressions", false},
            {"columns", json::array({"fulfilment_region", "created_at"})},
+           // What a real reading carries. The matcher declines to compare an
+           // index whose ordering and operator classes it cannot see -- a
+           // missing reading is not a matching one -- so a fixture without
+           // these is a fixture of an index this tool would not touch.
+           {"key_column_count", 2},
+           {"column_order", json::array({"asc nulls last", "asc nulls last"})},
+           {"column_opclasses", json::array({"", ""})},
            {"leading_column", "fulfilment_region"}};
   const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(minimal_spec()), obs, {});
   EXPECT_TRUE(plan.ok) << plan.render();
@@ -5048,6 +5222,132 @@ TEST(Planner, ADifferentPredicateWarnsRatherThanRefusing) {
   EXPECT_TRUE(warned) << json(plan.warnings).dump(2);
 }
 
+TEST(Planner, AMixedOrderingIsNotSatisfiedByAnAscendingOrADescendingIndex) {
+  // The case a human converting SQL by hand gets wrong, and the one that made
+  // recording indoption necessary. A btree scans backwards as a WHOLE, so
+  // (a DESC, b DESC) serves (a ASC, b ASC) -- but (a ASC, b DESC) is served by
+  // neither, and before the ordering was observed at all, an existing (a, b)
+  // compared equal to every one of these.
+  //
+  // Under the default on_equivalent_index the consequence was not a wasted
+  // index but a wrong one: the ascending index would have been RENAMED to the
+  // declared name and the spec reported satisfied, leaving the database without
+  // the ordering it asked for and the ledger saying it had it.
+  const auto spec_for = [](json columns) {
+    json doc = minimal_spec();
+    doc["intents"] = json::array({json{{"kind", "create_index"},
+                                       {"schema", "shop"},
+                                       {"table", "orders"},
+                                       {"name", "orders_mixed_idx"},
+                                       {"columns", std::move(columns)},
+                                       {"comment", "Mixed ordering."}}});
+    return pglaswell::parse_spec(doc);
+  };
+  const auto with_index = [](const char* name, json order) {
+    auto obs = observations(1024, 10);
+    obs.tables["shop.orders"]["indexes"][name] =
+        json{{"is_valid", true},      {"is_unique", false},
+             {"method", "btree"},     {"predicate", ""},
+             {"has_expressions", false},
+             {"columns", json::array({"fulfilment_region", "created_at"})},
+             {"key_column_count", 2},
+             {"column_order", std::move(order)},
+             {"column_opclasses", json::array({"", ""})},
+             {"leading_column", "fulfilment_region"}};
+    return obs;
+  };
+  const json mixed = json::array(
+      {"fulfilment_region", json{{"name", "created_at"}, {"direction", "desc"}}});
+
+  // Against an all-ascending index: build, and do not call it a reverse.
+  for (const char* existing_order : {"asc", "desc"}) {
+    const json order = json::array({std::string(existing_order) + " nulls " +
+                                        (std::string(existing_order) == "desc"
+                                             ? "first"
+                                             : "last"),
+                                    std::string(existing_order) + " nulls " +
+                                        (std::string(existing_order) == "desc"
+                                             ? "first"
+                                             : "last")});
+    const auto obs = with_index("uniform", order);
+    const auto plan = pglaswell::plan_migration(spec_for(mixed), obs, {});
+    ASSERT_TRUE(plan.ok) << plan.render();
+    const auto* step = find_step(plan, "create_index");
+    ASSERT_NE(step, nullptr);
+    const auto sql = all_sql(*step);
+    EXPECT_NE(sql.find("CREATE INDEX"), std::string::npos)
+        << "a uniformly " << existing_order
+        << " index must not satisfy a mixed ordering:\n" << sql;
+    EXPECT_EQ(sql.find("RENAME TO"), std::string::npos)
+        << "the existing index was renamed into the declared name, which leaves "
+           "the database without the ordering the spec asked for:\n" << sql;
+    for (const auto& w : plan.warnings) {
+      EXPECT_EQ(w.find("exact reverse"), std::string::npos)
+          << "a partial flip is not a reverse: " << w;
+    }
+  }
+
+  // And the same mixed ordering IS recognised, or the test above would pass
+  // against a planner that simply never matches anything.
+  {
+    const auto obs = with_index("already_mixed",
+                               json::array({"asc nulls last", "desc nulls first"}));
+    const auto plan = pglaswell::plan_migration(spec_for(mixed), obs, {});
+    ASSERT_TRUE(plan.ok) << plan.render();
+    const auto* step = find_step(plan, "create_index");
+    ASSERT_NE(step, nullptr);
+    EXPECT_NE(all_sql(*step).find("RENAME TO"), std::string::npos)
+        << "an index with the SAME mixed ordering should be adopted:\n"
+        << all_sql(*step);
+  }
+}
+
+TEST(Planner, ABackfillWhoseKeyIsUniqueOnlyWithinAGroupWalksGroupByGroup) {
+  // CORE behaviour, so tested in core: a module-off build must do this too. A
+  // table whose only proof of uniqueness is (tenant_id, id) -- the primary key of
+  // every table whose tenant column comes first -- was refused by backfill on
+  // every server. It is now walked one tenant at a time.
+  //
+  // The outcome alone cannot tell the walks apart (the apply matches keys by
+  // value, so a whole-table walk on a non-unique key still finishes), which is
+  // why the CHOICE is asserted here: walking `id` across the table would give
+  // up the batch bound on every run of equal ids.
+  pglaswell::Observations obs;
+  obs.server_version = 180000;
+  obs.server = json{{"max_connections", 100}, {"current_backends", 5}};
+  obs.tables["public.ledger"] = json{
+      {"exists", true},
+      {"reltuples", 100000},
+      {"columns", json{{"tenant_id", {{"type", "bigint"}}},
+                       {"id", {{"type", "bigint"}}},
+                       {"balance", {{"type", "numeric"}}}}},
+      {"indexes", json{{"ledger_pkey",
+                        json{{"is_unique", true}, {"is_valid", true},
+                             {"predicate", ""}, {"has_expressions", false},
+                             {"columns", json::array({"tenant_id", "id"})},
+                             {"key_column_count", 2},
+                             {"leading_column", "tenant_id"}}}}}};
+  json doc = minimal_spec();
+  doc["intents"] = json::array({json{{"kind", "backfill"}, {"schema", "public"},
+                                     {"table", "ledger"}, {"key", "id"},
+                                     {"set", {{"balance", "0"}}},
+                                     {"where", "balance IS NULL"}}});
+  const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(doc), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto* s = find_step(plan, "backfill");
+  ASSERT_NE(s, nullptr);
+  EXPECT_EQ(s->detail.value("batch_mode", ""), "grouped") << plan.render();
+  EXPECT_EQ(s->detail.value("group_column", ""), "tenant_id");
+  EXPECT_EQ(s->detail.value("supporting_index", ""), "ledger_pkey");
+  // No module decided this -- and none may be credited with it.
+  EXPECT_FALSE(s->detail.contains("confined_by"));
+  ASSERT_EQ(s->sql.size(), 3u);
+  EXPECT_NE(s->sql[1].find("\"tenant_id\" = $1"), std::string::npos) << s->sql[1];
+  EXPECT_NE(s->sql[2].find("\"tenant_id\" = $1"), std::string::npos)
+      << "the change must stay inside the group: id is unique only within one,\n"
+      << s->sql[2];
+}
+
 TEST(Planner, APrefixRedundantIndexWarnsRatherThanRefusing) {
   // There are legitimate reasons to want a narrower index -- size, fillfactor
   // -- so refusing would be the tool overriding a judgement it cannot make.
@@ -5056,6 +5356,10 @@ TEST(Planner, APrefixRedundantIndexWarnsRatherThanRefusing) {
       json{{"is_valid", true}, {"is_unique", false}, {"method", "btree"},
            {"predicate", "(status = 'open'::text)"}, {"has_expressions", false},
            {"columns", json::array({"fulfilment_region", "created_at", "id"})},
+           {"key_column_count", 3},
+           {"column_order", json::array({"asc nulls last", "asc nulls last",
+                                         "asc nulls last"})},
+           {"column_opclasses", json::array({"", "", ""})},
            {"leading_column", "fulfilment_region"}};
   const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(minimal_spec()), obs, {});
   EXPECT_TRUE(plan.ok) << plan.render();
@@ -5087,6 +5391,13 @@ TEST(Planner, AnInvalidDuplicateDoesNotBlockTheRebuild) {
       json{{"is_valid", false}, {"is_unique", false}, {"method", "btree"},
            {"predicate", "(status = 'open'::text)"}, {"has_expressions", false},
            {"columns", json::array({"fulfilment_region", "created_at"})},
+           // What a real reading carries. The matcher declines to compare an
+           // index whose ordering and operator classes it cannot see -- a
+           // missing reading is not a matching one -- so a fixture without
+           // these is a fixture of an index this tool would not touch.
+           {"key_column_count", 2},
+           {"column_order", json::array({"asc nulls last", "asc nulls last"})},
+           {"column_opclasses", json::array({"", ""})},
            {"leading_column", "fulfilment_region"}};
   const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(minimal_spec()), obs, {});
   EXPECT_TRUE(plan.ok) << plan.render();
@@ -5101,6 +5412,13 @@ TEST(Planner, APartialAndAFullIndexAreDifferentNotAmbiguous) {
       json{{"is_valid", true}, {"is_unique", false}, {"method", "btree"},
            {"predicate", "(status = 'open'::text)"}, {"has_expressions", false},
            {"columns", json::array({"fulfilment_region", "created_at"})},
+           // What a real reading carries. The matcher declines to compare an
+           // index whose ordering and operator classes it cannot see -- a
+           // missing reading is not a matching one -- so a fixture without
+           // these is a fixture of an index this tool would not touch.
+           {"key_column_count", 2},
+           {"column_order", json::array({"asc nulls last", "asc nulls last"})},
+           {"column_opclasses", json::array({"", ""})},
            {"leading_column", "fulfilment_region"}};
   auto doc = minimal_spec();
   for (auto& i : doc["intents"]) {
@@ -6560,11 +6878,19 @@ TEST(Planner, PreserveIsRealForEveryRowLevelKindAndEveryForm) {
   const json del_where{{"kind", "delete_rows"}, {"schema", "shop"}, {"table", "orders"},
                        {"key", "id"}, {"where", "status = 'old'"}, {"preserve", preserve}};
 
+  // How the capture is RESTRICTED to the rows the statement changes. The kinds
+  // whose rows come from the specification join to a relation holding them
+  // (`src` unpaced, `batch` paced). A keyset walk over the TARGET names an
+  // explicit key array instead, because its batch is a selection plus an apply
+  // rather than one statement with a CTE -- two statements is what Citus can
+  // route and what lets a batch be bounded by bytes. Either way the property
+  // asserted is the same: the capture covers exactly those rows, and it travels
+  // in the same statement as the mutation.
   struct Form { json intent; bool paced; const char* join_alias; };
   for (const Form& f : {Form{update, false, "src"}, Form{update, true, "batch"},
                        Form{merge, false, "src"}, Form{merge, true, "batch"},
                        Form{del_values, false, "src"}, Form{del_values, true, "batch"},
-                       Form{del_where, true, "batch"}}) {
+                       Form{del_where, true, nullptr}}) {
     pglaswell::ExecutorConfig cfg;
     if (f.paced) cfg.dml_single_txn_rows = 1;  // force the paced form
     const auto plan = pglaswell::plan_migration(spec_of(json::array({f.intent})), obs_dml(), cfg);
@@ -6581,11 +6907,32 @@ TEST(Planner, PreserveIsRealForEveryRowLevelKindAndEveryForm) {
     const auto sql = all_sql(change);
     EXPECT_NE(sql.find("preserved AS ("), std::string::npos) << label << ": " << sql;
     EXPECT_NE(sql.find("INSERT INTO \"archive\".\"orders_before\""), std::string::npos) << label << ": " << sql;
-    EXPECT_NE(sql.find(std::string(", ") + f.join_alias + " AS pb"), std::string::npos)
-        << label << ": the capture must join to the rows this statement changes:\n" << sql;
-    EXPECT_NE(sql.find("= pb.\"id\""), std::string::npos) << label << ": " << sql;
+    if (f.join_alias != nullptr) {
+      EXPECT_NE(sql.find(std::string(", ") + f.join_alias + " AS pb"), std::string::npos)
+          << label << ": the capture must join to the rows this statement changes:\n" << sql;
+      EXPECT_NE(sql.find("= pb.\"id\""), std::string::npos) << label << ": " << sql;
+      EXPECT_EQ(change.sql.size(), 1u)
+          << label << ": ONE statement, or the capture is not atomic with the change";
+    } else {
+      // The two-statement walk. The capture must name the SAME key array the
+      // mutation does, and must sit in the same statement as it -- one snapshot,
+      // so the INSERT reads the rows as they were.
+      const auto apply = change.sql.back();
+      EXPECT_NE(apply.find("WITH preserved AS ("), std::string::npos) << label << ": " << apply;
+      EXPECT_EQ(apply.find("SELECT"), apply.rfind("SELECT"))
+          << label << ": the apply statement should hold one SELECT, the capture's";
+      const auto uses = [&apply](const std::string& needle) {
+        std::size_t n = 0, at = 0;
+        while ((at = apply.find(needle, at)) != std::string::npos) { ++n; at += needle.size(); }
+        return n;
+      };
+      EXPECT_EQ(uses("= ANY($1::bigint[])"), 2u)
+          << label << ": the capture and the delete must name the same keys:\n" << apply;
+      EXPECT_EQ(change.sql.size(), 2u)
+          << label << ": a keyset walk over the target is a selection and an apply";
+      EXPECT_EQ(change.detail.value("batch_mode", ""), "two_statement") << label;
+    }
     EXPECT_EQ(change.detail.value("preserve", ""), "archive.orders_before") << label;
-    EXPECT_EQ(change.sql.size(), 1u) << label << ": ONE statement, or the capture is not atomic with the change";
 
     // What is saved. A change saves the key and what it touches; a delete
     // saves the whole row, because a pre-image of a deleted row that holds
@@ -7310,6 +7657,9 @@ TEST(Spec, EveryKindThatPlansAgainstAnObjectHasAnObjectKey) {
   // The list is explicit rather than inferred from the name, so adding a kind
   // means deciding whether it belongs here.
   const std::set<std::string> needs_object = {
+#define PGLASWELL_NEEDS_OBJECT(kind) kind,
+#include "modules/enabled_tests.inc"
+#undef PGLASWELL_NEEDS_OBJECT
       "create_schema", "drop_schema", "alter_schema",
       "create_extension", "drop_extension", "alter_extension",
       "create_type", "drop_type", "add_enum_value", "alter_domain",
@@ -8899,11 +9249,10 @@ TEST_F(DatabaseTest, TheRemainingKindsRunAndRowSecurityReallyHidesEverything) {
     ASSERT_EQ(steps.size(), 1u);
     pglaswell::WriteSession w(cfg);
     w.begin("pg_laswell/test/rest-delete");
-    const std::string stmt = steps[0]->sql[0];
-    const auto rows = pglaswell::pqxx_exec(
-        w.txn(), stmt.substr(0, stmt.size() - 1), pqxx::params{"0", 1000});
     w.commit();
-    EXPECT_EQ(rows.size(), 40u) << "the paced delete statement is malformed";
+    const auto considered =
+        drive_paced_step(cfg, *steps[0], "pg_laswell/test/rest-delete");
+    EXPECT_EQ(considered, 40) << "the paced delete statement is malformed";
   }
   {
     pglaswell::ReadSession r(cfg);
@@ -9706,9 +10055,19 @@ TEST(Planner, PreserveCapturesInTheSameStatementAsTheUpdate) {
   EXPECT_NE(all_sql(*s[0]).find("laswell_saved_at"), std::string::npos);
   EXPECT_NE(all_sql(*s[0]).find("COMMENT ON TABLE"), std::string::npos);
 
-  // One statement, not two: the INSERT is a CTE of the UPDATE.
+  // The capture is a CTE of the UPDATE, which is the property that matters: one
+  // snapshot, so the INSERT reads the rows as they were and there is no window
+  // in which one committed and the other did not.
+  //
+  // It is now the FIRST CTE of the apply statement rather than a second one
+  // after `batch`, because a batch is a selection and an apply rather than one
+  // statement with a CTE. The property is unchanged; only where the WITH sits
+  // moved, so this asserts the property and not the old spelling.
+  const auto apply = s[1]->sql.back();
+  EXPECT_NE(apply.find("WITH preserved AS ("), std::string::npos) << apply;
+  EXPECT_NE(apply.find("UPDATE "), std::string::npos)
+      << "the capture must travel with the UPDATE, not alone:\n" << apply;
   const auto sql = all_sql(*s[1]);
-  EXPECT_NE(sql.find(", preserved AS ("), std::string::npos) << sql;
   EXPECT_NE(sql.find("INSERT INTO \"archive\".\"orders_before\" (\"id\", \"fulfilment_region\")"),
             std::string::npos) << sql;
   // Quoted, and asserted to BE there before the ordering is compared: with an
@@ -10774,6 +11133,198 @@ TEST(Planner, AnOrdinaryMigrationHasNoPrerequisites) {
   EXPECT_EQ(plan.render().find("before this can run"), std::string::npos);
 }
 
+TEST_F(DatabaseTest, AnExpressionIndexInTheDatabaseDoesNotBreakPlanning) {
+  // An index whose first key is an EXPRESSION names no attribute, so
+  // pg_attribute has no row for it and both `leading_column` and `columns`
+  // aggregated to SQL NULL. A json null is not a missing key, so
+  // value("leading_column", "") returned the null rather than the default and
+  // the next conversion threw type_error.302 out of the planner.
+  //
+  // This was reachable before pg_laswell could CREATE such an index -- any
+  // database that already had one broke planning for its whole table -- and it
+  // surfaced the moment a conformance case built one. The fix is in the
+  // observation: no nulls where a reader expects a string or an array.
+  pglaswell::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = url_;
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test");
+    w.txn().exec("DROP TABLE IF EXISTS expr_idx_probe");
+    w.txn().exec("CREATE TABLE expr_idx_probe (id bigint PRIMARY KEY, name text)");
+    w.txn().exec("CREATE INDEX expr_idx_probe_lower ON expr_idx_probe (lower(name))");
+    w.commit();
+  }
+
+  pglaswell::Catalog cat(cfg);
+  const auto obs = cat.observe({"public"}, {"expr_idx_probe"}, {});
+  const auto& ix =
+      obs.table("public.expr_idx_probe")["indexes"]["expr_idx_probe_lower"];
+  ASSERT_TRUE(ix.is_object()) << obs.tables.dump(2);
+  EXPECT_TRUE(ix.value("has_expressions", false));
+  // The two fields that were null. Absent-or-empty is fine; null is not.
+  EXPECT_FALSE(ix["leading_column"].is_null()) << ix.dump(2);
+  EXPECT_FALSE(ix["columns"].is_null()) << ix.dump(2);
+  EXPECT_EQ(ix.value("leading_column", std::string("unset")), "");
+
+  // And the reader that threw. No EXPECT_NO_THROW: an exception here fails the
+  // test on its own, and the macro cannot take a brace-enclosed body anyway.
+  json doc = json{{"laswell_spec_version", 1},
+                  {"id", "expr-idx"},
+                  {"description", "plan against a table with an expression index"},
+                  {"intents", json::array({json{{"kind", "add_column"},
+                                                {"schema", "public"},
+                                                {"table", "expr_idx_probe"},
+                                                {"column", "note"},
+                                                {"type", "text"},
+                                                {"nullable", true},
+                                                {"comment", "Note."}}})}};
+  const auto spec = pglaswell::parse_spec(doc);
+  const auto plan = pglaswell::plan_migration(spec, obs, pglaswell::ExecutorConfig{});
+  EXPECT_TRUE(plan.ok) << (plan.conflicts.empty() ? "" : plan.conflicts[0]);
+}
+
+TEST_F(DatabaseTest, ABatchIsBoundedByBytesAsWellAsRows) {
+  // batch_rows bounds how many rows one statement touches. It says nothing about
+  // how much memory the executor holds or how large the array literal it sends
+  // is, and those differ by three orders of magnitude between a bigint key and a
+  // composite text one. 1000 rows is a rounding error for the first and megabytes
+  // for the second.
+  //
+  // Only the two-statement form can honour a byte budget at all: a single
+  // statement with LIMIT is bounded by rows by construction, because the keys
+  // never come back to the client before the mutation runs.
+  pglaswell::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = url_;
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test");
+    w.txn().exec("DROP TABLE IF EXISTS wide_keys");
+    w.txn().exec("CREATE TABLE wide_keys (k text PRIMARY KEY, flag boolean)");
+    // 100-byte keys, so a 250-byte budget admits two of them and not three.
+    w.txn().exec("INSERT INTO wide_keys SELECT repeat('k', 90) || lpad(g::text, 10, '0'),"
+                 " NULL FROM generate_series(1, 20) g");
+    w.commit();
+  }
+
+  const std::string select_sql =
+      "SELECT \"wide_keys\".\"k\" FROM \"public\".\"wide_keys\""
+      " WHERE \"wide_keys\".\"k\" > $1 AND (flag IS NULL)"
+      " ORDER BY \"wide_keys\".\"k\" LIMIT $2 FOR UPDATE OF \"wide_keys\"";
+  const std::string apply_sql =
+      "UPDATE \"public\".\"wide_keys\" SET \"flag\" = true"
+      " WHERE \"wide_keys\".\"k\" = ANY($1::text[]) AND (flag IS NULL)"
+      " RETURNING \"wide_keys\".\"k\"";
+
+  // A generous row limit and a mean byte limit: the bytes must be what bounds it.
+  std::string cursor;
+  int batches = 0;
+  long long applied = 0;
+  for (; batches < 100; ++batches) {
+    pglaswell::WriteSession b(cfg);
+    b.begin("pg_laswell/test/bytes");
+    const auto out = pglaswell::run_paced_batch(b.txn(), select_sql, apply_sql,
+                                                cursor, 1000, /*batch_bytes=*/250);
+    b.commit();
+    if (out.considered == 0) break;
+    applied += out.considered;
+    cursor = out.cursor;
+  }
+
+  EXPECT_EQ(applied, 20) << "the walk must still finish, batch budget or not";
+  // 20 keys of 100 bytes under a 250-byte budget: two per batch, so ten batches.
+  // Asserted as a range rather than exactly ten, because the point is that the
+  // budget bounded the batch and not that it bounded it to a particular number.
+  EXPECT_GE(batches, 8) << "the byte budget did not split the batch: " << batches;
+  EXPECT_LE(batches, 12) << "the byte budget split the batch too far: " << batches;
+
+  {
+    pglaswell::ReadSession r(cfg);
+    EXPECT_EQ(r.txn().exec("SELECT count(*) FROM wide_keys WHERE flag IS NULL")[0][0].as<int>(), 0)
+        << "rows were left behind";
+  }
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test");
+    w.txn().exec("DROP TABLE wide_keys");
+    w.commit();
+  }
+
+  // And a budget smaller than one key still makes progress rather than spinning:
+  // the first key is always admitted.
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test");
+    w.txn().exec("CREATE TABLE wide_keys (k text PRIMARY KEY, flag boolean)");
+    w.txn().exec("INSERT INTO wide_keys VALUES (repeat('x', 500), NULL)");
+    w.commit();
+  }
+  {
+    pglaswell::WriteSession b(cfg);
+    b.begin("pg_laswell/test/bytes-tiny");
+    const auto out = pglaswell::run_paced_batch(b.txn(), select_sql, apply_sql,
+                                                std::string(), 1000, /*batch_bytes=*/1);
+    b.commit();
+    EXPECT_EQ(out.considered, 1)
+        << "a budget below one key must still admit one, or the walk spins on it";
+  }
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test");
+    w.txn().exec("DROP TABLE wide_keys");
+    w.commit();
+  }
+}
+
+TEST(Executor, AGroupCursorRoundTripsAndRefusesWhatItCannotRead) {
+  // The cursor of a grouped walk says WHICH group value and HOW
+  // FAR into it. A misread does not fail loudly: it resumes at the start of some
+  // group, silently redoing or skipping a whole shard, and the job reports
+  // success. So the decoder refuses anything it cannot read, and this asserts
+  // both halves of that.
+  using pglaswell::GroupCursor;
+
+  // Round trip, including the values a delimiter-based encoding would ruin.
+  for (const auto& pair : std::vector<std::pair<std::string, std::string>>{
+           {"3", "800"},
+           {"tenant,with,commas", "key\"with\"quotes"},
+           {"", ""},
+           {"5", ""},
+           {std::string("unit\x1f") + "separator", std::string("and\x1f") + "another"}}) {
+    GroupCursor out;
+    ASSERT_TRUE(GroupCursor::decode(
+        GroupCursor{pair.first, pair.second}.encode(), out))
+        << pair.first << " / " << pair.second;
+    EXPECT_EQ(out.group, pair.first);
+    EXPECT_EQ(out.key, pair.second);
+  }
+
+  // The fresh-start sentinel resume_cursor returns when there is nothing to
+  // resume. Accepted BY NAME, and it cannot collide with a real cursor because
+  // a real one is always a JSON array.
+  {
+    GroupCursor out{"x", "y"};
+    EXPECT_TRUE(GroupCursor::decode("0", out));
+    EXPECT_TRUE(GroupCursor::decode("", out));
+  }
+
+  // Everything else it cannot read is refused rather than guessed at. Each of
+  // these would otherwise be read as "the beginning", which is the failure the
+  // decoder exists to prevent.
+  for (const char* bad : {"800",              // a plain key: an OLD cursor format
+                          "[\"3\"]",           // one element
+                          "[\"3\",\"8\",\"9\"]",  // three
+                          "[3,800]",          // numbers, not strings
+                          "{\"group\":\"3\"}",   // an object
+                          "not json at all",
+                          "[\"3\",null]"}) {
+    GroupCursor out;
+    EXPECT_FALSE(GroupCursor::decode(bad, out))
+        << "read as a cursor when it is not one: " << bad;
+  }
+}
+
 // --- conformance: every kind, executed ------------------------------------
 
 #include "conformance.inc"
@@ -10885,18 +11436,13 @@ TEST_F(DatabaseTest, EveryIntentKindPlansAndRunsAgainstARealDatabase) {
         // is being tested -- a batch statement that only works inside the
         // executor is a batch statement nobody can check.
         if (step.txn_class == pglaswell::TxnClass::kOwnTxnPerBatch) {
-          std::string cursor = "0";
-          for (int pass = 0; pass < 100; ++pass) {
-            pglaswell::WriteSession b(cfg);
-            b.begin("pg_laswell/conformance/batch");
-            const auto rows =
-                pglaswell::pqxx_exec(b.txn(), trimmed,
-                                     pqxx::params{cursor, 1000});
-            for (const auto& row : rows) cursor = row[0].as<std::string>();
-            b.commit();
-            if (rows.empty()) break;
-          }
-          continue;
+          // Driven through the executor's OWN batch driver, not a copy of it.
+          // The copy that used to live here ran every statement of the step with
+          // the cursor and batch parameters, which broke the moment a batch
+          // became a selection plus an apply -- exactly the drift this comment
+          // used to warn about while demonstrating it.
+          drive_paced_step(cfg, step, "pg_laswell/conformance/batch");
+          break;  // the whole step is driven at once, statements and all
         }
         // The plan says which statements cannot run in a transaction block;
         // honouring that here is part of what is being tested.
@@ -11117,17 +11663,8 @@ TEST_F(DatabaseTest, ReservedWordIdentifiersAreQuotedEverywhereTheyAreEmitted) {
       for (const auto& q : step.sql) {
         const auto trimmed = q.substr(0, q.size() - 1);
         if (step.txn_class == pglaswell::TxnClass::kOwnTxnPerBatch) {
-          std::string cursor = "0";
-          for (int pass = 0; pass < 100; ++pass) {
-            pglaswell::WriteSession b(cfg);
-            b.begin("pg_laswell/test/reserved-batch");
-            const auto rows = pglaswell::pqxx_exec(
-                b.txn(), trimmed, pqxx::params{cursor, 1000});
-            for (const auto& row : rows) cursor = row[0].as<std::string>();
-            b.commit();
-            if (rows.empty()) break;
-          }
-          continue;
+          drive_paced_step(cfg, step, "pg_laswell/test/reserved-batch");
+          break;  // the whole step is driven at once, statements and all
         }
         pglaswell::WriteSession w(cfg);
         try {
@@ -11240,11 +11777,24 @@ class DeployTest : public RepoTest {
     return {result, out.str()};
   }
 
+  // --dry-run=chain. Separate from deploy() so no existing call gains a flag it
+  // did not ask for.
+  std::pair<pglaswell::DeployResult, std::string> deploy_chain() {
+    std::ostringstream out;
+    pglaswell::DeployOptions opts;
+    opts.repo = dir_;
+    opts.dry_run = true;
+    opts.chain = true;
+    opts.poll_ms = 50;
+    opts.out = &out;
+    pglaswell::Deployment run(*ctx_, opts);
+    const auto result = run.run();
+    return {result, out.str()};
+  }
+
   int column_count(const std::string& table, const std::string& column) {
     pglaswell::ReadSession r(cfg());
-    return pglaswell::pqxx_exec(
-               r.txn(),
-               "SELECT count(*) FROM pg_attribute WHERE attrelid = $1::regclass"
+    return r.txn().exec("SELECT count(*) FROM pg_attribute WHERE attrelid = $1::regclass"
                " AND attname = $2 AND NOT attisdropped",
                pqxx::params{"shop." + table, column})[0][0]
         .as<int>();
@@ -11768,8 +12318,7 @@ TEST_F(TwoDatabaseTest, DeployAppliesEachSpecificationInItsOwnDatabase) {
     c.name = "probe";
     c.conninfo = url;
     pglaswell::ReadSession r(c);
-    return pglaswell::pqxx_exec(
-               r.txn(), "SELECT count(*) FROM pg_class c JOIN pg_namespace n"
+    return r.txn().exec("SELECT count(*) FROM pg_class c JOIN pg_namespace n"
                         " ON n.oid = c.relnamespace WHERE n.nspname = 'public'"
                         " AND c.relname = $1", pqxx::params{t})[0][0].as<int>();
   };
@@ -11786,8 +12335,7 @@ TEST_F(TwoDatabaseTest, DeployAppliesEachSpecificationInItsOwnDatabase) {
     c.name = "probe";
     c.conninfo = url;
     pglaswell::ReadSession r(c);
-    return pglaswell::pqxx_exec(
-               r.txn(), "SELECT count(*) FROM laswell.migration WHERE spec_id = $1",
+    return r.txn().exec("SELECT count(*) FROM laswell.migration WHERE spec_id = $1",
                pqxx::params{id})[0][0].as<int>();
   };
   EXPECT_EQ(ledger_has(url_, "0001-producer"), 1);
@@ -11917,10 +12465,178 @@ TEST_F(DeployTest, ADryRunSaysWhyASpecWasRefusedWhenThereIsNoPlanToShow) {
   EXPECT_EQ(result, pglaswell::DeployResult::kRefused) << text;
   EXPECT_NE(text.find("untrusted"), std::string::npos) << text;
   // The point of the test: a reason, not just the verdict.
-  EXPECT_NE(text.find("REFUSED"), std::string::npos) << text;
+  //
+  // "not accepted", the same words the apply path uses. This branch covers a
+  // spec that never got as far as a plan -- an untrusted signature, or a plan
+  // the dry run rejected -- and it used to say REFUSED here and "not accepted"
+  // there for the identical condition, which reads as two different outcomes.
+  // REFUSED is kept for a plan that WAS built and rejected on its conflicts.
+  EXPECT_NE(text.find("not accepted"), std::string::npos) << text;
   EXPECT_NE(text.find("not accepted by this machine"), std::string::npos)
       << "the refusal must say WHY, and this is the gate that said no:\n" << text;
   EXPECT_EQ(column_count("orders", "cu"), 0) << "a dry run applied something";
+}
+
+TEST_F(DeployTest, AFailedMigrationIsRetriedAndResumesWhereItStopped) {
+  // Two defects, found together by asking what happens when a backfill fails
+  // partway.
+  //
+  // The deployment acted on "pending" alone. A spec whose last job FAILED was
+  // listed with no status, not counted and not run, and the run exited 0 --
+  // measured: 400 of 800 rows done, and every later run said "0 pending".
+  //
+  // And the resume the executor was built for could not happen for most keys:
+  // the staleness check cast the recorded cursor as $1::bigint, threw on a text
+  // key, and a check that throws is read as "stale" -- so the retry quietly
+  // started over. The predicate hides rows already done, so the outcome looked
+  // identical; only where the retry STARTED differs, and nothing recorded that.
+  exec("DROP SCHEMA IF EXISTS shop CASCADE");
+  exec("CREATE SCHEMA shop");
+  exec("CREATE TABLE shop.tk (k text PRIMARY KEY, flag boolean)");
+  exec("INSERT INTO shop.tk SELECT 'k' || lpad(g::text, 4, '0'), NULL"
+       " FROM generate_series(1, 400) g");
+  // Blocks the second half, so the first run commits some batches and fails.
+  exec("ALTER TABLE shop.tk ADD CONSTRAINT tk_block CHECK (NOT (k > 'k0200' AND flag))");
+
+  // A commit per batch, or the whole walk is one transaction and the failure
+  // rolls every row back -- correct, and not the case under test. batch_cap_rows
+  // is what forces it: each 25-row batch reaches the cap and commits.
+  //
+  // NOT commit_interval_ms = 1, which this first used. The executor sets
+  // idle_in_transaction_session_timeout to three times it, so 1 ms made it 3 ms,
+  // and under valgrind the gap between a batch's selection and its apply is
+  // longer than that: the server terminated the connection, as the self-guard
+  // asks it to, and the test failed with "Lost connection" in CI's valgrind job.
+  auto& e = ctx_->registry.mutable_get(ctx_->registry.default_name()).executor;
+  e.batch_rows = 25;
+  e.batch_cap_rows = 25;
+
+  write_spec("0001.json",
+             json{{"laswell_spec_version", 1},
+                  {"id", "0001-text-key"},
+                  {"description", "a backfill keyed on text"},
+                  {"intents", json::array({json{{"kind", "backfill"},
+                                                {"schema", "shop"},
+                                                {"table", "tk"},
+                                                {"key", "k"},
+                                                {"set", {{"flag", "true"}}},
+                                                {"where", "flag IS NULL"}}})}});
+
+  const auto [first, first_text] = deploy();
+  EXPECT_NE(first, pglaswell::DeployResult::kOk) << first_text;
+
+  // The half-done state, and the status run over it. Exiting 0 here would tell
+  // a pipeline the database is where the repository says it is.
+  const auto [status, status_text] = deploy(/*dry_run=*/false, /*status_only=*/true);
+  EXPECT_NE(status, pglaswell::DeployResult::kOk)
+      << "a failed migration is unfinished work:\n" << status_text;
+  EXPECT_NE(status_text.find("will be retried"), std::string::npos) << status_text;
+
+  exec("ALTER TABLE shop.tk DROP CONSTRAINT tk_block");
+  const auto [second, second_text] = deploy();
+  EXPECT_EQ(second, pglaswell::DeployResult::kOk) << second_text;
+  EXPECT_NE(second_text.find("1 retried"), std::string::npos) << second_text;
+
+  pglaswell::ReadSession r(cfg());
+  EXPECT_EQ(r.txn().exec("SELECT count(*) FROM shop.tk WHERE flag IS NULL")[0][0].as<int>(), 0)
+      << "the retry did not finish the walk";
+  // Where the retry STARTED. Not from the top: from the last committed key of
+  // the failed run, which is at or below k0200 and not empty.
+  const auto resumed = r.txn().exec(
+      "SELECT s.detail->>'resumedFrom' FROM laswell.step s"
+      "  JOIN laswell.job j USING (job_id) WHERE j.state = 'succeeded'"
+      "  AND j.migration_id = (SELECT migration_id FROM laswell.migration"
+      "                         WHERE spec_id = '0001-text-key')");
+  ASSERT_EQ(resumed.size(), 1u);
+  ASSERT_FALSE(resumed[0][0].is_null())
+      << "the retry started over: a text-keyed cursor was read as stale";
+  const auto from = resumed[0][0].as<std::string>();
+  EXPECT_GT(from, std::string("k0000")) << from;
+  EXPECT_LE(from, std::string("k0200")) << from;
+}
+
+namespace {
+json create_table_spec(const std::string& id, const std::string& table,
+                       const std::vector<std::string>& deps = {}) {
+  json d{{"laswell_spec_version", 1},
+         {"id", id},
+         {"description", "creates " + table},
+         {"intents", json::array({json{
+             {"kind", "create_table"}, {"schema", "shop"}, {"table", table},
+             {"columns", json::array({json{{"name", "id"}, {"type", "bigint"},
+                                           {"nullable", false},
+                                           {"comment", "Key."}}})},
+             {"primary_key", json::array({"id"})},
+             {"comment", "A table the chain creates."}}})}};
+  if (!deps.empty()) d["depends_on"] = deps;
+  return d;
+}
+}  // namespace
+
+TEST_F(DeployTest, AChainRehearsesWhatAPlainDryRunCannot) {
+  // Reported by a lab converting schemas to specifications: a plain dry run
+  // plans each specification against the database as it is NOW, so in a
+  // repository nobody has applied yet the second is refused for a table only
+  // the first would have created. "Does this repository build its schema?" had
+  // no answer short of applying it.
+  exec("DROP SCHEMA IF EXISTS shop CASCADE");
+  exec("CREATE SCHEMA shop");
+  write_spec("0001.json", create_table_spec("0001-create", "chained"));
+  write_spec("0002.json", add_column_spec("0002-extend", "chained", "note",
+                                          {"0001-create"}));
+
+  const auto [plain, plain_text] = deploy(/*dry_run=*/true);
+  EXPECT_EQ(plain, pglaswell::DeployResult::kRefused) << plain_text;
+  EXPECT_NE(plain_text.find("does not exist"), std::string::npos) << plain_text;
+
+  const auto [chain, chain_text] = deploy_chain();
+  EXPECT_EQ(chain, pglaswell::DeployResult::kOk) << chain_text;
+  EXPECT_NE(chain_text.find("0001-create: rehearsed"), std::string::npos) << chain_text;
+  EXPECT_NE(chain_text.find("0002-extend: rehearsed"), std::string::npos) << chain_text;
+
+  // And NOTHING of it survives: no table, no ledger row.
+  pglaswell::ReadSession r(cfg());
+  EXPECT_EQ(r.txn().exec("SELECT count(*) FROM pg_tables WHERE schemaname = 'shop'"
+                         " AND tablename = 'chained'")[0][0].as<int>(), 0)
+      << "a rehearsal committed DDL";
+  EXPECT_EQ(r.txn().exec("SELECT count(*) FROM laswell.migration"
+                         " WHERE spec_id IN ('0001-create','0002-extend')")[0][0].as<int>(), 0)
+      << "a rehearsal wrote the ledger";
+}
+
+TEST_F(DeployTest, AChainReportsEveryIndependentFailureAndNamesWhatItBlocks) {
+  // One pass, every independent problem: a failing specification is rolled back
+  // to its savepoint and the chain goes on. What depends on it is NOT
+  // rehearsed -- that would report a missing column the failure explains, and
+  // send someone to debug the wrong file -- and it is named, with the cause.
+  exec("DROP SCHEMA IF EXISTS shop CASCADE");
+  exec("CREATE SCHEMA shop");
+  write_spec("0001.json", create_table_spec("0001-create", "chained"));
+  // Valid to parse and plan, refused by PostgreSQL: no such function.
+  json broken = add_column_spec("0002-broken", "chained", "note", {"0001-create"});
+  broken["intents"][0]["default"] = "laswell_no_such_function()";
+  write_spec("0002.json", broken);
+  write_spec("0003.json", add_column_spec("0003-after", "chained", "later",
+                                          {"0002-broken"}));
+  write_spec("0004.json", create_table_spec("0004-independent", "elsewhere"));
+
+  const auto [result, text] = deploy_chain();
+  EXPECT_EQ(result, pglaswell::DeployResult::kRefused) << text;
+  EXPECT_NE(text.find("0001-create: rehearsed"), std::string::npos) << text;
+  EXPECT_NE(text.find("0002-broken"), std::string::npos) << text;
+  EXPECT_NE(text.find("laswell_no_such_function"), std::string::npos)
+      << "the server's own answer must reach the reader:\n" << text;
+  EXPECT_NE(text.find("0003-after: not rehearsed -- depends on 0002-broken"),
+            std::string::npos) << text;
+  EXPECT_NE(text.find("0004-independent: rehearsed"), std::string::npos)
+      << "an independent specification after the failure was not rehearsed:\n"
+      << text;
+  EXPECT_NE(text.find("nothing was committed"), std::string::npos) << text;
+
+  pglaswell::ReadSession r(cfg());
+  EXPECT_EQ(r.txn().exec("SELECT count(*) FROM pg_tables WHERE schemaname = 'shop'")[0][0]
+                .as<int>(), 0)
+      << "a rehearsal committed DDL";
 }
 
 TEST_F(DeployTest, HeldAndNotForHereAreReportedAndAreNotFailures) {
@@ -11992,6 +12708,12 @@ TEST(Conformance, CoversEveryIntentKind) {
     (void)why;
     covered.insert(k);
   }
+  // A vendor module's kinds cannot be proved against a plain PostgreSQL either,
+  // and defer with the same discipline: a reason, not an omission.
+  for (const auto& [k, why] : conformance::deferred_by_modules()) {
+    (void)why;
+    covered.insert(k);
+  }
 
   std::set<std::string> missing;
   for (const auto& [name, kind] : pglaswell::intent_kinds()) {
@@ -12003,13 +12725,61 @@ TEST(Conformance, CoversEveryIntentKind) {
   EXPECT_TRUE(missing.empty())
       << "these intent kinds are never executed against a database: " << list
       << ".\nAdd a case to conformance.inc, or a reason to "
-         "deferred_to_two_clusters() if it genuinely needs a second cluster.";
+         "deferred_to_two_clusters() if it genuinely needs a second cluster, "
+         "or to a module's tests.inc if it needs that vendor's cluster.";
 
-  // And the deferral list must not rot: a kind listed there must still exist.
+  // And the deferral lists must not rot: a kind listed there must still exist.
   for (const auto& [k, why] : conformance::deferred_to_two_clusters()) {
     (void)why;
     EXPECT_EQ(pglaswell::intent_kinds().count(k), 1u)
         << k << " is deferred but is no longer an intent kind";
   }
+  for (const auto& [k, why] : conformance::deferred_by_modules()) {
+    (void)why;
+    EXPECT_EQ(pglaswell::intent_kinds().count(k), 1u)
+        << k << " is deferred by a module but is no longer an intent kind";
+  }
 }
 
+
+// Vendor module planner tests, generated from the enabled module list. Empty
+// for a PostgreSQL-only build.
+//
+// They live here rather than in the module because they need gtest and the
+// helpers above, and here rather than in a separate binary because a module's
+// planner is not a separate program -- it is compiled into this one, and a
+// second binary would be a second thing to remember to run.
+
+// The naming rule, enforced rather than documented: every kind a module
+// declares must carry its module's name. A kind called "distribute_table"
+// looks like something pg_laswell does; "citus_distribute_table" says which
+// module implements it, so the refusal on a PostgreSQL-only build is
+// predictable rather than surprising -- and two modules cannot collide.
+//
+// Derived from the module list rather than hardcoded, so it keeps holding for
+// modules that do not exist yet.
+TEST(Modules, EveryModuleKindCarriesItsModulesName) {
+  const auto modules = pglaswell::Plan::modules();
+  if (modules.empty()) GTEST_SKIP() << "no modules compiled in";
+
+  std::set<std::string> declared;
+#define PGLASWELL_KIND(spec_name, enum_id, parse_fn, plan_fn) \
+  declared.insert(#spec_name);
+#include "modules/enabled_kinds.inc"
+#undef PGLASWELL_KIND
+
+  for (const auto& kind : declared) {
+    bool prefixed = false;
+    for (const auto& m : modules) {
+      const auto prefix = m.get<std::string>() + "_";
+      if (kind.rfind(prefix, 0) == 0) prefixed = true;
+    }
+    EXPECT_TRUE(prefixed)
+        << "\"" << kind << "\" is declared by a module but does not begin with "
+        << "that module's name. A reader of a specification could not tell "
+        << "which binary can run it, and two modules could collide over the "
+        << "name.";
+  }
+}
+
+#include "modules/enabled_planner_tests.h"

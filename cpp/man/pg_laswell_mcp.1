@@ -1,4 +1,4 @@
-.Dd September 5, 2026
+.Dd September 25, 2026
 .Dt PG_LASWELL_MCP 1
 .Os
 .Sh NAME
@@ -290,16 +290,53 @@ bounds the attempt, so planning can never queue behind anything.
 cannot run inside a transaction block, so it is listed as unverified rather
 than silently passed.
 .It
-Statements are planned with
+Queries are planned with
 .Ic EXPLAIN Pq Cm GENERIC_PLAN ,
 never executed, and
 .Cm ANALYZE
 is never used.
+Where the server cannot plan generically -- any Citus table -- the query is
+checked with
+.Ic PREPARE
+instead, which catches a malformed statement but not one an extension will
+refuse to route, and the step is reported as unverified with the reason.
+A step whose statements change the schema through a function call
+.Pq Citus's Fn create_distributed_table
+is executed like any other DDL, because planning a
+.Ic SELECT
+would not run it.
 .El
 .Pp
 Pass
 .Va dryRun
 false to decline it.
+.Pp
+.Em A dry run answers for one specification at a time.
+Each is planned against the database as it is now, so in a repository that has
+not been applied yet, a specification needing a table that an earlier
+.Em pending
+one creates is refused -- not because it is wrong, but because the table does
+not exist yet.
+To check a whole repository before it is applied, rehearse it as a chain:
+.Bd -literal -offset indent
+pg_laswell --repo ./migrations --dry-run=chain
+.Ed
+.Pp
+The chain takes every pending specification in dependency order, in one
+transaction per database with a savepoint for each, and plans each against the
+schema the ones before it produced -- the reading is taken through that same
+transaction, so it sees their uncommitted work.
+A specification that fails is rolled back to its savepoint and reported, and the
+chain continues; anything that depends on it is reported as not rehearsed, with
+the cause, rather than failing for a reason the earlier failure explains.
+Everything is rolled back at the end.
+.Pp
+It holds every lock every specification takes until that final rollback, so it
+is for an empty database or a restored copy.
+Against production it would block the application for the length of the run,
+which is why it is a separate mode and not what
+.Fl -dry-run
+does.
 .Sh PACING
 A backfill walks the table by keyset and commits on whichever comes first:
 .Bl -tag -width Ds -compact
@@ -503,53 +540,113 @@ so a direct call cannot route around the listing.
 The set of kinds a binary knows is exactly the set it implements: there is no
 recognised-but-unsupported kind, and an unknown one refuses the whole
 specification rather than skipping a step.
-This build implements
+Core implements the kinds below.
+A vendor's kinds come from a build-time module and are documented separately:
+see
+.Sx MODULES .
+.\" BEGIN CORE KIND LIST -- checked by tools/check-manual.py against
+.\" intent_kinds() in cpp/src/spec.h. Do not edit by hand without re-running it.
+.Bl -tag -width "Schemas and extensions" -compact
+.It Columns
 .Cm add_column ,
-.Cm backfill ,
+.Cm drop_column ,
+.Cm alter_column_type ,
+.Cm alter_column_default ,
+.Cm set_not_null ,
+.Cm drop_not_null ,
+.Cm drop_expression ,
+.Cm set_identity ,
+.Cm set_column_options ,
+.Cm rename_column .
+.It Indexes
 .Cm create_index ,
 .Cm drop_index ,
-.Cm set_not_null ,
+.Cm cluster_on .
+.It Constraints
+.Cm add_primary_key ,
+.Cm add_unique_constraint ,
 .Cm add_foreign_key ,
 .Cm add_check_constraint ,
 .Cm drop_constraint ,
-.Cm alter_column_type ,
-.Cm drop_column ,
-.Cm replace_view ,
-.Cm add_unique_constraint ,
-.Cm add_primary_key ,
-.Cm attach_partition ,
-.Cm detach_partition ,
-.Cm rename_table ,
-.Cm rename_column ,
-.Cm rename_constraint ,
+.Cm rename_constraint .
+.It Tables
 .Cm create_table ,
+.Cm create_table_as ,
 .Cm drop_table ,
+.Cm rename_table ,
+.Cm set_table_options ,
+.Cm set_tablespace ,
+.Cm set_access_method ,
+.Cm set_logged ,
+.Cm set_replica_identity ,
+.Cm attach_partition ,
+.Cm detach_partition .
+.It Data
+.Cm insert_rows ,
+.Cm update_rows ,
 .Cm delete_rows ,
-.Cm set_row_security ,
-.Cm create_policy ,
-.Cm drop_policy ,
-.Cm set_trigger_state ,
-.Cm grant ,
-.Cm revoke ,
+.Cm merge_rows ,
+.Cm copy_rows ,
+.Cm backfill .
+.It Views
+.Cm replace_view ,
+.Cm drop_view ,
+.Cm alter_view ,
+.Cm create_materialized_view .
+.It Schemas and extensions
 .Cm create_schema ,
+.Cm alter_schema ,
 .Cm drop_schema ,
 .Cm create_extension ,
-.Cm drop_extension ,
+.Cm alter_extension ,
+.Cm drop_extension .
+.It Types
 .Cm create_type ,
 .Cm drop_type ,
 .Cm add_enum_value ,
+.Cm alter_domain .
+.It Routines
 .Cm create_function ,
+.Cm alter_function ,
 .Cm drop_function ,
 .Cm create_trigger ,
 .Cm drop_trigger ,
+.Cm set_trigger_state ,
+.Cm create_rule ,
+.Cm drop_rule .
+.It Sequences
 .Cm create_sequence ,
-.Cm drop_sequence ,
-.Cm drop_view ,
-.Cm insert_rows ,
-.Cm update_rows ,
-.Cm merge_rows
-and
-.Cm copy_rows .
+.Cm alter_sequence ,
+.Cm drop_sequence .
+.It Statistics
+.Cm create_statistics ,
+.Cm drop_statistics .
+.It Replication
+.Cm create_publication ,
+.Cm alter_publication ,
+.Cm drop_publication ,
+.Cm create_subscription ,
+.Cm alter_subscription ,
+.Cm drop_subscription .
+.It Privileges
+.Cm grant ,
+.Cm revoke ,
+.Cm alter_default_privileges ,
+.Cm set_row_security ,
+.Cm create_policy ,
+.Cm alter_policy ,
+.Cm drop_policy ,
+.Cm security_label ,
+.Cm set_owner .
+.It Any object
+.Cm create_object ,
+.Cm alter_object ,
+.Cm drop_object ,
+.Cm set_comment .
+.It Foreign data
+.Cm import_foreign_schema .
+.El
+.\" END CORE KIND LIST
 .Pp
 An intent that creates an object must carry a
 .Va comment ,
@@ -649,6 +746,39 @@ gives them.
 requires an explicit
 .Va name ,
 because a derived name is a name nobody can search for during an incident.
+.Pp
+Each entry of
+.Va columns
+is a column name, or an object saying more about that position:
+.Va name
+or
+.Va expression
+.Pq exactly one of the two ,
+with any of
+.Va direction
+.Pq Cm asc | Cm desc ,
+.Va nulls
+.Pq Cm first | Cm last
+and
+.Va opclass .
+A sibling
+.Va include
+lists covering columns, which are stored in the index but not part of its key.
+.Bd -literal -offset indent
+"columns": [
+  "account_id",
+  {"name": "ts", "direction": "desc"},
+  {"expression": "lower(name)"}
+],
+"include": ["status"]
+.Ed
+.Pp
+An index differing only in a column's direction or operator class is a
+.Em different
+index, and is treated as one: an existing index is adopted or renamed only when
+its ordering and operator classes match as well as its columns.
+Where every key column is exactly reversed, the plan says so and builds nothing,
+because a btree scans backwards at the same cost.
 .Va on_equivalent_index
 selects what happens when an equivalent index already exists under a different
 name:
@@ -1469,6 +1599,94 @@ to a wider precision at the same scale, and a widened timestamp precision --
 and assumes a rewrite otherwise, because reporting one that does not happen
 costs a cautious plan while missing one is an unplanned outage under
 .Va AccessExclusiveLock .
+.Sh MODULES
+The core binary speaks PostgreSQL and nothing else.
+Support for a vendor's extensions -- distribution, sharding, anything whose
+behaviour is not PostgreSQL's -- is a
+.Em build-time module ,
+so that a deployment which does not run that vendor carries none of its code and
+none of its assumptions.
+.Pp
+Modules are chosen when the binary is configured:
+.Bd -literal -offset indent
+cmake -S cpp -B build -DPGLASWELL_MODULES=citus
+.Ed
+.Pp
+The released package is built with every module, so
+.Xr pg_laswell_citus 7
+is installed beside this page.
+A module's kinds are refused where its extension is absent, and a server without
+the extension plans exactly as a build without the module would.
+.Pp
+.Fl -version
+names the set a binary was built with, and says nothing when it was built with
+none:
+.Bd -literal -offset indent
+$ pg_laswell_mcp --version
+0.1.2
+modules: citus
+.Ed
+.Pp
+This matters because two binaries with the same version string accept different
+kinds.
+A binary built without a module does not recognise that module's kinds, and an
+unrecognised kind refuses the whole specification -- the same rule as any other
+unknown kind, not a special case for modules.
+So a specification naming
+.Cm citus_distribute_table
+is refused outright by a stock build, rather than skipped or approximated.
+.Pp
+The module set is
+.Em not
+hashed into
+.Va planDigest .
+For a specification a binary can plan at all, the module set does not change a
+single statement; one it cannot plan is refused outright.
+Hashing it would change every existing digest and make two builds disagree about
+specifications they handle identically.
+.Pp
+A module may add kinds, may add readings of its own, and may refuse -- including
+refusing a
+.Em core
+kind whose plan would be wrong on that vendor's topology.
+It may also
+.Em inform
+core: answer a question core asks, after which core decides what to emit.
+There is one such question, and it is how the same
+.Cm backfill
+runs on plain PostgreSQL and on a distributed table: must row-locking batches on
+this table be confined to single values of a column, and which?
+Where a module answers, the step records the reading as
+.Va confined_by
+and its reason names it, and because the statements differ so does
+.Va planDigest .
+.Pp
+What a module may not do is emit or rewrite SQL for a core kind, or shape a plan
+for a table it has no reading about.
+For such a table a build with the module and one without it emit the same
+statements, and that is tested.
+The boundary is enforced by the build rather than asked for in review; see
+.Pa cpp/src/modules/README.md
+in the source.
+.Pp
+This is what lets one configuration serve several targets.
+The same repository can run against plain PostgreSQL in development and a Citus
+cluster in staging: a specification never names its vendor to do an ordinary
+thing, and the binary adapts per target through what it reads.
+.Pp
+Every kind a module adds carries the module's name as its prefix, so
+.Cm citus_distribute_table
+rather than
+.Cm distribute_table :
+a specification says which vendor it needs, and two vendors cannot collide on a
+kind name.
+.Ss Available modules
+.Bl -tag -width Ds
+.It Cm citus
+Citus: distributed tables, reference tables and distributed functions, plus
+refusals for a distributed topology.
+.Xr pg_laswell_citus 7
+.El
 .Sh PREREQUISITES
 Some migrations need something done that this program cannot do, often on a
 machine it is not connected to: a replication slot on the publisher, a package
@@ -1739,6 +1957,29 @@ at or above
 .Va pause_waiters
 would make the breaker flap, and is refused when the file is read rather than
 discovered during a migration.
+.Pp
+A key with a dot in a connection section is a
+.Em module setting
+for that connection:
+.Va citus.workers
+belongs to the Citus module.
+It is refused when the file is read if this binary has no module of that name,
+because a setting nothing reads would look configured and do nothing.
+Module settings describe the target, not the change, so they are the place for
+what differs between clusters that run the same signed specifications:
+.Bd -literal -offset indent
+[staging]
+service       = shop-staging
+citus.workers = st-w1, st-w2, st-w3
+
+[production]
+service       = shop-prod
+citus.workers = pr-w1, pr-w2, pr-w3, pr-w4, pr-w5, pr-w6
+.Ed
+.Pp
+See
+.Xr pg_laswell_citus 7 ,
+.Cm citus_ensure_workers .
 .Ss The connection budget
 .Va app_pool_size
 is the application's own connection-pool limit.
@@ -1877,8 +2118,10 @@ pg_laswell_mcp --call planMigration --args @spec-args.json \e
 .Ed
 .Sh SEE ALSO
 .Xr openssl 1 ,
+.Xr pg_laswell 1 ,
 .Xr pg_licht_mcp 1 ,
-.Xr psql 1
+.Xr psql 1 ,
+.Xr pg_laswell_citus 7
 .Sh STANDARDS
 Model Context Protocol, revisions 2024-11-05 through 2025-11-25, over stdio
 using JSON-RPC 2.0.

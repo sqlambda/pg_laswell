@@ -60,10 +60,43 @@ enum class IntentKind { kAddColumn, kBackfill, kCreateIndex, kDropIndex,
                         kCreateObject, kDropObject, kAlterObject,
                         kCreateTableAs, kImportForeignSchema, kSecurityLabel,
                         kAlterDefaultPrivileges,
-                        kInsertRows, kUpdateRows, kMergeRows, kCopyRows };
+                        kInsertRows, kUpdateRows, kMergeRows, kCopyRows,
+// Vendor module kinds. Generated from the enabled module list, so core names no
+// vendor -- and the enum is still CLOSED at compile time, which is what keeps
+// every switch over it exhaustive under -Wswitch -Werror. A runtime registry
+// would have traded that compiler guarantee for a test.
+#define PGLASWELL_KIND(spec_name, enum_id, parse_fn, plan_fn) enum_id,
+#include "modules/enabled_kinds.inc"
+#undef PGLASWELL_KIND
+};
+
+// Did a MODULE declare this kind, or is it core's?
+//
+// constexpr so the hooks below can static_assert on it. An audit found that
+// object_key_for and conflict_keys would happily accept a module naming a CORE
+// kind -- the compiler caught only the kinds core already cased, and said
+// nothing about the ones core leaves to `default:`. A module answering for
+// kAddColumn would have changed how a core kind plans, which is the forbidden
+// shape.
+//
+// Generated from the same list the enum arms come from, so it cannot drift from
+// what a module actually declared.
+constexpr bool is_module_kind(IntentKind k) {
+  switch (k) {
+#define PGLASWELL_KIND(spec_name, enum_id, parse_fn, plan_fn) \
+    case IntentKind::enum_id: return true;
+#include "modules/enabled_kinds.inc"
+#undef PGLASWELL_KIND
+    default: return false;
+  }
+}
 
 inline const std::map<std::string, IntentKind>& intent_kinds() {
   static const std::map<std::string, IntentKind> kKinds = {
+#define PGLASWELL_KIND(spec_name, enum_id, parse_fn, plan_fn) \
+      {#spec_name, IntentKind::enum_id},
+#include "modules/enabled_kinds.inc"
+#undef PGLASWELL_KIND
       {"add_column", IntentKind::kAddColumn},
       {"backfill", IntentKind::kBackfill},
       {"create_index", IntentKind::kCreateIndex},
@@ -195,6 +228,17 @@ inline std::string object_key_for(const Intent& in) {
     case IntentKind::kCreateSequence:
     case IntentKind::kDropSequence:
     case IntentKind::kAlterSequence:   return "sequence:" + schema + "." + name;
+// A module's kinds that plan against a non-relation object say so here. The
+// comment above records what a kind missing from this switch cost: it read back
+// as absent, for a whole batch of kinds, found only end-to-end.
+#define PGLASWELL_OBJECT_KEY(enum_id, expr)                                     \
+    case IntentKind::enum_id:                                                   \
+      static_assert(is_module_kind(IntentKind::enum_id),                        \
+                    "a module may only answer for kinds IT declared; naming a " \
+                    "core kind here would change how a core kind plans");       \
+      return expr;
+#include "modules/enabled_keys.inc"
+#undef PGLASWELL_OBJECT_KEY
     default:                           return {};
   }
 }
@@ -229,6 +273,20 @@ inline std::vector<std::string> conflict_keys(const Intent& in) {
   // between two intents naming the same thing -- a column of a type against a
   // drop of that type, a trigger against the function it calls.
   switch (in.kind) {
+// A module's extra conflict edges. Citus adds one single-node PostgreSQL has
+// no equivalent of: two tables in the same colocation group conflict for
+// alter_distributed_table and a rebalance, though they share no name.
+// Variadic for the same reason PGLASWELL_PROJECT is: the block is C++ and its
+// commas are not the preprocessor's to split on.
+#define PGLASWELL_CONFLICT_KEYS(enum_id, ...)                                    \
+    case IntentKind::enum_id: {                                                  \
+      static_assert(is_module_kind(IntentKind::enum_id),                         \
+                    "a module may only answer for kinds IT declared; adding an " \
+                    "edge for a core kind would change how a core kind is "      \
+                    "grouped");                                                  \
+      __VA_ARGS__ return keys; }
+#include "modules/enabled_keys.inc"
+#undef PGLASWELL_CONFLICT_KEYS
     case IntentKind::kAddColumn:
     case IntentKind::kAlterColumnType: {
       // A column's type may be a user-defined one in any schema. Unqualified
@@ -573,8 +631,8 @@ inline void parse_create_index(Intent& in) {
   const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
   detail::reject_unknown_keys(
       in.body,
-      {"kind", "schema", "table", "name", "columns", "unique", "method",
-       "where", "comment", "on_equivalent_index"},
+      {"kind", "schema", "table", "name", "columns", "include", "unique",
+       "method", "where", "comment", "on_equivalent_index"},
       at);
   detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
   detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
@@ -586,9 +644,92 @@ inline void parse_create_index(Intent& in) {
       in.body["columns"].empty()) {
     detail::fail(at + " needs a non-empty \"columns\" array", "");
   }
+  // A column is a bare name, or an object saying more about it. The string form
+  // is unchanged and stays canonical, so every specification written before this
+  // parses to the same bytes and no applied migration is disturbed.
+  //
+  // The object form exists because an index PostgreSQL accepts was unreachable:
+  // require_identifier admits "ts" and refuses "ts DESC", "lower(name)" and
+  // "a text_pattern_ops" alike. A schema needing a functional index could not
+  // put its table in a repository at all -- not the index, the whole table,
+  // because the index had to be applied somewhere and that somewhere was then
+  // outside the ledger.
   for (const auto& c : in.body["columns"]) {
-    if (!c.is_string()) detail::fail(at + ".columns entries must be strings", "");
-    detail::require_identifier(c.get<std::string>(), "columns", in.ordinal);
+    if (c.is_string()) {
+      detail::require_identifier(c.get<std::string>(), "columns", in.ordinal);
+      continue;
+    }
+    if (!c.is_object()) {
+      detail::fail(at + ".columns entries must be a column name or an object",
+                   "A string is the column name. An object takes \"name\" or "
+                   "\"expression\", plus any of \"direction\", \"nulls\" "
+                   "and \"opclass\".");
+    }
+    detail::reject_unknown_keys(
+        c, {"name", "expression", "direction", "nulls", "opclass"},
+        at + ".columns");
+    const bool has_name = c.contains("name");
+    const bool has_expr = c.contains("expression");
+    if (has_name == has_expr) {
+      detail::fail(at + ".columns entries need exactly one of \"name\" and "
+                        "\"expression\"",
+                   "\"name\" indexes a column; \"expression\" indexes the "
+                   "result of an expression over the row. An entry with both, "
+                   "or neither, does not say what to index.");
+    }
+    if (has_name) {
+      detail::require_identifier(detail::require_string(c, "name", at + ".columns"),
+                                 "name", in.ordinal);
+    } else {
+      // Raw SQL, like "where" on the same intent: an expression cannot be an
+      // identifier and there is nothing to validate it against without a
+      // server. It is signed with the rest of the specification, which is what
+      // makes it reviewable.
+      if (detail::require_string(c, "expression", at + ".columns").empty()) {
+        detail::fail(at + ".columns expression must not be empty", "");
+      }
+    }
+    if (c.contains("direction")) {
+      const auto d = c["direction"];
+      if (!d.is_string() || (d != "asc" && d != "desc")) {
+        detail::fail(at + ".columns direction must be \"asc\" or \"desc\"", "");
+      }
+    }
+    if (c.contains("nulls")) {
+      const auto n = c["nulls"];
+      if (!n.is_string() || (n != "first" && n != "last")) {
+        detail::fail(at + ".columns nulls must be \"first\" or \"last\"",
+                     "PostgreSQL defaults to NULLS LAST for ASC and NULLS "
+                     "FIRST for DESC; state it only when you want the other.");
+      }
+    }
+    if (c.contains("opclass")) {
+      detail::require_identifier(
+          detail::require_string(c, "opclass", at + ".columns"), "opclass",
+          in.ordinal);
+    }
+  }
+
+  // Covering columns: stored in the index but not part of its key, so they
+  // answer a query from the index without ordering or restricting anything.
+  if (in.body.contains("include")) {
+    if (!in.body["include"].is_array() || in.body["include"].empty()) {
+      detail::fail(at + ".include must be a non-empty array of column names", "");
+    }
+    for (const auto& c : in.body["include"]) {
+      if (!c.is_string()) {
+        detail::fail(at + ".include entries must be column names", "");
+      }
+      detail::require_identifier(c.get<std::string>(), "include", in.ordinal);
+    }
+    // Measured on 18.6: INCLUDE is a btree/gist feature. A GIN index with
+    // INCLUDE fails 0A000 at execution, which this can say beforehand.
+    const auto method = in.body.value("method", "btree");
+    if (method != "btree" && method != "gist" && method != "spgist") {
+      detail::fail(at + " uses include with method \"" + method + "\"",
+                   "INCLUDE is supported by btree, gist and spgist only. Drop "
+                   "include, or index those columns as key columns.");
+    }
   }
   (void)detail::require_string(in.body, "comment", at);
 
@@ -2152,12 +2293,15 @@ inline void parse_merge_rows(Intent& in) {
 //
 // NO `WITH` OPTIONS, AND THE REASON IS THE CLIENT LIBRARY RATHER THAN A
 // JUDGEMENT. PostgreSQL 17 and 18 added ON_ERROR ignore, LOG_VERBOSITY and
-// REJECT_LIMIT, and they were in an earlier draft of this kind. libpqxx 7.10
-// offers exactly one sanctioned way to send COPY data -- pqxx::stream_to --
-// which builds its own statement and accepts no options; the two entry points
-// that would allow one, connection::raw_connection() and write_copy_line(), are
-// private and reachable only through internal gate classes. Probed against
-// 18.6, stream_to sends:
+// REJECT_LIMIT, and they were in an earlier draft of this kind. libpqxx 8.0.2,
+// the pinned version, offers exactly one sanctioned way to send COPY data --
+// pqxx::stream_to -- which builds its own statement and accepts no options; the
+// two entry points that would allow one, connection::raw_connection() and
+// write_copy_line(), are private and reachable only through internal gate
+// classes, and release_raw_connection() surrenders the whole connection, so it
+// cannot carry a COPY inside a transaction. (Written against 7.10 and checked
+// again against 8.0.2's headers: nothing here changed.) Probed against 18.6,
+// stream_to sends:
 //
 //     COPY cf_probe(id, code) FROM STDIN
 //
@@ -2223,10 +2367,36 @@ inline void parse_create_table(Intent& in) {
   const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
   detail::reject_unknown_keys(
       in.body, {"kind", "schema", "table", "columns", "comment", "primary_key",
-                "partition_by", "unlogged"}, at);
+                "partition_by", "unlogged", "options"}, at);
   detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
   detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
   detail::require_string(in.body, "comment", at);
+  // Storage parameters at creation. The same shape set_table_options takes,
+  // minus "reset": there is nothing to reset on a table being created, and an
+  // accepted key that can never do anything is worse than a refused one.
+  if (in.body.contains("options")) {
+    if (!in.body["options"].is_object()) {
+      detail::fail(at + ".options must be an object of name to value", "");
+    }
+    for (const auto& [k, v] : in.body["options"].items()) {
+      detail::require_identifier(k, "options", in.ordinal);
+      if (!v.is_string() && !v.is_number()) {
+        detail::fail(at + ".options." + k + " must be a string or a number", "");
+      }
+    }
+    // Measured on 18.6: CREATE TABLE ... PARTITION BY ... WITH (fillfactor)
+    // fails 42809, "cannot specify storage parameters for a partitioned
+    // table". A partitioned parent holds no rows, so it has no storage to
+    // parametrise. Both keys are in the specification, so this needs no
+    // reading of the database and is refused here rather than at execution.
+    if (in.body.contains("partition_by")) {
+      detail::fail(at + " gives storage options to a partitioned table",
+                   "A partitioned parent holds no rows, so PostgreSQL refuses "
+                   "storage parameters on it (42809). Put the options on the "
+                   "leaf partitions -- each is its own create_table -- or drop "
+                   "partition_by.");
+    }
+  }
   if (!in.body.contains("columns") || !in.body["columns"].is_array() ||
       in.body["columns"].empty()) {
     detail::fail(at + ".columns must be a non-empty array",
@@ -2419,6 +2589,12 @@ inline void parse_drop_constraint(Intent& in) {
 
 // Parses and validates a spec document. Throws SpecError, whose hint names the
 // exact thing to change.
+// Vendor modules, included here and not at the top: a module's parser is
+// written against core's own helpers -- reject_unknown_keys, require_string,
+// the Intent shape -- and those have to exist first. Generated, and empty when
+// no module is enabled, so core never names a vendor.
+#include "modules/enabled_modules.h"
+
 inline Spec parse_spec(const json& doc) {
   if (!doc.is_object()) {
     detail::fail("the spec is not a JSON object", "A spec is a single object.");
@@ -2547,6 +2723,10 @@ inline Spec parse_spec(const json& doc) {
     in.ordinal = ordinal;
     in.body = body;
     switch (in.kind) {
+#define PGLASWELL_KIND(spec_name, enum_id, parse_fn, plan_fn) \
+      case IntentKind::enum_id: parse_fn(in); break;
+#include "modules/enabled_kinds.inc"
+#undef PGLASWELL_KIND
       case IntentKind::kAddColumn:   parse_add_column(in);   break;
       case IntentKind::kBackfill:    parse_backfill(in);     break;
       case IntentKind::kCreateIndex: parse_create_index(in); break;

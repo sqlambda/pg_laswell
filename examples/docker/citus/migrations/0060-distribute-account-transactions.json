@@ -1,0 +1,31 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0060-distribute-account-transactions",
+  "description": "Distribute account_transactions, colocated with accounts.",
+  "rationale": "Colocation is what lets the join and the foreign key stay local to one shard.",
+  "target": {
+    "epoch": "citus"
+  },
+  "depends_on": [
+    "0020-account-transactions",
+    "0040-citus-cluster",
+    "0050-distribute-accounts"
+  ],
+  "intents": [
+    {
+      "kind": "citus_distribute_table",
+      "schema": "public",
+      "table": "account_transactions",
+      "distribution_column": "account_id",
+      "comment": "Hash distributed on account_id.",
+      "colocate_with": "public.accounts"
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:0a1ed85ee9747a3a",
+      "algorithm": "ed25519",
+      "signature": "C9FIjsNlugtPM3rtHtR6Ytmmwj3UjLOJOasnvsXrpcfvYP2DvwQazw/LRF3CYaRk0YH9Cx271dEDud+zq0JBBw=="
+    }
+  ]
+}

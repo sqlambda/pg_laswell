@@ -1,0 +1,46 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0010-accounts",
+  "description": "The accounts table.",
+  "rationale": "fillfactor 90 leaves page headroom for HOT updates, which is the difference between a heap-only update and an index write on every transaction.",
+  "intents": [
+    {
+      "kind": "create_table",
+      "schema": "public",
+      "table": "accounts",
+      "comment": "Accounts.",
+      "primary_key": [
+        "id"
+      ],
+      "columns": [
+        {
+          "name": "id",
+          "type": "bigserial",
+          "nullable": false,
+          "comment": "Account id, and the distribution column."
+        },
+        {
+          "name": "customer_name",
+          "type": "text",
+          "nullable": false,
+          "comment": "Account holder's name."
+        }
+      ]
+    },
+    {
+      "kind": "set_table_options",
+      "schema": "public",
+      "table": "accounts",
+      "options": {
+        "fillfactor": "90"
+      }
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:0a1ed85ee9747a3a",
+      "algorithm": "ed25519",
+      "signature": "RchP3w0cOMVHUf751ATQZvaaF26Nvq1LvnrWOAsVX7dS0vPOCtWvNnHtZ3F4qxBGfwmrzXVviquMAUKEGF7dDQ=="
+    }
+  ]
+}

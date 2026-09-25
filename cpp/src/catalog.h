@@ -12,6 +12,7 @@
 // all marshalling code, and it is pg_licht's dominant pattern for the same
 // reason.
 
+#include <algorithm>
 #include <optional>
 #include <string>
 #include <vector>
@@ -126,13 +127,54 @@ SELECT COALESCE(
                    -- these are never renamed.
                    'constraint_backed', EXISTS (SELECT 1 FROM pg_constraint k
                                                  WHERE k.conindid = i.indexrelid),
-                   'columns', (SELECT JSONB_AGG(a.attname ORDER BY k.ord)
+                   -- COALESCE, because an index over an EXPRESSION has attnum
+                   -- 0 for that position and the join drops it -- an index
+                   -- entirely of expressions aggregates to SQL NULL. A null
+                   -- here reaches a reader as json null, and value("columns",
+                   -- json::array()) returns the null rather than the default,
+                   -- so the very next get<std::string>() throws. Measured: a
+                   -- backfill on a table carrying one expression index threw
+                   -- type_error.302 out of the planner.
+                   'columns', COALESCE((SELECT JSONB_AGG(a.attname ORDER BY k.ord)
                                  FROM unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord)
                                  JOIN pg_attribute a ON a.attrelid = t.oid
-                                                    AND a.attnum = k.attnum),
-                   'leading_column', (SELECT a.attname FROM pg_attribute a
+                                                    AND a.attnum = k.attnum), '[]'::jsonb),
+                   -- How many of indkey are KEY columns. The rest are INCLUDE
+                   -- payload, which does not order or restrict anything, so an
+                   -- index keyed the same with different payload is a different
+                   -- index and must not be mistaken for an equivalent one.
+                   'key_column_count', i.indnkeyatts,
+                   -- Per-key-column sort order, as PostgreSQL stores it in
+                   -- indoption: bit 0 is DESC, bit 1 is NULLS FIRST. Without
+                   -- these, (a, b) and (a, b DESC) read as the same index --
+                   -- and the equivalence check would have renamed one into the
+                   -- other and called the spec satisfied.
+                   'column_order', COALESCE((SELECT JSONB_AGG(
+                                      CASE WHEN (o.opt & 1) = 1 THEN 'desc'
+                                           ELSE 'asc' END ||
+                                      CASE WHEN (o.opt & 2) = 2 THEN ' nulls first'
+                                           ELSE ' nulls last' END
+                                      ORDER BY o.ord)
+                                     FROM unnest(i.indoption) WITH ORDINALITY AS o(opt, ord)
+                                    WHERE o.ord <= i.indnkeyatts), '[]'::jsonb),
+                   -- The operator class of each key column, named only when it
+                   -- is NOT the type's default: a spec that says nothing means
+                   -- the default, so recording the default everywhere would
+                   -- make every ordinary index look opclass-bearing.
+                   'column_opclasses', COALESCE((SELECT JSONB_AGG(
+                                          CASE WHEN oc.opcdefault THEN ''
+                                               ELSE oc.opcname END
+                                          ORDER BY c.ord)
+                                         FROM unnest(i.indclass) WITH ORDINALITY AS c(oid, ord)
+                                         JOIN pg_opclass oc ON oc.oid = c.oid
+                                        WHERE c.ord <= i.indnkeyatts), '[]'::jsonb),
+                   -- Same reason: indkey[0] = 0 when the first key column is
+                   -- an expression, which names no attribute. Empty string, not
+                   -- null: readers treat "" as "no leading column I can name",
+                   -- which is exactly the truth here.
+                   'leading_column', COALESCE((SELECT a.attname FROM pg_attribute a
                                        WHERE a.attrelid = t.oid
-                                         AND a.attnum = i.indkey[0])))
+                                         AND a.attnum = i.indkey[0]), '')))
                    FROM pg_index i
                    JOIN pg_class ic ON ic.oid = i.indexrelid
                    JOIN pg_am am ON am.oid = ic.relam
@@ -275,6 +317,17 @@ SELECT COALESCE(
                        'column', (SELECT a.attname FROM pg_attribute a
                                    WHERE a.attrelid = t.oid
                                      AND a.attnum = k.conkey[1]),
+                       -- Every column, in key order. `column` above is only
+                       -- conkey[1], which is enough for a single-column
+                       -- constraint and silently wrong for a compound one: a
+                       -- caller asking "does this key cover X" got the first
+                       -- column and nothing else.
+                       'columns', COALESCE((
+                          SELECT JSONB_AGG(a.attname ORDER BY x.ord)
+                            FROM UNNEST(k.conkey) WITH ORDINALITY AS x(attnum, ord)
+                            JOIN pg_attribute a
+                              ON a.attrelid = t.oid AND a.attnum = x.attnum),
+                          '[]'::jsonb),
                        'depended_on_by', COALESCE((
                           SELECT JSONB_AGG(d.conname || ' on ' ||
                                            d.conrelid::regclass::text)
@@ -407,6 +460,35 @@ SELECT COALESCE((
        (SELECT p.oid::regprocedure::text FROM pg_proc p WHERE p.oid = t.oid) END,
     'returns', CASE WHEN $1 = 'function' THEN
        (SELECT PG_GET_FUNCTION_RESULT(p.oid) FROM pg_proc p WHERE p.oid = t.oid) END,
+    -- A function's input arguments in order: name (NULL when unnamed), type and
+    -- type category. Read by the Citus module to check a distribution argument
+    -- before Citus does -- it refuses a name that does not exist or a position
+    -- out of range (22023), and ACCEPTS a type that cannot be coerced to the
+    -- group's, after which every call fails. IN and INOUT only: an OUT argument
+    -- is not something a caller passes, and $n counts the ones it does.
+    'arguments', CASE WHEN $1 = 'function' THEN COALESCE((
+       SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
+                'name', NULLIF(a.name, ''),
+                'type_oid', a.typ::bigint,
+                'type', format_type(a.typ, NULL),
+                'category', ty.typcategory::text) ORDER BY a.ord)
+         FROM pg_proc pp,
+              LATERAL unnest(pp.proargtypes::oid[]) WITH ORDINALITY AS a0(typ, ord)
+              LEFT JOIN LATERAL (
+                SELECT (pp.proargnames)[
+                         -- proargnames spans ALL arguments when any are OUT;
+                         -- proargtypes lists only the inputs. Map input
+                         -- position to overall position through proargmodes.
+                         CASE WHEN pp.proargmodes IS NULL THEN a0.ord::int
+                         ELSE (SELECT m.pos FROM (
+                                 SELECT row_number() OVER () AS pos, mode
+                                   FROM unnest(pp.proargmodes) AS mode) m
+                                WHERE m.mode IN ('i','b','v')
+                                ORDER BY m.pos OFFSET a0.ord - 1 LIMIT 1)
+                         END] AS name) nm ON true
+              CROSS JOIN LATERAL (SELECT a0.typ, a0.ord, nm.name) a
+              JOIN pg_type ty ON ty.oid = a.typ
+        WHERE pp.oid = t.oid), '[]'::jsonb) END,
     'owner', CASE $1
        WHEN 'function' THEN (SELECT PG_GET_USERBYID(proowner) FROM pg_proc WHERE oid = t.oid)
        WHEN 'type' THEN (SELECT PG_GET_USERBYID(typowner) FROM pg_type WHERE oid = t.oid)
@@ -510,6 +592,10 @@ inline bool is_lock_not_available(const pqxx::sql_error& e) {
   return std::string(e.sqlstate()) == "55P03";
 }
 
+// Vendor module observation queries, at namespace scope so the class below can
+// name them. Empty when no module is enabled.
+#include "modules/enabled_observer_headers.h"
+
 class Catalog {
  public:
   explicit Catalog(const ConnConfig& cfg, ConnectionCache* cache = nullptr)
@@ -518,7 +604,7 @@ class Catalog {
   // Gathers everything the planner needs for the tables a spec names.
   // Observes non-relation objects. `keys` are "kind:schema.name" or
   // "kind:name" for the unqualified ones (schema, extension).
-  void observe_objects(ReadSession& s, Observations& obs,
+  void observe_objects(pqxx::work& txn, Observations& obs,
                        const std::vector<std::string>& keys) {
     for (const auto& key : keys) {
       if (obs.objects.contains(key)) continue;
@@ -534,13 +620,13 @@ class Catalog {
         schema = rest.substr(0, dot);
         name = rest.substr(dot + 1);
       }
-      const auto r = pqxx_exec(s.txn(), detail::kObjectObservationSql,
+      const auto r = txn.exec(detail::kObjectObservationSql,
                                pqxx::params{kind, name, schema});
       if (!r.empty() && !r[0][0].is_null()) {
         obs.objects[key] = json::parse(r[0][0].as<std::string>());
       }
       if (kind == "extension") {
-        const auto a = pqxx_exec(s.txn(), detail::kAvailableExtensionSql,
+        const auto a = txn.exec(detail::kAvailableExtensionSql,
                                  pqxx::params{name});
         if (!a.empty() && !a[0][0].is_null()) {
           const auto avail = json::parse(a[0][0].as<std::string>());
@@ -549,6 +635,28 @@ class Catalog {
         }
       }
     }
+  }
+
+  // Vendor extension readings. Each enabled module contributes a block here,
+  // and each one is gated on its extension actually being installed -- so the
+  // key is ABSENT when the extension is not there, never an empty object.
+  //
+  // A planner that cannot tell "not installed" from "installed and reporting
+  // nothing" refuses the wrong things in both directions, which is why this
+  // costs a probe query per module rather than a COALESCE.
+  void observe_extensions(pqxx::work& txn, Observations& obs) {
+#define PGLASWELL_OBSERVE(module_name, present_sql, observation_sql)         \
+    do {                                                                      \
+      const auto probe = txn.exec(present_sql);                               \
+      if (probe.empty() || !probe[0][0].as<bool>()) break;                    \
+      const auto r = txn.exec(observation_sql);                               \
+      if (!r.empty() && !r[0][0].is_null()) {                                 \
+        obs.extensions[module_name] = json::parse(r[0][0].as<std::string>()); \
+      }                                                                       \
+    } while (false);
+#include "modules/enabled_observers.h"
+#undef PGLASWELL_OBSERVE
+    (void)txn; (void)obs;
   }
 
   Observations observe(const std::vector<std::string>& schemas,
@@ -566,13 +674,14 @@ class Catalog {
       obs.server = json::parse(server[0][0].as<std::string>());
     }
     obs.gathered_at = obs.server.value("now", json());
-    observe_objects(s, obs, object_keys);
+    observe_objects(s.txn(), obs, object_keys);
+    observe_extensions(s.txn(), obs);
 
     for (std::size_t i = 0; i < schemas.size(); ++i) {
       const auto qualified = schemas[i] + "." + tables[i];
       if (obs.tables.contains(qualified)) continue;
       try {
-        const auto r = pqxx_exec(s.txn(), detail::kTableObservationSql,
+        const auto r = s.txn().exec(detail::kTableObservationSql,
                                  pqxx::params{schemas[i], tables[i]});
         if (!r.empty() && !r[0][0].is_null()) {
           obs.tables[qualified] = json::parse(r[0][0].as<std::string>());
@@ -602,6 +711,44 @@ class Catalog {
     return obs;
   }
 
+  // The same reading, taken through a transaction the CALLER holds -- so it sees
+  // that transaction's uncommitted DDL. A chained rehearsal plans each
+  // specification against the schema the ones before it produced, and a reading
+  // on any other connection would see the database as it was before the
+  // rehearsal began, which is the limitation the rehearsal exists to remove.
+  //
+  // No lock-wait recovery, unlike observe(): renewing the transaction would
+  // throw away every earlier specification's work. A lock conflict here fails
+  // the rehearsal, and it runs against a restored copy, where there is nothing
+  // else to conflict with.
+  Observations observe_in(pqxx::work& txn, int server_version,
+                          const std::vector<std::string>& schemas,
+                          const std::vector<std::string>& tables,
+                          const std::vector<std::string>& object_keys = {}) {
+    if (schemas.size() != tables.size()) {
+      throw std::runtime_error("observe_in: schema/table lists differ in length");
+    }
+    Observations obs;
+    obs.server_version = server_version;
+    const auto server = txn.exec(detail::kServerObservationSql);
+    if (!server.empty() && !server[0][0].is_null()) {
+      obs.server = json::parse(server[0][0].as<std::string>());
+    }
+    obs.gathered_at = obs.server.value("now", json());
+    observe_objects(txn, obs, object_keys);
+    observe_extensions(txn, obs);
+    for (std::size_t i = 0; i < schemas.size(); ++i) {
+      const auto qualified = schemas[i] + "." + tables[i];
+      if (obs.tables.contains(qualified)) continue;
+      const auto r = txn.exec(detail::kTableObservationSql,
+                               pqxx::params{schemas[i], tables[i]});
+      if (!r.empty() && !r[0][0].is_null()) {
+        obs.tables[qualified] = json::parse(r[0][0].as<std::string>());
+      }
+    }
+    return obs;
+  }
+
   // Proves a whole plan actually works, in a transaction that never commits.
   //
   // This is the property the project was conceived around: almost all
@@ -622,9 +769,9 @@ class Catalog {
   //    is skipped and reported as unverified rather than silently passed.
   //  - The backfill is EXPLAINed, never executed. ANALYZE is never used.
   // COPY ... FROM STDIN, from a step's detail. Shared by the dry run and, in
-  // spirit, by executor.h::run_copy -- pqxx::stream_to is the only sanctioned
-  // way to send COPY data through libpqxx 7.10, and it builds the statement
-  // itself, which is why the planner emits exactly the form it produces.
+  // spirit, by executor.h::run_copy -- pqxx::stream_to is libpqxx's own way to
+  // send COPY data, and it builds the statement itself, which is why the
+  // planner emits exactly the form it produces.
   // ONE implementation, called by the dry run here and by executor.h::run_copy.
   // There were two, differing in ways that were nobody's intent: one quoted
   // column names by concatenating a quote character, the other did the same a
@@ -637,6 +784,9 @@ class Catalog {
   // had been handed to the stream before the server refused one.
   static void stream_copy(WriteSession& session, const json& detail,
                           long long& written) {
+    stream_copy(session.txn(), detail, written);
+  }
+  static void stream_copy(pqxx::work& txn, const json& detail, long long& written) {
     std::vector<std::string> columns;
     for (const auto& c : detail.value("copy_columns", json::array())) {
       columns.push_back(pglaswell::detail::quote_identifier(c.get<std::string>()));
@@ -644,7 +794,7 @@ class Catalog {
     // copy_relation, not qualified: stream_to splices the path straight into
     // the COPY statement, so it has to be the quoted form.
     auto stream = pqxx::stream_to::raw_table(
-        session.txn(),
+        txn,
         detail.value("copy_relation", detail.value("qualified", "")),
         pglaswell::detail::join(columns, ", "));
     for (const auto& row : detail.value("copy_rows", json::array())) {
@@ -667,14 +817,47 @@ class Catalog {
     stream.complete();
   }
 
+  // What failed, as three separate facts rather than one sentence.
+  //
+  // It used to be a single string, and the deployment binary printed none of it
+  // -- so a spec that PostgreSQL rejected reported only "the plan failed when
+  // applied to a rolled-back transaction" and invited a defect report, while
+  // the server had said exactly what was wrong. The server's answer is the
+  // whole value of this check; throwing it away left the check saying only
+  // that it had run.
+  struct Problem {
+    int step = -1;
+    std::string sqlstate;   // "0A000". Empty when the failure carried none.
+    std::string message;    // the server's own words, without ERROR: or newline
+    std::string statement;  // the statement that produced it
+  };
+
   struct DryRun {
     bool ran = false;
-    std::vector<std::string> problems;
+    // Why a step could only be checked WEAKLY, when that is the case. Empty
+    // when every step was either fully checked or not reached.
+    std::string weak_verification;
+    std::vector<Problem> problems;
     std::vector<int> unverified_steps;  // could not be included, or not reached
     std::string skipped_reason;
     int timed_out_at = -1;
     bool depends_on_skipped = false;
   };
+
+  // pqxx hands back the server's line verbatim -- "ERROR:  extension ...\n".
+  // The prefix and the newline are presentation, and this is a field, so they
+  // are stripped here rather than by every reader.
+  static std::string server_message(const std::string& raw) {
+    std::string m = raw;
+    const std::string prefix = "ERROR:";
+    if (m.rfind(prefix, 0) == 0) m.erase(0, prefix.size());
+    while (!m.empty() && (m.back() == '\n' || m.back() == '\r' || m.back() == ' ')) {
+      m.pop_back();
+    }
+    std::size_t i = 0;
+    while (i < m.size() && (m[i] == ' ' || m[i] == '\t')) ++i;
+    return m.substr(i);
+  }
 
   // `copy_payloads` is parallel to `steps`: a null entry for an ordinary step,
   // and for a copy_rows step the {copy_columns, copy_rows, qualified} detail its
@@ -683,102 +866,192 @@ class Catalog {
   // and skipping it would leave the column count, the types and every
   // constraint on the table unverified, which is most of what a COPY can get
   // wrong. Streamed for real here, inside the transaction that is rolled back.
-  DryRun dry_run(const std::vector<std::pair<int, std::vector<std::string>>>& steps,
-                 const std::vector<bool>& txn_forbidden, int server_version,
-                 const std::vector<json>& copy_payloads = {}) {
-    DryRun out;
-    WriteSession w(cfg_);
-    // A dry run must never queue: it holds strong locks, and a planning call
-    // that blocks the application is worse than one that declines to check.
-    ConnConfig probe = cfg_;
-    probe.executor.lock_timeout_ms = kObservationLockTimeoutMs;
-    // The dry run runs the whole plan in one transaction, so a scanning step
-    // holds every lock the steps before it took. Bounded so a planning call
-    // can never block writes for the length of a scan: correctness is what a
-    // dry run proves, and it does not need to finish the work to prove it.
-    probe.statement_timeout_ms = cfg_.executor.dry_run_statement_timeout_ms;
-    WriteSession session(probe);
-
-    try {
-      session.begin("pg_laswell/dry-run (rolled back)");
-    } catch (const std::exception& e) {
-      out.skipped_reason = std::string("could not open a dry-run transaction: ") + e.what();
-      return out;
+  // ONE statement, checked inside an open transaction. Throws the pqxx::sql_error
+  // PostgreSQL raised when it fails; returns true when the check was only WEAK.
+  //
+  // DDL is executed for real -- the caller rolls it back -- because that is the
+  // one check that proves a later step can see what an earlier one made. A
+  // query is PLANNED, never executed: EXPLAIN (GENERIC_PLAN) on PG16+, which
+  // plans $1/$2 without binding values, and PREPARE as the fallback.
+  //
+  // GENERIC_PLAN is unavailable on a Citus table at any server version, and it
+  // fails in more than one way -- "EXPLAIN GENERIC_PLAN is currently not
+  // supported for Citus tables" (XX000), "could not create distributed plan"
+  // (0A000), and for an explicitly cast parameter "no value found for parameter
+  // 1" (42704). Matching those strings was the first attempt and was brittle by
+  // construction: the third was found only when a new kind emitted a cast. So
+  // GENERIC_PLAN's failure is never itself reported. PREPARE decides: if it
+  // fails, ITS error is the real one; if it succeeds, the statement is well
+  // formed and plannable and the only thing lost is the stronger check.
+  //
+  // That loss is reported, not hidden. Measured on Citus 13: PREPARE accepts a
+  // multi-shard SELECT ... FOR UPDATE that EXECUTE then refuses, because Citus
+  // plans at execution time. An earlier version called such a step verified --
+  // a false success, which is worse than a false failure because the dry run
+  // exists to be believed.
+  //
+  // The SAVEPOINT is required rather than tidy: a failed statement aborts the
+  // transaction, and without one the fallback would fail with 25P02.
+  //
+  // `execute` overrides the classification for a step whose statements CHANGE
+  // THE SCHEMA through a SELECT -- Citus's create_distributed_table and
+  // create_reference_table are function calls. Classified by their first word
+  // they were planned and never run, so no dry run ever distributed anything,
+  // and a later specification colocating with the table was refused for
+  // colocating with something "not distributed". The planner marks such a step
+  // (detail rehearse_by = "execution"); this does not guess from function names.
+  static bool verify_statement(pqxx::work& txn, const std::string& stmt,
+                               int server_version, bool execute = false) {
+    const auto head = stmt.substr(0, stmt.find_first_of(" \n"));
+    const bool is_query =
+        !execute &&
+        (stmt.rfind("WITH", 0) == 0 || head == "UPDATE" || head == "INSERT" ||
+         head == "SELECT" || head == "DELETE" || head == "MERGE");
+    if (!is_query) {
+      txn.exec(stmt);  // real DDL; the caller rolls it back
+      return false;
     }
+    if (server_version >= 160000) {
+      txn.exec("SAVEPOINT laswell_generic_plan");
+      try {
+        txn.exec("EXPLAIN (GENERIC_PLAN, FORMAT JSON) " + stmt);
+        txn.exec("RELEASE SAVEPOINT laswell_generic_plan");
+        return false;
+      } catch (const pqxx::sql_error&) {
+        txn.exec("ROLLBACK TO SAVEPOINT laswell_generic_plan");
+        txn.exec("RELEASE SAVEPOINT laswell_generic_plan");
+      }
+    }
+    txn.exec("PREPARE laswell_dry AS " + stmt);
+    txn.exec("DEALLOCATE laswell_dry");
+    return true;
+  }
 
-    out.ran = true;
-    // Once a step has been skipped, anything after it may depend on what that
-    // step would have created -- a partitioned index recipe attaches the child
-    // indexes its skipped concurrent builds would have made. A failure after a
-    // skip is therefore a gap the DRY RUN created, not a defect in the plan,
-    // and reporting it as a problem would send someone hunting for a fault
-    // that is not there.
-    bool skipped_any = false;
+  // How a rehearsal of one plan's steps ended. Rollback is the CALLER's choice:
+  // a single-plan dry run discards everything; a chained rehearsal discards only
+  // the failing specification, back to its savepoint, and keeps going.
+  enum class Rehearsal { kOk, kFailed, kTimedOut, kGap };
+
+  // Every step of one plan, in order, inside `txn`. Records what happened in
+  // `out`; never rolls back.
+  //
+  // `skipped_any` is the caller's so it can outlive one plan. Once a step has
+  // been skipped -- a CREATE INDEX CONCURRENTLY cannot run in a transaction --
+  // anything after it may depend on what that step would have made, so a
+  // failure after a skip is a gap the REHEARSAL created, not a defect, and is
+  // reported as unverified rather than as a problem.
+  static Rehearsal rehearse_steps(
+      pqxx::work& txn,
+      const std::vector<std::pair<int, std::vector<std::string>>>& steps,
+      const std::vector<bool>& txn_forbidden, int server_version,
+      const std::vector<json>& copy_payloads, DryRun& out, bool& skipped_any,
+      const std::vector<bool>& execute = {}) {
+    const auto note_unverified = [&out](int ordinal) {
+      if (std::find(out.unverified_steps.begin(), out.unverified_steps.end(),
+                    ordinal) == out.unverified_steps.end()) {
+        out.unverified_steps.push_back(ordinal);
+      }
+    };
     for (std::size_t i = 0; i < steps.size(); ++i) {
       if (txn_forbidden[i]) {
-        out.unverified_steps.push_back(steps[i].first);
+        note_unverified(steps[i].first);
         skipped_any = true;
         continue;
       }
       if (i < copy_payloads.size() && copy_payloads[i].is_object()) {
         try {
           long long sent = 0;
-          stream_copy(session, copy_payloads[i], sent);
+          stream_copy(txn, copy_payloads[i], sent);
         } catch (const pqxx::sql_error& e) {
-          out.problems.push_back(
-              "step " + std::to_string(steps[i].first) + " (COPY): " + e.what());
-          break;
+          out.problems.push_back(Problem{steps[i].first, std::string(e.sqlstate()),
+                                        server_message(e.what()),
+                                        "COPY into " +
+                                            copy_payloads[i].value("qualified", "?")});
+          return Rehearsal::kFailed;
         }
         continue;
       }
       for (const auto& raw : steps[i].second) {
         const auto stmt = detail::strip_trailing_semicolon(raw);
         if (stmt.empty()) continue;
-        const auto head = stmt.substr(0, stmt.find_first_of(" \n"));
-        const bool is_query =
-            stmt.rfind("WITH", 0) == 0 || head == "UPDATE" || head == "INSERT" ||
-            head == "SELECT" || head == "DELETE" || head == "MERGE";
         try {
-          if (is_query) {
-            // GENERIC_PLAN (PG16+) plans a statement with $1/$2 placeholders
-            // without binding values. On older servers PREPARE catches the
-            // same class of error. Never ANALYZE: EXPLAIN must not execute the
-            // thing being planned.
-            if (server_version >= 160000) {
-              session.txn().exec("EXPLAIN (GENERIC_PLAN, FORMAT JSON) " + stmt);
-            } else {
-              session.txn().exec("PREPARE laswell_dry AS " + stmt);
-              session.txn().exec("DEALLOCATE laswell_dry");
+          const bool run_it = i < execute.size() && execute[i];
+          if (verify_statement(txn, stmt, server_version, run_it)) {
+            note_unverified(steps[i].first);
+            if (out.weak_verification.empty()) {
+              out.weak_verification =
+                  "a statement was checked by PREPARE rather than by EXPLAIN "
+                  "(GENERIC_PLAN), which this server does not support for these "
+                  "tables -- Citus among them. PREPARE catches a malformed "
+                  "statement and not one the extension will refuse to route, "
+                  "because Citus plans at execution time. Those steps are listed "
+                  "as unverified rather than claimed as checked.";
             }
-          } else {
-            session.txn().exec(stmt);  // real DDL, rolled back below
           }
         } catch (const pqxx::sql_error& e) {
-          // A statement timeout is not a defect in the plan -- it means this
-          // step does real work that a dry run declines to finish. Everything
-          // from here on is simply unverified, and saying so beats reporting a
-          // problem that does not exist.
+          // A statement timeout is not a defect in the plan: the step does real
+          // work that a rehearsal declines to finish. Everything from here on
+          // is unverified, and saying so beats reporting a problem that is not.
           if (std::string(e.sqlstate()) == "57014") {
             out.timed_out_at = steps[i].first;
             for (std::size_t k = i; k < steps.size(); ++k) {
-              out.unverified_steps.push_back(steps[k].first);
+              note_unverified(steps[k].first);
             }
-            session.rollback();
-            return out;
+            return Rehearsal::kTimedOut;
           }
           if (skipped_any) {
-            out.unverified_steps.push_back(steps[i].first);
+            note_unverified(steps[i].first);
             out.depends_on_skipped = true;
-            session.rollback();
-            return out;
+            return Rehearsal::kGap;
           }
-          out.problems.push_back("step " + std::to_string(steps[i].first) + ": " +
-                                 e.what());
-          session.rollback();
-          return out;
+          out.problems.push_back(Problem{steps[i].first, std::string(e.sqlstate()),
+                                        server_message(e.what()), stmt});
+          return Rehearsal::kFailed;
+        } catch (const pqxx::broken_connection& e) {
+          // libpqxx raises broken_connection for ANY server error in SQLSTATE
+          // class 08, whether or not this connection is broken. Measured:
+          // citus_add_node on a host that does not resolve fails with a class-08
+          // error about the NODE -- "connection to the remote node ... failed"
+          // -- on a connection that is perfectly healthy, and the dry run
+          // escaped as a tool error instead of reporting the problem it had
+          // found. It carries no SQLSTATE, so the class is all that can be said.
+          if (!txn.conn().is_open()) throw;
+          out.problems.push_back(Problem{steps[i].first, "08000",
+                                        server_message(e.what()), stmt});
+          return Rehearsal::kFailed;
         }
       }
     }
+    return Rehearsal::kOk;
+  }
+
+  // A dry run must never queue, and must never hold its locks for the length of
+  // a scan: a planning call that blocks the application is worse than one that
+  // declines to check.
+  ConnConfig rehearsal_config() const {
+    ConnConfig probe = cfg_;
+    probe.executor.lock_timeout_ms = kObservationLockTimeoutMs;
+    probe.statement_timeout_ms = cfg_.executor.dry_run_statement_timeout_ms;
+    return probe;
+  }
+
+  // Proves ONE plan works, in a transaction that never commits.
+  DryRun dry_run(const std::vector<std::pair<int, std::vector<std::string>>>& steps,
+                 const std::vector<bool>& txn_forbidden, int server_version,
+                 const std::vector<json>& copy_payloads = {},
+                 const std::vector<bool>& execute = {}) {
+    DryRun out;
+    WriteSession session(rehearsal_config());
+    try {
+      session.begin("pg_laswell/dry-run (rolled back)");
+    } catch (const std::exception& e) {
+      out.skipped_reason = std::string("could not open a dry-run transaction: ") + e.what();
+      return out;
+    }
+    out.ran = true;
+    bool skipped_any = false;
+    rehearse_steps(session.txn(), steps, txn_forbidden, server_version,
+                   copy_payloads, out, skipped_any, execute);
     // Always. Nothing a dry run does is ever committed.
     session.rollback();
     return out;
@@ -795,9 +1068,7 @@ class Catalog {
   void escalate_size(Observations& obs, const std::string& schema,
                      const std::string& table) {
     ReadSession s(cfg_, std::nullopt, cache_);
-    const auto r = pqxx_exec(
-        s.txn(),
-        "SELECT JSONB_BUILD_OBJECT("
+    const auto r = s.txn().exec("SELECT JSONB_BUILD_OBJECT("
         "  'size_measured', pg_table_size(c.oid),"
         "  'indexes_size', pg_indexes_size(c.oid),"
         "  'total_size', pg_total_relation_size(c.oid))"

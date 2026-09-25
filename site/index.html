@@ -180,6 +180,7 @@
     <a href="reference/index.html">Reference</a>
     <a href="pg_laswell.1.html">pg_laswell(1)</a>
     <a href="pg_laswell_mcp.1.html">pg_laswell_mcp(1)</a>
+    <a href="pg_laswell_citus.7.html">Citus</a>
     <a href="https://github.com/sqlambda/pg_laswell">GitHub</a>
   </div>
 </nav>
@@ -194,14 +195,16 @@
   </p>
   <div class="cta">
     <a class="btn primary" href="https://github.com/sqlambda/pg_laswell/releases">Download {{VERSION}}</a>
-    <a class="btn" href="#uses">See it arranged ten ways</a>
+    <a class="btn" href="#uses">See it arranged nine ways</a>
     <a class="btn" href="https://github.com/sqlambda/pg_laswell/tree/main/examples/docker">Run the examples</a>
   </div>
   <p class="hero-try">
     Every arrangement below is a directory you can run:
     <code>docker compose -f examples/docker/compose.yml up -d</code> and then
     <code>./examples/docker/run-all.sh</code>. Three PostgreSQL containers,
-    because two of the arrangements cannot be shown inside one.
+    because two of the arrangements cannot be shown inside one. The Citus
+    arrangement has a coordinator and two workers of its own:
+    <code>examples/docker/citus/compose.yml</code>.
   </p>
 </div>
 
@@ -209,6 +212,7 @@
   <div class="stat"><b>{{KINDS}}</b><span>intent kinds, each executed against a real PostgreSQL on every test run</span></div>
   <div class="stat"><b>{{TESTS}}</b><span>tests, green on PostgreSQL 15 through 18</span></div>
   <div class="stat"><b>{{CASES}}</b><span>conformance cases, applied to a live database</span></div>
+  <div class="stat"><b>{{CITUS_KINDS}}</b><span>Citus kinds in the same binary, applied to a coordinator and two workers in CI</span></div>
   <div class="stat"><b>0</b><span>agents required to deploy</span></div>
   <div class="stat"><b>{{TARGETS}}</b><span>release targets, deb, rpm and tarball</span></div>
 </div>
@@ -917,6 +921,32 @@ flowchart LR
         <a class="try" href="https://github.com/sqlambda/pg_laswell/tree/main/examples/docker/two-roles">Run it: <code>examples/docker/two-roles/run.sh</code></a>
       </div>
     </article>
+    <article class="arr">
+      <div class="arr-figure">
+        <pre class="mermaid">
+flowchart LR
+  R[/"one repository"/] --> L["pg_laswell<br/>modules: citus"]
+  L -->|"epoch: plain"| P[("dev<br/>PostgreSQL")]
+  L -->|"epoch: citus"| C[("staging<br/>Citus")]
+  CFG["citus.workers<br/>in the configuration"] -.-> L
+  C --> W1[("worker")]
+  C --> W2[("worker")]
+        </pre>
+      </div>
+      <div class="arr-body">
+        <span class="tag">Citus</span>
+        <h3>Plain PostgreSQL and Citus, from one repository</h3>
+        <p class="arr-lede">The same signed specifications build a developer's single server and a distributed cluster, and a bulk change is a bulk change on both.</p>
+        <ol class="seq">
+          <li>Tables and procedures name no vendor, so every target runs them.</li>
+          <li>Distribution, routing and cluster registration sit in epoch <code>citus</code>; the foreign key a single server adds straight away sits in epoch <code>plain</code>. Each database opens the epoch it is.</li>
+          <li><code>citus_ensure_workers</code> signs the intent and reads the hosts from the connection's configuration, so the same file registers two workers here and twelve elsewhere.</li>
+          <li>On Citus, a <code>backfill</code> walks one shard at a time because the module says it must; on plain PostgreSQL the same specification walks as it always did.</li>
+        </ol>
+        <p class="how">pg_laswell --config dev.ini, then --config staging.ini</p>
+        <a class="try" href="https://github.com/sqlambda/pg_laswell/tree/main/examples/docker/citus">Run it: <code>examples/docker/citus/run.sh</code></a>
+      </div>
+    </article>
   </div>
 </section>
 
@@ -927,7 +957,8 @@ flowchart LR
     <code>conformance.inc</code> rather than written beside them, so it cannot
     drift: the options on a page are the keys the parser enforces, and the
     example on a page is a case the test suite applies to a real database on
-    every run.
+    every run. A module's kinds come from the module's own parser, and their
+    examples from the repository CI applies to a real cluster.
   </p>
   <div class="grid">
     <div class="feature">
@@ -944,6 +975,11 @@ flowchart LR
       <h3><a href="pg_laswell.1.html">pg_laswell(1)</a></h3>
       <p>The deployment binary: one repository, exit codes a pipeline can
       branch on, and no agent anywhere in the path.</p>
+    </div>
+    <div class="feature">
+      <h3><a href="pg_laswell_citus.7.html">pg_laswell_citus(7)</a></h3>
+      <p>The Citus module: every kind, every refusal and the measurement behind
+      it, and how a distributed table is written to without naming the vendor.</p>
     </div>
   </div>
 </section>

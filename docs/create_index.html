@@ -79,6 +79,7 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
   &quot;name&quot;: &lt;required&gt;,
   &quot;comment&quot;: &lt;required&gt;,
   &quot;columns&quot;: &lt;optional&gt;,
+  &quot;include&quot;: &lt;optional&gt;,
   &quot;unique&quot;: &lt;optional&gt;,
   &quot;method&quot;: &lt;optional&gt;,
   &quot;where&quot;: &lt;optional&gt;,
@@ -94,6 +95,8 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
 <dt>comment<span class="tag req">required</span></dt>
 <dd>&nbsp;</dd>
 <dt>columns<span class="tag opt">optional</span></dt>
+<dd>A string is the column name. An object takes &quot;name&quot; or &quot;expression&quot;, plus any of &quot;direction&quot;, &quot;nulls&quot; and &quot;opclass&quot;.</dd>
+<dt>include<span class="tag opt">optional</span></dt>
 <dd>&nbsp;</dd>
 <dt>unique<span class="tag opt">optional</span></dt>
 <dd>&nbsp;</dd>

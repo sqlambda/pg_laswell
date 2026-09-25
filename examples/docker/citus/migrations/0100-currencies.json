@@ -1,0 +1,38 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0100-currencies",
+  "description": "A small lookup table.",
+  "rationale": "Created in every epoch; made a reference table only where Citus is.",
+  "intents": [
+    {
+      "kind": "create_table",
+      "schema": "public",
+      "table": "currencies",
+      "comment": "Currency codes.",
+      "primary_key": [
+        "code"
+      ],
+      "columns": [
+        {
+          "name": "code",
+          "type": "text",
+          "nullable": false,
+          "comment": "ISO 4217 code."
+        },
+        {
+          "name": "scale",
+          "type": "integer",
+          "nullable": false,
+          "comment": "Digits after the decimal point."
+        }
+      ]
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:0a1ed85ee9747a3a",
+      "algorithm": "ed25519",
+      "signature": "PzFQyobrry86D6+UMiZeT85QIBKeLGc+q7sKLq0LsUuo+Z2Rgti3OOu+gfV1+rz4SNHowm8wSSjRzVjpzhOJAw=="
+    }
+  ]
+}

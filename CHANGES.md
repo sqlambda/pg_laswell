@@ -2,10 +2,160 @@
 
 ## 0.1.2
 
-The multi-directory work, end to end: a repository may be several directories, a
-specification belongs to a lineage, and a manifest can say whether those
-directories are all of a database's story. 416 tests, and **the ledger schema
+Two arcs. Vendor modules, with Citus as the first: one package that speaks plain
+PostgreSQL and Citus alike, seventeen Citus kinds, and the core fixes that
+building them exposed, `--dry-run=chain` among them. And the multi-directory
+work, end to end: a repository may be several directories, a specification
+belongs to a lineage, and a manifest can say whether those directories are all
+of a database's story. 506 tests, plus 55 live cases against a Citus coordinator
+and two workers; 100 intent kinds, 83 core and 17 Citus. **The ledger schema
 moves to version 3** -- run the bootstrap script shipped with this binary.
+
+### One package, every module
+
+The released `pg-laswell` is built with the Citus module compiled in, and
+`--version` prints the set (`modules: citus`). A module is inert on a server
+without its extension: its kinds carry the vendor's prefix (`citus_*`), its
+reading is absent rather than empty, and for a table it has nothing to say
+about, the build with it and the build without it emit the same statements,
+which is tested. A PostgreSQL-only build is `cmake` with no
+`PGLASWELL_MODULES`, and CI keeps building it. Modules are compiled in, never
+loaded: a binary without one refuses a specification naming its kinds as a
+whole, so two builds never disagree silently. Separate packages, or shared
+libraries, wait until two modules actually conflict.
+
+`cpp/src/modules/README.md` is the guide to writing the next one: every file a
+module may provide and which are required, a step-by-step walkthrough pointing
+at the working Citus instance of each piece, and **THE RULE**: a module may
+*inform* core's SQL through a reading core interprets, and may never emit or
+rewrite SQL for a core kind.
+
+### A bulk change is the same specification on any server
+
+The same `backfill`, and `delete_rows` by predicate, runs on plain
+PostgreSQL in development and on a distributed table in staging. Core asks
+each module one question (must row-locking batches on this table be confined
+to one value of a column, and which?), and on a distributed table Citus answers
+with the distribution column. Core then walks one value at a time, and a lock
+that Citus refuses across shards is taken inside one. The specification names
+no vendor. Refused only where the walk cannot be shaped: a distribution column
+that *is* the walk key.
+
+Underneath it, a paced batch is now a selection and an apply rather than one
+statement with a CTE: its keys are selected and locked, then the change is
+applied to exactly those keys. Batches are bounded by bytes of key as well as
+by rows. A failed walk records where it stopped and resumes there.
+
+### Citus: seventeen kinds, each measured before it was written
+
+- **Distribution:** `citus_distribute_table` (the concurrent form chosen only
+  when nothing rules it out, and the reading that decided named),
+  `citus_create_reference_table`, `citus_distribute_function`.
+- **Lifecycle:** `citus_alter_distributed_table`, `citus_undistribute_table`,
+  `citus_add_local_table_to_metadata`, `citus_truncate_local_data`,
+  `citus_update_table_statistics`.
+- **The cluster:** `citus_set_coordinator_host`, `citus_add_node`,
+  `citus_ensure_workers`, `citus_set_node_property`, `citus_disable_node`,
+  `citus_activate_node`, `citus_remove_node`, `citus_drain_node`,
+  `citus_rebalance_shards` (synchronous, so "applied" means balanced).
+
+`citus_ensure_workers` takes the hosts from the connection's configuration
+(`citus.workers = ...`), never from the specification, so one signed file
+registers three workers on staging and twelve in production. The
+specification can bound what the unsigned file may supply: `hosts_matching`,
+`min_workers`, `max_workers`. Node membership is projected like table state,
+so one specification can register the coordinator, set its property and add
+the workers, in that order.
+
+No kind moves or splits a shard by id: shard ids come from a sequence in each
+database, so a signed specification naming one would mean a different shard
+on every other target.
+
+### Refusals that stop what Citus would accept and regret
+
+Each is a behaviour measured on Citus 13.2, and most are cases where Citus
+does *not* fail:
+
+- **An empty cluster.** With nothing registered, distributing a table succeeds
+  by registering the coordinator as `localhost` with every shard on it, and
+  every worker added afterwards is refused. Refused before it happens.
+- **A foreign key dropped by a rewrite.** Moving a table out of its colocation
+  group while a distributed table references it succeeds with a warning, and
+  the key is gone. Refused.
+- **A truncate that cascades into real rows.** `truncate_local_data...`
+  truncates with CASCADE, and emptied a local table that referenced the
+  reference table. Refused.
+- **A distributed function that routes nothing.** On Citus 11+, every
+  function is recorded in `pg_dist_object`, so the kind read every function as
+  already distributed and did nothing. It now compares how the function routes.
+  A text argument on a bigint group is refused: Citus accepts that distribution
+  and then fails every call.
+- **A concurrent distribution that cannot finish.** It needs `wal_level =
+  logical` on the coordinator too, and a failure leaves the table half
+  converted. The concurrent form is chosen only when the reading rules both out.
+- **A cluster that would diverge, or is not healthy:**
+  - `citus.enable_ddl_propagation` off
+  - a worker on another Citus version
+  - prepared transactions older than twice Citus's own recovery interval, which
+    hold locks and pin the xmin horizon
+
+  All three refuse every plan, core kinds included.
+- Colocation with a different distribution-column type (exactly, `int` against
+  `bigint` included), foreign keys Citus cannot hold, keys that omit the
+  distribution column, a drain or rebalance by logical replication on workers
+  that cannot do it.
+
+### Core, changed by what Citus exposed
+
+- **`--dry-run=chain`.** Rehearses every pending specification in dependency
+  order, each on top of the ones before it: one transaction per database,
+  rolled back. It lifts most of the 0.1.2 "Known limit": a repository nobody has
+  applied can now be checked. Paced batches and `CREATE INDEX CONCURRENTLY`
+  still cannot run inside it, and are listed as unverified.
+- **The dry run executes what must be executed.** A Citus call is a `SELECT`
+  that changes the catalog, and was only ever planned. It is now run and rolled
+  back, and a step that does not roll back (a rebalance, a drain) is skipped
+  and says so rather than being run.
+- **A dry run reports what the server said,** with SQLSTATE, message and
+  statement, instead of inviting a defect report. A server error in the
+  connection class on a healthy connection is reported as a problem rather than
+  escaping as a tool error.
+- **Pacing sees the workers.** Contention was read on the coordinator only,
+  where a distributed write is quiet while every worker queues behind it. Waits
+  on workers now count, and have an age the breaker can use.
+- **A failed migration is unfinished work.** The deployment ignored one:
+  listed with no status, never retried, exit 0. It is now retried, resuming
+  where it stopped, and `--status` exits non-zero over it.
+- **An index can say how it sorts, and what it is on.** A column may be an
+  object: `direction`, `nulls`, `opclass`, or an `expression` in place of a
+  name, plus `include`. The equivalent-index match compares ordering and
+  operator classes, so an ascending index no longer satisfies a descending
+  one. A plain string stays a string, so no existing signature changes.
+- **Configuration:** a dotted key in a connection section
+  (`citus.workers`) is a module setting for that connection. It is refused
+  when read if no compiled-in module owns it.
+- **Reference pages** read the checks a parser delegates to helpers. Two
+  pages had called required keys optional.
+- **The pooler diagnostic** says what it observed (the backend pid changed)
+  rather than naming a pool mode it could not know.
+
+### Building: libpqxx 8.0.2, exactly
+
+CMake now requires the libpqxx CI and every release build from source, 8.0.2,
+and stops naming the version it found otherwise. A distribution's package is
+whatever that distribution froze (Debian 13 ships 7.10), and code compiling
+against two versions is written to what they share: a build against 7.10
+compiled locally and failed in CI, where `sqlstate()` is a `string_view`. The
+7.x compatibility shim around `exec` is gone, and so is a GCC warning
+suppression the 8.0.2 headers no longer need. BUILD.md shows how to build the
+pinned version into a prefix of your own, with the script CI uses.
+
+### CI
+
+A `citus` job builds with the module, runs the example against a real
+three-node cluster, and runs the live suite. The ASan/UBSan and TSan jobs
+build with the module, so the shipped code is what they watch. Release builds
+package with it.
 
 ### A repository may be several directories
 
@@ -89,11 +239,11 @@ omitting it costs scope and never safety.
 The page now lists every idea the tool has -- thirty terms in six layers, each
 with what it ACTUALLY is rather than a gloss, because `target` does four
 unrelated jobs and saying so once beats four paragraphs elsewhere -- and then
-twelve ways people arrange it, each with a diagram, a numbered sequence, and a
+nine ways people arrange it, each with a diagram, a numbered sequence, and a
 link to a directory you can run. It states the dry-run limit below rather than
 leaving a reader to discover it.
 
-### Ten runnable examples, and CI runs them
+### Eleven runnable examples, and CI runs them
 
 `examples/docker/` starts three `postgres:latest` containers and demonstrates
 each arrangement: the baseline, a CI gate, release tags, environments, two roles
@@ -107,12 +257,19 @@ its demonstration -- because an example that runs without failing is not the
 same as one that still shows anything, and exactly that had already happened to
 one of the ten.
 
-### Known limit
+The eleventh is `examples/docker/citus/`, on a coordinator and two workers of its
+own: one repository, borrowed from the pgshard lab's banking/journal variant,
+applied to a plain PostgreSQL and to a Citus cluster, told apart by epoch. CI
+runs it in the `citus` job.
 
-`--dry-run` is per specification. One that needs a table an earlier PENDING
-specification creates cannot be planned yet, and says so. A repository-wide dry
-run is not merely unimplemented: paced batches commit by design and an index
-built concurrently cannot run in a transaction at all.
+### Known limit, and how far it moved
+
+`--dry-run` is per specification: one that needs a table an earlier PENDING
+specification creates cannot be planned yet, and says so. `--dry-run=chain`
+(above) is the repository-wide rehearsal that closes most of that. What it still
+cannot run is what cannot run inside a transaction at all: paced batches, which
+commit by design, an index built concurrently, and a Citus drain or rebalance.
+Those are listed as unverified, never passed.
 
 ### Wave one, as published in v0.1.2-alpha1
 

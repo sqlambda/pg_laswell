@@ -1,0 +1,52 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0020-account-transactions",
+  "description": "The account_transactions table.",
+  "rationale": "The primary key leads with the distribution column, which Citus requires: uniqueness cannot be enforced across shards without it. Harmless on a plain server, so one spec serves both.",
+  "intents": [
+    {
+      "kind": "create_table",
+      "schema": "public",
+      "table": "account_transactions",
+      "comment": "Account transactions.",
+      "primary_key": [
+        "account_id",
+        "reference"
+      ],
+      "columns": [
+        {
+          "name": "account_id",
+          "type": "bigint",
+          "nullable": false,
+          "comment": "Owning account, and the distribution column."
+        },
+        {
+          "name": "amount",
+          "type": "numeric",
+          "nullable": false,
+          "comment": "Signed amount; negative is a debit."
+        },
+        {
+          "name": "ts",
+          "type": "timestamptz",
+          "nullable": false,
+          "comment": "When the entry was written.",
+          "default": "CURRENT_TIMESTAMP"
+        },
+        {
+          "name": "reference",
+          "type": "uuid",
+          "nullable": false,
+          "comment": "Groups the two halves of a transfer."
+        }
+      ]
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:0a1ed85ee9747a3a",
+      "algorithm": "ed25519",
+      "signature": "ofKN2NcQuycD+IgkjjgOuXV3VYjjlXaj010F9QWz7nCfVxW6LG1OHulxn1OgMCD0ya1Bns/bre5u4v/v6Fz+DA=="
+    }
+  ]
+}

@@ -37,7 +37,14 @@ void usage(const char* argv0) {
       "                     ALL of it, so the drift check answers for every\n"
       "                     epoch rather than only the ones on disk\n"
       "  --status           report what is pending and exit; change nothing\n"
-      "  --dry-run          plan every pending migration; apply nothing\n"
+      "  --dry-run          plan every pending migration; apply nothing. Each is\n"
+      "                     planned against the database as it is NOW, so in a\n"
+      "                     repository not yet applied, a specification needing\n"
+      "                     what an earlier PENDING one creates is refused.\n"
+      "  --dry-run=chain    rehearse the pending migrations in order, each on top\n"
+      "                     of the ones before it, then roll everything back.\n"
+      "                     Holds every lock until the end: for an empty database\n"
+      "                     or a restored copy, not for production.\n"
       "  -c, --config FILE  configuration file (or PGLASWELL_CONFIG)\n"
       "  -V, --version      print the version and exit\n"
       "  -h, --help         this text\n"
@@ -64,11 +71,16 @@ int main(int argc, char* argv[]) {
     const std::string arg = argv[i];
     if (arg == "-h" || arg == "--help") { usage(argv[0]); return 0; }
     if (arg == "-V" || arg == "--version") {
-      std::cout << "pg_laswell " PGLASWELL_VERSION "\n";
+      std::cout << "pg_laswell " PGLASWELL_VERSION "\n" << pglaswell::module_banner();
       return 0;
     }
     if (arg == "--status")  { opts.status_only = true; continue; }
     if (arg == "--dry-run") { opts.dry_run = true;     continue; }
+    if (arg == "--dry-run=chain") {
+      opts.dry_run = true;
+      opts.chain = true;
+      continue;
+    }
     if (arg == "--repo") {
       if (i + 1 >= argc) { std::cerr << "--repo requires a directory\n"; return 3; }
       // Repeatable: a project per directory, applied as one repository.

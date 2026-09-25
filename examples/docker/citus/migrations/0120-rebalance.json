@@ -1,0 +1,27 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0120-rebalance",
+  "description": "Balance the shards across the configured workers.",
+  "rationale": "Last, after everything is distributed. On a fresh cluster Citus's own plan has no moves and this is satisfied; after citus.workers grows, the same signed file moves shards onto the new workers.",
+  "target": {
+    "epoch": "citus"
+  },
+  "depends_on": [
+    "0060-distribute-account-transactions",
+    "0110-currencies-reference"
+  ],
+  "intents": [
+    {
+      "kind": "citus_rebalance_shards",
+      "transfer_mode": "block_writes",
+      "comment": "block_writes: these containers run wal_level replica."
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:0a1ed85ee9747a3a",
+      "algorithm": "ed25519",
+      "signature": "Gnqxoz0LdtjObGPz0ZIHrfJh25DPuxml2T9WFrn5C50yup6qYu6xLIQ7nc+hTWs/sNoNi232p+Lf/gzaO8ZUBw=="
+    }
+  ]
+}

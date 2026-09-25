@@ -1,0 +1,80 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0030-procedures",
+  "description": "The write path, as stored procedures.",
+  "rationale": "Bodies are carried verbatim from the variant's SQL. These ARE the workload being measured, so they are transcribed rather than rewritten -- a reformatting that changed a plan would change the result while looking like a refactor. Borrowed from pgshard's banking/journal variant, with uuidv7() replaced by gen_random_uuid(): these containers run PostgreSQL 17, and uuidv7() arrived in 18.",
+  "depends_on": [
+    "0010-accounts",
+    "0020-account-transactions"
+  ],
+  "intents": [
+    {
+      "kind": "create_function",
+      "schema": "public",
+      "name": "account_transfer",
+      "routine_kind": "PROCEDURE",
+      "language": "plpgsql",
+      "arguments": [
+        {
+          "name": "account_from",
+          "type": "integer"
+        },
+        {
+          "name": "account_to",
+          "type": "integer"
+        },
+        {
+          "name": "transfer_amount",
+          "type": "numeric"
+        }
+      ],
+      "body": "DECLARE\n ref UUID DEFAULT gen_random_uuid();\nBEGIN\n IF account_from = account_to THEN\n  RETURN;\n END IF;\n IF (SELECT SUM(amount) FROM account_transactions WHERE account_id = account_from) >= transfer_amount\n THEN\n  INSERT INTO account_transactions (account_id, amount, reference)\n  VALUES (account_from, -transfer_amount, ref),\n         (account_to, transfer_amount, ref);\n END IF;\nEND",
+      "comment": "Account transfer."
+    },
+    {
+      "kind": "create_function",
+      "schema": "public",
+      "name": "account_deposit",
+      "routine_kind": "PROCEDURE",
+      "language": "plpgsql",
+      "arguments": [
+        {
+          "name": "deposit_account",
+          "type": "integer"
+        },
+        {
+          "name": "deposit_amount",
+          "type": "numeric"
+        }
+      ],
+      "body": "DECLARE\n ref UUID DEFAULT gen_random_uuid();\nBEGIN\n INSERT INTO account_transactions (account_id, amount, reference)\n VALUES (deposit_account, deposit_amount, ref);\nEND",
+      "comment": "Account deposit."
+    },
+    {
+      "kind": "create_function",
+      "schema": "public",
+      "name": "account_withdrawal",
+      "routine_kind": "PROCEDURE",
+      "language": "plpgsql",
+      "arguments": [
+        {
+          "name": "withdrawal_account",
+          "type": "integer"
+        },
+        {
+          "name": "withdrawal_amount",
+          "type": "numeric"
+        }
+      ],
+      "body": "DECLARE\n ref UUID DEFAULT gen_random_uuid();\nBEGIN\n IF (SELECT SUM(amount) FROM account_transactions WHERE account_id = withdrawal_account) >= withdrawal_amount\n THEN\n  INSERT INTO account_transactions (account_id, amount, reference)\n  VALUES (withdrawal_account, -withdrawal_amount, ref);\n END IF;\nEND",
+      "comment": "Account withdrawal."
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:0a1ed85ee9747a3a",
+      "algorithm": "ed25519",
+      "signature": "+DGyjJ3dwArmPHyz2zFtJ6RDVJbF4Sq60i2l7Ki/qiRvzz8SoEU2ySMQZ71XGECxAW9UHVcdQ2Kx1r48q8+PDA=="
+    }
+  ]
+}

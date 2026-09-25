@@ -1,0 +1,29 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0050-distribute-accounts",
+  "description": "Distribute accounts.",
+  "rationale": "Distributed first so everything colocating with it has a group to join.",
+  "target": {
+    "epoch": "citus"
+  },
+  "depends_on": [
+    "0010-accounts",
+    "0040-citus-cluster"
+  ],
+  "intents": [
+    {
+      "kind": "citus_distribute_table",
+      "schema": "public",
+      "table": "accounts",
+      "distribution_column": "id",
+      "comment": "Hash distributed on id."
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:0a1ed85ee9747a3a",
+      "algorithm": "ed25519",
+      "signature": "KP6lS8qo77j9cdIUz4cBQqE3j7kF7/8lEcujiKrgiXcyJw9VENFxIAbe7kd2MBemXDK1OhBTJfJcDX0/CJhJDQ=="
+    }
+  ]
+}

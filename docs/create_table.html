@@ -81,7 +81,8 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
   &quot;columns&quot;: &lt;optional&gt;,
   &quot;primary_key&quot;: &lt;optional&gt;,
   &quot;partition_by&quot;: &lt;optional&gt;,
-  &quot;unlogged&quot;: &lt;optional&gt;
+  &quot;unlogged&quot;: &lt;optional&gt;,
+  &quot;options&quot;: &lt;optional&gt;
 }</pre>
 <h2>Description</h2>
 <p>—- create_table / drop_table ——————————————————————-</p>
@@ -100,6 +101,8 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
 <dt>partition_by<span class="tag opt">optional</span></dt>
 <dd>&nbsp;</dd>
 <dt>unlogged<span class="tag opt">optional</span></dt>
+<dd>&nbsp;</dd>
+<dt>options<span class="tag opt">optional</span></dt>
 <dd>&nbsp;</dd>
 </dl>
 <div class="note">Any key not listed here is <strong>refused</strong>, not ignored: a key this binary skips and a newer one honours would be a silent difference between what was reviewed and what ran.</div>
