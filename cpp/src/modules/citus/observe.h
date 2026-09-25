@@ -54,8 +54,20 @@ SELECT JSONB_BUILD_OBJECT(
   --
   -- It asks the workers for shard sizes. Measured, 64ms on the three-node
   -- example cluster.
+  --
+  -- NOT READ inside a transaction that has already written. The call measures
+  -- shard sizes over connections of its own, which cannot see uncommitted
+  -- shards: measured, after a create_distributed_table with rows in the same
+  -- transaction it raised "cannot get the size because of a connection error".
+  -- A chained dry run plans every specification inside one such transaction,
+  -- and an error here failed the planning of every one after it. There the
+  -- reading is a string saying why, and a rebalance runs without it.
   'rebalance_moves',
-     CASE WHEN (SELECT count(*) FROM pg_dist_node
+     CASE WHEN txid_current_if_assigned() IS NOT NULL
+            THEN to_jsonb('not readable inside a transaction that has already '
+                          'written: Citus measures shard sizes over separate '
+                          'connections, which cannot see uncommitted shards'::text)
+          WHEN (SELECT count(*) FROM pg_dist_node
                  WHERE shouldhaveshards AND isactive AND noderole = 'primary')
                >= COALESCE(NULLIF(current_setting('citus.shard_replication_factor',
                                                   true), '')::int, 1)
@@ -109,12 +121,22 @@ SELECT JSONB_BUILD_OBJECT(
   -- reference data -- and the next create_distributed_table copied them all to
   -- it. So the cost lands on whichever step next needs them everywhere, and a
   -- node holding fewer than all is where it will land.
-  -- citus_total_relation_size asks one placement; measured ~1 ms.
+  --
+  -- The size is read from the COORDINATOR's own copy, with pg_total_relation_size
+  -- on the local shard relation. citus_total_relation_size was the first
+  -- version, and Citus refuses its size functions in a transaction that has
+  -- made multi-shard modifications ("citus size functions cannot be called in
+  -- transaction blocks which contain multi-shard data modifications") -- which
+  -- is every chained dry run past its first distribution. Null when the
+  -- coordinator holds no copy, and then the plan says the size was not read.
   'reference_tables', JSONB_BUILD_OBJECT(
      'count', (SELECT count(*) FROM pg_dist_partition
                 WHERE partmethod = 'n' AND repmodel = 't'),
-     'bytes', (SELECT COALESCE(sum(citus_total_relation_size(logicalrelid)), 0)
-                 FROM pg_dist_partition WHERE partmethod = 'n' AND repmodel = 't')),
+     'bytes', (SELECT sum(pg_total_relation_size(to_regclass(shard_name(p.logicalrelid, s.shardid))))
+                 FROM pg_dist_partition p
+                 JOIN pg_dist_shard s USING (logicalrelid)
+                 JOIN pg_dist_placement pl USING (shardid)
+                WHERE p.partmethod = 'n' AND p.repmodel = 't' AND pl.groupid = 0)),
   'worker_count', (SELECT count(*) FROM pg_dist_node
                     WHERE noderole = 'primary' AND isactive
                       AND NOT (nodename = COALESCE(

@@ -178,13 +178,16 @@ inline void citus_note_reference_copy(const json& citus, Step& step, Plan& plan,
     }
   }
   if (lacking.empty()) return;
-  const long long bytes = refs.value("bytes", 0LL);
+  const auto b = refs.value("bytes", json(nullptr));
   step.detail["reference_copy_to"] = lacking;
-  step.detail["reference_bytes"] = bytes;
+  step.detail["reference_bytes"] = b;
+  const std::string size =
+      b.is_number() ? std::to_string(b.get<long long>() / (1024 * 1024)) +
+                          " MiB per copy, measured on the coordinator's copy"
+                    : std::string("size not read: the coordinator holds no copy");
   plan.warnings.push_back(
       what + " first copies the " + std::to_string(count) + " reference table(s) (" +
-      std::to_string(bytes / (1024 * 1024)) + " MiB per copy, by "
-      "citus_total_relation_size) to " + detail::join(lacking, ", ") +
+      size + ") to " + detail::join(lacking, ", ") +
       ", which do not hold them yet. Adding a node copies nothing (measured); "
       "the next step needing them everywhere pays for it, and this is that step.");
 }
@@ -1424,8 +1427,10 @@ inline void plan_citus_add_node(const Intent& in, const Observations& obs,
       plan.warnings.push_back(
           name + " joins holding none of the " +
           std::to_string(refs.value("count", 0)) + " reference table(s) (" +
-          std::to_string(refs.value("bytes", 0LL) / (1024 * 1024)) +
-          " MiB per copy). Adding it copies nothing -- measured -- and the next "
+          (refs.value("bytes", json(nullptr)).is_number()
+               ? std::to_string(refs["bytes"].get<long long>() / (1024 * 1024)) + " MiB per copy"
+               : std::string("size not read")) +
+          "). Adding it copies nothing -- measured -- and the next "
           "distribute or rebalance copies them all to it.");
     }
   }
@@ -1687,15 +1692,18 @@ inline void plan_citus_rebalance_shards(const Intent& in, const Observations& ob
   // the plan Citus gave was for the cluster before it. Then the rebalance runs
   // unconditionally -- Citus plans again when it runs, and a rebalance with
   // nothing to move does nothing -- rather than reading an old "balanced".
-  if (citus.contains("rebalance_moves_stale_after_step")) {
+  const bool unreadable = citus.value("rebalance_moves", json(nullptr)).is_string();
+  if (citus.contains("rebalance_moves_stale_after_step") || unreadable) {
     if (!citus_transfer_mode_possible(in, citus, step, plan)) return;
     const auto mode = in.body.value("transfer_mode", "auto");
     const int after = citus.value("rebalance_moves_stale_after_step", 0);
     step.action = Action::kApply;
     step.txn_class = TxnClass::kForbidden;
     step.detail["transfer_mode"] = mode;
-    step.detail["moves"] = "unknown: step " + std::to_string(after) +
-                           " of this plan changes the cluster's nodes first";
+    step.detail["moves"] =
+        unreadable ? "unknown: " + citus.value("rebalance_moves", std::string())
+                   : "unknown: step " + std::to_string(after) +
+                         " of this plan changes the cluster's nodes first";
     step.detail["on_failure"] =
         "a failed rebalance keeps the moves it had already made. Nothing needs "
         "undoing: running the specification again re-reads Citus's plan and "
@@ -1704,8 +1712,11 @@ inline void plan_citus_rebalance_shards(const Intent& in, const Observations& ob
                     ? "writes to each shard wait while that shard is copied"
                     : "each shard is copied by logical replication; writes wait "
                       "only for the final switch";
-    step.why = "an earlier intent changes the cluster's nodes, so the moves are "
-               "decided by Citus when this runs";
+    step.why = unreadable
+                   ? std::string("Citus's rebalance plan could not be read here, "
+                                 "so the moves are decided by Citus when this runs")
+                   : std::string("an earlier intent changes the cluster's nodes, so "
+                                 "the moves are decided by Citus when this runs");
     step.sql.push_back("SELECT rebalance_table_shards(shard_transfer_mode := " +
                        detail::quote_literal(mode) + ");");
     plan.warnings.push_back(
@@ -1982,8 +1993,10 @@ inline void plan_citus_ensure_workers(const Intent& in, const Observations& obs,
       plan.warnings.push_back(
           detail::join(adding, ", ") + " join holding none of the " +
           std::to_string(refs.value("count", 0)) + " reference table(s) (" +
-          std::to_string(refs.value("bytes", 0LL) / (1024 * 1024)) +
-          " MiB per copy, to each). Adding copies nothing -- measured -- and the "
+          (refs.value("bytes", json(nullptr)).is_number()
+               ? std::to_string(refs["bytes"].get<long long>() / (1024 * 1024)) + " MiB per copy, to each"
+               : std::string("size not read")) +
+          "). Adding copies nothing -- measured -- and the "
           "next distribute or rebalance copies them all.");
     }
   }

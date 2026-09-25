@@ -19,9 +19,9 @@
   ],
   "signatures": [
     {
-      "key_id": "ed25519:c6a0b46e75c99c34",
+      "key_id": "ed25519:0a1ed85ee9747a3a",
       "algorithm": "ed25519",
-      "signature": "tW1uCBAeeJ3qWe/XcF/h3DMECR4IHtcQ5GS088ByBAEbfFlSSNtVOP0j85iE04yOYf595FGY/IjajEDO2jGXCA=="
+      "signature": "VlIhc0mz0ISTIbNlZbBK3MkDiwo2mKd/BIszLbpgtqZf51E3vsaStyBwUQ1/R5b9IeUwxwPlFLanu86/RnSrBQ=="
     }
   ]
 }

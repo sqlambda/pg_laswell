@@ -1731,3 +1731,17 @@ TEST(CitusPlanner, TableStatisticsAreForTablesCitusShards) {
   c["tables"]["public.a"] = managed_local();
   EXPECT_FALSE(plan_citus(in, citus_observations(c, tables)).ok);
 }
+
+TEST(CitusPlanner, ARebalanceWhosePlanCouldNotBeReadRunsRatherThanRefusing) {
+  // Measured: inside a transaction that has written distributed rows, Citus's
+  // rebalance plan cannot be read -- which is every chained dry run past its
+  // first distribution. The reading says so, and the rebalance is applied.
+  json c = cluster();
+  c["rebalance_moves"] = "not readable inside a transaction that has already written";
+  const auto p = plan_citus(json{{"kind", "citus_rebalance_shards"}},
+                            citus_observations(c, json::object()));
+  ASSERT_TRUE(p.ok) << first_conflict(p);
+  EXPECT_EQ(p.steps[0].action, pglaswell::Action::kApply);
+  EXPECT_EQ(p.steps[0].txn_class, pglaswell::TxnClass::kForbidden);
+  EXPECT_NE(p.steps[0].why.find("could not be read"), std::string::npos) << p.steps[0].why;
+}
