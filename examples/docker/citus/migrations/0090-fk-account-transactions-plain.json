@@ -1,0 +1,36 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0090-fk-account-transactions-plain",
+  "description": "Foreign keys on account_transactions (single-server ordering).",
+  "rationale": "Straight after the tables, which is all a single PostgreSQL needs. Held on a Citus database, where the citus-epoch twin of this spec carries the same constraint in the order distribution requires.",
+  "target": {
+    "epoch": "plain"
+  },
+  "depends_on": [
+    "0010-accounts",
+    "0020-account-transactions"
+  ],
+  "intents": [
+    {
+      "kind": "add_foreign_key",
+      "schema": "public",
+      "table": "account_transactions",
+      "name": "account_transactions_account_id_fkey",
+      "columns": [
+        "account_id"
+      ],
+      "references_schema": "public",
+      "references_table": "accounts",
+      "references_columns": [
+        "id"
+      ]
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:0a1ed85ee9747a3a",
+      "algorithm": "ed25519",
+      "signature": "1jZhr8cR99M/ni9uvJWoDBPUSuQffAmXvnz2q2tdfJVNlDYf0aY68ydDr8GnfY5lC9r2235oa+6OEtvzulTmAw=="
+    }
+  ]
+}

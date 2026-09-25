@@ -1,0 +1,28 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0110-currencies-reference",
+  "description": "Replicate currencies to every node.",
+  "rationale": "Read by every transfer and almost never written, which is what a reference table is for: every join against it stays on the worker.",
+  "target": {
+    "epoch": "citus"
+  },
+  "depends_on": [
+    "0100-currencies",
+    "0040-citus-cluster"
+  ],
+  "intents": [
+    {
+      "kind": "citus_create_reference_table",
+      "schema": "public",
+      "table": "currencies",
+      "comment": "One copy on every node."
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:0a1ed85ee9747a3a",
+      "algorithm": "ed25519",
+      "signature": "z6yboqVNq45boNB6eZDIWlQMUVAA0kVO62ZO3jlz0udqG3rXL/1vMAFPdYOveruYAmPGoc/Bc2qfcZNq8XTNDw=="
+    }
+  ]
+}

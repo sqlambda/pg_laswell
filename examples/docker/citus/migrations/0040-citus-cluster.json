@@ -1,0 +1,39 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0040-citus-cluster",
+  "description": "Register the coordinator and the configured workers.",
+  "rationale": "citus_ensure_workers names no host: the addresses come from citus.workers in this connection's section of the configuration, which run.sh writes. Bounded here because that file is unsigned and a worker receives shards of the data. unlisted=refuse, because a cluster that does not match what was configured should stop the run rather than be quietly corrected. The coordinator takes no shards: it routes, the workers hold the data.",
+  "target": {
+    "epoch": "citus"
+  },
+  "intents": [
+    {
+      "kind": "citus_set_coordinator_host",
+      "host": "coordinator",
+      "port": 5432,
+      "comment": "How the workers reach the coordinator."
+    },
+    {
+      "kind": "citus_set_node_property",
+      "host": "coordinator",
+      "port": 5432,
+      "should_have_shards": false,
+      "comment": "The coordinator routes; the workers hold the shards."
+    },
+    {
+      "kind": "citus_ensure_workers",
+      "hosts_matching": "worker*",
+      "min_workers": 2,
+      "max_workers": 6,
+      "unlisted": "refuse",
+      "comment": "The workers are whatever this connection's citus.workers says they are."
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:0a1ed85ee9747a3a",
+      "algorithm": "ed25519",
+      "signature": "NYkn81yuF+wtGWFyf4s6cGmYjXg/fEoZ4xGGlL6JBB78lW/kjmTGxJMCaTYQiO75arzblHLp2S4TxE9v2yavDw=="
+    }
+  ]
+}

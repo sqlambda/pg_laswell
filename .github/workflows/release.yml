@@ -401,6 +401,11 @@ jobs:
           python3 tools/gen-site.py _site
           mandoc -T html cpp/man/pg_laswell.1     > _site/pg_laswell.1.html
           mandoc -T html cpp/man/pg_laswell_mcp.1 > _site/pg_laswell_mcp.1.html
+          # Every module's page too: the released package carries them, and the
+          # landing page links them.
+          for m in cpp/man/pg_laswell_*.7; do
+            mandoc -T html "$m" > "_site/$(basename "$m").html"
+          done
           # The diagrams are the point of the landing page, so a syntax error in
           # one is a build failure rather than an empty box on a live site.
           python3 tools/check-mermaid.py site/index.html

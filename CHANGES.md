@@ -1,11 +1,15 @@
 # Changes
 
-## Unreleased
+## 0.1.2
 
-Vendor modules, with Citus as the first, and the core fixes that building one
-exposed. 506 tests (plus 55 live cases against a coordinator and two workers),
-100 intent kinds: 83 core and 17 Citus. **No ledger schema change**, so there is
-no bootstrap to re-run. Rename this heading to the version when it is tagged.
+Two arcs. Vendor modules, with Citus as the first: one package that speaks plain
+PostgreSQL and Citus alike, seventeen Citus kinds, and the core fixes that
+building them exposed, `--dry-run=chain` among them. And the multi-directory
+work, end to end: a repository may be several directories, a specification
+belongs to a lineage, and a manifest can say whether those directories are all
+of a database's story. 506 tests, plus 55 live cases against a Citus coordinator
+and two workers; 100 intent kinds, 83 core and 17 Citus. **The ledger schema
+moves to version 3** -- run the bootstrap script shipped with this binary.
 
 ### One package, every module
 
@@ -142,13 +146,6 @@ three-node cluster, and runs the live suite. The ASan/UBSan and TSan jobs
 build with the module, so the shipped code is what they watch. Release builds
 package with it.
 
-## 0.1.2
-
-The multi-directory work, end to end: a repository may be several directories, a
-specification belongs to a lineage, and a manifest can say whether those
-directories are all of a database's story. 416 tests, and **the ledger schema
-moves to version 3** -- run the bootstrap script shipped with this binary.
-
 ### A repository may be several directories
 
 A project per directory, read as one repository. The ledger is what permits it:
@@ -231,11 +228,11 @@ omitting it costs scope and never safety.
 The page now lists every idea the tool has -- thirty terms in six layers, each
 with what it ACTUALLY is rather than a gloss, because `target` does four
 unrelated jobs and saying so once beats four paragraphs elsewhere -- and then
-twelve ways people arrange it, each with a diagram, a numbered sequence, and a
+nine ways people arrange it, each with a diagram, a numbered sequence, and a
 link to a directory you can run. It states the dry-run limit below rather than
 leaving a reader to discover it.
 
-### Ten runnable examples, and CI runs them
+### Eleven runnable examples, and CI runs them
 
 `examples/docker/` starts three `postgres:latest` containers and demonstrates
 each arrangement: the baseline, a CI gate, release tags, environments, two roles
@@ -249,12 +246,19 @@ its demonstration -- because an example that runs without failing is not the
 same as one that still shows anything, and exactly that had already happened to
 one of the ten.
 
-### Known limit
+The eleventh is `examples/docker/citus/`, on a coordinator and two workers of its
+own: one repository, borrowed from the pgshard lab's banking/journal variant,
+applied to a plain PostgreSQL and to a Citus cluster, told apart by epoch. CI
+runs it in the `citus` job.
 
-`--dry-run` is per specification. One that needs a table an earlier PENDING
-specification creates cannot be planned yet, and says so. A repository-wide dry
-run is not merely unimplemented: paced batches commit by design and an index
-built concurrently cannot run in a transaction at all.
+### Known limit, and how far it moved
+
+`--dry-run` is per specification: one that needs a table an earlier PENDING
+specification creates cannot be planned yet, and says so. `--dry-run=chain`
+(above) is the repository-wide rehearsal that closes most of that. What it still
+cannot run is what cannot run inside a transaction at all: paced batches, which
+commit by design, an index built concurrently, and a Citus drain or rebalance.
+Those are listed as unverified, never passed.
 
 ### Wave one, as published in v0.1.2-alpha1
 

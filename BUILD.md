@@ -31,9 +31,21 @@ cmake --build cpp/build -j
 ctest --test-dir cpp/build --output-on-failure
 ```
 
-`ctest` registers three entries: the gtest binary, a Valgrind-wrapped run of it
-(auto-registered when valgrind is present and no sanitizer is active), and a
-`mandoc -Tlint` of the man page.
+`ctest` registers, with the Citus module built in:
+
+| Entry | What it runs |
+|---|---|
+| `mcp_test` | the gtest binary |
+| `pg_laswell_mcp_test_valgrind` | the same under Valgrind, when valgrind is present and no sanitizer is active |
+| `manpage_lint` | `mandoc -Tlint` of every man page |
+| `manpage_kinds` | `tools/check-manual.py`: every kind documented, on the right page |
+| `no_dangling_items` | a source check for iterating a temporary JSON value, a bug shape found five times |
+| `plans` | the plan renderer against committed transcripts |
+| `replication` | the replication suite; it needs a second cluster and skips without one |
+| `call_mode` | the binaries' `--call` mode |
+| `citus_tests` | the live Citus suite, only in a build with the module; it skips without `CITUS_URL` |
+
+A build without the module registers the same list minus `citus_tests`.
 
 ### Tests and the database
 
@@ -50,6 +62,31 @@ DATABASE_URL="port=5555 dbname=postgres" ctest --test-dir cpp/build
 
 A skip nobody notices is a test that silently stopped running, so CI sets
 `PGLASWELL_REQUIRE_DATABASE=1`, which turns that skip into a failure.
+
+## Modules
+
+A vendor module is compiled in, never loaded at runtime:
+
+```bash
+cmake -S cpp -B cpp/build -DPGLASWELL_MODULES=citus
+```
+
+The released package is built this way, and `pg_laswell --version` prints
+`modules: citus`. Without the option the binary is PostgreSQL-only, and CI builds
+both: the plain builds prove core needs no module, the module builds prove the
+module. A module's kinds are refused by a binary without it, as a whole
+specification, never skipped.
+
+The Citus module's live suite needs a coordinator and two workers:
+
+```bash
+docker compose -f examples/docker/citus/compose.yml up -d
+./examples/docker/citus/run.sh                   # the example, and a database the suite uses
+CITUS_URL=postgresql://postgres:laswell@127.0.0.1:55440/citus_example \
+  ctest --test-dir cpp/build -R citus_tests --output-on-failure
+```
+
+How a module is written is in `cpp/src/modules/README.md`.
 
 ## Warnings are errors
 
@@ -96,11 +133,15 @@ portable suite; see the README there. Do not "clean up" after them with
 ## Packaging
 
 ```bash
-cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release
-cmake --build cpp/build --target pg_laswell_mcp
+cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
+      -DPGLASWELL_MODULES=citus
+cmake --build cpp/build --target pg_laswell pg_laswell_mcp
 cd cpp/build && cpack -G DEB    # or RPM
 ```
 
-The man page is checked in rather than generated: release containers carry no
-doc toolchain, and the release build names a single target rather than `all`,
-so a generator target would never run and CPack would fail on a missing file.
+That is what the release builds: one package, `pg-laswell`, with every module
+compiled in, and each module's man page installed in section 7.
+
+The man pages are checked in rather than generated: release containers carry no
+doc toolchain, and the release build names its targets rather than `all`, so a
+generator target would never run and CPack would fail on a missing file.

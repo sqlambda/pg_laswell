@@ -99,7 +99,16 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
 </dl>
 <div class="note">Any key not listed here is <strong>refused</strong>, not ignored: a key this binary skips and a newer one honours would be a silent difference between what was reviewed and what ran.</div>
 <h2>Examples</h2>
-<div class="note warn">No single-database example: needs a Citus cluster and a configuration naming its workers. This kind is covered by <code>cpp/test/replication-tests.sh</code>, which builds two clusters.</div>
+<p>From <code>examples/docker/citus/migrations/0040-citus-cluster.json</code>, specification <code>0040-citus-cluster</code>. CI applies that repository to a real Citus cluster on every run (<code>examples/docker/citus/run.sh</code>):</p>
+<pre>{
+ &quot;kind&quot;: &quot;citus_ensure_workers&quot;,
+ &quot;hosts_matching&quot;: &quot;worker*&quot;,
+ &quot;min_workers&quot;: 2,
+ &quot;max_workers&quot;: 6,
+ &quot;unlisted&quot;: &quot;refuse&quot;,
+ &quot;comment&quot;: &quot;The workers are whatever this connection&#x27;s citus.workers says they are.&quot;
+}</pre>
+<p>Its refusals are proved against that cluster too, in <code>cpp/test/citus-tests.sh</code>.</p>
 <h2>See also</h2><p><a href="citus_distribute_table.html"><code>citus_distribute_table</code></a>, <a href="citus_create_reference_table.html"><code>citus_create_reference_table</code></a>, <a href="citus_distribute_function.html"><code>citus_distribute_function</code></a>, <a href="citus_alter_distributed_table.html"><code>citus_alter_distributed_table</code></a>, <a href="citus_undistribute_table.html"><code>citus_undistribute_table</code></a>, <a href="citus_add_local_table_to_metadata.html"><code>citus_add_local_table_to_metadata</code></a>, <a href="citus_truncate_local_data.html"><code>citus_truncate_local_data</code></a>, <a href="citus_add_node.html"><code>citus_add_node</code></a>, <a href="citus_remove_node.html"><code>citus_remove_node</code></a>, <a href="citus_set_coordinator_host.html"><code>citus_set_coordinator_host</code></a>, <a href="citus_set_node_property.html"><code>citus_set_node_property</code></a>, <a href="citus_drain_node.html"><code>citus_drain_node</code></a>, <a href="citus_rebalance_shards.html"><code>citus_rebalance_shards</code></a>, <a href="citus_disable_node.html"><code>citus_disable_node</code></a>, <a href="citus_activate_node.html"><code>citus_activate_node</code></a>, <a href="citus_update_table_statistics.html"><code>citus_update_table_statistics</code></a></p>
 <footer>Generated from <code>cpp/src/spec.h</code> and <code>cpp/src/conformance.inc</code> by <code>tools/gen-manual.py</code>. The manual page <code>pg_laswell_mcp(1)</code> remains the authoritative reference for everything that is not a per-kind option.</footer>
 </div></body></html>

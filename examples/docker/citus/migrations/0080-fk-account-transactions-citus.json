@@ -1,0 +1,36 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0080-fk-account-transactions-citus",
+  "description": "Foreign keys on account_transactions (Citus ordering).",
+  "rationale": "After distribution, because Citus refuses a reference from a local table to a distributed one and requires colocation between two distributed ones.",
+  "target": {
+    "epoch": "citus"
+  },
+  "depends_on": [
+    "0050-distribute-accounts",
+    "0060-distribute-account-transactions"
+  ],
+  "intents": [
+    {
+      "kind": "add_foreign_key",
+      "schema": "public",
+      "table": "account_transactions",
+      "name": "account_transactions_account_id_fkey",
+      "columns": [
+        "account_id"
+      ],
+      "references_schema": "public",
+      "references_table": "accounts",
+      "references_columns": [
+        "id"
+      ]
+    }
+  ],
+  "signatures": [
+    {
+      "key_id": "ed25519:0a1ed85ee9747a3a",
+      "algorithm": "ed25519",
+      "signature": "LGhO31+9SKUpXEX8Emff+uhPB4ZJkIcHjHSb2Te1bEqGvLhG5cGxuRWVPWHzrZgddbjXiBQH3jt6TtKY94oLBQ=="
+    }
+  ]
+}

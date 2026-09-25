@@ -351,6 +351,32 @@ def module_kinds():
     return out
 
 
+def module_examples(mod):
+    """kind -> the first intent of that kind in examples/docker/<mod>/migrations.
+
+    A module's kinds cannot be proved on a single plain PostgreSQL, so they have
+    no conformance case to take an example from. The docker example's
+    specifications are the next best thing and just as honest: CI applies them
+    to a real cluster on every run (the module's own job runs run.sh), so an
+    example taken from them is one that is known to plan and apply.
+    """
+    import json as _json
+    out = {}
+    d = os.path.join(ROOT, 'examples', 'docker', mod, 'migrations')
+    if not os.path.isdir(d):
+        return out
+    for name in sorted(os.listdir(d)):
+        if not name.endswith('.json'):
+            continue
+        spec = _json.load(open(os.path.join(d, name)))
+        for intent in spec.get('intents', []):
+            k = intent.get('kind', '')
+            if k and k not in out:
+                out[k] = {'intent': intent, 'spec': spec.get('id', name),
+                          'path': 'examples/docker/%s/migrations/%s' % (mod, name)}
+    return out
+
+
 def collect():
     spec, conf = _read('spec.h'), _read('conformance.inc')
     disp, ex, defer = dispatch(spec), examples(conf), deferred(conf)
@@ -362,10 +388,14 @@ def collect():
                    'source': None})
         o.update(kind=name, enum=enum, example=ex.get(name), deferred=defer.get(name))
         out.append(o)
+    mod_examples = {}
     for mod, name, fn, parse_text, plan_text, reason in module_kinds():
+        if mod not in mod_examples:
+            mod_examples[mod] = module_examples(mod)
         o = options(parse_text, fn)
         o.update(kind=name, enum=None, example=None, deferred=reason, module=mod,
-                 module_parse=parse_text, module_plan=plan_text)
+                 module_parse=parse_text, module_plan=plan_text,
+                 module_example=mod_examples[mod].get(name))
         out.append(o)
     return out
 

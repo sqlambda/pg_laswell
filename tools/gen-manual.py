@@ -467,6 +467,23 @@ def page(d, all_kinds, prose, prev_k, next_k):
         if d['example']['verify']:
             h.append('<p>Afterwards, <code>%s</code> returns <code>%s</code>.</p>' % (
                 E(d['example']['verify']), E(d['example']['expect'] or '')))
+    elif d.get('module_example'):
+        mx = d['module_example']
+        h.append('<p>From <code>%s</code>, specification <code>%s</code>. CI applies '
+                 'that repository to a real %s cluster on every run '
+                 '(<code>examples/docker/%s/run.sh</code>):</p>' % (
+                     E(mx['path']), E(mx['spec']), E(d['module'].capitalize()),
+                     E(d['module'])))
+        h.append('<pre>%s</pre>' % E(json.dumps(mx['intent'], indent=1,
+                                                ensure_ascii=False)))
+        if d['deferred']:
+            h.append('<p>Its refusals are proved against that cluster too, in '
+                     '<code>cpp/test/%s-tests.sh</code>.</p>' % E(d['module']))
+    elif d['deferred'] and d.get('module'):
+        h.append('<div class="note warn">No single-database example: %s. '
+                 'This kind is covered by <code>cpp/test/%s-tests.sh</code>, which '
+                 'runs against a real cluster.</div>' % (md(d['deferred']),
+                                                         E(d['module'])))
     elif d['deferred']:
         h.append('<div class="note warn">No single-database example: %s. '
                  'This kind is covered by <code>cpp/test/replication-tests.sh</code>, '
@@ -517,6 +534,7 @@ def index_page(data):
         req = [x for x in d['accepted'] if x in d['required'] and x != 'kind']
         opt = [x for x in d['accepted'] if x not in d['required'] and x != 'kind']
         ex = ('tested' if d['example'] else
+              'example, live cluster' if d.get('module_example') else
               'live cluster' if d.get('module') and d['deferred'] else
               'two clusters' if d['deferred'] else '—')
         h.append('<tr><td class="k"><a href="%s.html">%s</a></td><td>%d</td>'
@@ -600,6 +618,8 @@ def main():
     print("  with a description: %d / %d" % (described, len(data)))
     print("  with a tested example: %d / %d" % (
         sum(1 for d in data if d['example']), len(data)))
+    print("  with an example run against a live cluster: %d / %d" % (
+        sum(1 for d in data if d.get('module_example')), len(data)))
     print("  options documented:    %d / %d" % (
         sum(len(d.get('hints', {})) for d in data),
         sum(len([k for k in d['accepted'] if k != 'kind']) for d in data)))

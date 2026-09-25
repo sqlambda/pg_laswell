@@ -1,4 +1,4 @@
-.Dd September 24, 2026
+.Dd September 25, 2026
 .Dt PG_LASWELL_CITUS 7
 .Os
 .Sh NAME
@@ -871,9 +871,22 @@ it does not need a separate deployment:
 }
 .Ed
 .Pp
-A runnable three-node cluster and the specifications above are in
 .Pa examples/docker/citus
-in the source.
+in the source is a runnable coordinator and two workers, and a repository
+borrowed from a benchmarking lab that applies to plain PostgreSQL and to Citus
+alike.
+Specifications that name no epoch create the tables and procedures everywhere.
+Those in epoch
+.Cm citus
+register the cluster from
+.Va citus.workers ,
+distribute and colocate the tables, and route each procedure to the shard that
+owns its account.
+The one in epoch
+.Cm plain
+adds the foreign key straight after the tables, where Citus needs it after
+distribution.
+Each database opens the epoch it is.
 .Sh SEE ALSO
 .Xr pg_laswell 1 ,
 .Xr pg_laswell_mcp 1

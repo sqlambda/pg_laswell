@@ -1,10 +1,8 @@
 {
   "laswell_spec_version": 1,
-  "id": "0050-currencies",
-  "description": "A small lookup, replicated to every node.",
-  "depends_on": [
-    "0005-cluster"
-  ],
+  "id": "0100-currencies",
+  "description": "A small lookup table.",
+  "rationale": "Created in every epoch; made a reference table only where Citus is.",
   "intents": [
     {
       "kind": "create_table",
@@ -19,28 +17,22 @@
           "name": "code",
           "type": "text",
           "nullable": false,
-          "comment": "ISO code."
+          "comment": "ISO 4217 code."
         },
         {
           "name": "scale",
           "type": "integer",
           "nullable": false,
-          "comment": "Minor units."
+          "comment": "Digits after the decimal point."
         }
       ]
-    },
-    {
-      "kind": "citus_create_reference_table",
-      "schema": "public",
-      "table": "currencies",
-      "comment": "Joined from every shard, so replicated everywhere."
     }
   ],
   "signatures": [
     {
       "key_id": "ed25519:0a1ed85ee9747a3a",
       "algorithm": "ed25519",
-      "signature": "TRgDHivkV4RR4p36mW4Zp961QUKlY6U4vWw8fNtzjyQ2+LyZI5IhtS01OjO5e31BmKdd7b4/Ref64IXwmK+PBQ=="
+      "signature": "PzFQyobrry86D6+UMiZeT85QIBKeLGc+q7sKLq0LsUuo+Z2Rgti3OOu+gfV1+rz4SNHowm8wSSjRzVjpzhOJAw=="
     }
   ]
 }

@@ -114,6 +114,13 @@ def tests():
     return measured or counted
 
 
+def module_kinds(module):
+    """A module's intent kinds, from its own kinds.inc: the one place a module
+    declares them."""
+    path = os.path.join(ROOT, 'cpp', 'src', 'modules', module, 'kinds.inc')
+    return re.findall(r'^PGLASWELL_KIND\(\s*([a-z_0-9]+)\s*,', _read(path), re.M)
+
+
 def version():
     m = re.search(r'project\(pg_laswell_mcp VERSION ([0-9.]+)',
                   _read('cpp', 'CMakeLists.txt'))
@@ -133,6 +140,7 @@ def main():
     n_tests = tests()
     values = {
         'KINDS': str(len(kinds())),
+        'CITUS_KINDS': str(len(module_kinds('citus'))),
         'CASES': str(conformance_cases()),
         'VERSION': version(),
         'TARGETS': str(release_targets()),

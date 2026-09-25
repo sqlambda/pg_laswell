@@ -1,4 +1,4 @@
-.Dd September 8, 2026
+.Dd September 25, 2026
 .Dt PG_LASWELL 1
 .Os
 .Sh NAME
@@ -117,6 +117,22 @@ A libpq connection string.
 Also read from
 .Ev DATABASE_URL .
 .El
+.Ss Modules
+A binary built with a vendor module says so:
+.Ql pg_laswell --version
+prints
+.Ql modules: citus
+after the version.
+Such a binary also applies that vendor's kinds, and reads the module's
+settings from a connection's section of the configuration file, such as
+.Va citus.workers ,
+the hosts a Citus cluster's workers are.
+Settings describe the target rather than the change, so one repository can
+be applied to a plain PostgreSQL and to a Citus cluster, each with its own
+configuration file; see
+.Xr pg_laswell_citus 7 .
+A binary without the module refuses a specification naming one of its kinds,
+and refuses a configuration naming one of its settings.
 .Sh EXAMPLES
 Gate a build on whether anything is pending or has drifted:
 .Bd -literal -offset indent
@@ -131,6 +147,13 @@ pg_laswell --repo ./migrations --dry-run
 Apply, in a deployment step:
 .Bd -literal -offset indent
 pg_laswell --repo ./migrations
+.Ed
+.Pp
+Apply one repository to a developer's PostgreSQL and a Citus staging cluster,
+each configuration naming its own connection and, for Citus, its workers:
+.Bd -literal -offset indent
+pg_laswell --config dev.ini     --repo ./migrations
+pg_laswell --config staging.ini --repo ./migrations
 .Ed
 .Sh SEE ALSO
 .Xr pg_laswell_mcp 1 ,
