@@ -47,17 +47,27 @@ jobs:
           # everywhere, so a disagreement is a build failure rather than a
           # warning nobody reads. pg_laswell links OpenSSL directly, which is
           # the boundary they disagree at.
+          #
+          # The two plain builds carry NO module: they are what proves core is
+          # PostgreSQL-only. The two sanitizer builds carry the Citus module,
+          # because the released package does (one package, every module), so
+          # the code that ships is the code ASan, UBSan and TSan watch. Without
+          # a cluster its live cases skip; its planner tests and every core
+          # test still run.
           - config: plain-gcc
             compiler: g++
             sanitizer: NONE
+            modules: ''
             tools: true
           - config: plain-clang
             compiler: clang++
             sanitizer: NONE
+            modules: ''
             tools: false
           - config: address-undefined
             compiler: g++
             sanitizer: ADDRESS_UNDEFINED
+            modules: citus
             tools: false
           # THREAD is a gate for this project rather than belt-and-braces: a
           # worker thread per job plus one process-wide observer against a
@@ -65,6 +75,7 @@ jobs:
           - config: thread
             compiler: g++
             sanitizer: THREAD
+            modules: citus
             tools: false
 
     steps:
@@ -85,7 +96,8 @@ jobs:
         run: |
           cmake -S cpp -B build -G Ninja \
             -DCMAKE_CXX_COMPILER=${{ matrix.compiler }} \
-            -DPGLASWELL_SANITIZER=${{ matrix.sanitizer }}
+            -DPGLASWELL_SANITIZER=${{ matrix.sanitizer }} \
+            "-DPGLASWELL_MODULES=${{ matrix.modules }}"
       - name: Build the test binary
         run: cmake --build build --target pg_laswell_mcp_test
       - name: Build the shipped binaries and the plan renderer

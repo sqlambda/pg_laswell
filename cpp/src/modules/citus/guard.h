@@ -7,8 +7,9 @@
 // emits. An audit found the earlier block form compiled happily while pushing
 // a warning, which is the forbidden shape available by accident.
 //
-// Three passes, each independent: DDL propagation, what a distributed table
-// cannot do, and foreign keys by the kinds of table at their two ends. Every
+// Independent passes: DDL propagation, one Citus version across the nodes,
+// prepared transactions nobody is resolving, what a distributed table cannot
+// do, and foreign keys by the kinds of table at their two ends. Every
 // refusal quotes the Citus error it pre-empts, so the author reads the rule
 // they would otherwise have hit at execution.
 template <typename Refuse>
@@ -60,6 +61,84 @@ inline void citus_plan_refusals(const Spec& spec, const Observations& obs,
         "here would ever report it. Turn it on for the migration: SET "
         "citus.enable_ddl_propagation TO on; (or ALTER SYSTEM, if it is off by "
         "default here).");
+  }
+
+  // 1b. ONE CITUS VERSION ACROSS THE CLUSTER. Each worker is asked which
+  // version of the extension is installed IN THIS DATABASE; a worker on another
+  // version -- mid-upgrade, or never upgraded -- fails distributed work
+  // partway, after the coordinator's half has run. A worker that did not
+  // answer is not judged: its version is unknown, not wrong.
+  {
+    const auto mine = citus.value("version", "");
+    const auto workers = citus.value("workers", json::object());
+    std::vector<std::string> differ;
+    for (auto it = workers.begin(); it != workers.end(); ++it) {
+      if (!it.value().is_object()) continue;
+      const auto v = it.value().value("citus", json(nullptr));
+      if (v.is_null()) {
+        differ.push_back(it.key() + " (citus is not installed in this database there)");
+      } else if (v.is_string() && v.get<std::string>() != mine) {
+        differ.push_back(it.key() + " (" + v.get<std::string>() + ")");
+      }
+    }
+    if (!differ.empty()) {
+      refuse("the workers do not all run the coordinator's Citus " + mine + ": " +
+             detail::join(differ, ", ") +
+             ". Distributed work runs on every node, and one on another version "
+             "fails partway, after the coordinator's half has run. Finish the "
+             "upgrade -- ALTER EXTENSION citus UPDATE in this database on each "
+             "node -- before migrating.");
+    }
+  }
+
+  // 1c. PREPARED TRANSACTIONS NOBODY IS RESOLVING. A multi-shard write is a
+  // two-phase commit, and one killed between PREPARE and COMMIT leaves a
+  // prepared transaction on a worker. Measured, it holds its locks -- an INSERT
+  // waited on one indefinitely -- and it pins that node's xmin horizon, so
+  // VACUUM there reclaims nothing while it lives. Citus's maintenance daemon
+  // resolves its OWN (measured: recover_prepared_transactions() cleared a
+  // citus_-named one) every citus.recover_2pc_interval; anything older than
+  // twice that is not being resolved, by Citus or by whoever else prepared it.
+  {
+    const auto interval_s = [&]() -> long long {
+      const auto raw = settings.value("recover_2pc_interval", "");
+      try {
+        std::size_t used = 0;
+        const long long n = std::stoll(raw, &used);
+        if (n < 0) return -1;  // disabled: Citus resolves nothing
+        const auto unit = raw.substr(used);
+        if (unit == "ms" || unit.empty()) return n / 1000;
+        if (unit == "s") return n;
+        if (unit == "min") return n * 60;
+        if (unit == "h") return n * 3600;
+        if (unit == "d") return n * 86400;
+      } catch (const std::exception&) {
+      }
+      return 60;  // Citus's default, when the setting cannot be read
+    }();
+    const long long limit = interval_s < 0 ? 120 : std::max<long long>(2 * interval_s, 120);
+    std::vector<std::string> stuck;
+    const auto check = [&](const std::string& node, const json& r) {
+      if (!r.is_object()) return;
+      const auto n = r.value("prepared", 0LL);
+      const auto age = r.value("oldest_s", 0LL);
+      if (n > 0 && age > limit) {
+        stuck.push_back(node + " (" + std::to_string(n) + ", the oldest " +
+                        std::to_string(age) + " s)");
+      }
+    };
+    check("the coordinator", citus.value("coordinator", json::object()));
+    const auto workers = citus.value("workers", json::object());
+    for (auto it = workers.begin(); it != workers.end(); ++it) check(it.key(), it.value());
+    if (!stuck.empty()) {
+      refuse("prepared transactions older than " + std::to_string(limit) +
+             " s are waiting on " + detail::join(stuck, ", ") + ". Each holds its locks and pins that "
+             "node's xmin horizon, and at this age nothing is resolving them. "
+             "Look at pg_prepared_xacts there: SELECT "
+             "recover_prepared_transactions() on the coordinator resolves Citus's "
+             "own, and any other gid belongs to whoever prepared it, to COMMIT "
+             "PREPARED or ROLLBACK PREPARED.");
+    }
   }
 
   // 2. WHAT A DISTRIBUTED TABLE CANNOT DO, per form rather than per kind.

@@ -1145,7 +1145,10 @@ json cluster(json nodes = nullptr, json moves = json::array(),
                                   node("worker2", 2, true, 32)})
                    : nodes;
   c["rebalance_moves"] = std::move(moves);
-  c["worker_wal_level"] = json{{"worker1:5432", wal}, {"worker2:5432", wal}};
+  c["workers"] = json{{"worker1:5432", json{{"wal_level", wal}, {"citus", "13.2-1"},
+                                             {"prepared", 0}, {"oldest_s", 0}}},
+                      {"worker2:5432", json{{"wal_level", wal}, {"citus", "13.2-1"},
+                                             {"prepared", 0}, {"oldest_s", 0}}}};
   return c;
 }
 pglaswell::Plan plan_topology(const json& intent, json c) {
@@ -1503,4 +1506,165 @@ TEST(CitusPlanner, AWorkerEnsureWorkersAddsIsSeenByTheNextIntent) {
       cluster(), "worker1, worker2, worker3");
   ASSERT_TRUE(p.ok) << first_conflict(p);
   EXPECT_EQ(p.steps[1].action, pglaswell::Action::kApply) << p.steps[1].why;
+}
+
+// --- The pieces CITUS.md asked for, each from a measurement -----------------
+
+namespace {
+json distribute_intent(const char* table = "a") {
+  return json{{"kind", "citus_distribute_table"}, {"schema", "public"},
+              {"table", table}, {"distribution_column", "id"}};
+}
+}  // namespace
+
+TEST(CitusPlanner, DistributingIntoAnEmptyClusterIsRefused) {
+  // Measured: with nothing registered, create_distributed_table SUCCEEDS,
+  // registers the coordinator as localhost with every shard on it, and every
+  // citus_add_node afterwards is refused.
+  const auto tables = json{{"public.a", table_with_pk({"id"})}};
+  for (const json& in : {distribute_intent(),
+                         json{{"kind", "citus_create_reference_table"},
+                              {"schema", "public"}, {"table", "a"}},
+                         json{{"kind", "citus_add_local_table_to_metadata"},
+                              {"schema", "public"}, {"table", "a"}}}) {
+    const auto p = plan_citus(in, citus_observations(cluster(json::array()), tables));
+    EXPECT_FALSE(p.ok) << in.dump();
+    EXPECT_TRUE(conflicts_mention(p, "localhost")) << first_conflict(p);
+  }
+  // Registering first, earlier in the same specification, is enough.
+  const auto spec = pglaswell::parse_spec(citus_spec_many(json::array(
+      {json{{"kind", "citus_set_coordinator_host"}, {"host", "coordinator"}},
+       json{{"kind", "citus_ensure_workers"}}, distribute_intent()})));
+  pglaswell::ExecutorConfig cfg;
+  cfg.module_settings["citus.workers"] = "worker1, worker2";
+  const auto ok = pglaswell::plan_migration(
+      spec, citus_observations(cluster(json::array()), tables), cfg);
+  EXPECT_TRUE(ok.ok) << first_conflict(ok);
+}
+
+TEST(CitusPlanner, DistributingWhereNoNodeMayHoldShardsIsRefused) {
+  // Measured: "replication_factor (1) exceeds number of worker nodes (0)".
+  const auto p = plan_citus(distribute_intent(), citus_observations(
+      cluster(json::array({node("coordinator", 0, false, 0)})),
+      json{{"public.a", table_with_pk({"id"})}}));
+  EXPECT_FALSE(p.ok);
+  EXPECT_TRUE(conflicts_mention(p, "nowhere to be distributed")) << first_conflict(p);
+}
+
+TEST(CitusPlanner, AddingAWorkerToALocalhostCoordinatorIsRefusedUntilItIsRegistered) {
+  const auto nodes = json::array({node("localhost", 0, true, 32)});
+  const auto p = plan_citus(json{{"kind", "citus_add_node"}, {"host", "worker1"}},
+                            citus_observations(cluster(nodes), json::object()));
+  EXPECT_FALSE(p.ok);
+  EXPECT_TRUE(conflicts_mention(p, "citus_set_coordinator_host")) << first_conflict(p);
+  const auto fixed = plan_topology_many(
+      json::array({json{{"kind", "citus_set_coordinator_host"}, {"host", "coordinator"}},
+                   json{{"kind", "citus_add_node"}, {"host", "worker1"}}}),
+      cluster(nodes));
+  EXPECT_TRUE(fixed.ok) << first_conflict(fixed);
+}
+
+TEST(CitusPlanner, TheStepThatCopiesReferenceTablesSaysSo) {
+  // Measured: adding a node copies none; the next distribute copied them all.
+  json c = cluster(json::array({node("coordinator", 0, false, 0),
+                                node("worker1", 1, true, 32),
+                                node("worker2", 2, true, 0)}));
+  c["reference_tables"] = json{{"count", 2}, {"bytes", 227540992}};
+  for (auto& n : c["nodes"]) {
+    n["reference_placements"] = n["nodename"] == "worker2" ? 0 : 2;
+  }
+  const auto p = plan_citus(distribute_intent(), citus_observations(
+      c, json{{"public.a", table_with_pk({"id"})}}));
+  ASSERT_TRUE(p.ok) << first_conflict(p);
+  EXPECT_EQ(p.steps[0].detail.value("reference_copy_to", json::array()),
+            json::array({"worker2:5432"}));
+  EXPECT_EQ(p.steps[0].detail.value("reference_bytes", 0LL), 227540992);
+
+  const auto add = plan_citus(json{{"kind", "citus_add_node"}, {"host", "worker3"}},
+                              citus_observations(c, json::object()));
+  ASSERT_TRUE(add.ok);
+  bool warned = false;
+  for (const auto& w : add.warnings) warned = warned || w.find("reference") != std::string::npos;
+  EXPECT_TRUE(warned);
+}
+
+TEST(CitusPlanner, TheConcurrentFormIsChosenOnlyWhenNothingRulesItOut) {
+  // It is never rehearsed and does not roll back: measured, a failed one left
+  // the table half converted. So what fails it is read first.
+  json big = table_with_pk({"id"}, 5000000);
+  big["columns"]["id"]["not_null"] = true;
+  const auto tables = json{{"public.a", big}};
+  json logical = cluster(nullptr, json::array(), "logical");
+  logical["coordinator"] = json{{"wal_level", "logical"}, {"prepared", 0}, {"oldest_s", 0}};
+  json replica = logical;
+  replica["coordinator"]["wal_level"] = "replica";
+
+  const auto ok = plan_citus(distribute_intent(), citus_observations(logical, tables));
+  ASSERT_TRUE(ok.ok) << first_conflict(ok);
+  EXPECT_TRUE(ok.steps[0].detail.value("concurrent", false));
+
+  // The COORDINATOR's wal_level decides too (measured: it raised there).
+  const auto fell_back = plan_citus(distribute_intent(), citus_observations(replica, tables));
+  ASSERT_TRUE(fell_back.ok);
+  EXPECT_FALSE(fell_back.steps[0].detail.value("concurrent", true));
+  EXPECT_NE(fell_back.steps[0].why.find("coordinator is at wal_level replica"),
+            std::string::npos) << fell_back.steps[0].why;
+
+  json always = distribute_intent();
+  always["concurrently"] = "always";
+  const auto refused = plan_citus(always, citus_observations(replica, tables));
+  EXPECT_FALSE(refused.ok);
+  EXPECT_TRUE(conflicts_mention(refused, "half converted")) << first_conflict(refused);
+
+  // A nullable distribution column rules it out: a NULL fails the copy halfway.
+  json nullable = big;
+  nullable["columns"]["id"]["not_null"] = false;
+  const auto null_fell_back = plan_citus(
+      distribute_intent(), citus_observations(logical, json{{"public.a", nullable}}));
+  ASSERT_TRUE(null_fell_back.ok);
+  EXPECT_FALSE(null_fell_back.steps[0].detail.value("concurrent", true));
+  bool warned = false;
+  for (const auto& w : null_fell_back.warnings) {
+    warned = warned || w.find("refuses every write that leaves it NULL") != std::string::npos;
+  }
+  EXPECT_TRUE(warned);
+}
+
+TEST(CitusPlanner, AWorkerOnAnotherCitusVersionRefusesThePlan) {
+  json c = cluster();
+  c["workers"]["worker2:5432"]["citus"] = "12.1-1";
+  const auto p = plan_citus(distribute_intent(), citus_observations(
+      c, json{{"public.a", table_with_pk({"id"})}}));
+  EXPECT_FALSE(p.ok);
+  EXPECT_TRUE(conflicts_mention(p, "worker2:5432 (12.1-1)")) << first_conflict(p);
+
+  json missing = cluster();
+  missing["workers"]["worker1:5432"]["citus"] = nullptr;
+  EXPECT_FALSE(plan_citus(distribute_intent(), citus_observations(
+      missing, json{{"public.a", table_with_pk({"id"})}})).ok);
+
+  // A worker that did not answer is unknown, not wrong.
+  json silent = cluster();
+  silent["workers"]["worker1:5432"] = nullptr;
+  EXPECT_TRUE(plan_citus(distribute_intent(), citus_observations(
+      silent, json{{"public.a", table_with_pk({"id"})}})).ok);
+}
+
+TEST(CitusPlanner, PreparedTransactionsNobodyResolvesRefuseThePlan) {
+  // Measured: one held its locks (an INSERT waited on it indefinitely); Citus
+  // resolves its own every recover_2pc_interval.
+  const auto tables = json{{"public.a", table_with_pk({"id"})}};
+  json c = cluster();
+  c["settings"]["recover_2pc_interval"] = "1min";
+  c["workers"]["worker1:5432"]["prepared"] = 2;
+  c["workers"]["worker1:5432"]["oldest_s"] = 30;
+  EXPECT_TRUE(plan_citus(distribute_intent(), citus_observations(c, tables)).ok)
+      << "a young one is Citus's business, still inside its recovery window";
+  c["workers"]["worker1:5432"]["oldest_s"] = 900;
+  const auto p = plan_citus(distribute_intent(), citus_observations(c, tables));
+  EXPECT_FALSE(p.ok);
+  EXPECT_TRUE(conflicts_mention(p, "worker1:5432 (2, the oldest 900 s)")) << first_conflict(p);
+  // The window follows the setting: at 10min, 900 s is still inside it.
+  c["settings"]["recover_2pc_interval"] = "10min";
+  EXPECT_TRUE(plan_citus(distribute_intent(), citus_observations(c, tables)).ok);
 }

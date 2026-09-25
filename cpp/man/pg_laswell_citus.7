@@ -30,6 +30,18 @@ Build one with:
 cmake -S cpp -B build -DPGLASWELL_MODULES=citus
 .Ed
 .Pp
+.Sy Versions.
+Everything on this page was measured on Citus 13.2 with PostgreSQL 17, on a
+coordinator and two workers.
+No Citus version is assumed: whether a call exists is read from
+.Va pg_proc ,
+so a Citus that lacks one is refused for that kind and the refusal names the
+version it found, rather than being sent SQL it cannot parse.
+Older Citus releases are not tested, and a plan against one says which calls it
+found.
+Every node must run the same Citus version in this database; see
+.Sx REFUSALS .
+.Pp
 Every kind here is prefixed
 .Cm citus_ ,
 so a specification says which vendor it needs and two vendors cannot collide on
@@ -110,13 +122,48 @@ decided.
 .Cm always
 requires
 .Fn create_distributed_table_concurrently ,
-which needs a replica identity -- a table with no primary key cannot use it --
 and is refused, not silently downgraded, on a Citus too old to have it.
+.Pp
+The concurrent form runs outside a transaction and is not rehearsed, and a
+failure is not clean: measured, a failed one left the table registered as a
+Citus-managed local table, half converted.
+So what fails it is read first, and rules it out:
+.Li wal_level
+not
+.Cm logical
+on the coordinator or any worker (measured: the error was raised on the
+coordinator), or a nullable distribution column (a NULL in it fails the copy
+halfway, and whether one exists is not read).
+Under
+.Cm auto
+the plan then takes the blocking form and says which of these decided;
+.Cm always
+is refused.
+A table with no primary key
+.Em can
+be distributed concurrently (measured): UPDATE and DELETE on it fail until the
+copy finishes, and INSERT still works, which the plan says.
 Someone who wrote
 .Cm always
 was making a decision about a table too big to lock, and quietly locking it
 anyway is the worst available answer.
 .El
+.Pp
+A nullable distribution column is accepted by Citus, which then refuses every
+write that leaves it NULL (measured), so the plan warns.
+Identity and sequence keys need nothing special: a
+.Li bigserial ,
+.Li bigint
+or
+.Li int
+identity, as the distribution column or beside it, all distributed and generated
+values on Citus 13 (measured).
+.Pp
+Distributing is also the step that copies the reference tables to any node that
+does not hold them yet: adding a node copies none of them (measured, 20 ms
+beside 217 MB of reference data), and the next distribution copies them all.
+The plan names those nodes and the size, as it does for a rebalance and for a
+new reference table.
 .Ss Cm citus_create_reference_table
 Replicate a table in full to every node, so reads join against it locally.
 .Pp
@@ -599,6 +646,30 @@ A shard-ordered walk measured about 16% better per row than a key-ordered one,
 not the eightfold a first measurement suggested.
 The reason to have it is that on a distributed table the alternative is not a
 slower walk, it is no walk at all.
+.Ss citus.multi_shard_modify_mode
+A write spanning several shards runs under this setting:
+.Cm parallel
+opens up to
+.Va citus.max_adaptive_executor_pool_size
+connections per worker (measured: one for fast shard tasks, six of sixteen for
+slow ones), and
+.Cm sequential
+one.
+The plan reads it and states it, with the connection bound it implies, in its
+.Va budget .
+It does not set it.
+Setting it would mean the module writing a
+.Ic SET LOCAL
+into statements core emits for core kinds, which is the one thing a module may
+not do (see
+.Sx MODULES
+in
+.Xr pg_laswell_mcp 1 ) .
+The paced walks are unaffected either way: each of their batches is confined to
+one distribution value and so to one shard.
+To run a migration sequentially, set it for the migrating role:
+.Dl ALTER ROLE laswell_runner SET citus.multi_shard_modify_mode = 'sequential';
+and the plan will say so.
 .Sh REFUSALS
 These are the reason the module exists: each is a Citus error that would
 otherwise surface at execution, partway through a migration, on a cluster, with
@@ -634,6 +705,22 @@ Express the change as
 and
 .Cm insert_rows ,
 which both run.
+.It Workers on another Citus version
+Refused for every kind.
+Each worker is asked which Citus version is installed in this database; one that
+differs from the coordinator's, or has none, fails distributed work partway,
+after the coordinator's half has run.
+A worker that does not answer is not judged.
+.It Prepared transactions nobody is resolving
+Refused for every kind, when a prepared transaction on the coordinator or a
+worker is older than twice
+.Va citus.recover_2pc_interval
+(and at least 120 seconds).
+A multi-shard write killed between PREPARE and COMMIT leaves one behind, and it
+holds its locks (measured: an INSERT waited on one indefinitely) and pins the
+node's xmin horizon, so VACUUM there reclaims nothing.
+Citus resolves its own within that interval, so one older than it is not being
+resolved; the refusal says how to find it.
 .It A walk whose key is the distribution column
 .Cm backfill
 and
@@ -662,7 +749,25 @@ names a table this database does not record as distributed.
 was asked for and this Citus has no concurrent form.
 .It
 .Va concurrently : Cm always
-on a table with no replica identity.
+where the coordinator or a worker is not at
+.Li wal_level = logical ,
+or the distribution column is nullable.
+.It
+Distributing, making a reference table, or adding a table to metadata when no
+node is registered at all.
+Measured: each call succeeds by registering the coordinator as
+.Li localhost ,
+a distributed table's shards all land on it, and every
+.Fn citus_add_node
+afterwards is refused.
+Registering the coordinator and workers earlier in the same specification is
+enough.
+.It
+Distributing when no node may hold shards.
+.It
+Adding a worker while the coordinator is registered as
+.Li localhost ,
+which Citus refuses.
 .It
 A function named for distribution does not exist.
 .It

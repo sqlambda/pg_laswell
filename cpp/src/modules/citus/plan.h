@@ -100,6 +100,95 @@ inline bool citus_unique_keys_include(const json& t, const std::string& column,
   return true;
 }
 
+// --- Readings several kinds share ---------------------------------------------
+
+// Workers (by name) whose wal_level is known and is not logical. A worker that
+// did not answer is not listed: its setting is unknown, not wrong.
+inline std::vector<std::string> citus_workers_not_logical(const json& citus) {
+  std::vector<std::string> out;
+  const auto workers = citus.value("workers", json::object());
+  for (auto it = workers.begin(); it != workers.end(); ++it) {
+    if (!it.value().is_object()) continue;
+    const auto w = it.value().value("wal_level", "");
+    if (!w.empty() && w != "logical") out.push_back(it.key() + " (" + w + ")");
+  }
+  return out;
+}
+
+// Whether the reading has a node list at all. An older reading, or a test
+// fixture, may not; absent is "not read", never "no nodes".
+inline bool citus_nodes_read(const json& citus) {
+  const auto it = citus.find("nodes");
+  return it != citus.end() && it->is_array();
+}
+
+// Active primary nodes allowed to hold shards.
+inline int citus_shard_holders(const json& citus) {
+  int n = 0;
+  for (const auto& nd : citus.value("nodes", json::array())) {
+    if (nd.value("isactive", false) && nd.value("noderole", "") == "primary" &&
+        nd.value("shouldhaveshards", false)) {
+      ++n;
+    }
+  }
+  return n;
+}
+
+// THE EMPTY-CLUSTER TRAP, which CITUS.md calls the highest-value refusal for a
+// lab. Measured on a database with nothing in pg_dist_node:
+// create_distributed_table, create_reference_table and
+// citus_add_local_table_to_metadata all SUCCEED -- each registers the
+// coordinator as "localhost" taking shards, and a distributed table's 32 shards
+// all land on it -- and every citus_add_node afterwards is refused: "cannot add
+// a worker node when the coordinator hostname is set to localhost". Nothing
+// fails at the time; the cluster is quietly a single node that cannot grow.
+inline bool citus_refuse_empty_cluster(const Intent& in, const json& citus,
+                                       Step& step, Plan& plan) {
+  if (!citus_nodes_read(citus) || !citus.value("nodes", json::array()).empty()) {
+    return false;
+  }
+  step.action = Action::kConflict;
+  step.why = "no node is registered in this database's Citus metadata, so " +
+             in.kind_name + " would register the coordinator as \"localhost\"";
+  plan.conflicts.push_back(
+      step.why + " and place everything on it. Measured: the call succeeds, and "
+      "every citus_add_node after it is refused (\"cannot add a worker node when "
+      "the coordinator hostname is set to localhost\"), so the cluster stays one "
+      "node. Register the coordinator (citus_set_coordinator_host) and the workers "
+      "(citus_ensure_workers) first -- earlier in this specification is enough. "
+      "For a deliberate single-node cluster, register the coordinator and set its "
+      "should_have_shards to true.");
+  return true;
+}
+
+// Where the reference tables are NOT yet. Measured: adding a node copies none
+// of them; the next step that needs them everywhere -- create_distributed_table
+// was measured -- copies all of them to every node lacking them.
+inline void citus_note_reference_copy(const json& citus, Step& step, Plan& plan,
+                                      const std::string& what) {
+  const auto refs = citus.value("reference_tables", json::object());
+  const int count = refs.value("count", 0);
+  if (count <= 0) return;
+  std::vector<std::string> lacking;
+  for (const auto& nd : citus.value("nodes", json::array())) {
+    if (!nd.value("isactive", false) || nd.value("noderole", "") != "primary") continue;
+    if (nd.value("reference_placements", 0) < count) {
+      lacking.push_back(nd.value("nodename", "") + ":" +
+                        std::to_string(nd.value("nodeport", 0)));
+    }
+  }
+  if (lacking.empty()) return;
+  const long long bytes = refs.value("bytes", 0LL);
+  step.detail["reference_copy_to"] = lacking;
+  step.detail["reference_bytes"] = bytes;
+  plan.warnings.push_back(
+      what + " first copies the " + std::to_string(count) + " reference table(s) (" +
+      std::to_string(bytes / (1024 * 1024)) + " MiB per copy, by "
+      "citus_total_relation_size) to " + detail::join(lacking, ", ") +
+      ", which do not hold them yet. Adding a node copies nothing (measured); "
+      "the next step needing them everywhere pays for it, and this is that step.");
+}
+
 inline void plan_citus_distribute_table(const Intent& in, const Observations& obs,
                                   const ExecutorConfig& cfg, Plan& plan,
                                   std::vector<Step>& out) {
@@ -139,6 +228,21 @@ inline void plan_citus_distribute_table(const Intent& in, const Observations& ob
           "alter_distributed_table, not citus_distribute_table -- it moves every row, "
           "where this kind only creates the distribution.");
     }
+    return;
+  }
+
+  if (citus_refuse_empty_cluster(in, citus, step, plan)) return;
+  // Measured with the coordinator registered as taking no shards and no
+  // workers: "replication_factor (1) exceeds number of worker nodes (0)".
+  if (citus_nodes_read(citus) && citus_shard_holders(citus) == 0) {
+    step.action = Action::kConflict;
+    step.why = "no active node may hold shards, so " + qualified +
+               " has nowhere to be distributed to";
+    plan.conflicts.push_back(
+        step.why + ". Citus refuses it (\"replication_factor exceeds number of "
+        "worker nodes\"). Add workers with citus_ensure_workers, or let a node "
+        "hold shards with citus_set_node_property -- earlier in this "
+        "specification is enough.");
     return;
   }
 
@@ -241,6 +345,43 @@ inline void plan_citus_distribute_table(const Intent& in, const Observations& ob
   const long long rows = t.value("reltuples", 0LL);
   bool concurrent = false;
   std::string decided_by;
+
+  // What stops the concurrent form, READ before it is chosen. It runs outside
+  // a transaction and is never rehearsed, and a failure is not clean: measured,
+  // a failed create_distributed_table_concurrently left the table registered
+  // as a Citus-managed local table (partmethod n, repmodel s), half converted.
+  //   - it needs wal_level = logical on the COORDINATOR as well as the workers
+  //     (measured: "logical decoding requires wal_level >= logical", raised on
+  //     the coordinator);
+  //   - a NULL in the distribution column fails it (measured: "the partition
+  //     column value cannot be NULL"), and whether a NULL exists is not read --
+  //     so a nullable column is enough to rule it out.
+  std::vector<std::string> blockers;
+  {
+    const auto cw = citus.value("coordinator", json::object()).value("wal_level", "");
+    if (!cw.empty() && cw != "logical") {
+      blockers.push_back("the coordinator is at wal_level " + cw);
+    }
+    const auto nl = citus_workers_not_logical(citus);
+    if (!nl.empty()) {
+      blockers.push_back(detail::join(nl, ", ") + " not at wal_level logical");
+    }
+    const auto col_reading = columns.value(column, json::object());
+    if (col_reading.contains("not_null") && !col_reading.value("not_null", false)) {
+      blockers.push_back(column + " is nullable, and a NULL in it fails the "
+                         "concurrent copy halfway");
+    }
+  }
+  if (when == "always" && has_concurrent && !blockers.empty()) {
+    step.action = Action::kConflict;
+    step.why = "concurrently: always was asked for, and " + detail::join(blockers, "; ");
+    plan.conflicts.push_back(
+        step.why + ". The concurrent form is not rehearsed and does not roll back: "
+        "measured, a failed one left the table half converted, registered as a "
+        "Citus-managed local table. Fix what is named, or write concurrently: "
+        "never to accept the blocking copy.");
+    return;
+  }
   if (when == "always" && !has_concurrent) {
     // Asked for explicitly and not available: a refusal, not a silent
     // downgrade. Someone who wrote "always" was making a decision about a
@@ -278,6 +419,16 @@ inline void plan_citus_distribute_table(const Intent& in, const Observations& ob
           "had it. Writes are blocked for the whole copy instead. Consider "
           "upgrading Citus before running this against a live system.");
     }
+  } else if (rows > kCitusConcurrentRowThreshold && !blockers.empty()) {
+    // auto would have chosen the concurrent form, and something rules it out.
+    concurrent = false;
+    decided_by = std::to_string(rows) + " estimated rows would take the "
+                 "concurrent form, but " + detail::join(blockers, "; ") +
+                 ", so the blocking form is the only safe path";
+    plan.warnings.push_back(
+        "At " + std::to_string(rows) + " estimated rows this would have been "
+        "distributed concurrently, and " + detail::join(blockers, "; ") +
+        ". Writes are blocked for the whole copy instead.");
   } else {
     concurrent = rows > kCitusConcurrentRowThreshold;
     decided_by = std::to_string(rows) + " estimated rows, " +
@@ -333,12 +484,31 @@ inline void plan_citus_distribute_table(const Intent& in, const Observations& ob
                                             : "create_distributed_table") +
                      "(" + args + ");");
 
+  // A nullable distribution column accepts the distribution and refuses every
+  // write that leaves it NULL -- measured, "cannot perform an INSERT with NULL
+  // in the partition column". Existing NULL rows fail the blocking copy, which
+  // the dry run executes, so that case is caught before anything commits.
+  {
+    const auto col_reading = columns.value(column, json::object());
+    if (col_reading.contains("not_null") && !col_reading.value("not_null", false)) {
+      plan.warnings.push_back(
+          qualified + "." + column + " is nullable. Citus distributes it, and then "
+          "refuses every write that leaves it NULL (measured). Make it NOT NULL, "
+          "in an earlier intent, unless NULL genuinely never occurs.");
+    }
+  }
+  citus_note_reference_copy(citus, step, plan, "Distributing " + qualified);
+
   if (concurrent) {
+    // Measured: a table with NO primary key distributes concurrently too; what
+    // it loses is UPDATE and DELETE during the copy. The earlier wording here
+    // said such a table "cannot use it", which was false.
     plan.warnings.push_back(
-        "create_distributed_table_concurrently keeps writes running, and needs "
-        "a replica identity: a table with no primary key cannot use it. It also "
-        "cannot run inside a transaction block, so this step commits on its "
-        "own.");
+        "create_distributed_table_concurrently keeps writes running. Without a "
+        "primary key or REPLICA IDENTITY on " + qualified + ", UPDATE and DELETE "
+        "on it fail until the copy finishes; INSERT still works. It cannot run "
+        "inside a transaction block, so this step commits on its own and is not "
+        "rehearsed.");
   } else {
     plan.warnings.push_back(
         qualified + " is copied to its shards under an exclusive lock. At " +
@@ -388,6 +558,10 @@ inline void plan_citus_create_reference_table(const Intent& in, const Observatio
         "undistributing it first, which moves data and is its own decision.");
     return;
   }
+
+  if (citus_refuse_empty_cluster(in, citus, step, plan)) return;
+  citus_note_reference_copy(citus, step, plan,
+                            "Making " + qualified + " a reference table");
 
   step.action = Action::kApply;
   step.txn_class = TxnClass::kRequired;
@@ -1050,6 +1224,8 @@ inline void plan_citus_add_local_table_to_metadata(const Intent& in,
     return;
   }
 
+  if (citus_refuse_empty_cluster(in, citus, step, plan)) return;
+
   step.action = Action::kApply;
   step.txn_class = TxnClass::kRequired;
   // Rehearsed by execution: see plan_citus_distribute_table.
@@ -1172,13 +1348,7 @@ inline bool citus_transfer_mode_possible(const Intent& in, const json& citus,
                                          Step& step, Plan& plan) {
   const auto mode = in.body.value("transfer_mode", "auto");
   if (mode == "block_writes") return true;
-  std::vector<std::string> not_logical;
-  const auto levels = citus.value("worker_wal_level", json::object());
-  for (auto it = levels.begin(); it != levels.end(); ++it) {
-    if (it.value().is_string() && it.value().get<std::string>() != "logical") {
-      not_logical.push_back(it.key() + " (" + it.value().get<std::string>() + ")");
-    }
-  }
+  const auto not_logical = citus_workers_not_logical(citus);
   if (not_logical.empty()) return true;
   step.action = Action::kConflict;
   step.why = "transfer_mode " + mode + " moves shards by logical replication, and " +
@@ -1188,6 +1358,31 @@ inline bool citus_transfer_mode_possible(const Intent& in, const json& citus,
       "decoding requires wal_level >= logical\"). Set wal_level = logical on the "
       "workers and restart them, or write transfer_mode: block_writes -- writes to "
       "each shard then wait while it is copied.");
+  return false;
+}
+
+// Measured: with the coordinator registered as localhost, citus_add_node is
+// refused -- "cannot add a worker node when the coordinator hostname is set to
+// localhost" -- because the workers could not connect back to it. Read from the
+// group-0 entry, so a citus_set_coordinator_host earlier in the same
+// specification (projected) clears it.
+inline bool citus_refuse_localhost_coordinator(const json& citus, Step& step,
+                                               Plan& plan) {
+  for (const auto& n : citus.value("nodes", json::array())) {
+    if (n.value("groupid", -1) != 0) continue;
+    const auto host = n.value("nodename", "");
+    if (host != "localhost" && host != "127.0.0.1" && host != "::1") return false;
+    step.action = Action::kConflict;
+    step.why = "the coordinator is registered as " + host +
+               ", which the workers cannot connect back to";
+    plan.conflicts.push_back(
+        step.why + ". Citus refuses to add a worker then (\"cannot add a worker "
+        "node when the coordinator hostname is set to localhost\"). Register its "
+        "real address with citus_set_coordinator_host first -- earlier in this "
+        "specification is enough. A coordinator becomes localhost when a table is "
+        "distributed before anything was registered.");
+    return true;
+  }
   return false;
 }
 
@@ -1222,6 +1417,18 @@ inline void plan_citus_add_node(const Intent& in, const Observations& obs,
     }
   }
 
+  if (node.empty()) {
+    if (citus_refuse_localhost_coordinator(citus, step, plan)) return;
+    const auto refs = citus.value("reference_tables", json::object());
+    if (refs.value("count", 0) > 0) {
+      plan.warnings.push_back(
+          name + " joins holding none of the " +
+          std::to_string(refs.value("count", 0)) + " reference table(s) (" +
+          std::to_string(refs.value("bytes", 0LL) / (1024 * 1024)) +
+          " MiB per copy). Adding it copies nothing -- measured -- and the next "
+          "distribute or rebalance copies them all to it.");
+    }
+  }
   step.action = Action::kApply;
   step.txn_class = TxnClass::kRequired;
   // Rehearsed by execution. Measured: citus_add_node runs in a transaction and
@@ -1547,6 +1754,7 @@ inline void plan_citus_rebalance_shards(const Intent& in, const Observations& ob
                     "only for the final switch";
   step.why = std::to_string(moves.size()) +
              " shard moves, as Citus's own rebalance plan lists them now";
+  citus_note_reference_copy(citus, step, plan, "The rebalance");
   // Synchronous: the step finishes when the rebalance does, so the ledger's
   // "applied" means balanced. citus_rebalance_start returns at once and leaves
   // a background job the ledger would know nothing about.
@@ -1766,6 +1974,18 @@ inline void plan_citus_ensure_workers(const Intent& in, const Observations& obs,
     step.why = "the cluster's workers are the " + std::to_string(n) +
                " configured for this connection";
     return;
+  }
+  if (!adding.empty()) {
+    if (citus_refuse_localhost_coordinator(citus, step, plan)) return;
+    const auto refs = citus.value("reference_tables", json::object());
+    if (refs.value("count", 0) > 0) {
+      plan.warnings.push_back(
+          detail::join(adding, ", ") + " join holding none of the " +
+          std::to_string(refs.value("count", 0)) + " reference table(s) (" +
+          std::to_string(refs.value("bytes", 0LL) / (1024 * 1024)) +
+          " MiB per copy, to each). Adding copies nothing -- measured -- and the "
+          "next distribute or rebalance copies them all.");
+    }
   }
   step.action = Action::kApply;
   step.txn_class = TxnClass::kRequired;

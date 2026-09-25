@@ -195,6 +195,37 @@ else
   bad "the walk did not finish (before=$before after=$after)" "$out"
 fi
 
+# --status ON A CITUS COORDINATOR: the ledger lives there, and drift is read
+# there. 9990 was just applied; the same id with different signed bytes is the
+# case the drift check exists for, and --status must name it and exit 2.
+drift_repo=$(mktemp -d)
+python3 - "$repo/9990-ct-ref.json" "$drift_repo/9990-ct-ref.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d.pop("signatures", None)
+d["description"] = "Backfill a Citus reference table -- edited after it was applied."
+json.dump(d, open(sys.argv[2], "w"), indent=2)
+PY
+dbytes=$("$MCP" --call getSpecDigest --args "{\"spec\":$(cat "$drift_repo/9990-ct-ref.json")}" \
+         "$CITUS_URL" 2>/dev/null | python3 -c 'import json,sys;print(json.load(sys.stdin)["canonicalBytes"],end="")')
+printf '%s' "$dbytes" > "$drift_repo/.bytes"
+dsig=$(openssl pkeyutl -sign -inkey "$key_dir/k.pem" -rawin -in "$drift_repo/.bytes" 2>/dev/null | base64 -w0)
+python3 - "$drift_repo/9990-ct-ref.json" "$kid" "$dsig" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d["signatures"] = [{"key_id": sys.argv[2], "algorithm": "ed25519", "signature": sys.argv[3]}]
+json.dump(d, open(sys.argv[1], "w"), indent=2)
+PY
+rm -f "$drift_repo/.bytes"
+out=$("$BIN" --repo "$drift_repo" --repo "$(dirname "$0")/../../examples/docker/citus/migrations" \
+        --status "$CITUS_URL" 2>&1); rc=$?
+if [ "$rc" = 2 ] && echo "$out" | grep -q '9990-ct-ref' && echo "$out" | grep -qi 'was applied here as'; then
+  ok "--status on the coordinator reports a spec changed after it was applied, and exits 2"
+else
+  bad "--status should report drift on a Citus coordinator (rc=$rc)" "$out"
+fi
+rm -rf "$drift_repo"
+
 # Leave the ledger as it was found, or the next run sees its own spec already
 # applied, does not re-run the walk, and reports a failure that is really just
 # yesterday's success. Innermost first: job and step are NO ACTION FKs onto the
@@ -587,6 +618,21 @@ p = u.urlparse(sys.argv[1])
 print(f"[fresh]\nhost = {p.hostname}\nport = {p.port}\ndbname = {p.path.lstrip('/')}\n"
       f"user = {p.username}\npassword = {p.password}\ncitus.workers = worker1, worker2")
 PY
+# THE EMPTY-CLUSTER TRAP, first, while nothing is registered. Measured: Citus
+# would distribute by registering the coordinator as localhost, put every shard
+# on it, and refuse every worker afterwards. It must be refused before that.
+psql -X -q "$reg_url" -c "CREATE TABLE lone (id bigint PRIMARY KEY)" >/dev/null 2>&1
+out=$("$MCP" --config "$reg_ini" --call planMigration --args '{"spec":{"laswell_spec_version":1,
+  "id":"ct-empty","description":"distribute into an empty cluster","intents":[
+  {"kind":"citus_distribute_table","schema":"public","table":"lone","distribution_column":"id"}]},
+  "skipTrustChecks":true}' 2>&1)
+if echo "$out" | grep -q '"ok":false' && echo "$out" | grep -q 'localhost' \
+   && [ "$(psql -X -qAt "$reg_url" -c "SELECT count(*) FROM pg_dist_node")" = 0 ]; then
+  ok "distributing into a cluster with nothing registered is refused, and nothing was registered"
+else
+  bad "distributing into an empty cluster should be refused" "$out"
+fi
+
 out=$("$MCP" --config "$reg_ini" --call planMigration --args '{"spec":{"laswell_spec_version":1,
   "id":"ct-register","description":"register a cluster in one specification","intents":[
   {"kind":"citus_set_coordinator_host","host":"coordinator","port":5432},

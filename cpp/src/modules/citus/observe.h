@@ -32,7 +32,12 @@ SELECT JSONB_BUILD_OBJECT(
               'placements', (SELECT count(*) FROM pg_dist_placement pl
                                JOIN pg_dist_shard s USING (shardid)
                                JOIN pg_dist_partition p USING (logicalrelid)
-                              WHERE pl.groupid = n.groupid AND p.partmethod <> 'n'))
+                              WHERE pl.groupid = n.groupid AND p.partmethod <> 'n'),
+              'reference_placements', (SELECT count(*) FROM pg_dist_placement pl
+                               JOIN pg_dist_shard s USING (shardid)
+                               JOIN pg_dist_partition p USING (logicalrelid)
+                              WHERE pl.groupid = n.groupid AND p.partmethod = 'n'
+                                AND p.repmodel = 't'))
             ORDER BY n.nodename, n.nodeport)
        FROM pg_dist_node n), '[]'::jsonb),
   -- The moves Citus's own rebalancer would make now, from the call it
@@ -62,17 +67,54 @@ SELECT JSONB_BUILD_OBJECT(
                    ORDER BY m.shardid)
               FROM get_rebalance_table_shards_plan() m), '[]'::jsonb)
      END,
-  -- Each worker's wal_level, because moving a shard while writes continue
-  -- uses logical replication. Measured: on workers at wal_level = replica, a
-  -- drain in the default transfer mode failed at its first shard -- "logical
-  -- decoding requires wal_level >= logical" -- AFTER it had already marked the
-  -- node as holding no shards. The coordinator's own setting says nothing
-  -- about the workers', so it is asked on them. A worker that does not answer
-  -- is recorded as null and does not fail the reading.
-  'worker_wal_level', COALESCE((
+  -- What only the WORKERS can say, asked of them in one round trip
+  -- (run_command_on_workers, measured ~20 ms on the example cluster). A worker
+  -- that does not answer is recorded as null and does not fail the reading.
+  --
+  --   wal_level     moving a shard while writes continue uses logical
+  --                 replication. Measured: at wal_level = replica a drain in
+  --                 the default transfer mode failed at its first shard, AFTER
+  --                 marking the node as taking no shards.
+  --   citus         the extension version IN THIS DATABASE on that node, to
+  --                 compare with the coordinator's: a worker on another Citus
+  --                 version fails partway through distributed work.
+  --   prepared /    prepared transactions and the age of the oldest. One left
+  --   oldest_s      behind by a killed multi-shard batch holds its locks --
+  --                 measured, an INSERT waited on one indefinitely -- and
+  --                 holds back the node's xmin horizon, so VACUUM there
+  --                 reclaims nothing while it lives.
+  'workers', COALESCE((
      SELECT JSONB_OBJECT_AGG(w.nodename || ':' || w.nodeport,
-                             CASE WHEN w.success THEN w.result END)
-       FROM run_command_on_workers('SHOW wal_level') w), '{}'::jsonb),
+                             CASE WHEN w.success THEN w.result::jsonb END)
+       FROM run_command_on_workers($w$
+         SELECT json_build_object(
+           'wal_level', current_setting('wal_level'),
+           'citus', (SELECT extversion FROM pg_extension WHERE extname = 'citus'),
+           'prepared', (SELECT count(*) FROM pg_prepared_xacts
+                         WHERE database = current_database()),
+           'oldest_s', (SELECT COALESCE(EXTRACT(EPOCH FROM now() - min(prepared))::bigint, 0)
+                          FROM pg_prepared_xacts WHERE database = current_database()))::text
+       $w$) w), '{}'::jsonb),
+  -- The same two facts about the coordinator, which is a node too: it runs
+  -- the concurrent distribution (measured: create_distributed_table_concurrently
+  -- failed on the COORDINATOR's wal_level) and can hold prepared transactions.
+  'coordinator', JSONB_BUILD_OBJECT(
+     'wal_level', current_setting('wal_level'),
+     'prepared', (SELECT count(*) FROM pg_prepared_xacts
+                   WHERE database = current_database()),
+     'oldest_s', (SELECT COALESCE(EXTRACT(EPOCH FROM now() - min(prepared))::bigint, 0)
+                    FROM pg_prepared_xacts WHERE database = current_database())),
+  -- Reference tables, and how many of them each node holds. Measured: adding a
+  -- node copies NONE of them -- citus_add_node took 20 ms beside 217 MB of
+  -- reference data -- and the next create_distributed_table copied them all to
+  -- it. So the cost lands on whichever step next needs them everywhere, and a
+  -- node holding fewer than all is where it will land.
+  -- citus_total_relation_size asks one placement; measured ~1 ms.
+  'reference_tables', JSONB_BUILD_OBJECT(
+     'count', (SELECT count(*) FROM pg_dist_partition
+                WHERE partmethod = 'n' AND repmodel = 't'),
+     'bytes', (SELECT COALESCE(sum(citus_total_relation_size(logicalrelid)), 0)
+                 FROM pg_dist_partition WHERE partmethod = 'n' AND repmodel = 't')),
   'worker_count', (SELECT count(*) FROM pg_dist_node
                     WHERE noderole = 'primary' AND isactive
                       AND NOT (nodename = COALESCE(
