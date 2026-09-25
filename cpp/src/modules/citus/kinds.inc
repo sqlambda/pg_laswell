@@ -29,3 +29,8 @@ PGLASWELL_KIND(citus_rebalance_shards,               kCitusRebalanceShards,     
 // The workers named by the connection's configuration, not by the
 // specification: one signed file for clusters of any size. See parse.h.
 PGLASWELL_KIND(citus_ensure_workers,                 kCitusEnsureWorkers,               parse_citus_ensure_workers,                 plan_citus_ensure_workers)
+//
+// Taking a worker out of service and back, and recording shard sizes.
+PGLASWELL_KIND(citus_disable_node,                   kCitusDisableNode,                 parse_citus_disable_node,                   plan_citus_disable_node)
+PGLASWELL_KIND(citus_activate_node,                  kCitusActivateNode,                parse_citus_activate_node,                  plan_citus_activate_node)
+PGLASWELL_KIND(citus_update_table_statistics,        kCitusUpdateTableStatistics,       parse_citus_update_table_statistics,        plan_citus_update_table_statistics)

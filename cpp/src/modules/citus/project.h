@@ -234,3 +234,23 @@ inline void citus_project_rebalance(const Intent&, const std::string&,
   mine.erase("rebalance_moves_stale_after_step");
   (void)step;
 }
+
+// Disabled or active: the node stays, its isactive changes, and with it the set
+// of nodes that take work -- so the rebalance plan read earlier is stale.
+inline void citus_project_node_active(json& mine, const Intent& in, const Step& step,
+                                      bool active) {
+  auto* n = citus_projected_node(mine, in.body.value("host", ""),
+                                 in.body.value("port", 5432));
+  if (n == nullptr) return;
+  (*n)["isactive"] = active;
+  (*n)["projected_by_step"] = step.ordinal;
+  citus_recount_workers(mine, step);
+}
+inline void citus_project_disable_node(const Intent& in, const std::string&,
+                                       const Step& step, json& mine) {
+  citus_project_node_active(mine, in, step, false);
+}
+inline void citus_project_activate_node(const Intent& in, const std::string&,
+                                        const Step& step, json& mine) {
+  citus_project_node_active(mine, in, step, true);
+}

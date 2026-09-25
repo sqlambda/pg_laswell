@@ -1668,3 +1668,66 @@ TEST(CitusPlanner, PreparedTransactionsNobodyResolvesRefuseThePlan) {
   c["settings"]["recover_2pc_interval"] = "10min";
   EXPECT_TRUE(plan_citus(distribute_intent(), citus_observations(c, tables)).ok);
 }
+
+// --- Disable, activate, statistics ------------------------------------------
+
+TEST(CitusPlanner, DisablingANodeIsSynchronousAndOnlyForAnEmptyWorker) {
+  const json in{{"kind", "citus_disable_node"}, {"host", "worker2"}};
+  const auto holding = plan_topology(in, cluster());
+  EXPECT_FALSE(holding.ok);
+  EXPECT_TRUE(conflicts_mention(holding, "citus_drain_node")) << first_conflict(holding);
+
+  const auto drained = cluster(json::array({node("coordinator", 0, false, 0),
+                                            node("worker1", 1, true, 64),
+                                            node("worker2", 2, false, 0)}));
+  const auto p = plan_topology(in, drained);
+  ASSERT_TRUE(p.ok) << first_conflict(p);
+  // Measured: the asynchronous default leaves the workers out of sync, and the
+  // next activate or remove fails.
+  EXPECT_EQ(p.steps[0].sql[0],
+            "SELECT citus_disable_node('worker2', 5432, synchronous => true);");
+  EXPECT_EQ(p.steps[0].detail.value("rehearse_by", ""), "execution");
+
+  const auto coord = plan_topology(
+      json{{"kind", "citus_disable_node"}, {"host", "coordinator"}}, drained);
+  EXPECT_FALSE(coord.ok);
+
+  auto off = drained;
+  off["nodes"][2]["isactive"] = false;
+  EXPECT_EQ(plan_topology(in, off).steps[0].action, pglaswell::Action::kSatisfied);
+}
+
+TEST(CitusPlanner, ANodeDisabledEarlierCanBeActivatedOrRemovedInTheSameSpecification) {
+  const auto drained = cluster(json::array({node("coordinator", 0, false, 0),
+                                            node("worker1", 1, true, 64),
+                                            node("worker2", 2, false, 0)}));
+  const auto p = plan_topology_many(
+      json::array({json{{"kind", "citus_disable_node"}, {"host", "worker2"}},
+                   json{{"kind", "citus_activate_node"}, {"host", "worker2"}}}),
+      drained);
+  ASSERT_TRUE(p.ok) << first_conflict(p);
+  EXPECT_EQ(p.steps[1].action, pglaswell::Action::kApply) << p.steps[1].why;
+  EXPECT_EQ(p.steps[1].sql[0], "SELECT citus_activate_node('worker2', 5432);");
+
+  const auto active = plan_topology(
+      json{{"kind", "citus_activate_node"}, {"host", "worker2"}}, drained);
+  EXPECT_EQ(active.steps[0].action, pglaswell::Action::kSatisfied);
+  EXPECT_FALSE(plan_topology(json{{"kind", "citus_activate_node"}, {"host", "worker9"}},
+                             drained).ok);
+}
+
+TEST(CitusPlanner, TableStatisticsAreForTablesCitusShards) {
+  const json in{{"kind", "citus_update_table_statistics"}, {"schema", "public"},
+                {"table", "a"}};
+  const auto tables = json{{"public.a", table_with_pk({"id"})}};
+  const auto p = plan_citus(in, citus_observations(
+      cluster(nullptr), tables));
+  EXPECT_FALSE(p.ok) << "public.a is not recorded by Citus";
+  json c = cluster();
+  c["tables"]["public.a"] = distributed("id", 5);
+  const auto ok = plan_citus(in, citus_observations(c, tables));
+  ASSERT_TRUE(ok.ok) << first_conflict(ok);
+  EXPECT_EQ(ok.steps[0].sql[0], "SELECT citus_update_table_statistics('public.a');");
+  c["tables"]["public.a"] = managed_local();
+  EXPECT_FALSE(plan_citus(in, citus_observations(c, tables)).ok);
+}

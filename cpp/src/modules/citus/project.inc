@@ -30,3 +30,7 @@ PGLASWELL_PROJECT(kCitusSetNodeProperty, citus_project_node_property)
 PGLASWELL_PROJECT(kCitusDrainNode, citus_project_drain_node)
 PGLASWELL_PROJECT(kCitusRebalanceShards, citus_project_rebalance)
 PGLASWELL_PROJECT(kCitusEnsureWorkers, citus_project_ensure_workers)
+PGLASWELL_PROJECT(kCitusDisableNode, citus_project_disable_node)
+PGLASWELL_PROJECT(kCitusActivateNode, citus_project_activate_node)
+// Sizes in metadata are not something a later step reads.
+PGLASWELL_PROJECT(kCitusUpdateTableStatistics, citus_project_nothing)

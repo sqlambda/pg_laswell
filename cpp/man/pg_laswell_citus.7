@@ -350,6 +350,22 @@ rows deleted: a local table referencing a reference table was emptied.
 The plan is refused while any such table references it.
 A distributed table referencing it is allowed: only the coordinator's stale copy
 of it is truncated, and Citus still served every row.
+.Ss Cm citus_update_table_statistics
+Record each shard's current size in Citus metadata.
+Required:
+.Va schema ,
+.Va table ;
+the table must be distributed or a reference table (Citus refuses anything
+else).
+.Pp
+Measured: it writes the sizes into
+.Va pg_dist_placement.shardlength
+(0 before, 3.4 to 3.9 MB after, on a four-shard table), took 5 ms for 32 shards,
+and rolls back cleanly.
+No reading tells a current size from a stale one, so it is always applied, and
+repeating it is harmless.
+It is maintenance rather than a change of schema: a specification that runs it
+runs it once, when applied.
 .Ss Cluster kinds
 The kinds below change the cluster, not a table.
 They name nodes, and a node exists on one cluster only:
@@ -485,6 +501,31 @@ Required:
 Satisfied when it already has that value.
 Setting it to false stops new shards arriving and moves none; the plan says how
 many the node keeps.
+.Ss Cm citus_disable_node
+Take a worker out of service without removing it: it stays registered and keeps
+its copies of the reference tables, and Citus stops sending it work.
+Satisfied when it is already disabled.
+Refused for the coordinator (Citus refuses it), and for a worker still holding
+shards of a distributed table (Citus refuses that too, as for removal), so drain
+it first.
+.Pp
+Always emitted with
+.Li synchronous => true .
+Measured: the asynchronous default leaves the workers' metadata out of sync for
+a while, and a
+.Cm citus_activate_node
+or
+.Cm citus_remove_node
+straight after it failed
+.Pq Qq is a metadata node, but is out of sync .
+Synchronous, both ran at once, in the same transaction too.
+It rolls back cleanly, so the dry run executes it.
+.Ss Cm citus_activate_node
+Put a disabled worker back into service.
+Satisfied when it is already active; refused for a node that is not registered.
+.Cm citus_add_node
+does not do this: on a disabled node it returns the node and leaves it disabled
+(measured), which is why that kind refuses an inactive node and names this one.
 .Ss Cm citus_drain_node
 Move every shard of a distributed table off a node, and mark it as taking no new
 ones.

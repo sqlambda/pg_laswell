@@ -359,6 +359,9 @@ expect_form "truncating local data that would cascade into ct.ll" refuse "ct.ll"
   '{"kind":"citus_truncate_local_data","schema":"ct","table":"lr"}'
 clean_apply "truncating the local copy under a distributed table" \
   '{"kind":"citus_truncate_local_data","schema":"ct","table":"la"}'
+clean_apply "recording ct.dist's shard sizes" \
+  '{"kind":"citus_update_table_statistics","schema":"ct","table":"dist"}'
+
 if [ "$(q "SELECT count(*) FROM ct.ll")" = 1 ]; then
   ok "ct.ll still has its row: nothing above committed"
 else
@@ -682,6 +685,19 @@ if [ "$rc" = 0 ] && [ "$before" -gt 0 ] && [ "$(shards_on worker2)" = 0 ] \
   ok "drained through the executor: worker2 went from $before distributed placements to 0"
 else
   bad "the drain did not finish (rc=$rc before=$before after=$(shards_on worker2))" "$out"
+fi
+# worker2 is empty now, which is what disabling needs. Measured: the
+# asynchronous disable left the workers out of sync and the next activate
+# failed; synchronous, both run in one transaction -- so the dry run executes
+# the pair and must leave worker2 exactly as it was.
+out=$(intent_plan '{"kind":"citus_disable_node","host":"worker2","port":5432},
+                   {"kind":"citus_activate_node","host":"worker2","port":5432}')
+if echo "$out" | grep -q '"ok":true' && ! echo "$out" | grep -q '"problems"' \
+   && echo "$out" | grep -q 'synchronous => true' \
+   && [ "$(q "SELECT isactive FROM pg_dist_node WHERE nodename = 'worker2'")" = t ]; then
+  ok "disabling and re-activating a drained worker rehearses cleanly and leaves it active"
+else
+  bad "disable then activate should rehearse cleanly" "$out"
 fi
 out=$("$BIN" --repo "$topo_repo" --repo "$drain_repo" "${base_repos[@]}" "$CITUS_URL" 2>&1); rc=$?
 moves=$(q "SELECT count(*) FROM get_rebalance_table_shards_plan()")

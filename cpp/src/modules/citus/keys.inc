@@ -55,4 +55,6 @@ PGLASWELL_CONFLICT_KEYS(kCitusSetNodeProperty, { add("citus:topology"); })
 PGLASWELL_CONFLICT_KEYS(kCitusDrainNode, { add("citus:topology"); })
 PGLASWELL_CONFLICT_KEYS(kCitusRebalanceShards, { add("citus:topology"); })
 PGLASWELL_CONFLICT_KEYS(kCitusEnsureWorkers, { add("citus:topology"); })
+PGLASWELL_CONFLICT_KEYS(kCitusDisableNode, { add("citus:topology"); })
+PGLASWELL_CONFLICT_KEYS(kCitusActivateNode, { add("citus:topology"); })
 #endif

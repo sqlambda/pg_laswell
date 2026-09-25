@@ -2009,3 +2009,138 @@ inline void plan_citus_ensure_workers(const Intent& in, const Observations& obs,
         "citus_rebalance_shards after this intent does it.");
   }
 }
+
+// --- Disable and activate ---------------------------------------------------
+//
+// Measured on Citus 13: citus_disable_node on a node holding the only copy of a
+// shard is refused, as removal is; on the coordinator it is refused ("cannot
+// change isactive field of the coordinator node"). Both calls run in a
+// transaction and roll back cleanly. The DEFAULT, asynchronous, disable leaves
+// the workers' metadata out of sync for a while, and the next citus_activate_node
+// or citus_remove_node then fails -- "worker1:5432 is a metadata node, but is
+// out of sync" -- so this always asks for synchronous => true, after which both
+// ran at once, in the same transaction too.
+
+inline void plan_citus_disable_node(const Intent& in, const Observations& obs,
+                                    const ExecutorConfig& cfg, Plan& plan,
+                                    std::vector<Step>& out) {
+  (void)cfg;
+  Step step;
+  step.kind = in.kind_name;
+  struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
+  const auto& citus = obs.extension("citus");
+  if (!citus_present(in, step, plan, citus)) return;
+
+  const auto name = citus_node_name(in);
+  const auto& node = citus_node(citus, in);
+  if (node.empty()) {
+    citus_refuse_absent_node(in, step, plan);
+    return;
+  }
+  if (node.value("groupid", -1) == 0) {
+    step.action = Action::kConflict;
+    step.why = name + " is the coordinator";
+    plan.conflicts.push_back(
+        step.why + ", and Citus refuses to disable it (\"cannot change isactive "
+        "field of the coordinator node\").");
+    return;
+  }
+  if (!node.value("isactive", true)) {
+    step.action = Action::kSatisfied;
+    step.why = name + " is already disabled";
+    return;
+  }
+  const auto placements = node.value("placements", 0LL);
+  if (placements > 0) {
+    step.action = Action::kConflict;
+    step.why = name + " holds " + std::to_string(placements) +
+               " shard placements of distributed tables";
+    plan.conflicts.push_back(
+        step.why + ", and Citus refuses to disable a node holding the only copy of "
+        "a shard (measured, the same refusal as removing it). Drain it first with "
+        "citus_drain_node, in an earlier intent or specification.");
+    return;
+  }
+  step.action = Action::kApply;
+  step.txn_class = TxnClass::kRequired;
+  step.detail["rehearse_by"] = "execution";
+  step.detail["node"] = name;
+  step.lock = "no table lock: cluster metadata, propagated to every node";
+  step.why = name + " holds no distributed shards and is taken out of service";
+  step.sql.push_back("SELECT citus_disable_node(" + citus_node_args(in) +
+                     ", synchronous => true);");
+  plan.warnings.push_back(
+      name + " stays registered and keeps its copies of the reference tables; "
+      "Citus stops sending it work. citus_activate_node brings it back; "
+      "citus_remove_node takes it out for good.");
+}
+
+inline void plan_citus_activate_node(const Intent& in, const Observations& obs,
+                                     const ExecutorConfig& cfg, Plan& plan,
+                                     std::vector<Step>& out) {
+  (void)cfg;
+  Step step;
+  step.kind = in.kind_name;
+  struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
+  const auto& citus = obs.extension("citus");
+  if (!citus_present(in, step, plan, citus)) return;
+
+  const auto name = citus_node_name(in);
+  const auto& node = citus_node(citus, in);
+  if (node.empty()) {
+    citus_refuse_absent_node(in, step, plan);
+    return;
+  }
+  // Measured: activating an active node returns its id and changes nothing.
+  if (node.value("isactive", false)) {
+    step.action = Action::kSatisfied;
+    step.why = name + " is already active";
+    return;
+  }
+  step.action = Action::kApply;
+  step.txn_class = TxnClass::kRequired;
+  step.detail["rehearse_by"] = "execution";
+  step.detail["node"] = name;
+  step.lock = "no table lock: cluster metadata, propagated to every node";
+  step.why = name + " is put back into service";
+  step.sql.push_back("SELECT citus_activate_node(" + citus_node_args(in) + ");");
+}
+
+// Measured: it writes each placement's current size into
+// pg_dist_placement.shardlength -- 0 before, 3.4 to 3.9 MB after on a 4-shard
+// table -- rolls back cleanly, took 5 ms for 32 shards, works on distributed and
+// reference tables, and is refused on anything else ("relation is not
+// distributed"). No reading says the recorded sizes are stale -- current and
+// out of date look the same -- so it is always applied, and it is harmless to
+// repeat.
+inline void plan_citus_update_table_statistics(const Intent& in,
+                                               const Observations& obs,
+                                               const ExecutorConfig& cfg,
+                                               Plan& plan, std::vector<Step>& out) {
+  (void)cfg;
+  Step step;
+  step.kind = in.kind_name;
+  struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
+  const auto qualified = in.qualified_table();
+  const auto& citus = obs.extension("citus");
+  bool already = false;
+  if (!citus_precondition(in, obs, step, plan, citus, qualified, already)) return;
+  const auto kind = citus_kind_of(citus, qualified);
+  if (kind != "distributed" && kind != "reference") {
+    step.action = Action::kConflict;
+    step.why = qualified + " is not a distributed or reference table" +
+               (kind.empty() ? std::string() : " (it is a Citus-managed local one)");
+    plan.conflicts.push_back(
+        step.why + ", so Citus has no shard sizes to record for it (\"relation is "
+        "not distributed\").");
+    return;
+  }
+  step.action = Action::kApply;
+  step.txn_class = TxnClass::kRequired;
+  step.detail["rehearse_by"] = "execution";
+  step.lock = "no table lock: reads each shard's size, writes Citus metadata";
+  step.why = "records the current size of each of " + qualified +
+             "'s shards in pg_dist_placement.shardlength";
+  step.sql.push_back("SELECT citus_update_table_statistics(" +
+                     detail::quote_literal(qualified) + ");");
+}

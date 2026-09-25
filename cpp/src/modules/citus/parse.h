@@ -376,3 +376,26 @@ inline void parse_citus_ensure_workers(Intent& in) {
     }
   }
 }
+
+// Take a worker out of service without removing it, and put it back.
+inline void parse_citus_disable_node(Intent& in) {
+  const auto at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(in.body, {"kind", "host", "port", "comment"}, at);
+  citus_parse_node(in, at);
+}
+
+inline void parse_citus_activate_node(Intent& in) {
+  const auto at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(in.body, {"kind", "host", "port", "comment"}, at);
+  citus_parse_node(in, at);
+}
+
+// Record each shard's current size in Citus metadata.
+inline void parse_citus_update_table_statistics(Intent& in) {
+  const auto at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(in.body, {"kind", "schema", "table", "comment"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at),
+                             "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at),
+                             "table", in.ordinal);
+}
