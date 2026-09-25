@@ -18,32 +18,11 @@
 #include <thread>
 #include <utility>
 
-#if defined(__GNUC__) && !defined(__clang__)
-// GCC-only false positive from std::variant inside pqxx headers; Clang has no
-// such warning group, and with -Werror an unguarded pragma would hard-fail
-// there on "unknown warning group".
-#  pragma GCC diagnostic push
-#  pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
-#endif
 #include <pqxx/pqxx>
-#if defined(__GNUC__) && !defined(__clang__)
-#  pragma GCC diagnostic pop
-#endif
 
 #include "config.h"
 
 namespace pglaswell {
-
-// pqxx 7.9 renamed exec_params to exec(sql, pqxx::params). Selected at compile
-// time so both spellings build from one source.
-template <typename T, typename P>
-inline pqxx::result pqxx_exec(T& txn, const std::string& sql, P&& params) {
-#if PQXX_VERSION_MAJOR > 7 || (PQXX_VERSION_MAJOR == 7 && PQXX_VERSION_MINOR >= 9)
-  return txn.exec(sql, std::forward<P>(params));
-#else
-  return txn.exec_params(sql, std::forward<P>(params));
-#endif
-}
 
 // A keyed pool of IDLE connections, with a reaper.
 //
@@ -410,7 +389,7 @@ class WriteSession {
       pqxx::nontransaction tx(*conn_);
       // The GUC name is from a fixed internal set, never from a spec; the
       // value is bound.
-      pqxx_exec(tx, "SELECT set_config($1, $2, false)",
+      tx.exec("SELECT set_config($1, $2, false)",
                 pqxx::params{name, value});
     }
     Reset guard{conn_.get(), name};

@@ -147,7 +147,7 @@ inline BatchOutcome run_paced_batch(pqxx::work& txn,
   BatchOutcome out;
   out.cursor = cursor;
   if (apply_sql.empty()) {
-    const auto r = pqxx_exec(txn, select_sql, pqxx::params{cursor, batch});
+    const auto r = txn.exec(select_sql, pqxx::params{cursor, batch});
     out.considered = static_cast<long long>(r.size());
     for (const auto& row : r) out.cursor = row[0].as<std::string>();
     return out;
@@ -156,7 +156,7 @@ inline BatchOutcome run_paced_batch(pqxx::work& txn,
   // The lock taken here is what makes the two statements safe as one: nothing
   // can change these rows before the apply below, because both run in this
   // transaction.
-  const auto sel = pqxx_exec(txn, select_sql, pqxx::params{cursor, batch});
+  const auto sel = txn.exec(select_sql, pqxx::params{cursor, batch});
   std::vector<std::string> keys;
   keys.reserve(static_cast<std::size_t>(sel.size()));
   long long bytes = 0;
@@ -189,7 +189,7 @@ inline BatchOutcome run_paced_batch(pqxx::work& txn,
   }
   literal += "}";
 
-  const auto r = pqxx_exec(txn, apply_sql, pqxx::params{literal});
+  const auto r = txn.exec(apply_sql, pqxx::params{literal});
   // The cursor advances over what was CONSIDERED -- the selection -- not over
   // what the mutation returned.
   out.cursor = keys.back();
@@ -246,7 +246,7 @@ inline BatchOutcome run_grouped_batch(pqxx::work& txn,
     if (at.group.empty()) {
       // `groups_sql` carries the predicate too, so a distribution value with no
       // matching rows never becomes a group at all.
-      const auto g = pqxx_exec(txn, groups_sql,
+      const auto g = txn.exec(groups_sql,
                                pqxx::params{maybe(at.group), 1});
       if (g.empty()) {  // no values left: the walk is finished
         out.cursor = at.encode();
@@ -256,14 +256,14 @@ inline BatchOutcome run_grouped_batch(pqxx::work& txn,
       at.key.clear();
     }
 
-    const auto sel = pqxx_exec(txn, select_sql,
+    const auto sel = txn.exec(select_sql,
                                pqxx::params{at.group, maybe(at.key), batch});
     if (sel.empty()) {
       // This group is done. Advance past it and look at the next one: `groups_sql`
       // is keyset-walked on the group, so an empty key with a group set means
       // "everything in this group is done", and the next iteration asks for the
       // next group after it.
-      const auto g = pqxx_exec(txn, groups_sql,
+      const auto g = txn.exec(groups_sql,
                                pqxx::params{maybe(at.group), 1});
       if (g.empty()) {
         out.cursor = at.encode();
@@ -298,7 +298,7 @@ inline BatchOutcome run_grouped_batch(pqxx::work& txn,
     }
     literal += "}";
 
-    const auto r = pqxx_exec(txn, apply_sql, pqxx::params{at.group, literal});
+    const auto r = txn.exec(apply_sql, pqxx::params{at.group, literal});
     at.key = keys.back();
     out.cursor = at.encode();
     out.considered = static_cast<long long>(r.size());
@@ -519,8 +519,10 @@ class Executor {
   // because "what ran" for a COPY is genuinely two things.
   //
   // pqxx::stream_to is the only sanctioned way to send COPY data through
-  // libpqxx 7.10; connection::raw_connection() and write_copy_line() are
-  // private, reachable only through internal gate classes. It builds the
+  // libpqxx 8.0.2, the pinned version: connection::raw_connection() and
+  // write_copy_line() are private, reachable only through internal gate
+  // classes, and release_raw_connection() gives up the whole connection, so it
+  // cannot serve a COPY inside a transaction. It builds the
   // statement itself, which is why the planner emits exactly the form probed
   // out of it -- COPY t(cols) FROM STDIN, no WITH clause -- and why spec.h
   // refuses ON_ERROR and friends rather than accepting keys that cannot travel.
@@ -625,9 +627,7 @@ class Executor {
       return;
     }
     w.begin(app_name(ordinal));
-    const auto r = pqxx_exec(
-        w.txn(),
-        "SELECT i.indisvalid, i.indisready FROM pg_index i"
+    const auto r = w.txn().exec("SELECT i.indisvalid, i.indisready FROM pg_index i"
         "  JOIN pg_class c ON c.oid = i.indexrelid"
         "  JOIN pg_namespace n ON n.oid = c.relnamespace"
         " WHERE c.relname = $1 AND n.nspname = $2",
@@ -867,8 +867,7 @@ class Executor {
         // step rows are written by the coordination connection: cursor and data
         // must be atomically consistent, or a crash produces re-applied or
         // skipped rows.
-        pqxx_exec(w.txn(),
-                  "INSERT INTO laswell.backfill_cursor"
+        w.txn().exec("INSERT INTO laswell.backfill_cursor"
                   "  (job_id, ordinal, last_key, rows_done, commits)"
                   "  VALUES ($1::uuid, $2, $3, $4, 1)"
                   "  ON CONFLICT (job_id, ordinal) DO UPDATE"
@@ -1031,16 +1030,12 @@ class Executor {
         const auto d = detail::quote_identifier(resume_group_);
         const auto k = detail::quote_identifier(resume_key_);
         if (at.key.empty()) {
-          const auto res = pqxx_exec(
-              r.txn(),
-              "SELECT EXISTS (SELECT 1 FROM " + rel + " WHERE " + d +
+          const auto res = r.txn().exec("SELECT EXISTS (SELECT 1 FROM " + rel + " WHERE " + d +
                   " < $1 AND (" + resume_where_ + "))",
               pqxx::params{at.group});
           return !res.empty() && res[0][0].as<bool>();
         }
-        const auto res = pqxx_exec(
-            r.txn(),
-            "SELECT EXISTS (SELECT 1 FROM " + rel + " WHERE (" + d + " < $1 OR (" +
+        const auto res = r.txn().exec("SELECT EXISTS (SELECT 1 FROM " + rel + " WHERE (" + d + " < $1 OR (" +
                 d + " = $1 AND " + k + " <= $2)) AND (" + resume_where_ + "))",
             pqxx::params{at.group, at.key});
         return !res.empty() && res[0][0].as<bool>();
@@ -1052,7 +1047,7 @@ class Executor {
       const auto q = "SELECT EXISTS (SELECT 1 FROM " + resume_qualified_ +
                      " WHERE " + resume_key_ + " <= $1 AND (" +
                      resume_where_ + "))";
-      const auto res = pqxx_exec(r.txn(), q, pqxx::params{from});
+      const auto res = r.txn().exec(q, pqxx::params{from});
       return !res.empty() && res[0][0].as<bool>();
     } catch (const std::exception&) {
       // If the check cannot run, do not resume on a cursor we could not
@@ -1078,9 +1073,7 @@ class Executor {
     // the idempotence mechanism: a re-run matches nothing and costs one scan.
     try {
       ReadSession r(cfg_, std::nullopt, nullptr, 2000);
-      const auto res = pqxx_exec(
-          r.txn(),
-          "SELECT c.last_key FROM laswell.backfill_cursor c"
+      const auto res = r.txn().exec("SELECT c.last_key FROM laswell.backfill_cursor c"
           "  JOIN laswell.job j ON j.job_id = c.job_id"
           "  JOIN laswell.migration m ON m.migration_id = j.migration_id"
           " WHERE m.spec_digest = $1 AND c.ordinal = $2"

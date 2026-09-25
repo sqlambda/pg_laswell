@@ -2293,12 +2293,15 @@ inline void parse_merge_rows(Intent& in) {
 //
 // NO `WITH` OPTIONS, AND THE REASON IS THE CLIENT LIBRARY RATHER THAN A
 // JUDGEMENT. PostgreSQL 17 and 18 added ON_ERROR ignore, LOG_VERBOSITY and
-// REJECT_LIMIT, and they were in an earlier draft of this kind. libpqxx 7.10
-// offers exactly one sanctioned way to send COPY data -- pqxx::stream_to --
-// which builds its own statement and accepts no options; the two entry points
-// that would allow one, connection::raw_connection() and write_copy_line(), are
-// private and reachable only through internal gate classes. Probed against
-// 18.6, stream_to sends:
+// REJECT_LIMIT, and they were in an earlier draft of this kind. libpqxx 8.0.2,
+// the pinned version, offers exactly one sanctioned way to send COPY data --
+// pqxx::stream_to -- which builds its own statement and accepts no options; the
+// two entry points that would allow one, connection::raw_connection() and
+// write_copy_line(), are private and reachable only through internal gate
+// classes, and release_raw_connection() surrenders the whole connection, so it
+// cannot carry a COPY inside a transaction. (Written against 7.10 and checked
+// again against 8.0.2's headers: nothing here changed.) Probed against 18.6,
+// stream_to sends:
 //
 //     COPY cf_probe(id, code) FROM STDIN
 //

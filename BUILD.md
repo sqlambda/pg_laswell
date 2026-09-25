@@ -5,19 +5,45 @@ therefore `-S cpp`.
 
 ## Dependencies
 
-All from system packages. There is no vcpkg, conan, FetchContent or submodule:
-the dependency list is the thing an operator has to install, so it is kept
-short and boring.
+All from system packages but one. There is no vcpkg, conan, FetchContent or
+submodule: the dependency list is the thing an operator has to install, so it is
+kept short and boring.
 
 | | Debian/Ubuntu | Fedora/RHEL |
 |---|---|---|
-| libpqxx | `libpqxx-dev` | `libpqxx-devel` |
+| libpqxx **8.0.2**, built from source (below) | — | — |
 | libpq | `libpq-dev` | `libpq-devel` |
 | nlohmann/json | `nlohmann-json3-dev` | `json-devel` |
 | OpenSSL | `libssl-dev` | `openssl-devel` |
 | GoogleTest | `libgtest-dev` | `gtest-devel` |
 | mandoc *(optional)* | `mandoc` | `mandoc` |
 | valgrind *(optional)* | `valgrind` | `valgrind` |
+
+### libpqxx: exactly 8.0.2
+
+pg_laswell builds against one libpqxx, the version CI and every release build
+from source, and CMake refuses any other. A distribution's package is whatever
+that distribution froze (Debian 13 ships 7.10), and code that compiles against
+two versions is written to what they share rather than to what the pinned one
+can do: the first build of this against 7.10 compiled here and failed in CI,
+where `sql_error::sqlstate()` returns a `string_view`.
+
+Build it the way CI does, with the version and checksum CI pins
+(`PQXX_VERSION` and `PQXX_SHA256` in `.github/workflows/tests.yml`), into a
+prefix of your own; nothing is installed system-wide:
+
+```bash
+sh .github/scripts/build-libpqxx.sh 8.0.2 <PQXX_SHA256> $HOME/.local/opt/libpqxx-8.0.2
+export CMAKE_PREFIX_PATH=$HOME/.local/opt/libpqxx-8.0.2
+```
+
+CMake reads `CMAKE_PREFIX_PATH` from the environment, so with it exported every
+`cmake` command in this file finds the pinned libpqxx; `-DCMAKE_PREFIX_PATH=...`
+on the command line does the same for one build tree. Without it, configuring
+stops and says which libpqxx it found instead.
+
+It is built as a static library, as in the release, so the binaries carry it and
+need no libpqxx at run time.
 
 OpenSSL is linked for `OpenSSL::Crypto` only — Ed25519 signature verification,
 never TLS. It adds no new *runtime* package: `libpq5` already depends on

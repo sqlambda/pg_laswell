@@ -14,7 +14,33 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(PQXX REQUIRED IMPORTED_TARGET libpqxx)
+# ONE libpqxx: 8.0.2, the version CI and every release build from source
+# (PQXX_VERSION in .github/workflows/*.yml -- change them together). Not "any
+# libpqxx the system has": that is how code written against the system's 7.10
+# compiled here and failed in CI, where sql_error::sqlstate() is a string_view.
+# A pinned version is written to its full capability, never to the part two
+# versions happen to share.
+#
+# Locally, build it the way CI does and point CMake at it:
+#   sh .github/scripts/build-libpqxx.sh 8.0.2 <PQXX_SHA256> $HOME/.local/opt/libpqxx-8.0.2
+#   cmake -S cpp -B cpp/build -DCMAKE_PREFIX_PATH=$HOME/.local/opt/libpqxx-8.0.2
+set(PGLASWELL_PQXX_VERSION "8.0.2")
+pkg_check_modules(PQXX IMPORTED_TARGET libpqxx=${PGLASWELL_PQXX_VERSION})
+if(NOT PQXX_FOUND)
+    pkg_check_modules(_PQXX_ANY QUIET libpqxx)
+    if(_PQXX_ANY_FOUND)
+        set(_pqxx_found "found libpqxx ${_PQXX_ANY_VERSION}")
+    else()
+        set(_pqxx_found "found no libpqxx")
+    endif()
+    message(FATAL_ERROR
+        "pg_laswell builds against libpqxx ${PGLASWELL_PQXX_VERSION} exactly, and "
+        "${_pqxx_found}. Build the pinned one the way CI does and point CMake at "
+        "it (see BUILD.md):\n"
+        "  sh .github/scripts/build-libpqxx.sh ${PGLASWELL_PQXX_VERSION} <PQXX_SHA256 "
+        "from .github/workflows/tests.yml> $HOME/.local/opt/libpqxx-${PGLASWELL_PQXX_VERSION}\n"
+        "  cmake -S cpp -B <build> -DCMAKE_PREFIX_PATH=$HOME/.local/opt/libpqxx-${PGLASWELL_PQXX_VERSION}")
+endif()
 # libpqxx's .pc only exposes libpq via Requires.private, which CMake's
 # IMPORTED_TARGET does not follow (it only reads the public Libs/Requires).
 # When libpqxx is linked statically this leaves every PQ* symbol unresolved

@@ -217,8 +217,15 @@ it is worth doing. Maintenance is not migration.
 
 ## Building
 
-PostgreSQL 14+ headers, libpqxx, nlohmann/json, OpenSSL and GoogleTest, all
-from system packages. See [BUILD.md](BUILD.md).
+PostgreSQL 14+ headers, nlohmann/json, OpenSSL and GoogleTest from system
+packages, and libpqxx **8.0.2** exactly, built from source the way CI builds it:
+CMake refuses any other version. See [BUILD.md](BUILD.md).
+
+```bash
+sh .github/scripts/build-libpqxx.sh 8.0.2 <PQXX_SHA256 from .github/workflows/tests.yml> \
+   $HOME/.local/opt/libpqxx-8.0.2
+export CMAKE_PREFIX_PATH=$HOME/.local/opt/libpqxx-8.0.2
+```
 
 ```bash
 cmake -S cpp -B cpp/build

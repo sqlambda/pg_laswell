@@ -266,9 +266,7 @@ class Ledger {
       if (!offered.empty()) offered += ", ";
       offered += key_id;
 
-      const auto r = pqxx_exec(
-          s.txn(),
-          "SELECT public_key, label, revoked_at IS NOT NULL"
+      const auto r = s.txn().exec("SELECT public_key, label, revoked_at IS NOT NULL"
           "  FROM laswell.trusted_key WHERE key_id = $1",
           pqxx::params{key_id});
       if (r.empty()) continue;
@@ -330,9 +328,7 @@ class Ledger {
   long long record_migration(const Spec& spec, const std::string& signer_key_id) {
     WriteSession w(cfg_);
     w.begin("pg_laswell/ledger/record-migration");
-    const auto r = pqxx_exec(
-        w.txn(),
-        "INSERT INTO laswell.migration"
+    const auto r = w.txn().exec("INSERT INTO laswell.migration"
         "  (spec_id, spec_digest, epoch, canonical_bytes, signer_key_id,"
         "   signature)"
         "  VALUES ($1, $2, $3, convert_to($4, 'UTF8'), $5,"
@@ -369,9 +365,7 @@ class Ledger {
     if (!coordination_) coordination_ = std::make_unique<WriteSession>(cfg_);
 
     for (const auto lock_key : lock_keys) {
-      const auto r = pqxx_exec(
-          coordination_->exec_nontransactional_txn(),
-          "SELECT pg_try_advisory_lock($1)", pqxx::params{lock_key});
+      const auto r = coordination_->exec_nontransactional_txn().exec("SELECT pg_try_advisory_lock($1)", pqxx::params{lock_key});
       if (r.empty() || !r[0][0].as<bool>()) {
         if (conflict_reason) {
           *conflict_reason =
@@ -384,8 +378,7 @@ class Ledger {
     }
 
     coordination_->begin("pg_laswell/" + job_id + "/open");
-    pqxx_exec(coordination_->txn(),
-              "INSERT INTO laswell.job (job_id, migration_id, state, plan,"
+    coordination_->txn().exec("INSERT INTO laswell.job (job_id, migration_id, state, plan,"
               "  plan_digest, observations, server_version, backend_pid, lock_key)"
               "  VALUES ($1::uuid, $2, 'running', $3::jsonb, $4, $5::jsonb, $6, $7, $8)",
               pqxx::params{job_id, migration_id, plan.dump(), plan_digest,
@@ -404,8 +397,7 @@ class Ledger {
       sql += q.get<std::string>() + "\n";
     }
     coordination_->begin("pg_laswell/" + job_id + "/ledger");
-    pqxx_exec(coordination_->txn(),
-              "INSERT INTO laswell.step (job_id, ordinal, txn_group, kind,"
+    coordination_->txn().exec("INSERT INTO laswell.step (job_id, ordinal, txn_group, kind,"
               "  txn_class, sql, why, state, started_at, finished_at,"
               "  rows_affected, detail)"
               "  VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, now(), now(), $9, $10::jsonb)"
@@ -425,8 +417,7 @@ class Ledger {
     if (!coordination_) return;
     try {
       coordination_->begin("pg_laswell/" + job_id + "/finish");
-      pqxx_exec(coordination_->txn(),
-                "UPDATE laswell.job SET state = $2, finished_at = now(),"
+      coordination_->txn().exec("UPDATE laswell.job SET state = $2, finished_at = now(),"
                 "  error = $3::jsonb WHERE job_id = $1::uuid",
                 pqxx::params{job_id, state,
                              error.is_null() ? std::string("null") : error.dump()});
@@ -440,8 +431,7 @@ class Ledger {
     if (!coordination_) return;
     for (const auto k : held_) {
       try {
-        pqxx_exec(coordination_->exec_nontransactional_txn(),
-                  "SELECT pg_advisory_unlock($1)", pqxx::params{k});
+        coordination_->exec_nontransactional_txn().exec("SELECT pg_advisory_unlock($1)", pqxx::params{k});
       } catch (const std::exception&) {
       }
     }

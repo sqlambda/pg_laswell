@@ -620,13 +620,13 @@ class Catalog {
         schema = rest.substr(0, dot);
         name = rest.substr(dot + 1);
       }
-      const auto r = pqxx_exec(txn, detail::kObjectObservationSql,
+      const auto r = txn.exec(detail::kObjectObservationSql,
                                pqxx::params{kind, name, schema});
       if (!r.empty() && !r[0][0].is_null()) {
         obs.objects[key] = json::parse(r[0][0].as<std::string>());
       }
       if (kind == "extension") {
-        const auto a = pqxx_exec(txn, detail::kAvailableExtensionSql,
+        const auto a = txn.exec(detail::kAvailableExtensionSql,
                                  pqxx::params{name});
         if (!a.empty() && !a[0][0].is_null()) {
           const auto avail = json::parse(a[0][0].as<std::string>());
@@ -681,7 +681,7 @@ class Catalog {
       const auto qualified = schemas[i] + "." + tables[i];
       if (obs.tables.contains(qualified)) continue;
       try {
-        const auto r = pqxx_exec(s.txn(), detail::kTableObservationSql,
+        const auto r = s.txn().exec(detail::kTableObservationSql,
                                  pqxx::params{schemas[i], tables[i]});
         if (!r.empty() && !r[0][0].is_null()) {
           obs.tables[qualified] = json::parse(r[0][0].as<std::string>());
@@ -740,7 +740,7 @@ class Catalog {
     for (std::size_t i = 0; i < schemas.size(); ++i) {
       const auto qualified = schemas[i] + "." + tables[i];
       if (obs.tables.contains(qualified)) continue;
-      const auto r = pqxx_exec(txn, detail::kTableObservationSql,
+      const auto r = txn.exec(detail::kTableObservationSql,
                                pqxx::params{schemas[i], tables[i]});
       if (!r.empty() && !r[0][0].is_null()) {
         obs.tables[qualified] = json::parse(r[0][0].as<std::string>());
@@ -769,9 +769,9 @@ class Catalog {
   //    is skipped and reported as unverified rather than silently passed.
   //  - The backfill is EXPLAINed, never executed. ANALYZE is never used.
   // COPY ... FROM STDIN, from a step's detail. Shared by the dry run and, in
-  // spirit, by executor.h::run_copy -- pqxx::stream_to is the only sanctioned
-  // way to send COPY data through libpqxx 7.10, and it builds the statement
-  // itself, which is why the planner emits exactly the form it produces.
+  // spirit, by executor.h::run_copy -- pqxx::stream_to is libpqxx's own way to
+  // send COPY data, and it builds the statement itself, which is why the
+  // planner emits exactly the form it produces.
   // ONE implementation, called by the dry run here and by executor.h::run_copy.
   // There were two, differing in ways that were nobody's intent: one quoted
   // column names by concatenating a quote character, the other did the same a
@@ -1068,9 +1068,7 @@ class Catalog {
   void escalate_size(Observations& obs, const std::string& schema,
                      const std::string& table) {
     ReadSession s(cfg_, std::nullopt, cache_);
-    const auto r = pqxx_exec(
-        s.txn(),
-        "SELECT JSONB_BUILD_OBJECT("
+    const auto r = s.txn().exec("SELECT JSONB_BUILD_OBJECT("
         "  'size_measured', pg_table_size(c.oid),"
         "  'indexes_size', pg_indexes_size(c.oid),"
         "  'total_size', pg_total_relation_size(c.oid))"

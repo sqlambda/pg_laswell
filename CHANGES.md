@@ -139,6 +139,17 @@ does *not* fail:
 - **The pooler diagnostic** says what it observed (the backend pid changed)
   rather than naming a pool mode it could not know.
 
+### Building: libpqxx 8.0.2, exactly
+
+CMake now requires the libpqxx CI and every release build from source, 8.0.2,
+and stops naming the version it found otherwise. A distribution's package is
+whatever that distribution froze (Debian 13 ships 7.10), and code compiling
+against two versions is written to what they share: a build against 7.10
+compiled locally and failed in CI, where `sqlstate()` is a `string_view`. The
+7.x compatibility shim around `exec` is gone, and so is a GCC warning
+suppression the 8.0.2 headers no longer need. BUILD.md shows how to build the
+pinned version into a prefix of your own, with the script CI uses.
+
 ### CI
 
 A `citus` job builds with the module, runs the example against a real

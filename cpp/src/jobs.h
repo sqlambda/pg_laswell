@@ -520,7 +520,7 @@ class Observer {
       }
       array += "}";
 
-      const auto r = pqxx_exec(txn, detail::kObserverSql, pqxx::params{array});
+      const auto r = txn.exec(detail::kObserverSql, pqxx::params{array});
       // The cluster's counts, merged into the local ones by taking the larger.
       // Merged rather than replaced, and this is the honest part: the
       // distributed graph carries no waitstart, so a worker-side wait has no
@@ -532,7 +532,7 @@ class Observer {
       json cluster = json::object();
       if (topology_observer_sql_ != nullptr) {
         try {
-          const auto cr = pqxx_exec(txn, topology_observer_sql_, pqxx::params{array});
+          const auto cr = txn.exec(topology_observer_sql_, pqxx::params{array});
           if (!cr.empty() && !cr[0][0].is_null()) {
             cluster = json::parse(cr[0][0].as<std::string>());
           }

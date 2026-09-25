@@ -2744,9 +2744,7 @@ TEST_F(BootstrappedTest, RecordingAMigrationIsIdempotentOnTheDigest) {
   EXPECT_EQ(first, second) << "the same spec must not create two ledger rows";
 
   pglaswell::ReadSession r(cfg());
-  const auto row = pglaswell::pqxx_exec(
-      r.txn(),
-      "SELECT spec_id, encode(canonical_bytes,'escape'), signer_key_id "
+  const auto row = r.txn().exec("SELECT spec_id, encode(canonical_bytes,'escape'), signer_key_id "
       "  FROM laswell.migration WHERE migration_id = $1",
       pqxx::params{first});
   ASSERT_EQ(row.size(), 1u);
@@ -3440,9 +3438,7 @@ TEST_F(ToolTest, CopyRowsTravelsThroughTheRealExecutorAndLandsInTheLedger) {
   }
 
   // And the ledger records the statement that ran, verbatim.
-  const auto sql = pglaswell::pqxx_exec(
-      r.txn(),
-      "SELECT s.sql FROM laswell.step s JOIN laswell.job j ON j.job_id = s.job_id"
+  const auto sql = r.txn().exec("SELECT s.sql FROM laswell.step s JOIN laswell.job j ON j.job_id = s.job_id"
       " WHERE j.job_id = $1::uuid AND s.kind = 'copy_rows' ORDER BY s.ordinal LIMIT 1",
       pqxx::params{p["jobId"].get<std::string>()});
   ASSERT_FALSE(sql.empty()) << "the COPY left no step row";
@@ -3550,9 +3546,7 @@ TEST_F(ToolTest, TheLedgerRecordsWhatRanVerbatim) {
   }));
 
   pglaswell::ReadSession r(cfg());
-  const auto rows = pglaswell::pqxx_exec(
-      r.txn(),
-      "SELECT ordinal, kind, state, sql, why FROM laswell.step"
+  const auto rows = r.txn().exec("SELECT ordinal, kind, state, sql, why FROM laswell.step"
       " WHERE job_id = $1::uuid ORDER BY ordinal",
       pqxx::params{p["jobId"].get<std::string>()});
   ASSERT_GE(rows.size(), 3u) << "the ledger has no steps";
@@ -3564,9 +3558,7 @@ TEST_F(ToolTest, TheLedgerRecordsWhatRanVerbatim) {
     EXPECT_FALSE(row[4].template as<std::string>("").empty())
         << "step " << row[0].template as<int>() << " recorded no reason";
   }
-  const auto job = pglaswell::pqxx_exec(
-      r.txn(),
-      "SELECT state, plan_digest, finished_at IS NOT NULL FROM laswell.job"
+  const auto job = r.txn().exec("SELECT state, plan_digest, finished_at IS NOT NULL FROM laswell.job"
       " WHERE job_id = $1::uuid",
       pqxx::params{p["jobId"].get<std::string>()});
   ASSERT_EQ(job.size(), 1u);
@@ -3624,15 +3616,11 @@ TEST_F(ToolTest, CancellingAJobStopsItAndLeavesTheCursorCommitted) {
 
   // Whatever it committed is consistent: the cursor and the data agree.
   pglaswell::ReadSession r(cfg());
-  const auto cur = pglaswell::pqxx_exec(
-      r.txn(),
-      "SELECT last_key FROM laswell.backfill_cursor WHERE job_id = $1::uuid",
+  const auto cur = r.txn().exec("SELECT last_key FROM laswell.backfill_cursor WHERE job_id = $1::uuid",
       pqxx::params{job_id});
   if (!cur.empty()) {
     const auto last = cur[0][0].template as<std::string>();
-    const auto beyond = pglaswell::pqxx_exec(
-        r.txn(),
-        "SELECT count(*) FROM shop.orders"
+    const auto beyond = r.txn().exec("SELECT count(*) FROM shop.orders"
         " WHERE id <= $1::bigint AND fulfilment_region IS NULL"
         "   AND warehouse_id IS NOT NULL",
         pqxx::params{last});
@@ -3841,9 +3829,7 @@ TEST_F(ToolTest, AFailedStepFailsTheJobAndTheLedgerSaysWhich) {
   })) << status_of(p["jobId"]).dump(2);
 
   pglaswell::ReadSession r(cfg());
-  const auto rows = pglaswell::pqxx_exec(
-      r.txn(),
-      "SELECT count(*) FROM laswell.step WHERE job_id = $1::uuid AND state = 'failed'",
+  const auto rows = r.txn().exec("SELECT count(*) FROM laswell.step WHERE job_id = $1::uuid AND state = 'failed'",
       pqxx::params{p["jobId"].get<std::string>()});
   EXPECT_GT(rows[0][0].template as<int>(), 0) << "no step was recorded as failed";
 }
@@ -4282,8 +4268,7 @@ class EpochTest : public RepoTest {
   void open_epoch(const std::string& name, const std::string& note = "test") {
     pglaswell::WriteSession w(cfg());
     w.begin("pg_laswell/test/epoch");
-    pglaswell::pqxx_exec(w.txn(),
-        "INSERT INTO laswell.epoch(name, note) VALUES ($1, $2)"
+    w.txn().exec("INSERT INTO laswell.epoch(name, note) VALUES ($1, $2)"
         " ON CONFLICT (name) DO NOTHING",
         pqxx::params{name, note});
     w.commit();
@@ -4291,8 +4276,7 @@ class EpochTest : public RepoTest {
   void retire_epoch(const std::string& name) {
     pglaswell::WriteSession w(cfg());
     w.begin("pg_laswell/test/epoch-retire");
-    pglaswell::pqxx_exec(w.txn(),
-        "UPDATE laswell.epoch SET retired_at = now(), retired_by = current_user"
+    w.txn().exec("UPDATE laswell.epoch SET retired_at = now(), retired_by = current_user"
         " WHERE name = $1", pqxx::params{name});
     w.commit();
   }
@@ -11810,9 +11794,7 @@ class DeployTest : public RepoTest {
 
   int column_count(const std::string& table, const std::string& column) {
     pglaswell::ReadSession r(cfg());
-    return pglaswell::pqxx_exec(
-               r.txn(),
-               "SELECT count(*) FROM pg_attribute WHERE attrelid = $1::regclass"
+    return r.txn().exec("SELECT count(*) FROM pg_attribute WHERE attrelid = $1::regclass"
                " AND attname = $2 AND NOT attisdropped",
                pqxx::params{"shop." + table, column})[0][0]
         .as<int>();
@@ -12336,8 +12318,7 @@ TEST_F(TwoDatabaseTest, DeployAppliesEachSpecificationInItsOwnDatabase) {
     c.name = "probe";
     c.conninfo = url;
     pglaswell::ReadSession r(c);
-    return pglaswell::pqxx_exec(
-               r.txn(), "SELECT count(*) FROM pg_class c JOIN pg_namespace n"
+    return r.txn().exec("SELECT count(*) FROM pg_class c JOIN pg_namespace n"
                         " ON n.oid = c.relnamespace WHERE n.nspname = 'public'"
                         " AND c.relname = $1", pqxx::params{t})[0][0].as<int>();
   };
@@ -12354,8 +12335,7 @@ TEST_F(TwoDatabaseTest, DeployAppliesEachSpecificationInItsOwnDatabase) {
     c.name = "probe";
     c.conninfo = url;
     pglaswell::ReadSession r(c);
-    return pglaswell::pqxx_exec(
-               r.txn(), "SELECT count(*) FROM laswell.migration WHERE spec_id = $1",
+    return r.txn().exec("SELECT count(*) FROM laswell.migration WHERE spec_id = $1",
                pqxx::params{id})[0][0].as<int>();
   };
   EXPECT_EQ(ledger_has(url_, "0001-producer"), 1);

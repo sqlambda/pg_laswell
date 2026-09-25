@@ -815,8 +815,7 @@ TEST(CitusLive, AWorkerSideWaitHasAnAgeTheBreakerCanUse) {
   try {
     pqxx::connection obs(url);
     pqxx::work r(obs);
-    const auto res = pglaswell::pqxx_exec(
-        r, pglaswell::kcitusObserverSql,
+    const auto res = r.exec(pglaswell::kcitusObserverSql,
         pqxx::params{"{" + std::to_string(blocker_pid) + "}"});
     reading = json::parse(res[0][0].as<std::string>());
   } catch (const std::exception& e) {
