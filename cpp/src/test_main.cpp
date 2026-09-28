@@ -10803,6 +10803,229 @@ TEST(Spec, ASubscriptionPasswordIsRefusedRatherThanRedacted) {
       << "the refusal repeated the credential it was refusing: " << err;
 }
 
+namespace {
+json partition_intent(json extra) {
+  json in{{"kind", "create_table"}, {"schema", "shop"}, {"table", "orders_2027"},
+          {"partition_of", "shop.orders"}, {"comment", "Orders of 2027."}};
+  in.update(extra);
+  return in;
+}
+json range_2027() { return json{{"from", "'2027-01-01'"}, {"to", "'2028-01-01'"}}; }
+pglaswell::Observations partitioned_orders(const char* key = "RANGE (created_at)") {
+  auto obs = observations(2LL << 30, 8100000, 0, "partitioned_table");
+  obs.tables["shop.orders"]["partition_key"] = key;
+  obs.tables["shop.orders"]["partitions"] = json::array({"shop.orders_2026"});
+  return obs;
+}
+}  // namespace
+
+TEST(Planner, APartitionTakesItsColumnsFromItsParentAndSaysWhatItLocks) {
+  // Reported from pgshard: with no way to create a partition, a partition was
+  // create_table restating seventeen columns, then attach_partition.
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({partition_intent(range_2027())})), partitioned_orders(), {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto* step = only_step(plan, "create_table");
+  EXPECT_EQ(step->sql.front(),
+            "CREATE TABLE \"shop\".\"orders_2027\" PARTITION OF \"shop\".\"orders\" "
+            "FOR VALUES FROM ('2027-01-01') TO ('2028-01-01');");
+  // Measured: AccessExclusiveLock on the parent; a SELECT on it waited.
+  EXPECT_NE(step->lock.find("AccessExclusiveLock on shop.orders"), std::string::npos)
+      << step->lock;
+  bool lighter = false;
+  for (const auto& w : plan.warnings) lighter = lighter || w.find("attach_partition") != std::string::npos;
+  EXPECT_TRUE(lighter) << "the lighter route for a busy parent must be named";
+
+  // Beside a DEFAULT partition: that is locked too, and scanned.
+  auto obs = partitioned_orders();
+  obs.tables["shop.orders"]["default_partition"] = "shop.orders_default";
+  obs.tables["shop.orders"]["default_partition_rows"] = 1000000;
+  const auto with_default = pglaswell::plan_migration(
+      spec_of(json::array({partition_intent(range_2027())})), obs, {});
+  ASSERT_TRUE(with_default.ok) << with_default.render();
+  EXPECT_NE(only_step(with_default, "create_table")->lock.find("shop.orders_default"),
+            std::string::npos);
+  bool scan = false;
+  for (const auto& w : with_default.warnings) scan = scan || w.find("1000000 estimated rows") != std::string::npos;
+  EXPECT_TRUE(scan) << with_default.render();
+}
+
+TEST(Planner, APartitionPostgreSQLWouldRefuseIsRefusedFirst) {
+  auto refused = [](const json& intent, const pglaswell::Observations& obs,
+                    const std::string& needle) {
+    const auto plan = pglaswell::plan_migration(spec_of(json::array({intent})), obs, {});
+    EXPECT_FALSE(plan.ok) << plan.render();
+    bool found = false;
+    for (const auto& c : plan.conflicts) found = found || c.find(needle) != std::string::npos;
+    EXPECT_TRUE(found) << "expected a refusal naming \"" << needle << "\":\n" << plan.render();
+  };
+  // The parent is an ordinary table ("is not partitioned", measured).
+  refused(partition_intent(range_2027()),
+          observations(2LL << 30, 8100000, 0, "table"), "not a partitioned table");
+  // A bound of the wrong kind for the parent's strategy.
+  refused(partition_intent(json{{"values", json::array({"'eu'"})}}),
+          partitioned_orders(), "partitioned by RANGE");
+  // A hash-partitioned parent has no default.
+  refused(partition_intent(json{{"default", true}}), partitioned_orders("HASH (id)"),
+          "no DEFAULT partition");
+  // A second default ("conflicts with existing default partition", measured).
+  auto obs = partitioned_orders();
+  obs.tables["shop.orders"]["default_partition"] = "shop.orders_default";
+  refused(partition_intent(json{{"default", true}}), obs, "already has a DEFAULT");
+  // The table exists and is not a partition of this parent.
+  auto taken = partitioned_orders();
+  taken.tables["shop.orders_2027"] = json{{"exists", true}, {"kind", "table"}};
+  refused(partition_intent(range_2027()), taken, "attach_partition");
+
+  // It exists AS a partition of this parent: done.
+  auto done = partitioned_orders();
+  done.tables["shop.orders_2027"] = json{{"exists", true}, {"kind", "table"}};
+  done.tables["shop.orders"]["partitions"].push_back("shop.orders_2027");
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({partition_intent(range_2027())})), done, {});
+  ASSERT_TRUE(plan.ok);
+  EXPECT_EQ(only_step(plan, "create_table")->action, pglaswell::Action::kSatisfied);
+}
+
+TEST(Planner, APartitionOfAParentCreatedEarlierInTheSpecificationIsPlanned) {
+  // The parent does not exist yet: the projection of the first intent is what
+  // the second reads, strategy included.
+  json parent{{"kind", "create_table"}, {"schema", "shop"}, {"table", "events"},
+              {"comment", "Events."}, {"partition_by", "LIST (region)"},
+              {"columns", json::array({json{{"name", "region"}, {"type", "text"},
+                                            {"nullable", false}, {"comment", "r"}}})}};
+  json child{{"kind", "create_table"}, {"schema", "shop"}, {"table", "events_eu"},
+             {"partition_of", "shop.events"}, {"values", json::array({"'eu'"})},
+             {"comment", "Europe."}};
+  // As the catalog reports tables that do not exist yet: present, and absent.
+  auto obs = obs_alter();
+  obs.tables["shop.events"] = json{{"exists", false}};
+  obs.tables["shop.events_eu"] = json{{"exists", false}};
+  const auto plan = pglaswell::plan_migration(spec_of(json::array({parent, child})),
+                                              obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  bool created = false;
+  for (const auto& st : plan.steps) {
+    for (const auto& sql : st.sql) {
+      created = created || sql.find("PARTITION OF \"shop\".\"events\" FOR VALUES IN ('eu')") != std::string::npos;
+    }
+  }
+  EXPECT_TRUE(created) << plan.render();
+  // The child's columns are its parent's, and a later intent reads them there:
+  // adding `region` to the partition finds it already present.
+  json add{{"kind", "add_column"}, {"schema", "shop"}, {"table", "events_eu"},
+           {"column", "region"}, {"type", "text"}, {"nullable", false},
+           {"comment", "r"}};
+  const auto added = pglaswell::plan_migration(
+      spec_of(json::array({parent, child, add})), obs, {});
+  ASSERT_TRUE(added.ok) << added.render();
+  EXPECT_EQ(only_step(added, "add_column")->action, pglaswell::Action::kSatisfied)
+      << added.render();
+
+  // And a range bound on that LIST parent is refused from the projection alone.
+  child.erase("values");
+  child["from"] = "'a'";
+  child["to"] = "'b'";
+  EXPECT_FALSE(pglaswell::plan_migration(spec_of(json::array({parent, child})),
+                                         obs, {}).ok);
+}
+
+TEST(Spec, APartitionIsDeclaredByItsBoundAndNothingItsParentOwns) {
+  auto err = [](json intent) {
+    json doc = minimal_spec();
+    doc["intents"] = json::array({intent});
+    return spec_error(doc);
+  };
+  EXPECT_NE(err(partition_intent(json{{"columns", json::array()}, {"default", true}}))
+                .find("gives columns to a partition"), std::string::npos);
+  EXPECT_NE(err(partition_intent(json{{"default", true}, {"values", json::array({"'x'"})}}))
+                .find("exactly one kind of bound"), std::string::npos);
+  EXPECT_NE(err(partition_intent(json{{"modulus", 4}, {"remainder", 4}}))
+                .find("remainder from 0 to modulus - 1"), std::string::npos);
+  EXPECT_NE(err(partition_intent(json{{"partition_of", "orders"}, {"default", true}}))
+                .find("\"schema.table\""), std::string::npos);
+  json plain{{"kind", "create_table"}, {"schema", "shop"}, {"table", "t"}, {"comment", "c"},
+             {"columns", json::array({json{{"name", "id"}, {"type", "int"},
+                                           {"nullable", false}, {"comment", "c"}}})},
+             {"default", true}};
+  EXPECT_NE(err(plain).find("without partition_of"), std::string::npos) << err(plain);
+}
+
+TEST(Planner, AnObjectIsDocumentedByTheIntentThatCreatesIt) {
+  // Reported from pgshard: create_index takes a comment and create_trigger did
+  // not, so a house rule of "every object documented where it is created"
+  // needed a second, set_comment intent restating schema, table and name.
+  // The live conformance cases prove the COMMENT ON for nine kinds; a
+  // subscription needs a publisher, so its SQL is checked here.
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "create_subscription"}, {"name", "sub"},
+                                {"connection", "host=pub dbname=d user=rep"},
+                                {"publications", json::array({"p"})},
+                                {"comment", "Orders from the shop."}}})),
+      obs_alter(), {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto* step = only_step(plan, "create_subscription");
+  ASSERT_GE(step->sql.size(), 2u);
+  EXPECT_NE(step->sql.back().find("COMMENT ON SUBSCRIPTION"), std::string::npos)
+      << step->sql.back();
+  EXPECT_NE(step->sql.back().find("'Orders from the shop.'"), std::string::npos)
+      << step->sql.back();
+  // After the CREATE, never before it: the object has to exist.
+  EXPECT_NE(step->sql.front().find("CREATE SUBSCRIPTION"), std::string::npos)
+      << step->sql.front();
+
+  // Without the key, nothing changes: existing specifications plan as before.
+  const auto bare = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "create_subscription"}, {"name", "sub"},
+                                {"connection", "host=pub dbname=d user=rep"},
+                                {"publications", json::array({"p"})}}})),
+      obs_alter(), {});
+  for (const auto& sql : only_step(bare, "create_subscription")->sql) {
+    EXPECT_EQ(sql.find("COMMENT ON"), std::string::npos) << sql;
+  }
+}
+
+TEST(Planner, SetCommentNamesTheLockPostgreSQLActuallyTakes) {
+  // Measured on 18.6. The plan said "AccessShareLock -- a comment blocks
+  // nothing" for every type; a relation's comment takes ShareUpdateExclusive.
+  auto lock_for = [](const json& intent) {
+    const auto plan = pglaswell::plan_migration(spec_of(json::array({intent})),
+                                                obs_alter(), {});
+    const auto* step = only_step(plan, "set_comment");
+    return step ? step->lock + " || " + step->sql.front() : std::string("no step");
+  };
+  const auto table = lock_for(json{{"kind", "set_comment"}, {"object_type", "TABLE"},
+                                   {"schema", "shop"}, {"name", "orders"},
+                                   {"comment", "c"}});
+  EXPECT_NE(table.find("ShareUpdateExclusiveLock on the relation"), std::string::npos) << table;
+  const auto rule = lock_for(json{{"kind", "set_comment"}, {"object_type", "RULE"},
+                                  {"schema", "shop"}, {"table", "orders"},
+                                  {"name", "no_del"}, {"comment", "c"}});
+  EXPECT_NE(rule.find("AccessShareLock on shop.orders"), std::string::npos) << rule;
+  EXPECT_NE(rule.find("COMMENT ON RULE \"no_del\" ON"), std::string::npos) << rule;
+  const auto pub = lock_for(json{{"kind", "set_comment"}, {"object_type", "PUBLICATION"},
+                                 {"name", "orders_pub"}, {"comment", "c"}});
+  EXPECT_NE(pub.find("no table is locked"), std::string::npos) << pub;
+  EXPECT_NE(pub.find("COMMENT ON PUBLICATION"), std::string::npos) << pub;
+}
+
+TEST(Spec, ACreationCommentIsOnlyForCreatingAndIsNeverEmpty) {
+  // alter_publication shares create_publication's parser. A comment it would
+  // read and never apply is refused, like any other key a kind does not use.
+  json doc = minimal_spec();
+  doc["intents"] = json::array({json{{"kind", "alter_publication"}, {"name", "p"},
+                                     {"add_tables", json::array({"shop.orders"})},
+                                     {"comment", "x"}}});
+  EXPECT_NE(spec_error(doc).find("comment"), std::string::npos) << spec_error(doc);
+
+  doc["intents"] = json::array({json{{"kind", "create_trigger"}, {"schema", "shop"},
+                                     {"table", "orders"}, {"name", "t"},
+                                     {"timing", "AFTER"}, {"events", json::array({"INSERT"})},
+                                     {"for_each", "ROW"}, {"function", "shop.f()"},
+                                     {"comment", ""}}});
+  EXPECT_NE(spec_error(doc).find("non-empty"), std::string::npos) << spec_error(doc);
+}
+
 TEST(Planner, CreateSubscriptionOwnsItsTransactionAndNamesTheSlotHazard) {
   // Measured: CREATE SUBSCRIPTION with create_slot cannot run inside a
   // transaction block -- the same shape as CIC and DETACH CONCURRENTLY.

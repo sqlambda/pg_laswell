@@ -67,8 +67,8 @@ inline std::vector<Case> cases() {
      "SELECT count(*)::text FROM pg_namespace WHERE nspname='cf'", "1"},
 
     {"create_extension", {},
-     json{{"kind","create_extension"},{"name","pg_trgm"},{"schema","cf"}},
-     "SELECT count(*)::text FROM pg_extension WHERE extname='pg_trgm'", "1"},
+     json{{"kind","create_extension"},{"comment","documented by create_extension"},{"name","pg_trgm"},{"schema","cf"}},
+     "SELECT count(*)::text || ':' || COALESCE(max(obj_description(oid, 'pg_extension')), 'none') FROM pg_extension WHERE extname='pg_trgm'", "1:documented by create_extension"},
 
     {"alter_extension", {},
      json{{"kind","alter_extension"},{"name","pg_trgm"},{"schema","public"}},
@@ -173,14 +173,14 @@ inline std::vector<Case> cases() {
      "{fillfactor=90}"},
 
     {"add_unique_constraint", {},
-     json{{"kind","add_unique_constraint"},{"schema","cf"},{"table","t"},
+     json{{"kind","add_unique_constraint"},{"comment","documented by add_unique_constraint"},{"schema","cf"},{"table","t"},
           {"name","t_code_uq"},{"columns",json::array({"code"})}},
-     "SELECT contype::text FROM pg_constraint WHERE conname='t_code_uq'", "u"},
+     "SELECT contype::text || ':' || COALESCE(obj_description(oid, 'pg_constraint'), 'none') FROM pg_constraint WHERE conname='t_code_uq'", "u:documented by add_unique_constraint"},
 
     {"add_check_constraint", {},
-     json{{"kind","add_check_constraint"},{"schema","cf"},{"table","t"},
+     json{{"kind","add_check_constraint"},{"comment","documented by add_check_constraint"},{"schema","cf"},{"table","t"},
           {"name","t_amount_ck"},{"expression","amount IS NULL OR amount >= 0"}},
-     "SELECT convalidated::text FROM pg_constraint WHERE conname='t_amount_ck'", "true"},
+     "SELECT convalidated::text || ':' || COALESCE(obj_description(oid, 'pg_constraint'), 'none') FROM pg_constraint WHERE conname='t_amount_ck'", "true:documented by add_check_constraint"},
 
     {"rename_constraint", {},
      json{{"kind","rename_constraint"},{"schema","cf"},{"table","t"},
@@ -205,9 +205,9 @@ inline std::vector<Case> cases() {
      "SELECT count(*)::text FROM pg_proc WHERE proname='touch' AND proconfig IS NOT NULL", "1"},
 
     {"create_trigger", {},
-     json{{"kind","create_trigger"},{"schema","cf"},{"table","t"},{"name","t_touch"},
+     json{{"kind","create_trigger"},{"comment","documented by create_trigger"},{"schema","cf"},{"table","t"},{"name","t_touch"},
           {"timing","AFTER"},{"events",json::array({"INSERT"})},{"function","cf.touch()"}},
-     "SELECT count(*)::text FROM pg_trigger WHERE tgname='t_touch'", "1"},
+     "SELECT count(*)::text || ':' || COALESCE(max(obj_description(oid, 'pg_trigger')), 'none') FROM pg_trigger WHERE tgname='t_touch'", "1:documented by create_trigger"},
 
     {"set_trigger_state", {},
      json{{"kind","set_trigger_state"},{"schema","cf"},{"table","t"},
@@ -522,26 +522,26 @@ inline std::vector<Case> cases() {
      "SELECT count(*)::text FROM cf.copyt", "40"},
 
     {"create_rule", {},
-     json{{"kind","create_rule"},{"schema","cf"},{"table","copyt"},{"name","no_del"},
+     json{{"kind","create_rule"},{"comment","documented by create_rule"},{"schema","cf"},{"table","copyt"},{"name","no_del"},
           {"event","DELETE"},{"instead",true},{"action","NOTHING"}},
-     "SELECT count(*)::text FROM pg_rules WHERE rulename='no_del'", "1"},
+     "SELECT count(*)::text || ':' || COALESCE(max(obj_description(oid, 'pg_rewrite')), 'none') FROM pg_rewrite WHERE rulename='no_del'", "1:documented by create_rule"},
 
     {"drop_rule", {},
      json{{"kind","drop_rule"},{"schema","cf"},{"table","copyt"},{"name","no_del"}},
      "SELECT count(*)::text FROM pg_rules WHERE rulename='no_del'", "0"},
 
     {"add_primary_key", {},
-     json{{"kind","add_primary_key"},{"schema","cf"},{"table","copyt"},
+     json{{"kind","add_primary_key"},{"comment","documented by add_primary_key"},{"schema","cf"},{"table","copyt"},
           {"name","copyt_pkey"},{"columns",json::array({"id"})}},
-     "SELECT contype::text FROM pg_constraint WHERE conname='copyt_pkey'", "p"},
+     "SELECT contype::text || ':' || COALESCE(obj_description(oid, 'pg_constraint'), 'none') FROM pg_constraint WHERE conname='copyt_pkey'", "p:documented by add_primary_key"},
 
     {"add_foreign_key",
      {"CREATE TABLE cf.child(pid bigint)"},
-     json{{"kind","add_foreign_key"},{"schema","cf"},{"table","child"},
+     json{{"kind","add_foreign_key"},{"comment","documented by add_foreign_key"},{"schema","cf"},{"table","child"},
           {"name","child_fk"},{"columns",json::array({"pid"})},
           {"references_schema","cf"},{"references_table","copyt"},
           {"references_columns",json::array({"id"})}},
-     "SELECT convalidated::text FROM pg_constraint WHERE conname='child_fk'", "true"},
+     "SELECT convalidated::text || ':' || COALESCE(obj_description(oid, 'pg_constraint'), 'none') FROM pg_constraint WHERE conname='child_fk'", "true:documented by add_foreign_key"},
 
     {"rename_column", {},
      json{{"kind","rename_column"},{"schema","cf"},{"table","child"},
@@ -571,9 +571,9 @@ inline std::vector<Case> cases() {
      "SELECT relrowsecurity::text FROM pg_class WHERE oid='cf.t'::regclass", "true"},
 
     {"create_policy", {},
-     json{{"kind","create_policy"},{"schema","cf"},{"table","t"},{"name","p_all"},
+     json{{"kind","create_policy"},{"comment","documented by create_policy"},{"schema","cf"},{"table","t"},{"name","p_all"},
           {"using","true"}},
-     "SELECT count(*)::text FROM pg_policy WHERE polname='p_all'", "1"},
+     "SELECT count(*)::text || ':' || COALESCE(max(obj_description(oid, 'pg_policy')), 'none') FROM pg_policy WHERE polname='p_all'", "1:documented by create_policy"},
 
     {"alter_policy", {},
      json{{"kind","alter_policy"},{"schema","cf"},{"table","t"},{"name","p_all"},
@@ -622,8 +622,8 @@ inline std::vector<Case> cases() {
      "SELECT count(*)::text FROM pg_collation WHERE collname='ci2'", "0"},
 
     {"create_publication", {},
-     json{{"kind","create_publication"},{"name","cf_pub"},{"tables",json::array({"cf.t"})}},
-     "SELECT count(*)::text FROM pg_publication WHERE pubname='cf_pub'", "1"},
+     json{{"kind","create_publication"},{"comment","documented by create_publication"},{"name","cf_pub"},{"tables",json::array({"cf.t"})}},
+     "SELECT count(*)::text || ':' || COALESCE(max(obj_description(oid, 'pg_publication')), 'none') FROM pg_publication WHERE pubname='cf_pub'", "1:documented by create_publication"},
 
     {"alter_publication",
      {"CREATE TABLE cf.pub2(id int PRIMARY KEY)"},
@@ -684,6 +684,23 @@ inline std::vector<Case> cases() {
     {"detach_partition", {},
      json{{"kind","detach_partition"},{"schema","cfp"},{"table","ev"},{"partition","ev_2026"}},
      "SELECT count(*)::text FROM pg_inherits WHERE inhparent='cfp.ev'::regclass", "1"},
+
+    // create_table with partition_of: the child takes its columns from the
+    // parent (none are stated), and is a partition the moment it exists.
+    {"create_table_partition_of", {},
+     json{{"kind","create_table"},{"schema","cfp"},{"table","ev_2027"},
+          {"partition_of","cfp.ev"},{"from","'2027-01-01'"},{"to","'2028-01-01'"},
+          {"comment","Events of 2027."}},
+     "SELECT count(*)::text || ':' || obj_description('cfp.ev_2027'::regclass, 'pg_class')"
+     " FROM pg_inherits WHERE inhparent='cfp.ev'::regclass", "2:Events of 2027."},
+
+    {"create_table_partition_of_hash",
+     {"CREATE TABLE cf.hx(id bigint NOT NULL, v int) PARTITION BY HASH (id)"},
+     json{{"kind","create_table"},{"schema","cf"},{"table","hx_0"},
+          {"partition_of","cf.hx"},{"modulus",2},{"remainder",0},
+          {"comment","Half of hx."}},
+     "SELECT pg_get_expr(c.relpartbound, c.oid) FROM pg_class c"
+     " WHERE c.oid = 'cf.hx_0'::regclass", "FOR VALUES WITH (modulus 2, remainder 0)"},
 
     {"create_domain_via_create_type", {},   // alias case; kind is create_type
      json{{"kind","create_type"},{"schema","cf"},{"name","pos"},{"type_kind","domain"},

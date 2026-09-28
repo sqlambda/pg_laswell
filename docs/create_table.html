@@ -72,20 +72,26 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
 </style></head><body><div class="wrap">
 <nav class="crumb"><div class="l"><a href="index.html">Intent kinds</a><span>Tables</span></div><div class="r"><a href="rename_constraint.html">← rename_constraint</a><a href="drop_table.html">drop_table →</a></div></nav>
 <h1><code>create_table</code></h1>
-<p class="purpose">—- create_table / drop_table ——————————————————————-</p>
+<p class="purpose">These emit one statement whatever the database looks like, so the original rule — a kind must make a real decision — excluded them. That was the wrong instrument.</p>
 <h2>Synopsis</h2><pre>{
   &quot;kind&quot;: &quot;create_table&quot;,
   &quot;schema&quot;: &lt;required&gt;,
   &quot;table&quot;: &lt;required&gt;,
   &quot;comment&quot;: &lt;required&gt;,
+  &quot;partition_of&quot;: &lt;required&gt;,
+  &quot;from&quot;: &lt;required&gt;,
+  &quot;to&quot;: &lt;required&gt;,
   &quot;columns&quot;: &lt;optional&gt;,
   &quot;primary_key&quot;: &lt;optional&gt;,
   &quot;partition_by&quot;: &lt;optional&gt;,
   &quot;unlogged&quot;: &lt;optional&gt;,
-  &quot;options&quot;: &lt;optional&gt;
+  &quot;options&quot;: &lt;optional&gt;,
+  &quot;values&quot;: &lt;optional&gt;,
+  &quot;default&quot;: &lt;optional&gt;,
+  &quot;modulus&quot;: &lt;optional&gt;,
+  &quot;remainder&quot;: &lt;optional&gt;
 }</pre>
 <h2>Description</h2>
-<p>—- create_table / drop_table ——————————————————————-</p>
 <p>These emit one statement whatever the database looks like, so the original rule — a kind must make a real decision — excluded them. That was the wrong instrument. The second test decides it: a migration is a change to schema state applied exactly once, and creating a table is the clearest example there is. A repository that cannot express the tables it depends on describes a database that does not exist.</p>
 <h2>Parameters</h2><dl class="params">
 <dt>schema<span class="tag req">required</span></dt>
@@ -93,6 +99,12 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
 <dt>table<span class="tag req">required</span></dt>
 <dd>&nbsp;</dd>
 <dt>comment<span class="tag req">required</span></dt>
+<dd>&nbsp;</dd>
+<dt>partition_of<span class="tag req">required</span></dt>
+<dd>One of <code>schema.table</code>. The parent may be in another schema, so it is always named in full.</dd>
+<dt>from<span class="tag req">required</span></dt>
+<dd>&nbsp;</dd>
+<dt>to<span class="tag req">required</span></dt>
 <dd>&nbsp;</dd>
 <dt>columns<span class="tag opt">optional</span></dt>
 <dd>Each entry needs name, type, nullable and comment — the same vocabulary add_column uses.</dd>
@@ -103,6 +115,14 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
 <dt>unlogged<span class="tag opt">optional</span></dt>
 <dd>&nbsp;</dd>
 <dt>options<span class="tag opt">optional</span></dt>
+<dd>&nbsp;</dd>
+<dt>values<span class="tag opt">optional</span></dt>
+<dd>List the key values this partition accepts.</dd>
+<dt>default<span class="tag opt">optional</span></dt>
+<dd>&nbsp;</dd>
+<dt>modulus<span class="tag opt">optional</span></dt>
+<dd>&nbsp;</dd>
+<dt>remainder<span class="tag opt">optional</span></dt>
 <dd>&nbsp;</dd>
 </dl>
 <div class="note">Any key not listed here is <strong>refused</strong>, not ignored: a key this binary skips and a newer one honours would be a silent difference between what was reviewed and what ran.</div>

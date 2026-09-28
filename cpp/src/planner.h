@@ -429,11 +429,31 @@ inline void project(const Intent& in, const Step& step, Observations& projected)
             json{{"type", c.value("type", "")},
                  {"not_null", !c.value("nullable", true)}};
       }
-      projected.tables[qualified] =
-          json{{"exists", true}, {"kind", "table"}, {"columns", cols},
-               {"indexes", json::object()}, {"constraints", json::object()},
-               {"dependent_views", json::object()},
-               {"referenced_by", json::array()}, {"size_estimate", 0}};
+      // A partition's columns are its parent's, and the parent learns of it.
+      const auto parent = in.body.value("partition_of", "");
+      if (!parent.empty() && projected.tables.contains(parent)) {
+        cols = projected.tables[parent].value("columns", json::object());
+        auto& pp = projected.tables[parent];
+        if (!pp["partitions"].is_array()) pp["partitions"] = json::array();
+        pp["partitions"].push_back(qualified);
+        if (in.body.value("default", false)) {
+          pp["default_partition"] = qualified;
+          pp["default_partition_rows"] = 0;
+        }
+      }
+      json entry{{"exists", true},
+                 {"kind", in.body.contains("partition_by") ? "partitioned_table"
+                                                           : "table"},
+                 {"columns", cols},
+                 {"indexes", json::object()}, {"constraints", json::object()},
+                 {"dependent_views", json::object()},
+                 {"referenced_by", json::array()}, {"size_estimate", 0}};
+      if (in.body.contains("partition_by")) {
+        entry["partition_by"] = in.body.value("partition_by", "");
+        entry["partitions"] = json::array();
+      }
+      if (!parent.empty()) entry["is_partition"] = true;
+      projected.tables[qualified] = entry;
       return;
     }
     case IntentKind::kDropTable:
@@ -2824,17 +2844,38 @@ inline void plan_alter_misc(const Intent& in, const Observations& obs,
       if (ot == "COLUMN") {
         stmt = "COMMENT ON COLUMN " + sql_rel_tbl + "." +
                detail::quote_identifier(name) + " IS ";
-      } else if (ot == "TRIGGER" || ot == "POLICY" || ot == "CONSTRAINT") {
+      } else if (ot == "TRIGGER" || ot == "POLICY" || ot == "CONSTRAINT" ||
+                 ot == "RULE") {
         stmt = "COMMENT ON " + ot + " " + detail::quote_identifier(name) +
                " ON " + sql_rel_tbl + " IS ";
-      } else if (ot == "SCHEMA" || ot == "EXTENSION") {
+      } else if (ot == "SCHEMA" || ot == "EXTENSION" || ot == "PUBLICATION" ||
+                 ot == "SUBSCRIPTION") {
         stmt = "COMMENT ON " + ot + " " + detail::quote_identifier(name) + " IS ";
       } else {
         stmt = "COMMENT ON " + ot + " " + target + " IS ";
       }
+      // The lock, measured per shape on 18.6. This said "AccessShareLock -- a
+      // comment blocks nothing", which was never measured and is not what
+      // PostgreSQL takes: a comment on a relation takes ShareUpdateExclusiveLock
+      // on it, which reads and writes pass but VACUUM, ANALYZE, CREATE INDEX
+      // CONCURRENTLY and other DDL on that relation wait for.
+      std::string lock;
+      if (ot == "TABLE" || ot == "COLUMN" || ot == "VIEW" ||
+          ot == "MATERIALIZED VIEW" || ot == "INDEX" || ot == "SEQUENCE") {
+        lock = "ShareUpdateExclusiveLock on the relation -- reads and writes "
+               "continue; VACUUM, ANALYZE and other DDL on it wait";
+      } else if (ot == "TRIGGER" || ot == "POLICY" || ot == "CONSTRAINT" ||
+                 ot == "RULE") {
+        lock = "AccessShareLock on " + qualified_tbl +
+               ", and ShareUpdateExclusiveLock on the " + ot +
+               " itself -- nothing that touches rows waits";
+      } else {
+        lock = "ShareUpdateExclusiveLock on the " + ot +
+               " itself -- no table is locked";
+      }
       emit(TxnClass::kRequired,
            {stmt + detail::quote_literal(in.body.value("comment", "")) + ";"},
-           "AccessShareLock -- a comment blocks nothing",
+           lock,
            "documentation is a change to schema state like any other, and this "
            "is the intent that changes one without recreating the object",
            /*own=*/false);
@@ -3674,6 +3715,159 @@ inline void plan_security(const Intent& in, const Observations& obs, Plan& plan,
 // state applied exactly once, and creating a table is the clearest example
 // there is. A repository that cannot express the tables it depends on describes
 // a database that does not exist.
+namespace detail {
+// Defined below with attach_partition, whose bound syntax this shares: the two
+// kinds must not disagree about how a bound is written.
+inline std::string bounds_as_for_values(const Intent& in);
+}  // namespace detail
+
+// create_table with partition_of: CREATE TABLE child PARTITION OF parent.
+//
+// Measured on 18.6, and the measurements are the plan:
+//   - it takes AccessExclusiveLock on the PARENT (and on its DEFAULT
+//     partition, if there is one): every read and write on the parent waits
+//     until it commits -- a SELECT on the parent timed out behind it. ATTACH
+//     PARTITION takes only ShareUpdateExclusiveLock on the parent, which is
+//     the lighter route for a busy one.
+//   - beside a DEFAULT partition it reads every row of the default to prove
+//     none belongs to the new bound (47 ms for 1M rows), and a row that does
+//     fails the statement: "updated partition constraint for default
+//     partition would be violated by some row". The dry run executes it, so
+//     that is found before anything commits.
+//   - refused by PostgreSQL, and so here where the reading shows it first: a
+//     parent that is not partitioned, a second DEFAULT. An overlapping bound
+//     is refused too ("would overlap partition"), and is left to the dry run:
+//     the bounds of existing partitions are not read.
+//   - accepted: hash bounds, an UNLOGGED child of a logged parent, a child
+//     that is itself partitioned, storage options.
+inline void plan_create_partition(const Intent& in, const Observations& obs,
+                                  Plan& plan, Step& step) {
+  const auto qualified = in.qualified_table();
+  const auto sql_rel = detail::quote_qualified(qualified);
+  const auto parent = in.body.value("partition_of", "");
+  const auto& t = obs.table(qualified);
+  const auto& p = obs.table(parent);
+  const auto refuse = [&](const std::string& why, const std::string& more) {
+    step.action = Action::kConflict;
+    step.why = why;
+    plan.conflicts.push_back(why + (more.empty() ? "" : ". " + more));
+  };
+
+  if (t.value("exists", false)) {
+    for (const auto& already : p.value("partitions", json::array())) {
+      if (already.is_string() && already.get<std::string>() == qualified) {
+        step.action = Action::kSatisfied;
+        step.why = qualified + " is already a partition of " + parent;
+        return;
+      }
+    }
+    refuse(qualified + " exists and is not a partition of " + parent,
+           "attach_partition adopts an existing table as a partition, and takes "
+           "only ShareUpdateExclusiveLock on the parent to do it");
+    return;
+  }
+  if (!p.value("exists", false)) {
+    refuse(parent + " does not exist, so nothing can be a partition of it",
+           "Create it with create_table and partition_by, in an earlier intent.");
+    return;
+  }
+  if (p.value("kind", "") != "partitioned_table") {
+    refuse(parent + " is a " + p.value("kind", std::string("relation")) +
+               ", not a partitioned table",
+           "PostgreSQL refuses it (\"is not partitioned\"). A table is "
+           "partitioned when it is created, with partition_by.");
+    return;
+  }
+  // The strategy is the first word of the key: RANGE, LIST or HASH. A parent
+  // projected from an earlier intent carries its partition_by text instead.
+  std::string key = p.value("partition_key", std::string());
+  if (key.empty()) key = p.value("partition_by", std::string());
+  std::string strategy = key.substr(0, key.find_first_of(" ("));
+  for (auto& ch : strategy) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+  const bool deflt = in.body.value("default", false);
+  const char* bound = in.body.contains("modulus") ? "HASH"
+                      : in.body.contains("values") ? "LIST"
+                      : deflt ? "DEFAULT" : "RANGE";
+  if (!strategy.empty()) {
+    if (deflt && strategy == "HASH") {
+      refuse(parent + " is hash partitioned, and a hash-partitioned table has "
+                      "no DEFAULT partition",
+             "Every value hashes to some remainder, so there is nothing for a "
+             "default to hold. Create one partition per remainder.");
+      return;
+    }
+    if (!deflt && strategy != bound) {
+      refuse(parent + " is partitioned by " + strategy + ", and this bound is " + bound,
+             std::string("Use ") +
+                 (strategy == "RANGE" ? "\"from\" and \"to\""
+                  : strategy == "LIST" ? "\"values\""
+                                       : "\"modulus\" and \"remainder\"") +
+                 " for a partition of " + parent + ".");
+      return;
+    }
+  }
+  const auto existing_default = p.value("default_partition", json(nullptr));
+  if (deflt && existing_default.is_string()) {
+    refuse(parent + " already has a DEFAULT partition, " +
+               existing_default.get<std::string>(),
+           "PostgreSQL refuses a second one (\"conflicts with existing default "
+           "partition\").");
+    return;
+  }
+
+  std::string sql = std::string("CREATE ") +
+                    (in.body.value("unlogged", false) ? "UNLOGGED " : "") +
+                    "TABLE " + sql_rel + " PARTITION OF " +
+                    detail::quote_qualified(parent) + " " +
+                    detail::bounds_as_for_values(in);
+  if (in.body.contains("partition_by")) {
+    sql += " PARTITION BY " + in.body.value("partition_by", "");
+  }
+  const json options = in.body.value("options", json::object());
+  if (!options.empty()) sql += " WITH (" + storage_parameters(options) + ")";
+  step.sql.push_back(sql + ";");
+  step.sql.push_back("COMMENT ON TABLE " + sql_rel + " IS " +
+                     detail::quote_literal(in.body.value("comment", "")) + ";");
+
+  step.action = Action::kApply;
+  step.txn_class = TxnClass::kRequired;
+  step.detail["partition_of"] = parent;
+  step.detail["bound"] = detail::bounds_as_for_values(in);
+  std::string locked = parent;
+  if (existing_default.is_string()) locked += " and " + existing_default.get<std::string>();
+  step.lock = "AccessExclusiveLock on " + locked +
+              " -- measured: reads and writes on the parent wait until this "
+              "commits";
+  step.why = qualified + " is created as a partition of " + parent +
+             ", taking its columns from it rather than restating them";
+  plan.warnings.push_back(
+      "Creating a partition locks " + parent + " against every read and write "
+      "until the step commits. It is brief -- the new table is empty -- but it "
+      "queues behind any long transaction on " + parent + " (lock_timeout "
+      "bounds that). On a busy parent the lighter route is create_table without "
+      "partition_of, then attach_partition, which takes only "
+      "ShareUpdateExclusiveLock on the parent.");
+  if (existing_default.is_string()) {
+    const auto rows = p.value("default_partition_rows", json(nullptr));
+    step.detail["default_partition"] = existing_default;
+    step.detail["default_partition_rows"] = rows;
+    plan.warnings.push_back(
+        "Beside the DEFAULT partition " + existing_default.get<std::string>() +
+        (rows.is_number() ? " (" + std::to_string(rows.get<long long>()) +
+                                " estimated rows)"
+                          : std::string()) +
+        ", every row of it is read under lock to prove none belongs to the new "
+        "bound -- measured, 47 ms for 1M rows. One that does fails the step; "
+        "the dry run executes it, so that is found before anything commits.");
+  }
+  if (in.body.value("unlogged", false)) {
+    plan.warnings.push_back(
+        qualified + " is UNLOGGED: it is not written to WAL, so it is not "
+        "replicated to any standby and its rows do not survive a crash. That is "
+        "a durability decision, not a performance setting.");
+  }
+}
+
 inline void plan_create_table(const Intent& in, const Observations& obs,
                               Plan& plan, std::vector<Step>& out) {
   Step step;
@@ -3683,6 +3877,11 @@ inline void plan_create_table(const Intent& in, const Observations& obs,
   const auto qualified = in.qualified_table();
   const auto sql_rel = detail::quote_qualified(qualified);
   const auto& t = obs.table(qualified);
+
+  if (in.body.contains("partition_of")) {
+    plan_create_partition(in, obs, plan, step);
+    return;
+  }
 
   if (t.value("exists", false)) {
     // Deliberately NOT compared column by column. A table that exists with a
@@ -4005,6 +4204,13 @@ inline std::string bounds_as_check(const Intent& in, const std::string& key) {
 }
 
 inline std::string bounds_as_for_values(const Intent& in) {
+  // Hash bounds come only from create_table's partition_of: attach_partition
+  // does not accept them, because it derives a CHECK from the bound to avoid
+  // the scan, and a hash bound has no such CHECK.
+  if (in.body.contains("modulus")) {
+    return "FOR VALUES WITH (MODULUS " + std::to_string(in.body.value("modulus", 1)) +
+           ", REMAINDER " + std::to_string(in.body.value("remainder", 0)) + ")";
+  }
   if (in.body.contains("from")) {
     return "FOR VALUES FROM (" + in.body.value("from", "") + ") TO (" +
            in.body.value("to", "") + ")";
@@ -5261,6 +5467,52 @@ inline void plan_add_foreign_key(const Intent& in, const Observations& obs,
 
 // --- the planner ----------------------------------------------------------
 
+namespace detail {
+// The COMMENT ON a creating kind's optional `comment` becomes, appended to the
+// step that leaves the object in place: the LAST step the plan applies. For a
+// foreign key or a check that is the VALIDATE after the NOT VALID add, for a
+// unique constraint the ADD ... USING INDEX after the concurrent build, and
+// for the rest the one statement that creates it -- in every case the object
+// exists by then, and the comment commits with it.
+//
+// Nothing is appended when no step applies: an object that already exists is
+// reported satisfied without comparing its comment, as create_table does, and
+// set_comment is the kind that changes one.
+//
+// Measured on 18.6: each COMMENT ON below succeeds in the transaction that
+// created the object. A comment on a constraint, trigger, policy or rule takes
+// AccessShareLock on its table and ShareUpdateExclusiveLock on the object; on
+// an extension, publication or subscription, ShareUpdateExclusiveLock on the
+// object only. Both are weaker than what creating the object already holds.
+inline void append_creation_comment(const Intent& in, std::vector<Step>& steps) {
+  if (!in.body.contains("comment")) return;
+  const auto name = quote_identifier(in.body.value("name", ""));
+  const auto on_table = [&] { return " ON " + quote_qualified(in.qualified_table()); };
+  std::string target;
+  switch (in.kind) {
+    case IntentKind::kAddForeignKey:
+    case IntentKind::kAddCheckConstraint:
+    case IntentKind::kAddUniqueConstraint:
+    case IntentKind::kAddPrimaryKey:
+      target = "CONSTRAINT " + name + on_table();
+      break;
+    case IntentKind::kCreateTrigger: target = "TRIGGER " + name + on_table(); break;
+    case IntentKind::kCreatePolicy:  target = "POLICY " + name + on_table(); break;
+    case IntentKind::kCreateRule:    target = "RULE " + name + on_table(); break;
+    case IntentKind::kCreateExtension:    target = "EXTENSION " + name; break;
+    case IntentKind::kCreatePublication:  target = "PUBLICATION " + name; break;
+    case IntentKind::kCreateSubscription: target = "SUBSCRIPTION " + name; break;
+    default: return;  // kinds that document themselves, or create nothing named
+  }
+  for (auto it = steps.rbegin(); it != steps.rend(); ++it) {
+    if (it->action != Action::kApply || it->sql.empty()) continue;
+    it->sql.push_back("COMMENT ON " + target + " IS " +
+                      quote_literal(in.body.value("comment", "")) + ";");
+    return;
+  }
+}
+}  // namespace detail
+
 inline Plan plan_migration(const Spec& spec, const Observations& obs,
                            const ExecutorConfig& cfg) {
   Plan plan;
@@ -5467,6 +5719,7 @@ inline Plan plan_migration(const Spec& spec, const Observations& obs,
       case IntentKind::kRevoke:
         plan_security(in, projected, plan, emitted); break;
     }
+    detail::append_creation_comment(in, emitted);
     if (!emitted.empty()) project(in, emitted.front(), projected);
 
     for (auto& step : emitted) {
