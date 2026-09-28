@@ -56,6 +56,15 @@ stated in the plan:
 
 `attach_partition` keeps its meaning, for a table that already exists.
 
+### FreeBSD
+
+pg_laswell builds and passes its suite on FreeBSD 14.5 and 15.1 (511 of 513
+against PostgreSQL 18.6; the two skips need a second cluster and Citus), and
+`cpack -G FREEBSD` makes a native package. One fix was needed: the threads
+library is now linked by name. On Linux it had linked only because glibc 2.34
+folded libpthread into libc; on FreeBSD every binary failed to link on
+`pthread_create`. BUILD.md lists the packages.
+
 ### A comment's lock, measured
 
 `set_comment` said "AccessShareLock -- a comment blocks nothing". Measured, a

@@ -59,11 +59,20 @@ find_package(OpenSSL REQUIRED)
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/SafetyFlags.cmake)
 
+# Threads by name, not by luck. The executor runs a worker thread per job and
+# an observer thread, and on Linux that linked without saying so only because
+# glibc 2.34 folded libpthread into libc. FreeBSD keeps it separate: built
+# there, every binary failed to link on pthread_create. Threads::Threads is
+# CMake's portable spelling, and on glibc it costs nothing.
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
+
 set(PGLASWELL_LIBS
     nlohmann_json::nlohmann_json
     PkgConfig::PQXX
     PkgConfig::LIBPQ
     OpenSSL::Crypto
+    Threads::Threads
 )
 
 # Two binaries, one core. pg_laswell_mcp is for AUTHORING a migration -- an

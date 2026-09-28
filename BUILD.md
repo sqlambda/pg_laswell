@@ -45,6 +45,24 @@ stops and says which libpqxx it found instead.
 It is built as a static library, as in the release, so the binaries carry it and
 need no libpqxx at run time.
 
+### FreeBSD
+
+Builds and passes on FreeBSD 14.5 (base clang 21) and 15.1 (base clang 19),
+amd64, checked on both with the full suite against a local PostgreSQL 18.6: 511
+of 513, the two skips being the second cluster and Citus. Clang, OpenSSL, `tar`
+and `mandoc` come with the base system; the rest from packages:
+
+```sh
+pkg install cmake pkgconf curl postgresql18-client nlohmann-json googletest
+pkg install postgresql18-server postgresql18-contrib   # for the database tests
+```
+
+`postgresql18-contrib` is needed by the tests, not the tool: the conformance
+suite creates `pg_trgm`, and without contrib the planner correctly refuses it as
+not available on the server. libpqxx is built exactly as above, with the same
+script. `cpack -G FREEBSD` produces a native package that installs under
+`/usr/local` and depends on `postgresql18-client` for `libpq.so.5`.
+
 OpenSSL is linked for `OpenSSL::Crypto` only — Ed25519 signature verification,
 never TLS. It adds no new *runtime* package: `libpq5` already depends on
 libcrypto, which is why libsodium was not used despite its nicer API.
