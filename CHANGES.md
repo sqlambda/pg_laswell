@@ -1,5 +1,72 @@
 # Changes
 
+## 0.1.3
+
+Two gaps reported from pgshard while writing specifications for an audit
+application, and one wrong lock found fixing them. No ledger schema change.
+
+### An object is documented by the intent that creates it
+
+`comment` was accepted by thirteen core kinds and absent from the rest, and the
+line was nearly but not quite "does this create a named object": `create_index`
+required one and `create_trigger` refused one. A house rule of "every object
+documented where it is created" took a second, `set_comment` intent restating
+the schema, table and name of the first -- and a rename in one and not the
+other documents the wrong object.
+
+`comment` is now accepted, optionally, by every kind that creates a named object
+and did not take one: `add_foreign_key`, `add_check_constraint`,
+`add_unique_constraint`, `add_primary_key`, `create_trigger`, `create_policy`,
+`create_rule`, `create_extension`, `create_publication` and
+`create_subscription`. Optional, because requiring it would refuse every
+repository written before it. It becomes the object's `COMMENT ON`, appended to
+the step that leaves the object in place -- the VALIDATE after a `NOT VALID`
+foreign key, the `ADD ... USING INDEX` after a concurrent unique build -- so it
+commits with the object. `alter_publication` and `alter_subscription`, which
+share a parser with the create kinds, refuse it rather than ignore it.
+`add_enum_value` stays without one: PostgreSQL has no `COMMENT ON` for an enum
+label.
+
+`set_comment` also takes `RULE`, `PUBLICATION` and `SUBSCRIPTION`.
+
+### A partition can be created, not only adopted
+
+`create_table` took `partition_by`, which makes a parent, and `attach_partition`
+adopted an existing table as a child. Nothing created a child, so a partition
+was `create_table` restating every column of its parent -- seventeen, for the
+audit table -- followed by an attach, and a restated copy is one that can drift.
+
+`create_table` with `partition_of` creates it: `CREATE TABLE ... PARTITION OF`,
+taking the parent's columns and keys, with one bound -- `from`/`to`, `values`,
+`modulus`/`remainder` (new: hash) or `default`. Measured on PostgreSQL 18.6 and
+stated in the plan:
+
+- it takes **AccessExclusiveLock on the parent**, and on its DEFAULT partition
+  if it has one: a SELECT on the parent waited behind it. `attach_partition`
+  takes only ShareUpdateExclusiveLock on the parent, and the plan names it as
+  the lighter route for a busy one;
+- beside a DEFAULT partition, every row of the default is read to prove none
+  belongs to the new bound (47 ms for 1M rows), and the plan states the
+  default's row count. A row that does belong fails the statement, which the
+  dry run executes, so it is found before anything commits;
+- refused first where the reading shows it: a parent that is not partitioned,
+  a bound of the wrong kind for the parent, a DEFAULT for a hash parent or a
+  second DEFAULT, and a table of that name that exists and is not already its
+  partition. One that already is, is satisfied.
+
+`attach_partition` keeps its meaning, for a table that already exists.
+
+### A comment's lock, measured
+
+`set_comment` said "AccessShareLock -- a comment blocks nothing". Measured, a
+comment on a table, column, index, view or sequence takes
+**ShareUpdateExclusiveLock** on it: reads and writes pass, but VACUUM, ANALYZE,
+`CREATE INDEX CONCURRENTLY` and other DDL on that relation wait. A comment on a
+constraint, trigger, policy or rule takes AccessShareLock on its table and
+ShareUpdateExclusiveLock on the object; on a schema, type, function, extension
+or publication, ShareUpdateExclusiveLock on the object only. The plan now says
+which.
+
 ## 0.1.2
 
 Two arcs. Vendor modules, with Citus as the first: one package that speaks plain
