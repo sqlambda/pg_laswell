@@ -115,6 +115,21 @@ say "6. And an index pgvector would refuse, before a concurrent build starts"
   | python3 -c 'import json,sys; [print("  refused:", c) for c in json.load(sys.stdin)["conflicts"]]' \
   || true   # a refused plan exits 1, which is the point being shown
 
-say "7. Run both again: nothing to do"
+say "7. A job edited by hand is noticed on the next plan, whatever it is for"
+echo "  Someone moves the purge to 05:00 with cron.alter_job, outside any"
+echo "  specification. The ledger says 0030 declared 03:00, so the next plan"
+echo "  against that database says so -- here, a plan for an unrelated schema:"
+psql -X -q -c "SELECT cron.alter_job(jobid, schedule => '0 5 * * *') FROM cron.job
+                WHERE jobname = 'purge-expired-documents'" "$(url "$CENTRAL_PORT" postgres)" >/dev/null
+"$PG_LASWELL_MCP" --call planMigration --args '{"spec":{"laswell_spec_version":1,
+   "id":"unrelated","description":"an unrelated change",
+   "intents":[{"kind":"create_schema","schema":"reporting","comment":"Reports."}]},
+   "skipTrustChecks":true}' "$(url "$CENTRAL_PORT" postgres)" 2>&1 \
+  | python3 -c 'import json,sys; [print("  note:", a) for a in json.load(sys.stdin).get("advisories", [])]'
+psql -X -q -c "SELECT cron.alter_job(jobid, schedule => '0 3 * * *') FROM cron.job
+                WHERE jobname = 'purge-expired-documents'" "$(url "$CENTRAL_PORT" postgres)" >/dev/null
+echo "  (put back to 03:00, so the run below has nothing to say)"
+
+say "8. Run both again: nothing to do"
 run "$PG_LASWELL" --config "$central_cfg" --repo "$build"
 run "$PG_LASWELL" --config "$local_cfg" --repo "$build"

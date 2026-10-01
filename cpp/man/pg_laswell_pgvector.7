@@ -120,7 +120,25 @@ for
 and
 .Li can_multi_col .
 Both are false for both methods.
+.It Va dynamic_shared_memory_type
+Where a parallel build's shared memory comes from;
+.Ql posix
+is
+.Pa /dev/shm .
 .El
+.Pp
+The advisories also read core's own readings: the table's row count, the larger
+of
+.Va reltuples
+and
+.Va n_live_tup ,
+because the first is 0 until an
+.Ic ANALYZE ;
+.Va max_parallel_maintenance_workers ;
+and the
+.Va maintenance_work_mem
+the step will run with, which core decides
+.Pq Xr pg_laswell_mcp 1 , Sx CAPACITY .
 .Pp
 When the specification itself creates the extension, there is no reading yet,
 and the classes pgvector 0.8.6 declares are used instead.
@@ -134,7 +152,16 @@ or
 .Ql ivfflat .
 A column's type is the catalog's, or what an earlier intent of the same
 specification declares it to be.
-An expression key is not checked: its type is not known without the server.
+An expression key is checked when it is an explicit cast, as the type it casts
+to:
+.Li embedding::halfvec(3072) ,
+.Li CAST(embedding AS halfvec(3072))
+and
+.Li binary_quantize(embedding)::bit(1536) ,
+the shapes pgvector documents for indexing past the
+.Li vector
+limit.
+Any other expression is left to the server, whose type it is to know.
 .Bl -tag -width Ds
 .It Too many dimensions
 .Qq column cannot have more than N dimensions for hnsw index .
@@ -191,33 +218,50 @@ ivfflat takes
 Anything else is
 .Qq unrecognized parameter .
 .El
-.Sh SEE ALSO
-.Xr pg_laswell 1 ,
-.Xr pg_laswell_mcp 1 ,
-.Xr pg_laswell_citus 7 ,
-.Xr pg_laswell_pg_cron 7
-.Sh AUTHORS
-.An Daniel Cristian Cruz
-.Sh CAVEATS
-Measured, and not refused, because they are not errors:
-.Bl -bullet
-.It
-An IVFFlat index built on an empty or small table chooses its lists from the
-rows present
-.Pq Qq ivfflat index created with little data
-and recalls poorly once the table fills.
-Build it after the data is loaded.
-.It
-An HNSW build that outgrows
-.Va maintenance_work_mem
-continues on disk, much more slowly:
-.Qq hnsw graph no longer fits into maintenance_work_mem after N tuples .
-Measured: 50 000 rows of
+.Sh ADVISORIES
+Not refusals, because none is an error, and not warnings: each rests on a
+reading that moves on its own, such as a row count autovacuum rewrites, so it is
+an
+.Em advisory ,
+shown with the plan as
+.Ql note:
+and left out of
+.Va planDigest
+.Pq Xr pg_laswell_mcp 1 , Sx planMigration .
+.Bl -tag -width Ds
+.It An IVFFlat index on an empty or small table
+IVFFlat chooses its list centres from the rows present when it is built, and
+recalls poorly once the table fills.
+Said when the table is empty or created by the same specification, and when it
+has fewer rows than lists, which is where pgvector itself says
+.Qq ivfflat index created with little data .
+Build it in a later specification, after the data is loaded.
+.It An HNSW graph larger than maintenance_work_mem
+The build then continues on disk, much more slowly: measured, 50 000 rows of
 .Li vector(128)
-took 41.6 s with 1 MB and 12.1 s with 256 MB; the graph needed about 1.2 KB a
-row.
-.It
-A parallel HNSW build allocates
+took 41.6 s with 1 MB and 12.1 s with 256 MB.
+The size is estimated from rows, dimensions and
+.Va m ,
+by a rule measured on 0.8.6 at the row where pgvector reports
+.Qq hnsw graph no longer fits into maintenance_work_mem :
+the vector's own bytes
+.Pq 8 + 4 a dimension for Li vector , 2 for Li halfvec , 1/8 for Li bit
+plus about 210 + 32 x
+.Va m .
+Four shapes, from
+.Li vector(128)
+to
+.Li vector(768)
+and
+.Va m
+16 to 32, agree within 2%.
+The advisory names the size and the setting to raise,
+.Va maintenance_work_mem_mb .
+Not given for
+.Li sparsevec ,
+whose size is its count of non-zero elements, a property of the data.
+.It A parallel HNSW build and /dev/shm
+A parallel build allocates the whole
 .Va maintenance_work_mem
 in dynamic shared memory.
 Measured in a container with the default 64 MB
@@ -225,4 +269,19 @@ Measured in a container with the default 64 MB
 a build with 256 MB failed,
 .Qq could not resize shared memory segment ... No space left on device ,
 and left an invalid index for the next run to drop.
+The size of
+.Pa /dev/shm
+is not visible from SQL, so this is said whenever it could matter: parallel
+maintenance workers allowed,
+.Va dynamic_shared_memory_type
+.Ql posix ,
+and more than 64 MB of
+.Va maintenance_work_mem .
 .El
+.Sh SEE ALSO
+.Xr pg_laswell 1 ,
+.Xr pg_laswell_mcp 1 ,
+.Xr pg_laswell_citus 7 ,
+.Xr pg_laswell_pg_cron 7
+.Sh AUTHORS
+.An Daniel Cristian Cruz

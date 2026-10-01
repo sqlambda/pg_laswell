@@ -20,6 +20,9 @@ inline const char* kpgvectorPresentSql =
 inline const char* kpgvectorObservationSql = R"SQL(
 SELECT JSONB_BUILD_OBJECT(
   'version', (SELECT extversion FROM pg_extension WHERE extname = 'vector'),
+  -- Where a parallel build's shared memory comes from: posix is /dev/shm,
+  -- whose size a container sets (guard.h, the parallel-build advisory).
+  'dynamic_shared_memory_type', current_setting('dynamic_shared_memory_type'),
   'opclasses', COALESCE((
      SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
               'method', a.amname, 'opclass', c.opcname,
@@ -38,3 +41,4 @@ SELECT JSONB_BUILD_OBJECT(
 
 // Nothing is read where pgvector is not installed in this database.
 inline const char* kpgvectorAbsentSql = nullptr;
+inline constexpr bool kpgvectorReadsAppliedSteps = false;

@@ -62,6 +62,35 @@ SELECT JSONB_BUILD_OBJECT(
   'databases', COALESCE((SELECT JSONB_OBJECT_AGG(datname,
                                   has_database_privilege(datname, 'CONNECT'))
                            FROM pg_database WHERE datallowconn), '{}'::jsonb),
+  -- Every role a job could run as, for a superuser only: only a superuser may
+  -- schedule a job for a role other than its own, so only then is it read.
+  -- Whether it may log in and which databases it may connect to are what
+  -- pg_cron checks when the job is scheduled.
+  'roles', CASE WHEN (SELECT rolsuper FROM pg_roles WHERE rolname = current_user)
+           THEN COALESCE((SELECT JSONB_OBJECT_AGG(r.rolname, JSONB_BUILD_OBJECT(
+                  'login', r.rolcanlogin,
+                  'connect', COALESCE((SELECT JSONB_AGG(d.datname ORDER BY d.datname)
+                                         FROM pg_database d
+                                        WHERE d.datallowconn
+                                          AND has_database_privilege(r.oid, d.oid, 'CONNECT')),
+                                      '[]'::jsonb)))
+                  FROM pg_roles r WHERE r.rolname !~ '^pg_'), '{}'::jsonb) END,
+  -- The last run of each job, from the most recent 1000 runs only:
+  -- job_run_details grows until something purges it, is indexed on runid and
+  -- nothing else (measured), and keeps runs of jobs since unscheduled. Shown as
+  -- an advisory when a specification touches a job whose last run failed.
+  -- Row-level security limits it to the applying role's runs, as for cron.job.
+  'last_runs', COALESCE((SELECT JSONB_OBJECT_AGG(x.jobid::text, JSONB_BUILD_OBJECT(
+                   'status', x.status, 'message', x.return_message,
+                   'start_time', x.start_time, 'failures', x.failures, 'runs', x.runs))
+                 FROM (SELECT DISTINCT ON (jobid) jobid, status, return_message, start_time,
+                              count(*) FILTER (WHERE status = 'failed')
+                                OVER (PARTITION BY jobid) AS failures,
+                              count(*) OVER (PARTITION BY jobid) AS runs
+                         FROM (SELECT jobid, runid, status, return_message, start_time
+                                 FROM cron.job_run_details
+                                ORDER BY runid DESC LIMIT 1000) recent
+                        ORDER BY jobid, runid DESC) x), '{}'::jsonb),
   'jobs', COALESCE((SELECT JSONB_OBJECT_AGG(username || '/' || jobname,
                              JSONB_BUILD_OBJECT(
                                'jobid', jobid, 'schedule', schedule,
@@ -92,3 +121,8 @@ SELECT CASE
          'superuser', (SELECT rolsuper FROM pg_roles WHERE rolname = current_user))
        END
 )SQL";
+
+// The steps this database's ledger records as applied, so a job edited by hand
+// is noticed on ANY plan against this database, not only when the spec that
+// scheduled it is planned again (guard.h). Read by core; see catalog.h.
+inline constexpr bool kpg_cronReadsAppliedSteps = true;

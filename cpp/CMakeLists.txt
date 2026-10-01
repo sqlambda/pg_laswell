@@ -119,7 +119,7 @@ foreach(_mod IN LISTS PGLASWELL_MODULES)
     string(APPEND _kinds_inc "#include \"modules/${_mod}/kinds.inc\"\n")
     string(APPEND _heads_inc "#include \"modules/${_mod}/module.h\"\n")
     string(APPEND _plan_inc "#include \"modules/${_mod}/plan.h\"\n")
-    string(APPEND _obs_inc  "PGLASWELL_OBSERVE(\"${_mod}\", k${_mod}PresentSql, k${_mod}ObservationSql, k${_mod}AbsentSql)\n")
+    string(APPEND _obs_inc  "PGLASWELL_OBSERVE(\"${_mod}\", k${_mod}PresentSql, k${_mod}ObservationSql, k${_mod}AbsentSql, k${_mod}ReadsAppliedSteps)\n")
     string(APPEND _obs_head "#include \"modules/${_mod}/observe.h\"\n")
     # keys.inc is optional: a module whose kinds plan against relations only,
     # and add no conflict edge, does not need one.

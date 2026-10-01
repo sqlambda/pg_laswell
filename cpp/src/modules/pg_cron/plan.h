@@ -106,6 +106,12 @@ inline void plan_pg_cron_schedule(const Intent& in, const Observations& obs,
   step.detail["job"] = name;
   step.detail["username"] = username;
   step.detail["database"] = database;
+  // What this step declares, recorded in the ledger's copy of the plan: the
+  // guard compares cron.job with the newest of these to notice a job edited by
+  // hand, on any later plan against this database (guard.h).
+  step.detail["schedule"] = schedule;
+  step.detail["command"] = command;
+  step.detail["active"] = active;
 
   if (username != me && !super) {
     refuse("job " + name + " would run as " + username + ", and " + me +
@@ -113,6 +119,34 @@ inline void plan_pg_cron_schedule(const Intent& in, const Observations& obs,
            "another role\". Omit username to run it as " + me +
            ", or apply this specification as a superuser.");
     return;
+  }
+  // Another role: pg_cron checks it exists, may log in, and may connect to the
+  // job's database -- measured, "role \"nobody\" does not exist", "role
+  // \"nologin\" can not log in", "User noconn does not have CONNECT privilege
+  // on app". Only a superuser gets here, and only a superuser's reading lists
+  // the roles.
+  const auto roles = cron.value("roles", json());
+  if (username != me && roles.is_object()) {
+    if (!roles.contains(username)) {
+      refuse("job " + name + " would run as " + username +
+             ", and there is no such role. pg_cron: \"role \\\"" + username +
+             "\\\" does not exist\".");
+      return;
+    }
+    const auto& r = roles[username];
+    if (!r.value("login", false)) {
+      refuse("job " + name + " would run as " + username + ", which cannot log in. "
+             "pg_cron: \"Jobs may only be run by roles that have the LOGIN "
+             "attribute.\"");
+      return;
+    }
+    const auto connect = r.value("connect", json::array());
+    if (std::find(connect.begin(), connect.end(), json(database)) == connect.end()) {
+      refuse("job " + name + " runs in database " + database + " as " + username +
+             ", who may not connect to it. pg_cron: \"User " + username +
+             " does not have CONNECT privilege on " + database + "\".");
+      return;
+    }
   }
   // Only on a full reading: a pg_cron created earlier in this same
   // specification has not been read, and its databases are not listed.

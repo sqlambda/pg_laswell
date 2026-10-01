@@ -781,6 +781,10 @@ jobs:
           ./examples/docker/extensions/run.sh | tee example.log
           grep -q 'repository : 0 pending' example.log \
             || { echo "::error::the second run had something to do"; exit 1; }
+          # The ledger-backed advisory: a job edited by hand, noticed on a plan
+          # for something else entirely.
+          grep -q 'changed by hand since' example.log \
+            || { echo "::error::the hand-edited job was not noticed"; exit 1; }
       - name: The modules against the servers
         env:
           EXT_CENTRAL_URL: postgresql://postgres:laswell@127.0.0.1:55450

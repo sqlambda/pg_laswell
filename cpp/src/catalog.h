@@ -666,8 +666,49 @@ class Catalog {
   // observation query cannot be used there, because a statement naming
   // cron.job does not even parse where the cron schema does not exist. A NULL
   // result leaves the key absent, as for an extension the server lacks.
+  //
+  // reads_applied_steps asks for one more reading: the module's OWN steps that
+  // this database's ledger records as applied, newest first, under
+  // "applied_steps" in its slot. It is how a module can tell an object it
+  // created from the same object edited by hand since -- pg_cron's jobs live
+  // in a table anyone with the role can change, and nothing else records what
+  // a specification declared. Bounded (kAppliedStepsLimit), read only when the
+  // ledger exists and this role may read it, and only for a module whose
+  // reading is present, so a database without a ledger plans as before.
+  static constexpr int kAppliedStepsLimit = 500;
+  void observe_applied_steps(pqxx::work& txn, json& slot, const std::string& module) {
+    // Looked up through the catalogs and tested by OID, because every
+    // name-based form RAISES for a role without USAGE on the schema rather
+    // than answering no. Measured on 18.6, as such a role: to_regclass(
+    // 'laswell.job') and has_table_privilege('laswell.job', ...) both fail
+    // "permission denied for schema laswell". This runs on every plan a
+    // pg_cron server sees, so that role's every plan failed until it read
+    // pg_class instead. No row means no ledger; false means not readable.
+    const auto readable = txn.exec(
+        "SELECT COALESCE((SELECT has_schema_privilege(n.oid, 'USAGE')"
+        "                    AND has_table_privilege(c.oid, 'SELECT')"
+        "                   FROM pg_class c"
+        "                   JOIN pg_namespace n ON n.oid = c.relnamespace"
+        "                  WHERE n.nspname = 'laswell' AND c.relname = 'job'), false)");
+    if (readable.empty() || !readable[0][0].as<bool>()) return;
+    const auto r = txn.exec(
+        "SELECT COALESCE(JSONB_AGG(s.step ORDER BY s.finished_at DESC, s.n DESC), "
+        "'[]'::jsonb) FROM ("
+        "  SELECT st AS step, j.finished_at, e.n"
+        "    FROM laswell.job j"
+        "   CROSS JOIN LATERAL JSONB_ARRAY_ELEMENTS(j.plan->'steps')"
+        "         WITH ORDINALITY AS e(st, n)"
+        "   WHERE j.state = 'succeeded' AND starts_with(st->>'kind', $1)"
+        "   ORDER BY j.finished_at DESC, e.n DESC LIMIT $2) s",
+        pqxx::params{module + "_", kAppliedStepsLimit});
+    if (!r.empty() && !r[0][0].is_null()) {
+      slot["applied_steps"] = json::parse(r[0][0].as<std::string>());
+    }
+  }
+
   void observe_extensions(pqxx::work& txn, Observations& obs) {
-#define PGLASWELL_OBSERVE(module_name, present_sql, observation_sql, absent_sql) \
+#define PGLASWELL_OBSERVE(module_name, present_sql, observation_sql, absent_sql, \
+                          reads_applied_steps)                                 \
     do {                                                                      \
       const auto probe = txn.exec(present_sql);                               \
       const bool present = !probe.empty() && probe[0][0].as<bool>();          \
@@ -676,6 +717,9 @@ class Catalog {
       const auto r = txn.exec(sql);                                           \
       if (!r.empty() && !r[0][0].is_null()) {                                 \
         obs.extensions[module_name] = json::parse(r[0][0].as<std::string>()); \
+        if (reads_applied_steps) {                                            \
+          observe_applied_steps(txn, obs.extensions[module_name], module_name); \
+        }                                                                     \
       }                                                                       \
     } while (false);
 #include "modules/enabled_observers.h"

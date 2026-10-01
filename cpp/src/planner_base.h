@@ -18,6 +18,7 @@
 #include <functional>
 #include <map>
 #include <optional>
+#include <regex>
 #include <string>
 #include <vector>
 
@@ -98,6 +99,15 @@ struct Plan {
   std::string spec_digest;
   std::vector<Step> steps;
   std::vector<std::string> warnings;
+  // Warnings built from a reading that moves on its own -- a table's
+  // reltuples, which autovacuum rewrites; a scheduled job's last run, which
+  // changes every minute; a job someone edited by hand. Shown beside the
+  // warnings and NOT hashed into planDigest, for the reason the budget is not:
+  // planMigration and startMigration a minute apart would otherwise disagree
+  // about a migration that had not changed. Nothing in them decides what runs.
+  // Only a module's guard writes them, through a callback that can do nothing
+  // else.
+  std::vector<std::string> advisories;
   std::vector<std::string> conflicts;
   // Out-of-band actions this migration needs, structured so something can ACT
   // on them rather than read them.
@@ -118,15 +128,19 @@ struct Plan {
   json to_json() const {
     json steps_json = json::array();
     for (const auto& s : steps) steps_json.push_back(s.to_json());
-    return json{{"ok", ok},
-                {"specId", spec_id},
-                {"specDigest", spec_digest},
-                {"steps", std::move(steps_json)},
-                {"warnings", warnings},
-                {"conflicts", conflicts},
-                {"prerequisites", prerequisites},
-                {"modules", modules()},
-                {"budget", budget}};
+    json out{{"ok", ok},
+             {"specId", spec_id},
+             {"specDigest", spec_digest},
+             {"steps", std::move(steps_json)},
+             {"warnings", warnings},
+             {"conflicts", conflicts},
+             {"prerequisites", prerequisites},
+             {"modules", modules()},
+             {"budget", budget}};
+    // Present only when there are some, so a plan without them serialises
+    // exactly as it always did.
+    if (!advisories.empty()) out["advisories"] = advisories;
+    return out;
   }
 
   // The digest of the plan itself: the determinism receipt. planMigration and
@@ -210,6 +224,7 @@ struct Plan {
     json d = to_json();
     d.erase("budget");
     d.erase("modules");
+    d.erase("advisories");
     if (d.contains("steps")) {
       for (auto& step : d["steps"]) {
         if (!step.contains("detail") || !step["detail"].is_object()) continue;

@@ -5646,9 +5646,10 @@ inline Plan plan_migration(const Spec& spec, const Observations& obs,
   // fabricated a step. That is the forbidden shape -- a module altering what
   // core emits -- available by accident.
   //
-  // A module now provides a FUNCTION, and core calls it with (spec, obs) and a
-  // refuse callback. `plan` is not passed, so a guard cannot reach it: the only
-  // thing it can do is say no, and say why.
+  // A module now provides a FUNCTION, and core calls it with (spec, obs), the
+  // budget read-only, and two callbacks: refuse, and advise. `plan` is not
+  // passed, so a guard cannot reach it: it can say no and say why, or add an
+  // advisory -- a sentence outside planDigest that changes no statement.
   {
     std::vector<std::string> refusals;
     // maybe_unused because a PostgreSQL-only build has no guard to call it, and
@@ -5656,7 +5657,17 @@ inline Plan plan_migration(const Spec& spec, const Observations& obs,
     [[maybe_unused]] const auto refuse = [&refusals](std::string why) {
       refusals.push_back(std::move(why));
     };
-#define PGLASWELL_PLAN_GUARD(guard_fn) guard_fn(spec, obs, refuse);
+    // The one other thing a guard may do: add an ADVISORY, a sentence that is
+    // shown and never hashed and never changes a statement. Same shape as
+    // refuse, and the same reason for it -- a callback that appends a string
+    // cannot reach the plan.
+    [[maybe_unused]] const auto advise = [&plan](std::string note) {
+      plan.advisories.push_back(std::move(note));
+    };
+    // The budget is passed read-only so a guard can say what maintenance_work_mem
+    // a step will run with, which core decides there; it is outside planDigest.
+    [[maybe_unused]] const json& budget = plan.budget;
+#define PGLASWELL_PLAN_GUARD(guard_fn) guard_fn(spec, obs, budget, refuse, advise);
 #include "modules/enabled_guards.h"
 #undef PGLASWELL_PLAN_GUARD
     if (!refusals.empty()) {
@@ -5913,6 +5924,9 @@ inline std::string Plan::render() const {
     if (!s.why.empty()) out += "    why:  " + s.why + "\n";
   }
   for (const auto& w : warnings) out += "\n warn: " + w + "\n";
+  // Not part of planDigest (see Plan::advisories), and labelled so a reader
+  // comparing two renderings knows these lines may differ between them.
+  for (const auto& a : advisories) out += "\n note: " + a + "\n";
   // Prerequisites last and set apart, because they are the only lines here
   // that ask somebody to go and DO something -- often on another machine --
   // rather than to know something.

@@ -108,6 +108,47 @@ operator classes are read from the server. Said before an HNSW build starts,
 because a concurrent build cannot be rehearsed and one refused at execution has
 already scanned the table and left an invalid index.
 
+An expression key is checked when it is an explicit cast -- `embedding::halfvec(3072)`,
+`CAST(... AS ...)`, `binary_quantize(embedding)::bit(1536)` -- as the type it casts
+to, which is how a vector wider than 2000 is indexed.
+
+Three things pgvector does not refuse but a reader should know before a build
+are now **advisories**: an IVFFlat index on an empty table, or one with fewer
+rows than lists; an HNSW graph larger than the `maintenance_work_mem` the step
+will run with, sized from rows, dimensions and `m` by a rule measured on 0.8.6
+(the vector's bytes plus about 210 + 32·m a row, within 2% across four shapes),
+naming the setting to raise; and a parallel HNSW build that would allocate more
+shared memory than a container's default `/dev/shm`.
+
+### Advisories: shown, and not hashed
+
+A plan may now carry `advisories` beside its `warnings`, rendered as `note:`
+lines by both binaries. They hold facts that move on their own -- a row count
+autovacuum rewrites, a job's last run -- and are left out of `planDigest`, like
+the budget, so planMigration and startMigration a minute apart still agree. A
+plan with none serialises exactly as before. A module's guard may add them
+through a second callback beside `refuse`; it still cannot reach a step.
+
+### pg_cron, continued
+
+- A job for another role is checked as pg_cron checks it: the role exists, may
+  log in, and may connect to the job's database.
+- **A job edited by hand is noticed on any plan against pg_cron's database**,
+  not only when the specification that declared it is planned again. Each
+  `pg_cron_schedule` step records what it declared; a module may now ask core
+  for its own applied steps from the ledger, and pg_cron compares the newest
+  declaration of each job with `cron.job`. The example moves a job by hand and
+  shows the note on a plan for an unrelated schema.
+- A job a specification touches whose last run failed is named, with the
+  message, from the most recent 1000 runs.
+- No `alter_job` kind, deliberately: `pg_cron_schedule` already changes a job in
+  place and keeps its id, and `cron.alter_job` is not granted to PUBLIC.
+
+Found by the live suite: on PostgreSQL 18, `to_regclass('laswell.job')` and
+`has_table_privilege('laswell.job', ...)` RAISE for a role without USAGE on the
+schema instead of answering no. The ledger reading looks the table up through
+`pg_class` and tests by OID.
+
 Both modules are tested against real servers in CI (the `extensions` job), and
 every refusal is checked to pre-empt an error the server really raises: the
 refused statement is run by hand too, and must fail with the quoted message.

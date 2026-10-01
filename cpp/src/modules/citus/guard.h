@@ -12,9 +12,10 @@
 // do, and foreign keys by the kinds of table at their two ends. Every
 // refusal quotes the Citus error it pre-empts, so the author reads the rule
 // they would otherwise have hit at execution.
-template <typename Refuse>
+template <typename Refuse, typename Advise>
 inline void citus_plan_refusals(const Spec& spec, const Observations& obs,
-                                const Refuse& refuse) {
+                                const json& /*budget*/, const Refuse& refuse,
+                                const Advise& /*advise*/) {
   const auto& citus = obs.extension("citus");
   if (citus.empty()) return;
   const auto tables = citus.value("tables", json::object());

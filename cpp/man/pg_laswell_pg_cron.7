@@ -127,6 +127,11 @@ The role the job runs as.
 Default: the role applying the specification.
 Another role needs a superuser:
 .Qq must be superuser to create a job for another role .
+The role must exist, may log in, and may connect to the job's database, which
+pg_cron checks when the job is scheduled and the plan checks first:
+.Qq role \&"x\&" does not exist ,
+.Qq Jobs may only be run by roles that have the LOGIN attribute ,
+.Qq User x does not have CONNECT privilege on app .
 .It Va active
 Default
 .Li true .
@@ -199,9 +204,38 @@ which is enough to say where to go.
 Also
 .Va version ,
 .Va can_schedule_in_database ,
-every database with whether the applying role may connect to it, and the jobs
-the applying role can see, keyed by role and name.
+every database with whether the applying role may connect to it, the jobs the
+applying role can see keyed by role and name, and:
+.Bl -tag -width Ds
+.It Va roles
+For a superuser only, since only a superuser may schedule for another role:
+every role, whether it may log in, and the databases it may connect to.
+.It Va last_runs
+Each job's last run, from the most recent 1000 runs only:
+.Li cron.job_run_details
+grows until something purges it and is indexed on
+.Va runid
+and nothing else (measured), so a reading per job would scan all of it.
+.It Va applied_steps
+The pg_cron steps this database's ledger records as applied, newest first,
+read by core from
+.Li laswell.job
+when the ledger exists and the applying role may read it.
 .El
+.El
+.Pp
+.Va cron.database_name
+itself needs the privileges of
+.Li pg_read_all_settings :
+measured, a role without them gets
+.Qq permission denied to examine \&"cron.database_name\&"
+even from
+.Fn current_setting
+with
+.Va missing_ok .
+The reading is taken on every plan against a server that loads pg_cron, so it
+checks first: an ordinary specification plans for any role, and a pg_cron intent
+from such a role, outside pg_cron's database, names the grant it needs.
 .Sh REFUSALS
 .Bl -bullet
 .It
@@ -224,7 +258,58 @@ connect to.
 without
 .Li EXECUTE
 on it.
+.It
+A job for a role that does not exist, cannot log in, or may not connect to the
+job's database.
 .El
+.Sh ADVISORIES
+Facts that move on their own, shown with the plan as
+.Ql note:
+and left out of
+.Va planDigest
+.Pq Xr pg_laswell_mcp 1 , Sx planMigration .
+.Bl -tag -width Ds
+.It A job edited by hand
+.Li cron.job
+is a table the job's role can change \(em
+.Fn cron.alter_job ,
+.Fn cron.unschedule ,
+a second
+.Fn cron.schedule
+\(em so a job can drift from the specification that declared it with no
+migration involved.
+Each
+.Cm pg_cron_schedule
+step records what it declared, and the ledger keeps it.
+On
+.Em any
+plan against pg_cron's database \(em not only when the same specification is
+planned again \(em the newest declaration of each job is compared with
+.Li cron.job ,
+and a job whose schedule, command, database or
+.Va active
+differs, that has gone, or that came back after a
+.Cm pg_cron_unschedule
+is named.
+A role that is not a superuser sees only its own jobs, so only those are
+compared.
+Steps applied by 0.1.3-alpha1 recorded no declaration and are not compared.
+.It A job whose last run failed
+For each job the specification schedules or unschedules: the failure message,
+and how many of its runs among the most recent 1000 failed.
+.El
+.Sh WHY THERE IS NO ALTER_JOB KIND
+.Cm pg_cron_schedule
+already changes a job in place: pg_cron replaces a job of the same name and role
+and keeps its id (measured).
+.Fn cron.alter_job
+would be a second way to make the same change, and a worse one: it is not
+granted to PUBLIC, so the role that owns a job may reschedule it with
+.Fn cron.schedule
+and may not alter it.
+To pause a job, schedule it with
+.Va active
+false.
 .Sh SEE ALSO
 .Xr pg_laswell 1 ,
 .Xr pg_laswell_mcp 1 ,

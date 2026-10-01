@@ -154,6 +154,25 @@ That is how
 .Qq what ran is what you were shown
 becomes checkable rather than promised.
 .Pp
+Beside its
+.Va warnings
+a plan may carry
+.Va advisories ,
+rendered as
+.Ql note:
+lines: facts a module reads that move on their own \(em a table's row count,
+which autovacuum rewrites; a scheduled job's last run; a job edited by hand since
+a specification declared it.
+They are left out of
+.Va planDigest ,
+like the
+.Va budget ,
+because two plans a minute apart would otherwise disagree about a migration
+that had not changed, and they never change a statement.
+A plan with none has no
+.Va advisories
+key.
+.Pp
 By default it also performs a
 .Sx DRY RUN .
 .Ss listMigrations

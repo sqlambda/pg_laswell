@@ -47,7 +47,7 @@ required, and a build naming the module fails at configure time without them.
 | `../../man/pg_laswell_<name>.7` | yes | The module's own page: its kinds are absent from a stock build, so the core page cannot list them |
 | `keys.inc` | no | Object keys and conflict edges for kinds that plan against something other than a table |
 | `project.h` + `project.inc` | no | What a step leaves for later steps in the same plan -- written into the module's OWN slot only |
-| `guard.h` | no | `<name>_plan_refusals(spec, obs, refuse)`: refusals true of the whole topology |
+| `guard.h` | no | `<name>_plan_refusals(spec, obs, budget, refuse, advise)`: refusals true of the whole topology, and advisories |
 | `confine.h` | no | `<name>_required_confinement(obs, table)`: the one reading core's paced walks consult |
 | `observer.h` | no | Where contention is visible when it is not in `pg_locks` (Citus: on the workers) |
 | `tests.inc` | no, in practice yes | Deferred-case reasons and one representative body per kind, for core's coverage tests |
@@ -164,8 +164,15 @@ what it may touch, and nothing else.** A block that expands inside someone
 else's scope inherits every name in it, and then compliance is discipline. A
 function inherits its parameters, and then compliance is the signature.
 
-**The plan guard** is a function taking `(spec, obs, refuse)`. `plan` is not
-passed, so a guard can say no and say why, and nothing else.
+**The plan guard** is a function taking `(spec, obs, budget, refuse, advise)`.
+`plan` is not passed, so a guard can say no and say why, or add an ADVISORY,
+and nothing else. An advisory (added 2026-10-01, for pgvector and pg_cron) is a
+sentence shown beside the warnings and erased from `planDigest`, like the
+budget: it exists for facts that move on their own -- a table's reltuples, a
+job's last run, a job edited by hand -- which must not make planMigration and
+startMigration disagree. Both callbacks append a string; neither can reach a
+step. `budget` is passed read-only so a guard can say what
+`maintenance_work_mem` core will give a step, which core decides there.
 
 **The projection hook** calls a function taking `(in, qualified, step, json& mine)`,
 where `mine` is the module's own subtree of `Observations::extensions`. The

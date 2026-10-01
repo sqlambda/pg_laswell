@@ -239,3 +239,93 @@ TEST(PgCronSpec, AJobNeedsANameAScheduleAndACommand) {
         << missing;
   }
 }
+
+// --- 2026-10-01: other roles, jobs edited by hand, failed runs ---------------
+
+namespace {
+bool cron_advised(const pglaswell::Plan& p, const std::string& needle) {
+  for (const auto& a : p.advisories) {
+    if (a.find(needle) != std::string::npos) return true;
+  }
+  return false;
+}
+json cron_with_roles() {
+  auto c = cron_home();
+  c["roles"] = json{{"postgres", {{"login", true}, {"connect", {"app", "postgres"}}}},
+                    {"reporter", {{"login", true}, {"connect", {"postgres"}}}},
+                    {"group_role", {{"login", false}, {"connect", {"app"}}}}};
+  return c;
+}
+json applied_schedule(const char* schedule, const char* action = "apply") {
+  return json{{"kind", "pg_cron_schedule"}, {"action", action},
+              {"detail", {{"job", "nightly"}, {"username", "postgres"}, {"database", "app"},
+                          {"schedule", schedule}, {"command", "CALL app.purge_expired()"},
+                          {"active", true}}}};
+}
+}  // namespace
+
+TEST(PgCronPlanner, AJobForAnotherRoleIsCheckedAsPgCronWouldCheckIt) {
+  auto job = cron_job();
+  job["username"] = "nobody";
+  EXPECT_FALSE(cron_conflict(cron_plan(job, cron_observations(cron_with_roles())),
+                             "there is no such role").empty());
+  job["username"] = "group_role";
+  EXPECT_FALSE(cron_conflict(cron_plan(job, cron_observations(cron_with_roles())),
+                             "LOGIN attribute").empty());
+  job["username"] = "reporter";
+  EXPECT_FALSE(cron_conflict(cron_plan(job, cron_observations(cron_with_roles())),
+                             "User reporter does not have CONNECT privilege on app").empty());
+  job["database"] = "postgres";
+  // reporter may connect to postgres, but pg_cron here is kept in app: the job
+  // runs elsewhere, which needs schedule_in_database -- a superuser has it.
+  EXPECT_TRUE(cron_plan(job, cron_observations(cron_with_roles())).ok);
+}
+
+TEST(PgCronPlanner, AJobEditedByHandIsNoticedOnAnyPlanAgainstTheDatabase) {
+  auto c = cron_home("app", true,
+                     json{{"postgres/nightly", {{"jobid", 7}, {"schedule", "0 5 * * *"},
+                                                {"command", "CALL app.purge_expired()"},
+                                                {"database", "app"}, {"username", "postgres"},
+                                                {"active", true}}}});
+  // Newest first, as core reads them: the job was last declared at 03:00.
+  c["applied_steps"] = json::array({applied_schedule("0 3 * * *"),
+                                     applied_schedule("0 1 * * *")});
+  // An unrelated specification: a plain table. The advisory still appears.
+  const auto p = cron_plan(json{{"kind", "create_schema"}, {"schema", "other"},
+                                {"comment", "Unrelated."}},
+                           cron_observations(c));
+  EXPECT_TRUE(cron_advised(p, "schedule 0 3 * * * -> 0 5 * * *")) << p.render();
+
+  // Unscheduled by hand.
+  c["jobs"] = json::object();
+  EXPECT_TRUE(cron_advised(cron_plan(cron_job(), cron_observations(c)),
+                           "no longer in cron.job"));
+  // As declared: nothing to say.
+  c["jobs"] = json{{"postgres/nightly", {{"jobid", 7}, {"schedule", "0 3 * * *"},
+                                         {"command", "CALL app.purge_expired()"},
+                                         {"database", "app"}, {"username", "postgres"},
+                                         {"active", true}}}};
+  EXPECT_TRUE(cron_plan(cron_job(), cron_observations(c)).advisories.empty());
+}
+
+TEST(PgCronPlanner, ATouchedJobWhoseLastRunFailedSaysWhy) {
+  auto c = cron_home("app", true,
+                     json{{"postgres/nightly", {{"jobid", 7}, {"schedule", "0 3 * * *"},
+                                                {"command", "CALL app.purge_expired()"},
+                                                {"database", "app"}, {"username", "postgres"},
+                                                {"active", true}}}});
+  c["last_runs"] = json{{"7", {{"status", "failed"}, {"message", "ERROR:  division by zero\n"},
+                               {"failures", 3}, {"runs", 4}}}};
+  const auto p = cron_plan(cron_job("nightly", "0 4 * * *"), cron_observations(c));
+  ASSERT_TRUE(p.ok) << p.render();
+  EXPECT_TRUE(cron_advised(p, "last run failed: ERROR:  division by zero (3 of its last 4"))
+      << p.render();
+}
+
+TEST(PgCronPlanner, AScheduleStepRecordsWhatItDeclares) {
+  const auto p = cron_plan(cron_job(), cron_observations(cron_home()));
+  ASSERT_TRUE(p.ok);
+  EXPECT_EQ(p.steps[0].detail.value("schedule", ""), "0 3 * * *");
+  EXPECT_EQ(p.steps[0].detail.value("command", ""), "CALL app.purge_expired()");
+  EXPECT_TRUE(p.steps[0].detail.value("active", false));
+}

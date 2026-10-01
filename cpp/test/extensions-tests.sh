@@ -168,6 +168,40 @@ else
   bad "different parameters should build, with a warning" "$out"
 fi
 
+echo "pgvector: an expression key that is a cast is checked as the type it casts to"
+clean "a vector wider than 2000, indexed as halfvec through a cast" \
+  "$V" "$(idx v_cast hnsw '[{"expression":"wide::halfvec(2001)","opclass":"halfvec_l2_ops"}]')"
+refused "a cast to a halfvec wider than 4000" \
+  "$V" "$(idx v_castw hnsw '[{"expression":"h::halfvec(4001)","opclass":"halfvec_l2_ops"}]')" \
+  "more than 4000 dimensions" \
+  "CREATE INDEX ON public.v USING hnsw ((h::halfvec(4001)) halfvec_l2_ops)" \
+  "column cannot have more than 4000 dimensions for hnsw index"
+
+echo "pgvector: advisories, from the server's own readings, outside the digest"
+out=$(plan "$V" "$(idx v_ivf_empty ivfflat '["e"]')")
+if echo "$out" | grep -q '"advisories"' && echo "$out" | grep -q 'reads as empty'; then
+  ok "an ivfflat index on an empty table is an advisory"
+else
+  bad "an empty table should produce the ivfflat advisory" "$out"
+fi
+q "$V" "INSERT INTO public.v (id, e) SELECT g, (SELECT array_agg(random())::vector(128)
+        FROM generate_series(1,128) WHERE g > 0) FROM generate_series(1,3000) g" >/dev/null
+q "$V" "ANALYZE public.v" >/dev/null
+q "$CENTRAL/postgres" "ALTER DATABASE ext_test SET maintenance_work_mem = '1MB'" >/dev/null
+out=$(plan "$V" "$(idx v_mem hnsw '[{"name":"e","opclass":"vector_l2_ops"}]')")
+if echo "$out" | grep -q 'its graph needs about 4 MB' && echo "$out" | grep -q 'maintenance_work_mem 1 MB'; then
+  ok "an hnsw graph larger than maintenance_work_mem is sized from rows, dims and m"
+else
+  bad "3000 rows of vector(128) should be sized at about 4 MB against 1 MB" "$out"
+fi
+raw=$(q "$V" "SET maintenance_work_mem = '1MB'; SET max_parallel_maintenance_workers = 0;
+              BEGIN; CREATE INDEX ON public.v USING hnsw (e vector_l2_ops); ROLLBACK;")
+if echo "$raw" | grep -q 'hnsw graph no longer fits into maintenance_work_mem'; then
+  ok "and pgvector agrees the graph does not fit"
+else
+  bad "pgvector should report the graph outgrowing maintenance_work_mem" "$raw"
+fi
+
 # --- pg_cron ------------------------------------------------------------
 echo "pg_cron: both layouts"
 for url in "$CENTRAL/postgres" "$LOCAL/docs"; do
@@ -240,6 +274,22 @@ refused "schedule_in_database without the grant" \
 refused "a job for another role" \
   "$RUNNER/postgres" "$(job other '"username":"postgres"')" \
   "must be superuser to create a job for another role"
+
+echo "pg_cron: a job for another role, scheduled by a superuser"
+q "$CENTRAL/postgres" "DROP ROLE IF EXISTS ext_nologin; CREATE ROLE ext_nologin NOLOGIN" >/dev/null
+q "$CENTRAL/postgres" "DROP ROLE IF EXISTS ext_noconn; CREATE ROLE ext_noconn LOGIN" >/dev/null
+q "$CENTRAL/postgres" "REVOKE CONNECT ON DATABASE ext_test FROM PUBLIC" >/dev/null
+for case in "ext_absent|there is no such role|role \"ext_absent\" does not exist" \
+            "ext_nologin|LOGIN attribute|role \"ext_nologin\" can not log in" \
+            "ext_noconn|does not have CONNECT privilege on ext_test|User ext_noconn does not have CONNECT privilege on ext_test"; do
+  IFS='|' read -r role needle server <<<"$case"
+  refused "a job run as $role" \
+    "$CENTRAL/postgres" "$(job role '"database":"ext_test","username":"'"$role"'"')" "$needle" \
+    "SELECT cron.schedule_in_database('ext-test-raw', '0 3 * * *', 'SELECT 1', 'ext_test', '$role')" \
+    "$server"
+done
+q "$CENTRAL/postgres" "GRANT CONNECT ON DATABASE ext_test TO PUBLIC" >/dev/null
+q "$CENTRAL/postgres" "DROP ROLE ext_nologin; DROP ROLE ext_noconn" >/dev/null
 q "$CENTRAL/postgres" "REVOKE USAGE ON SCHEMA cron FROM ext_runner" >/dev/null
 q "$CENTRAL/postgres" "REVOKE CREATE ON SCHEMA public FROM ext_runner" >/dev/null
 q "$V" "REVOKE CREATE, USAGE ON SCHEMA public FROM ext_runner" >/dev/null

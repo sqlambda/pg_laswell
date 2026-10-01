@@ -257,3 +257,4 @@ SELECT JSONB_BUILD_OBJECT(
 // Nothing is read where Citus is not installed: the key stays absent, which is
 // how every Citus planner and guard tells "no Citus" from "Citus, empty".
 inline const char* kcitusAbsentSql = nullptr;
+inline constexpr bool kcitusReadsAppliedSteps = false;

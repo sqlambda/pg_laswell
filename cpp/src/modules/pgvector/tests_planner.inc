@@ -200,3 +200,97 @@ TEST(PgvectorPlanner, WithoutPgvectorTheModuleSaysNothing) {
   // And an ordinary btree on a vector database is untouched.
   EXPECT_TRUE(pv_plan(pv_index(json::array({"id"}), "btree"), pv_observations()).ok);
 }
+
+// --- 2026-10-01: expression keys, and the advisories --------------------------
+
+TEST(PgvectorPlanner, AnExpressionCastIsCheckedAsTheTypeItCastsTo) {
+  // The documented way to index a vector wider than 2000: as halfvec.
+  const auto ok = pv_plan(pv_index(json::array({json{{"expression", "wide::halfvec(3072)"},
+                                                     {"opclass", "halfvec_cosine_ops"}}})),
+                          pv_observations());
+  EXPECT_TRUE(ok.ok) << ok.render();
+  // The same cast with a vector class is the type mismatch pgvector raises.
+  const auto bad = pv_plan(pv_index(json::array({json{{"expression", "wide::halfvec(3072)"},
+                                                      {"opclass", "vector_cosine_ops"}}})),
+                           pv_observations());
+  EXPECT_FALSE(pv_refusal(bad, "does not accept data type halfvec").empty()) << bad.render();
+  // CAST(... AS ...), and a function over the column, read the same way.
+  EXPECT_FALSE(pv_refusal(pv_plan(pv_index(json::array({json{
+                                      {"expression", "CAST(embedding AS halfvec(4001))"},
+                                      {"opclass", "halfvec_l2_ops"}}})),
+                                  pv_observations()),
+                          "more than 4000 dimensions")
+                   .empty());
+  EXPECT_TRUE(pv_plan(pv_index(json::array({json{
+                          {"expression", "binary_quantize(embedding)::bit(1536)"},
+                          {"opclass", "bit_hamming_ops"}}})),
+                      pv_observations())
+                  .ok);
+  // Anything that is not an outermost cast is the server's to type.
+  EXPECT_TRUE(pv_plan(pv_index(json::array({json{{"expression", "l2_normalize(embedding)"},
+                                                 {"opclass", "vector_l2_ops"}}})),
+                      pv_observations())
+                  .ok);
+}
+
+namespace {
+bool pv_advised(const pglaswell::Plan& p, const std::string& needle) {
+  for (const auto& a : p.advisories) {
+    if (a.find(needle) != std::string::npos) return true;
+  }
+  return false;
+}
+}  // namespace
+
+TEST(PgvectorPlanner, AnIvfflatIndexOnAnEmptyTableIsAnAdvisoryNotARefusal) {
+  auto obs = pv_observations();
+  obs.tables["public.docs"]["reltuples"] = 0;
+  const auto p = pv_plan(pv_index(json::array({"embedding"}), "ivfflat"), obs);
+  EXPECT_TRUE(p.ok);
+  EXPECT_TRUE(pv_advised(p, "reads as empty")) << p.render();
+  // Below one row per list: pgvector's own notice, quoted.
+  obs.tables["public.docs"]["reltuples"] = 40;
+  EXPECT_TRUE(pv_advised(pv_plan(pv_index(json::array({"embedding"}), "ivfflat"), obs),
+                         "about 40 rows for 100 lists"));
+}
+
+TEST(PgvectorPlanner, AnHnswGraphLargerThanMaintenanceWorkMemIsSizedForTheReader) {
+  // 100 000 rows of vector(1536), m 16: (8 + 6144 + 210 + 512) bytes a row,
+  // about 656 MB, against the server's 64 MB.
+  auto obs = pv_observations();
+  obs.server["maintenance_work_mem_kb"] = 65536;
+  const auto p = pv_plan(pv_index(json::array({pv_col("embedding", "vector_cosine_ops")})), obs);
+  ASSERT_TRUE(p.ok) << p.render();
+  EXPECT_TRUE(pv_advised(p, "graph needs about 656 MB")) << p.render();
+  EXPECT_TRUE(pv_advised(p, "maintenance_work_mem 64 MB"));
+}
+
+TEST(PgvectorPlanner, AdvisoriesAreShownAndNotHashed) {
+  // The row count moves with autovacuum; a plan whose only difference is an
+  // advisory must keep its digest, or planMigration and startMigration a
+  // minute apart would disagree about a migration that has not changed.
+  auto obs = pv_observations();
+  obs.server["maintenance_work_mem_kb"] = 65536;
+  const auto a = pv_plan(pv_index(json::array({pv_col("embedding", "vector_cosine_ops")})), obs);
+  obs.tables["public.docs"]["reltuples"] = 10;
+  const auto b = pv_plan(pv_index(json::array({pv_col("embedding", "vector_cosine_ops")})), obs);
+  ASSERT_FALSE(a.advisories.empty());
+  ASSERT_TRUE(b.advisories.empty()) << b.render();
+  EXPECT_EQ(a.digest(), b.digest());
+  EXPECT_NE(a.render().find(" note: "), std::string::npos);
+  EXPECT_TRUE(a.to_json().contains("advisories"));
+  EXPECT_FALSE(b.to_json().contains("advisories"))
+      << "a plan without advisories serialises as it always did";
+}
+
+TEST(PgvectorPlanner, AParallelBuildBiggerThanAContainersShmIsMentioned) {
+  auto obs = pv_observations();
+  obs.tables["public.docs"]["reltuples"] = 10;
+  obs.server["maintenance_work_mem_kb"] = 256 * 1024;
+  obs.server["max_parallel_maintenance_workers"] = 2;
+  obs.extensions["pgvector"]["dynamic_shared_memory_type"] = "posix";
+  const auto col = json::array({pv_col("embedding", "vector_cosine_ops")});
+  EXPECT_TRUE(pv_advised(pv_plan(pv_index(col), obs), "/dev/shm"));
+  obs.server["max_parallel_maintenance_workers"] = 0;
+  EXPECT_FALSE(pv_advised(pv_plan(pv_index(col), obs), "/dev/shm"));
+}
