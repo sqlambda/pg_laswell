@@ -5185,6 +5185,131 @@ TEST(Planner, OnEquivalentIndexRefuseRestoresTheConflict) {
   EXPECT_NE(plan.conflicts[0].find("hand_built"), std::string::npos);
 }
 
+// Storage parameters: `with` on create_index. Core checks the shape only; which
+// names a method accepts is the method's (or its module's) to say.
+namespace {
+json index_with(json with) {
+  auto doc = minimal_spec();
+  for (auto& i : doc["intents"]) {
+    if (i["kind"] == "create_index") i["with"] = std::move(with);
+  }
+  return doc;
+}
+json hand_built_index(json options) {
+  return json{{"is_valid", true}, {"is_unique", false}, {"method", "btree"},
+              {"predicate", "(status = 'open'::text)"}, {"has_expressions", false},
+              {"columns", json::array({"fulfilment_region", "created_at"})},
+              {"key_column_count", 2},
+              {"column_order", json::array({"asc nulls last", "asc nulls last"})},
+              {"column_opclasses", json::array({"", ""})},
+              {"leading_column", "fulfilment_region"},
+              {"options", std::move(options)}};
+}
+}  // namespace
+
+TEST(Planner, StorageParametersAreEmittedBetweenIncludeAndWhere) {
+  const auto plan = pglaswell::plan_migration(
+      pglaswell::parse_spec(index_with(json{{"fillfactor", 70}, {"deduplicate_items", false}})),
+      observations(1024 * 1024, 500), {});
+  const auto* s = find_step(plan, "create_index");
+  ASSERT_NE(s, nullptr);
+  const auto sql = all_sql(*s);
+  // Name order, so the same object always renders the same statement.
+  EXPECT_NE(sql.find("(\"fulfilment_region\", \"created_at\") WITH "
+                     "(\"deduplicate_items\" = false, \"fillfactor\" = 70) WHERE "
+                     "status = 'open'"),
+            std::string::npos)
+      << sql;
+}
+
+TEST(Planner, StorageParametersReachEveryPartitionOfAPartitionedIndex) {
+  auto obs = observations(1024 * 1024, 500);
+  obs.tables["shop.orders"]["kind"] = "partitioned_table";
+  obs.tables["shop.orders"]["partitions"] = json::array({"shop.orders_2026"});
+  const auto plan = pglaswell::plan_migration(
+      pglaswell::parse_spec(index_with(json{{"fillfactor", 70}})), obs, {});
+  int with_count = 0;
+  for (const auto& st : plan.steps) {
+    for (const auto& q : st.sql) {
+      if (q.find("CREATE INDEX") != std::string::npos) {
+        EXPECT_NE(q.find("WITH (\"fillfactor\" = 70)"), std::string::npos) << q;
+        ++with_count;
+      }
+    }
+  }
+  EXPECT_GE(with_count, 1) << plan.render();
+}
+
+TEST(Spec, StorageParametersMustBeScalars) {
+  EXPECT_NE(spec_error(index_with(json::array())).find(".with must be a non-empty object"),
+            std::string::npos);
+  EXPECT_NE(spec_error(index_with(json::object())).find(".with must be a non-empty object"),
+            std::string::npos);
+  EXPECT_NE(spec_error(index_with(json{{"fillfactor", json::array({70})}}))
+                .find("must be a number, a boolean or a short word"),
+            std::string::npos);
+  // A word is a value, never a fragment of SQL.
+  EXPECT_NE(spec_error(index_with(json{{"buffering", "auto); DROP TABLE x; --"}}))
+                .find("must be a number, a boolean or a short word"),
+            std::string::npos);
+  EXPECT_NE(spec_error(index_with(json{{"Bad Name", 1}})).find("with"), std::string::npos);
+}
+
+TEST(Planner, AnEquivalentIndexWithOtherStorageParametersIsNotAdopted) {
+  // Same columns, method and predicate; different m, or here fillfactor. The
+  // two answer the same queries at different cost, so renaming the hand-built
+  // one to the declared name would report the spec satisfied with an index it
+  // did not describe.
+  auto obs = observations(1024, 10);
+  obs.tables["shop.orders"]["indexes"]["hand_built"] =
+      hand_built_index(json::array({"fillfactor=90"}));
+  const auto plan = pglaswell::plan_migration(
+      pglaswell::parse_spec(index_with(json{{"fillfactor", 70}})), obs, {});
+  const auto* s = find_step(plan, "create_index");
+  ASSERT_NE(s, nullptr);
+  EXPECT_EQ(all_sql(*s).find("RENAME"), std::string::npos) << all_sql(*s);
+  EXPECT_NE(all_sql(*s).find("CREATE INDEX"), std::string::npos);
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("different storage parameters") != std::string::npos &&
+        w.find("fillfactor=90") != std::string::npos) {
+      warned = true;
+    }
+  }
+  EXPECT_TRUE(warned) << plan.render();
+}
+
+TEST(Planner, TheSameStorageParametersSpelledDifferentlyAreTheSame) {
+  // PostgreSQL stores a reloption as written: WITH (fastupdate = off) reads
+  // back "fastupdate=off". A spec saying false means the same thing.
+  auto obs = observations(1024, 10);
+  obs.tables["shop.orders"]["indexes"]["hand_built"] =
+      hand_built_index(json::array({"fastupdate=off", "fillfactor=70"}));
+  const auto plan = pglaswell::plan_migration(
+      pglaswell::parse_spec(index_with(json{{"fillfactor", 70}, {"fastupdate", false}})),
+      obs, {});
+  const auto* s = find_step(plan, "create_index");
+  ASSERT_NE(s, nullptr);
+  EXPECT_NE(all_sql(*s).find("RENAME TO \"orders_open_by_region_idx\""), std::string::npos)
+      << plan.render();
+}
+
+TEST(Planner, AnIndexPresentByNameWithOtherParametersIsSatisfiedAndSaysSo) {
+  auto obs = observations(1024, 10);
+  obs.tables["shop.orders"]["indexes"]["orders_open_by_region_idx"] =
+      hand_built_index(json::array());
+  const auto plan = pglaswell::plan_migration(
+      pglaswell::parse_spec(index_with(json{{"fillfactor", 70}})), obs, {});
+  const auto* s = find_step(plan, "create_index");
+  ASSERT_NE(s, nullptr);
+  EXPECT_EQ(s->action, pglaswell::Action::kSatisfied);
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("not the [fillfactor=70]") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned) << plan.render();
+}
+
 TEST(Spec, AnUnknownOnEquivalentIndexPolicyIsRefused) {
   auto doc = minimal_spec();
   for (auto& i : doc["intents"]) {

@@ -86,9 +86,9 @@ set(PGLASWELL_LIBS
 # within touching distance of the "recognized but unsupported" state spec.h
 # opens by forbidding. See src/modules/README.md.
 #
-#   cmake -S cpp -B cpp/build -DPGLASWELL_MODULES=citus
+#   cmake -S cpp -B cpp/build -DPGLASWELL_MODULES="citus;pg_cron;pgvector"
 # --------------------------------------------------------------------------
-set(PGLASWELL_MODULES "" CACHE STRING "Vendor modules to compile in, e.g. citus")
+set(PGLASWELL_MODULES "" CACHE STRING "Vendor modules to compile in, e.g. citus;pg_cron;pgvector")
 set(_mod_names "")
 
 set(_gen_dir ${CMAKE_CURRENT_BINARY_DIR}/generated/modules)
@@ -119,7 +119,7 @@ foreach(_mod IN LISTS PGLASWELL_MODULES)
     string(APPEND _kinds_inc "#include \"modules/${_mod}/kinds.inc\"\n")
     string(APPEND _heads_inc "#include \"modules/${_mod}/module.h\"\n")
     string(APPEND _plan_inc "#include \"modules/${_mod}/plan.h\"\n")
-    string(APPEND _obs_inc  "PGLASWELL_OBSERVE(\"${_mod}\", k${_mod}PresentSql, k${_mod}ObservationSql)\n")
+    string(APPEND _obs_inc  "PGLASWELL_OBSERVE(\"${_mod}\", k${_mod}PresentSql, k${_mod}ObservationSql, k${_mod}AbsentSql)\n")
     string(APPEND _obs_head "#include \"modules/${_mod}/observe.h\"\n")
     # keys.inc is optional: a module whose kinds plan against relations only,
     # and add no conflict edge, does not need one.
@@ -322,6 +322,13 @@ if(BUILD_TESTING)
     if(PGLASWELL_MODULES)
         add_test(NAME citus_tests
                  COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/citus-tests.sh
+                         $<TARGET_FILE:pg_laswell> $<TARGET_FILE:pg_laswell_mcp>)
+        # The same for pg_cron and pgvector, against the two servers of
+        # examples/docker/extensions: every refusal is checked to pre-empt an
+        # error the server really raises, so a release of either extension
+        # that lifts a limit fails here instead of being refused forever.
+        add_test(NAME extensions_tests
+                 COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/extensions-tests.sh
                          $<TARGET_FILE:pg_laswell> $<TARGET_FILE:pg_laswell_mcp>)
     endif()
 

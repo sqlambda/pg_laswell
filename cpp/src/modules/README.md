@@ -43,7 +43,7 @@ required, and a build naming the module fails at configure time without them.
 | `module.h` | yes | Includes the parse surface (`parse.h`, `observer.h`); `spec.h` pulls it in. |
 | `parse.h` | yes | `parse_<kind>()` per kind, using `reject_unknown_keys` like core does |
 | `plan.h` | yes | `plan_<kind>()` per kind. **Must be pure** -- no pqxx, no clock, no connection |
-| `observe.h` | yes | `k<name>PresentSql` and `k<name>ObservationSql`: one query, gathered into `Observations::extensions["<name>"]` |
+| `observe.h` | yes | `k<name>PresentSql`, `k<name>ObservationSql` and `k<name>AbsentSql`: one query, gathered into `Observations::extensions["<name>"]`; the absent one (usually `nullptr`) is what to read where the extension is not installed |
 | `../../man/pg_laswell_<name>.7` | yes | The module's own page: its kinds are absent from a stock build, so the core page cannot list them |
 | `keys.inc` | no | Object keys and conflict edges for kinds that plan against something other than a table |
 | `project.h` + `project.inc` | no | What a step leaves for later steps in the same plan -- written into the module's OWN slot only |
@@ -240,6 +240,11 @@ it. Say the vendor is called `acme`.
    empty one. A reading must never raise on a healthy but unusual server: the
    Citus rebalance plan is wrapped in a `CASE` because the function raises when
    no node may hold shards, and an error there would fail every plan.
+   `k<name>AbsentSql` is what to read when the probe says the extension is not
+   installed here; `nullptr` leaves the key absent. pg_cron is the one that
+   needs it: the extension lives in one database per cluster, every other
+   database must still be able to say which one, and the observation query
+   names `cron.job`, which does not parse where the `cron` schema is missing.
 
 5. **Plan** in `acme/plan.h`, as a pure function. Each kind decides three things
    from the reading: is it already done (`kSatisfied` -- re-running a
@@ -277,7 +282,7 @@ it. Say the vendor is called `acme`.
 
 The released package, `pg-laswell`, carries every module:
 
-    cmake -S cpp -B build -DPGLASWELL_MODULES=citus
+    cmake -S cpp -B build -DPGLASWELL_MODULES="citus;pg_cron;pgvector"
 
 A module is safe to carry on servers without its extension. Its kinds are
 prefixed with its vendor's name, its reading is absent when the extension is

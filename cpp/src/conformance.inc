@@ -702,6 +702,17 @@ inline std::vector<Case> cases() {
      "SELECT pg_get_expr(c.relpartbound, c.oid) FROM pg_class c"
      " WHERE c.oid = 'cf.hx_0'::regclass", "FOR VALUES WITH (modulus 2, remainder 0)"},
 
+    // Storage parameters reach the index, in name order, as the server stores
+    // them -- the form the equivalence check reads back.
+    {"create_index_with",
+     {"CREATE TABLE cf.fx(id bigint, v int)"},
+     json{{"kind","create_index"},{"schema","cf"},{"table","fx"},{"name","fx_v"},
+          {"columns",json::array({"v"})},
+          {"with",json{{"fillfactor",70},{"deduplicate_items",false}}},
+          {"comment","v, packed less tightly."}},
+     "SELECT array_to_string(reloptions, ',') FROM pg_class WHERE oid = 'cf.fx_v'::regclass",
+     "deduplicate_items=false,fillfactor=70"},
+
     {"create_domain_via_create_type", {},   // alias case; kind is create_type
      json{{"kind","create_type"},{"schema","cf"},{"name","pos"},{"type_kind","domain"},
           {"base","integer"},{"check","VALUE > 0"},{"comment","Positive."}},

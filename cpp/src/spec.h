@@ -18,6 +18,7 @@
 // fully applied.
 
 #include <algorithm>
+#include <cctype>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -636,7 +637,7 @@ inline void parse_create_index(Intent& in) {
   detail::reject_unknown_keys(
       in.body,
       {"kind", "schema", "table", "name", "columns", "include", "unique",
-       "method", "where", "comment", "on_equivalent_index"},
+       "method", "where", "with", "comment", "on_equivalent_index"},
       at);
   detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
   detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
@@ -736,6 +737,41 @@ inline void parse_create_index(Intent& in) {
     }
   }
   (void)detail::require_string(in.body, "comment", at);
+
+  // Storage parameters: WITH (...). Every access method that has them reads
+  // them here -- btree fillfactor, gin fastupdate, brin pages_per_range, and
+  // the ones an extension's method declares (hnsw m and ef_construction,
+  // ivfflat lists). Which names a method accepts, and their ranges, are the
+  // method's to say: PostgreSQL refuses an unknown one with "unrecognized
+  // parameter", and a module that knows the method may refuse it earlier. This
+  // checks only the shape, so the value reaches SQL as a value and nothing
+  // else.
+  if (in.body.contains("with")) {
+    const auto& w = in.body["with"];
+    if (!w.is_object() || w.empty()) {
+      detail::fail(at + ".with must be a non-empty object",
+                   "Each key is a storage parameter of the index's method and "
+                   "each value a number, a boolean or a short word: "
+                   "{\"fillfactor\": 70}, {\"m\": 16, \"ef_construction\": 64}.");
+    }
+    for (auto it = w.begin(); it != w.end(); ++it) {
+      detail::require_identifier(it.key(), "with", in.ordinal);
+      const auto& v = it.value();
+      const bool word =
+          v.is_string() && !v.get<std::string>().empty() &&
+          std::all_of(v.get_ref<const std::string&>().begin(),
+                      v.get_ref<const std::string&>().end(), [](char c) {
+                        return std::isalnum(static_cast<unsigned char>(c)) ||
+                               c == '_' || c == '.';
+                      });
+      if (!(v.is_number() || v.is_boolean() || word)) {
+        detail::fail(at + ".with." + it.key() +
+                         " must be a number, a boolean or a short word",
+                     "Storage parameters take scalar values; a word may hold "
+                     "letters, digits, '_' and '.'.");
+      }
+    }
+  }
 
   // What to do when an index equivalent to this one already exists under a
   // DIFFERENT name -- the common shape of a database where somebody built it by

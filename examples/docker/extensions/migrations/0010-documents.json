@@ -1,0 +1,76 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0010-documents",
+  "description": "Documents with an embedding, and the index that finds the nearest ones.",
+  "rationale": "m 16 / ef_construction 64 are pgvector's defaults, written down so a later change is a visible diff. Cosine, because the embeddings are normalised by the model that writes them.",
+  "target": {
+    "connection": "app"
+  },
+  "intents": [
+    {
+      "kind": "create_extension",
+      "name": "vector",
+      "comment": "pgvector: the vector types and the hnsw and ivfflat index methods."
+    },
+    {
+      "kind": "create_table",
+      "schema": "public",
+      "table": "documents",
+      "comment": "Documents to search by meaning, kept until they expire.",
+      "primary_key": [
+        "id"
+      ],
+      "columns": [
+        {
+          "name": "id",
+          "type": "bigint",
+          "nullable": false,
+          "comment": "Document id."
+        },
+        {
+          "name": "body",
+          "type": "text",
+          "nullable": false,
+          "comment": "The text that was embedded."
+        },
+        {
+          "name": "embedding",
+          "type": "vector(384)",
+          "nullable": false,
+          "comment": "384-dimension embedding of body."
+        },
+        {
+          "name": "expires_at",
+          "type": "timestamptz",
+          "nullable": false,
+          "comment": "When the nightly purge removes it."
+        }
+      ]
+    },
+    {
+      "kind": "set_identity",
+      "schema": "public",
+      "table": "documents",
+      "column": "id",
+      "identity": "ALWAYS"
+    },
+    {
+      "kind": "create_index",
+      "schema": "public",
+      "table": "documents",
+      "name": "documents_embedding_idx",
+      "method": "hnsw",
+      "columns": [
+        {
+          "name": "embedding",
+          "opclass": "vector_cosine_ops"
+        }
+      ],
+      "with": {
+        "m": 16,
+        "ef_construction": 64
+      },
+      "comment": "Nearest documents by cosine distance (ORDER BY embedding <=> $1)."
+    }
+  ]
+}

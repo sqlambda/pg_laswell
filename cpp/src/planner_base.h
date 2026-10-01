@@ -15,7 +15,9 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <functional>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 

@@ -1,0 +1,228 @@
+.Dd October 1, 2026
+.Dt PG_LASWELL_PGVECTOR 7
+.Os
+.Sh NAME
+.Nm pg_laswell_pgvector
+.Nd pgvector support in pg_laswell: readings and refusals for vector indexes
+.Sh DESCRIPTION
+pgvector support is a
+.Em build-time module ,
+like Citus support
+.Pq Xr pg_laswell_citus 7 .
+Unlike Citus it adds no intent kinds.
+Everything pgvector provides is reached through core kinds:
+.Bl -bullet -compact
+.It
+.Cm create_extension
+with
+.Va name
+.Ql vector ;
+.It
+a
+.Li vector(n) ,
+.Li halfvec(n) ,
+.Li sparsevec(n)
+or
+.Li bit(n)
+column, as the
+.Va type
+of
+.Cm create_table ,
+.Cm add_column
+or
+.Cm alter_column_type ;
+.It
+an HNSW or IVFFlat index, as
+.Cm create_index
+with
+.Va method
+.Ql hnsw
+or
+.Ql ivfflat ,
+an operator class per column, and storage parameters in
+.Va with .
+.El
+.Pp
+What the module adds is what core cannot know: which of those indexes pgvector
+will refuse.
+Each one is an error PostgreSQL would raise anyway, but an HNSW index on a large
+table is built with
+.Ic CREATE INDEX CONCURRENTLY ,
+which the dry run cannot rehearse, and a concurrent build refused at execution
+has already scanned the table once and left an invalid index behind.
+The module says it before anything runs.
+.Pp
+A binary that carries the module says so:
+.Bd -literal -offset indent
+$ pg_laswell_mcp --version
+0.1.3
+modules: citus,pg_cron,pgvector
+.Ed
+.Pp
+.Sy Versions.
+Measured on PostgreSQL 18.6 with pgvector 0.8.6.
+The operator classes and the access methods' capabilities are read from the
+server, so a pgvector that adds a class is not refused for using it.
+The dimension limits and the storage parameter bounds are not in any catalog;
+they are the measured values, and each refusal quotes the pgvector error it
+pre-empts.
+.Sh AN HNSW INDEX
+.Bd -literal -offset indent
+{ "kind": "create_index", "schema": "public", "table": "documents",
+  "name": "documents_embedding_idx", "method": "hnsw",
+  "columns": [ { "name": "embedding", "opclass": "vector_cosine_ops" } ],
+  "with": { "m": 16, "ef_construction": 64 },
+  "comment": "Nearest documents by cosine distance." }
+.Ed
+.Pp
+The operator class is the distance the index serves, and it must match the
+operator queries order by:
+.Li <->
+.Pq l2 ,
+.Li <#>
+.Pq inner product ,
+.Li <=>
+.Pq cosine ,
+.Li <+>
+.Pq l1 ,
+and for
+.Li bit
+columns
+.Li <~>
+.Pq Hamming
+and
+.Li <%>
+.Pq Jaccard .
+An index built for one distance is not used by a query ordering by another.
+.Pp
+Whether the build is plain or concurrent is core's decision, by the same rule
+as any index
+.Pq Xr pg_laswell_mcp 1 , Cm create_index .
+.Sh READINGS
+Taken only where the extension is installed in the target database; absent
+otherwise.
+.Bl -tag -width Ds
+.It Va version
+.Li pg_extension.extversion .
+.It Va opclasses
+Every operator class of
+.Li hnsw
+and
+.Li ivfflat :
+the type it serves and whether it is the default.
+On 0.8.6, hnsw has fourteen and no default; ivfflat has seven, and
+.Li vector_l2_ops
+is its default.
+.It Va methods
+.Fn pg_indexam_has_property
+for
+.Li can_unique
+and
+.Li can_multi_col .
+Both are false for both methods.
+.El
+.Pp
+When the specification itself creates the extension, there is no reading yet,
+and the classes pgvector 0.8.6 declares are used instead.
+.Sh REFUSALS
+For every
+.Cm create_index
+with
+.Va method
+.Ql hnsw
+or
+.Ql ivfflat .
+A column's type is the catalog's, or what an earlier intent of the same
+specification declares it to be.
+An expression key is not checked: its type is not known without the server.
+.Bl -tag -width Ds
+.It Too many dimensions
+.Qq column cannot have more than N dimensions for hnsw index .
+2000 for
+.Li vector ,
+4000 for
+.Li halfvec ,
+64000 for
+.Li bit ,
+for both methods.
+.Li sparsevec
+has no dimension limit on an HNSW index; its limit is 1000 non-zero elements
+per row, a property of the data checked when a row is written.
+A
+.Li vector
+wider than 2000 is usually indexed as
+.Li halfvec :
+an expression key
+.Li (embedding::halfvec(3072))
+with a
+.Li halfvec_*
+class, queried with the same cast.
+.It No dimensions
+.Qq column does not have dimensions ,
+for a column declared as plain
+.Li vector .
+.It No operator class
+hnsw has no default class for any type, so every hnsw column names one.
+.It An operator class for another type
+.Qq operator class \&"halfvec_l2_ops\&" does not accept data type vector .
+.It A type the method cannot index
+ivfflat has no
+.Li sparsevec
+classes; neither method indexes anything but pgvector's types.
+.It UNIQUE, or more than one key column
+.Qq access method \&"hnsw\&" does not support unique indexes ,
+and the same for multicolumn indexes.
+A where clause still works, for filtering.
+.It Storage parameters
+hnsw takes
+.Va m
+(2 to 100, default 16) and
+.Va ef_construction
+(4 to 1000, default 64), and
+.Va ef_construction
+must be at least twice
+.Va m
+\(em including the default, so
+.Li {"m": 40}
+alone is refused.
+ivfflat takes
+.Va lists
+(1 to 32768).
+Anything else is
+.Qq unrecognized parameter .
+.El
+.Sh SEE ALSO
+.Xr pg_laswell 1 ,
+.Xr pg_laswell_mcp 1 ,
+.Xr pg_laswell_citus 7 ,
+.Xr pg_laswell_pg_cron 7
+.Sh AUTHORS
+.An Daniel Cristian Cruz
+.Sh CAVEATS
+Measured, and not refused, because they are not errors:
+.Bl -bullet
+.It
+An IVFFlat index built on an empty or small table chooses its lists from the
+rows present
+.Pq Qq ivfflat index created with little data
+and recalls poorly once the table fills.
+Build it after the data is loaded.
+.It
+An HNSW build that outgrows
+.Va maintenance_work_mem
+continues on disk, much more slowly:
+.Qq hnsw graph no longer fits into maintenance_work_mem after N tuples .
+Measured: 50 000 rows of
+.Li vector(128)
+took 41.6 s with 1 MB and 12.1 s with 256 MB; the graph needed about 1.2 KB a
+row.
+.It
+A parallel HNSW build allocates
+.Va maintenance_work_mem
+in dynamic shared memory.
+Measured in a container with the default 64 MB
+.Pa /dev/shm :
+a build with 256 MB failed,
+.Qq could not resize shared memory segment ... No space left on device ,
+and left an invalid index for the next run to drop.
+.El

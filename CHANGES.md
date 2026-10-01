@@ -3,7 +3,8 @@
 ## 0.1.3
 
 Two gaps reported from pgshard while writing specifications for an audit
-application, and one wrong lock found fixing them. No ledger schema change.
+application, one wrong lock found fixing them, and two more modules in the one
+package: pg_cron and pgvector. No ledger schema change.
 
 ### An object is documented by the intent that creates it
 
@@ -55,6 +56,61 @@ stated in the plan:
   partition. One that already is, is satisfied.
 
 `attach_partition` keeps its meaning, for a table that already exists.
+
+### Storage parameters on an index
+
+`create_index` takes `with`: the index's storage parameters, emitted as
+`WITH (...)` -- btree `fillfactor`, gin `fastupdate`, brin `pages_per_range`,
+and the ones an extension's method declares, such as HNSW's `m` and
+`ef_construction` and IVFFlat's `lists`. Values are numbers, booleans or short
+words. The parameters are now part of what makes two indexes the same: they are
+read back from `pg_class.reloptions` (with `off` and `false` alike), and an
+index matching in everything but its parameters is built as a second index,
+with a warning naming both, instead of being adopted or renamed. One already
+present under the declared name with other parameters is satisfied, and the plan
+says so.
+
+### pg_cron: scheduled jobs as intents
+
+`pg_cron_schedule` and `pg_cron_unschedule`, in a module of their own. A job is
+named, never numbered, and identified as pg_cron identifies it, by name and role.
+Both ways a server keeps pg_cron are supported, and the specification does not
+choose: in the application database, a job commits with the rest of the
+specification and its ledger row; in a maintenance database (the default,
+`postgres`), a specification targets a connection to it and names the database
+each job runs in. The example applies one set of signed specifications to both.
+A job scheduled from the wrong database, a `create_extension` of pg_cron
+outside `cron.database_name`, a job for another role by a role that is not a
+superuser, and `schedule_in_database` without its grant are refused before
+anything runs, each quoting the error it pre-empts. A schedule pg_cron cannot
+read is caught by the dry run, which executes the call and rolls it back.
+
+Measured on the way: `cron.database_name` is readable only with the privileges
+of `pg_read_all_settings`, and a role without them gets an error even from
+`current_setting(..., true)`. The module's reading runs on every plan against a
+server that loads pg_cron, so it checks first: an ordinary specification plans
+for any role, and a pg_cron kind from such a role names the grant it needs.
+
+The module reads, where its extension is not installed, what it needs to say
+where it is: a module's `observe.h` now declares an absent reading too
+(`nullptr` for Citus and pgvector).
+
+### pgvector: the indexes it would refuse, refused first
+
+No kinds of its own: a vector column is a `create_table` type, and an HNSW or
+IVFFlat index is a `create_index` with a method, an operator class and `with`.
+The module refuses what pgvector would: more dimensions than the method
+indexes (2000 for `vector`, 4000 for `halfvec`, 64000 for `bit`), a column with
+none, no operator class where the method has no default, a class for another
+type, `sparsevec` on IVFFlat, UNIQUE or multicolumn, and storage parameters out
+of bounds -- including `m` above half the default `ef_construction`. The
+operator classes are read from the server. Said before an HNSW build starts,
+because a concurrent build cannot be rehearsed and one refused at execution has
+already scanned the table and left an invalid index.
+
+Both modules are tested against real servers in CI (the `extensions` job), and
+every refusal is checked to pre-empt an error the server really raises: the
+refused statement is run by hand too, and must fail with the quoted message.
 
 ### FreeBSD
 

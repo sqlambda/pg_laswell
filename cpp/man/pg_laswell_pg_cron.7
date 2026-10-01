@@ -1,0 +1,234 @@
+.Dd October 1, 2026
+.Dt PG_LASWELL_PG_CRON 7
+.Os
+.Sh NAME
+.Nm pg_laswell_pg_cron
+.Nd pg_cron support in pg_laswell: scheduled jobs as intents
+.Sh DESCRIPTION
+pg_cron support is a
+.Em build-time module ,
+like Citus support
+.Pq Xr pg_laswell_citus 7 .
+It adds two intent kinds, which schedule and unschedule pg_cron jobs, and one
+refusal for the core
+.Cm create_extension .
+A job is then part of a signed specification and the ledger, like the schema
+its command calls, instead of something run by hand.
+.Pp
+A binary that carries the module says so:
+.Bd -literal -offset indent
+$ pg_laswell_mcp --version
+0.1.3
+modules: citus,pg_cron,pgvector
+.Ed
+.Pp
+.Sy Versions.
+Measured on PostgreSQL 18.6 with pg_cron 1.6.8.
+.Sh WHERE PG_CRON LIVES
+pg_cron is loaded per server, through
+.Va shared_preload_libraries ,
+and installed in
+.Em one
+database per server, the one
+.Va cron.database_name
+names
+.Pq Ql postgres
+unless it is set.
+.Ic CREATE EXTENSION pg_cron
+anywhere else fails:
+.Qq can only create extension in database postgres .
+Jobs are kept in that database's
+.Li cron.job
+and each one runs in whichever database it names.
+.Pp
+Both layouts are supported, and the specification does not choose between
+them: the module reads which one the server uses.
+.Bl -tag -width Ds
+.It pg_cron in the application database
+.Li cron.database_name = app .
+Specifications targeting
+.Li app
+schedule jobs directly, in the same transaction as the rest of the
+specification and its ledger row: a job and the function it calls are applied
+together or not at all.
+.It pg_cron in a maintenance database
+.Li cron.database_name = postgres ,
+the default.
+Jobs can only be scheduled from
+.Li postgres .
+A specification targeting
+.Li app
+that schedules one is refused, and the refusal names
+.Li postgres .
+The jobs go in a specification of their own whose
+.Va target.connection
+is a connection to
+.Li postgres ,
+with
+.Va database
+naming where each job runs, and
+.Va depends_on
+naming the specification that creates what the command calls:
+.Bd -literal -offset indent
+{ "laswell_spec_version": 1,
+  "id": "0042-nightly-purge",
+  "description": "Purge expired sessions every night.",
+  "target": { "connection": "cron" },
+  "depends_on": [ "0041-purge-function" ],
+  "intents": [
+    { "kind": "pg_cron_schedule", "name": "purge-sessions",
+      "schedule": "0 3 * * *", "database": "app",
+      "command": "CALL app.purge_expired_sessions()" } ] }
+.Ed
+.Pp
+That specification is applied, and recorded, in
+.Li postgres ,
+which needs its own ledger
+.Pq Xr pg_laswell_mcp 1 , Sx BOOTSTRAP .
+pg_laswell does not reach from one database into another: a specification is
+the unit of atomicity, and there is no transaction across two databases.
+.El
+.Sh INTENT KINDS
+.\" BEGIN PG_CRON KIND LIST -- checked by tools/check-manual.py against
+.\" cpp/src/modules/pg_cron/kinds.inc.
+Both kinds accept an optional
+.Va comment ,
+a note for whoever reads the specification; pg_cron has nowhere to store it.
+A job is identified as pg_cron identifies it, by its name and the role it runs
+as, never by its id, which comes from a sequence and differs on every server.
+.Ss Cm pg_cron_schedule
+Schedules a job, or changes one with the same name and role in place: pg_cron
+replaces it and keeps its id.
+.Bl -tag -width Ds
+.It Va name
+Required.
+pg_cron allows a job without a name, but it cannot be found again, so a second
+run would schedule it twice.
+.It Va schedule
+Required.
+Cron syntax
+.Pq Ql 0 3 * * * ,
+or
+.Ql N seconds
+for N from 1 to 59.
+Checked by pg_cron itself, which the dry run executes:
+.Qq invalid schedule .
+Times are in
+.Va cron.timezone
+.Pq GMT unless set .
+.It Va command
+Required.
+SQL, run as given at the schedule.
+.It Va database
+Where the job runs.
+Default: the database this specification targets.
+.It Va username
+The role the job runs as.
+Default: the role applying the specification.
+Another role needs a superuser:
+.Qq must be superuser to create a job for another role .
+.It Va active
+Default
+.Li true .
+.Li false
+schedules the job without running it.
+.El
+.Pp
+Already scheduled with the same schedule, command, database and
+.Va active :
+satisfied.
+Otherwise one statement: the same transaction class as an ordinary change, no
+table lock, rehearsed by executing it and rolling it back, which leaves nothing
+behind (measured).
+.Pp
+The statement is
+.Fn cron.schedule
+when the job runs in this database, as the applying role, active, and
+.Fn cron.schedule_in_database
+otherwise.
+The first is granted to PUBLIC.
+The second is not:
+.Qq permission denied for function schedule_in_database
+until a superuser runs
+.Bd -literal -offset indent
+GRANT EXECUTE ON FUNCTION
+  cron.schedule_in_database(text,text,text,text,text,boolean) TO runner;
+.Ed
+and the plan says so beforehand.
+The role must also be allowed to connect to the job's database:
+.Qq User runner does not have CONNECT privilege on app .
+.Pp
+The command itself is not checked: pg_cron stores it as text and first runs it
+at its schedule.
+A failure is recorded in
+.Li cron.job_run_details ,
+not in the plan, and the plan warns that this is so.
+.Ss Cm pg_cron_unschedule
+Removes a job, by
+.Va name
+and optional
+.Va username .
+Absent: satisfied, because unscheduling a name that does not exist raises
+.Qq could not find valid entry for job .
+A role that is not a superuser sees only its own jobs
+.Po
+.Li cron.job
+has row-level security on
+.Li username = CURRENT_USER
+.Pc ,
+so another role's job is refused rather than reported missing.
+.\" END PG_CRON KIND LIST
+.Sh READINGS
+.Bl -tag -width Ds
+.It absent
+The library is not loaded:
+.Va cron.database_name
+is not a setting.
+Every pg_cron kind is refused, naming the prerequisite.
+.It Va installed No false
+Loaded; this is not pg_cron's database, or it is and the extension has not been
+created.
+Read with
+.Va database_name ,
+.Va current_database ,
+.Va current_user
+and
+.Va superuser ,
+which is enough to say where to go.
+.It Va installed No true
+Also
+.Va version ,
+.Va can_schedule_in_database ,
+every database with whether the applying role may connect to it, and the jobs
+the applying role can see, keyed by role and name.
+.El
+.Sh REFUSALS
+.Bl -bullet
+.It
+.Cm create_extension
+of
+.Ql pg_cron
+outside the database
+.Va cron.database_name
+names, or on a server that has not loaded it
+.Pq Qq unrecognized configuration parameter \&"cron.database_name\&" .
+.It
+A job scheduled from a database that is not pg_cron's.
+.It
+A job for another role, by a role that is not a superuser.
+.It
+A job in a database that does not exist, or that the applying role may not
+connect to.
+.It
+.Fn cron.schedule_in_database
+without
+.Li EXECUTE
+on it.
+.El
+.Sh SEE ALSO
+.Xr pg_laswell 1 ,
+.Xr pg_laswell_mcp 1 ,
+.Xr pg_laswell_citus 7 ,
+.Xr pg_laswell_pgvector 7
+.Sh AUTHORS
+.An Daniel Cristian Cruz

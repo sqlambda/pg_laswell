@@ -219,7 +219,7 @@ jobs:
       - name: Build
         run: |
           cmake -S cpp -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
-                -DPGLASWELL_MODULES=citus
+                "-DPGLASWELL_MODULES=citus;pg_cron;pgvector"
           # BOTH binaries. The install rules name both, so a tree with only one
           # built either fails packaging or -- worse -- produces a package that
           # installs and has nothing to deploy with, which nobody would discover
@@ -313,7 +313,8 @@ jobs:
           esac
           for want in bin/pg_laswell bin/pg_laswell_mcp \
                       man1/pg_laswell.1 man1/pg_laswell_mcp.1 \
-                      man7/pg_laswell_citus.7 \
+                      man7/pg_laswell_citus.7 man7/pg_laswell_pg_cron.7 \
+                      man7/pg_laswell_pgvector.7 \
                       share/pg_laswell/bootstrap.sql; do
             printf '%s\n' "$LIST" | grep -q "$want" || {
               echo "::error::$want is missing from the package"; exit 1; }
@@ -352,8 +353,8 @@ jobs:
           "$BIN" --version
           # The modules the package promises. A release built without them
           # would install, answer, and refuse every citus_* specification.
-          "$BIN" --version | grep -qx 'modules: citus' || {
-            echo "::error::the installed binary does not carry the citus module"; exit 1; }
+          "$BIN" --version | grep -qx 'modules: citus,pg_cron,pgvector' || {
+            echo "::error::the installed binary does not carry every module"; exit 1; }
           OUT=$("$BIN" --call getSpecDigest --args "$SPEC")
           printf '%s\n' "$OUT" | grep -q '"digest"' || {
             echo "::error::the installed binary did not answer: $OUT"; exit 1; }

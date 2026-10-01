@@ -1,0 +1,14 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0030-nightly-purge",
+  "description": "Purge expired documents every night at 03:00 GMT.",
+  "rationale": "The job runs in docs, where the table is; it is scheduled from wherever pg_cron keeps its jobs. It depends on the table existing and on pg_cron being there.",
+  "target": { "connection": "cron" },
+  "depends_on": ["0010-documents", "0020-pg-cron"],
+  "intents": [
+    { "kind": "pg_cron_schedule", "name": "purge-expired-documents",
+      "schedule": "0 3 * * *", "database": "docs",
+      "command": "DELETE FROM public.documents WHERE expires_at < now()",
+      "comment": "Expired documents are not searched, so they need not be kept." }
+  ]
+}

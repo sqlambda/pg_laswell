@@ -1,6 +1,6 @@
 <!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>create_index — pg_laswell</title>
+<title>pg_cron_unschedule — pg_laswell</title>
 <style>
 :root{--fg:#333;--bg:#fff;--muted:#666;--rule:#ddd;--link:#0066a4;
       --code-bg:#f7f7f7;--code-rule:#e0e0e0;--req:#a33;--accent:#0e6ba8;
@@ -70,60 +70,26 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
  --dd:#c2c2c2;--req-bg:#3a2526;--req-rule:#573537;--opt-bg:#1d2a33;
  --opt-rule:#2b3f4d;--note-bg:#1a2126;--warn-bg:#2a2119}
 </style></head><body><div class="wrap">
-<nav class="crumb"><div class="l"><a href="index.html">Intent kinds</a><span>Indexes</span></div><div class="r"><a href="backfill.html">← backfill</a><a href="drop_index.html">drop_index →</a></div></nav>
-<h1><code>create_index</code></h1>
+<nav class="crumb"><div class="l"><a href="index.html">Intent kinds</a><span>Module: pg_cron</span></div><div class="r"><a href="pg_cron_schedule.html">← pg_cron_schedule</a></div></nav>
+<h1><code>pg_cron_unschedule</code></h1>
+<p class="purpose"><strong>A pg_cron module kind.</strong> Known only to a binary built with <code>-DPGLASWELL_MODULES=pg_cron</code> -- <code>--version</code> then prints <code>modules: pg_cron</code>. A PostgreSQL-only build refuses it as an unknown kind, and with it the whole specification. See <code>pg_laswell_pg_cron(7)</code>.</p>
 <h2>Synopsis</h2><pre>{
-  &quot;kind&quot;: &quot;create_index&quot;,
-  &quot;schema&quot;: &lt;required&gt;,
-  &quot;table&quot;: &lt;required&gt;,
-  &quot;name&quot;: &lt;required&gt;,
-  &quot;comment&quot;: &lt;required&gt;,
-  &quot;columns&quot;: &lt;optional&gt;,
-  &quot;include&quot;: &lt;optional&gt;,
-  &quot;unique&quot;: &lt;optional&gt;,
-  &quot;method&quot;: &lt;optional&gt;,
-  &quot;where&quot;: &lt;optional&gt;,
-  &quot;with&quot;: &lt;optional&gt;,
-  &quot;on_equivalent_index&quot;: &quot;rename&quot; | &quot;adopt&quot; | &quot;refuse&quot;
+  &quot;kind&quot;: &quot;pg_cron_unschedule&quot;,
+  &quot;name&quot;: &lt;optional&gt;,
+  &quot;username&quot;: &lt;optional&gt;,
+  &quot;comment&quot;: &lt;optional&gt;
 }</pre>
 <h2>Parameters</h2><dl class="params">
-<dt>schema<span class="tag req">required</span></dt>
+<dt>name<span class="tag opt">optional</span></dt>
 <dd>&nbsp;</dd>
-<dt>table<span class="tag req">required</span></dt>
+<dt>username<span class="tag opt">optional</span></dt>
 <dd>&nbsp;</dd>
-<dt>name<span class="tag req">required</span></dt>
+<dt>comment<span class="tag opt">optional</span></dt>
 <dd>&nbsp;</dd>
-<dt>comment<span class="tag req">required</span></dt>
-<dd>&nbsp;</dd>
-<dt>columns<span class="tag opt">optional</span></dt>
-<dd>A string is the column name. An object takes &quot;name&quot; or &quot;expression&quot;, plus any of &quot;direction&quot;, &quot;nulls&quot; and &quot;opclass&quot;.</dd>
-<dt>include<span class="tag opt">optional</span></dt>
-<dd>&nbsp;</dd>
-<dt>unique<span class="tag opt">optional</span></dt>
-<dd>&nbsp;</dd>
-<dt>method<span class="tag opt">optional</span></dt>
-<dd>&nbsp;</dd>
-<dt>where<span class="tag opt">optional</span></dt>
-<dd>&nbsp;</dd>
-<dt>with<span class="tag opt">optional</span></dt>
-<dd>Each key is a storage parameter of the index&#x27;s method and each value a number, a boolean or a short word: {&quot;fillfactor&quot;: 70}, {&quot;m&quot;: 16, &quot;ef_construction&quot;: 64}.</dd>
-<dt>on_equivalent_index<span class="tag opt">optional</span></dt>
-<dd>One of <code>rename</code>, <code>adopt</code>, <code>refuse</code>. rename (the default) renames the existing index to the declared name; adopt accepts it where it is and changes nothing; refuse treats it as a conflict.</dd>
 </dl>
 <div class="note">Any key not listed here is <strong>refused</strong>, not ignored: a key this binary skips and a newer one honours would be a silent difference between what was reviewed and what ran.</div>
 <h2>Examples</h2>
-<p>From the conformance suite, which plans this intent and <em>applies</em> it to a real PostgreSQL on every test run:</p>
-<pre>{
- &quot;kind&quot;: &quot;create_index&quot;,
- &quot;schema&quot;: &quot;cf&quot;,
- &quot;table&quot;: &quot;t&quot;,
- &quot;name&quot;: &quot;t_amount_idx&quot;,
- &quot;columns&quot;: [
-  &quot;amount&quot;
- ],
- &quot;comment&quot;: &quot;Lookup.&quot;
-}</pre>
-<p>Afterwards, <code>SELECT indisvalid::text FROM pg_index WHERE indexrelid=&#x27;cf.t_amount_idx&#x27;::regclass</code> returns <code>true</code>.</p>
-<h2>See also</h2><p><a href="drop_index.html"><code>drop_index</code></a></p>
+<div class="note warn">No single-database example: needs pg_cron in shared_preload_libraries and a job to remove. This kind is covered by <code>cpp/test/pg_cron-tests.sh</code>, which runs against a real cluster.</div>
+<h2>See also</h2><p><a href="pg_cron_schedule.html"><code>pg_cron_schedule</code></a></p>
 <footer>Generated from <code>cpp/src/spec.h</code> and <code>cpp/src/conformance.inc</code> by <code>tools/gen-manual.py</code>. The manual page <code>pg_laswell_mcp(1)</code> remains the authoritative reference for everything that is not a per-kind option.</footer>
 </div></body></html>

@@ -849,6 +849,40 @@ or
 A constraint-backed index is never renamed, because renaming it renames the
 constraint too.
 .Pp
+.Va with
+sets the index's storage parameters, emitted as
+.Ic WITH ( ... )
+between
+.Va include
+and
+.Va where :
+.Bd -literal -offset indent
+"with": {"fillfactor": 70}
+"with": {"m": 16, "ef_construction": 64}
+.Ed
+.Pp
+Each value is a number, a boolean, or a short word of letters, digits,
+.Ql _
+and
+.Ql \&. ;
+which names a method accepts is the method's to say, and PostgreSQL refuses an
+unknown one
+.Pq Qq unrecognized parameter .
+The parameters are part of what makes two indexes the same: they are read back
+from
+.Va pg_class.reloptions ,
+with
+.Ql off
+and
+.Ql false
+treated alike, and an index matching in everything but its parameters is
+built as a second index, with a warning naming both, rather than adopted.
+An index already present under the declared name with other parameters is
+satisfied, and the plan warns: changing them is a rebuild, which a later
+specification asks for by dropping and creating it.
+.Xr pg_laswell_pgvector 7
+checks the parameters of an HNSW or IVFFlat index against pgvector's bounds.
+.Pp
 .Cm drop_index
 decides on contention rather than size: a drop is fast whatever else is true,
 and what costs is acquiring the lock.
@@ -1665,12 +1699,15 @@ none of its assumptions.
 .Pp
 Modules are chosen when the binary is configured:
 .Bd -literal -offset indent
-cmake -S cpp -B build -DPGLASWELL_MODULES=citus
+cmake -S cpp -B build -DPGLASWELL_MODULES="citus;pg_cron;pgvector"
 .Ed
 .Pp
 The released package is built with every module, so
-.Xr pg_laswell_citus 7
-is installed beside this page.
+.Xr pg_laswell_citus 7 ,
+.Xr pg_laswell_pg_cron 7
+and
+.Xr pg_laswell_pgvector 7
+are installed beside this page.
 A module's kinds are refused where its extension is absent, and a server without
 the extension plans exactly as a build without the module would.
 .Pp
@@ -1679,8 +1716,8 @@ names the set a binary was built with, and says nothing when it was built with
 none:
 .Bd -literal -offset indent
 $ pg_laswell_mcp --version
-0.1.2
-modules: citus
+0.1.3
+modules: citus,pg_cron,pgvector
 .Ed
 .Pp
 This matters because two binaries with the same version string accept different
@@ -1742,6 +1779,14 @@ kind name.
 Citus: distributed tables, reference tables and distributed functions, plus
 refusals for a distributed topology.
 .Xr pg_laswell_citus 7
+.It Cm pg_cron
+pg_cron: scheduled jobs as intents, in the application database or in the one
+pg_cron keeps its jobs in.
+.Xr pg_laswell_pg_cron 7
+.It Cm pgvector
+pgvector: no kinds of its own; refusals for the HNSW and IVFFlat indexes
+pgvector would reject, said before a concurrent build starts.
+.Xr pg_laswell_pgvector 7
 .El
 .Sh PREREQUISITES
 Some migrations need something done that this program cannot do, often on a
@@ -2177,7 +2222,9 @@ pg_laswell_mcp --call planMigration --args @spec-args.json \e
 .Xr pg_laswell 1 ,
 .Xr pg_licht_mcp 1 ,
 .Xr psql 1 ,
-.Xr pg_laswell_citus 7
+.Xr pg_laswell_citus 7 ,
+.Xr pg_laswell_pg_cron 7 ,
+.Xr pg_laswell_pgvector 7
 .Sh STANDARDS
 Model Context Protocol, revisions 2024-11-05 through 2025-11-25, over stdio
 using JSON-RPC 2.0.

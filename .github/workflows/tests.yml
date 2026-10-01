@@ -67,7 +67,7 @@ jobs:
           - config: address-undefined
             compiler: g++
             sanitizer: ADDRESS_UNDEFINED
-            modules: citus
+            modules: citus;pg_cron;pgvector
             tools: false
           # THREAD is a gate for this project rather than belt-and-braces: a
           # worker thread per job plus one process-wide observer against a
@@ -75,7 +75,7 @@ jobs:
           - config: thread
             compiler: g++
             sanitizer: THREAD
-            modules: citus
+            modules: citus;pg_cron;pgvector
             tools: false
 
     steps:
@@ -678,12 +678,12 @@ jobs:
           version: ${{ env.PQXX_VERSION }}
           sha256: ${{ env.PQXX_SHA256 }}
       - name: Configure with the citus module
-        run: cmake -S cpp -B build -G Ninja -DPGLASWELL_MODULES=citus
+        run: cmake -S cpp -B build -G Ninja "-DPGLASWELL_MODULES=citus;pg_cron;pgvector"
       - name: Build everything
         run: cmake --build build
       - name: The binary says which modules it carries
         run: |
-          ./build/pg_laswell_mcp --version | tee /dev/stderr | grep -q '^modules: citus$'
+          ./build/pg_laswell_mcp --version | tee /dev/stderr | grep -q '^modules: citus,pg_cron,pgvector$'
       - name: The suite that needs no database, with the module in it
         run: ./build/pg_laswell_mcp_test
       - name: Manuals, source checks and plan transcripts, with the module in it
@@ -726,6 +726,73 @@ jobs:
         if: always()
         run: docker compose -f examples/docker/citus/compose.yml down -v
 
+  # pg_cron and pgvector, against PostgreSQL with both extensions: two servers,
+  # because pg_cron is kept two ways -- in a maintenance database, jobs for the
+  # application scheduled from there, or in the application database itself --
+  # and the module supports both. The modules' refusals are unit-tested in the
+  # citus job's build already; this proves what only a server can:
+  #
+  #   - every refusal pre-empts an error the server REALLY raises. The refused
+  #     statement is run by hand as well and must fail with the message the
+  #     refusal quotes, so an extension release that lifts a limit fails here;
+  #   - what is not refused is accepted -- the dry run executes it;
+  #   - the example applies one set of signed specifications to both layouts,
+  #     and the reading that runs for every plan does not break a role that
+  #     cannot read cron.database_name (measured: it needs pg_read_all_settings).
+  extensions:
+    name: extensions
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -o DPkg::Lock::Timeout=300
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build libpq-dev nlohmann-json3-dev \
+            libgtest-dev libssl-dev mandoc postgresql-client openssl
+      - name: Build libpqxx from source, not from apt
+        uses: ./.github/actions/libpqxx
+        with:
+          version: ${{ env.PQXX_VERSION }}
+          sha256: ${{ env.PQXX_SHA256 }}
+      - name: Configure with every module
+        run: cmake -S cpp -B build -G Ninja "-DPGLASWELL_MODULES=citus;pg_cron;pgvector"
+      - name: Build the binaries
+        run: cmake --build build --target pg_laswell pg_laswell_mcp
+      - name: Start PostgreSQL with pg_cron and pgvector
+        run: |
+          docker compose -f examples/docker/extensions/compose.yml up -d --build
+          for i in $(seq 1 90); do
+            ok=0
+            for c in laswell_cron_central laswell_cron_local; do
+              docker exec "$c" pg_isready -U postgres -d app -q 2>/dev/null && ok=$((ok+1))
+            done
+            [ "$ok" = 2 ] && break
+            sleep 2
+          done
+          [ "$ok" = 2 ] || { echo "::error::the extension servers did not come up"; exit 1; }
+      - name: The extensions example, both layouts
+        env:
+          PG_LASWELL: ${{ github.workspace }}/build/pg_laswell
+          PG_LASWELL_MCP: ${{ github.workspace }}/build/pg_laswell_mcp
+          PGPASSWORD: laswell
+        run: |
+          ./examples/docker/extensions/run.sh | tee example.log
+          grep -q 'repository : 0 pending' example.log \
+            || { echo "::error::the second run had something to do"; exit 1; }
+      - name: The modules against the servers
+        env:
+          EXT_CENTRAL_URL: postgresql://postgres:laswell@127.0.0.1:55450
+          EXT_LOCAL_URL: postgresql://postgres:laswell@127.0.0.1:55451
+        run: |
+          ./cpp/test/extensions-tests.sh build/pg_laswell build/pg_laswell_mcp | tee ext.log
+          grep -q ', 0 failed' ext.log || exit 1
+          ! grep -q '^SKIP' ext.log || { echo "::error::the live tests skipped"; exit 1; }
+      - name: Stop the servers
+        if: always()
+        run: docker compose -f examples/docker/extensions/compose.yml down -v
+
   ci-ok:
     name: ci-ok
     if: always()
@@ -741,6 +808,7 @@ jobs:
       - ledger_upgrade
       - examples
       - citus
+      - extensions
       - packages
     runs-on: ubuntu-latest
     timeout-minutes: 5

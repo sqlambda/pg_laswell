@@ -84,6 +84,62 @@ inline std::string index_column_sql(const IndexColumn& k) {
   return out;
 }
 
+// An index's storage parameters, as `name=value` strings in name order -- the
+// vocabulary pg_class.reloptions reports, so a planned index and a built one
+// compare directly. Booleans are spelled true/false whichever of PostgreSQL's
+// spellings was used (on, yes, 1 ...), because the server stores a reloption
+// exactly as written: measured, WITH (fastupdate = off) reads back as
+// "fastupdate=off", and the same index written with false would otherwise look
+// different.
+inline std::string normalize_reloption(std::string opt) {
+  for (auto& c : opt) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  const auto eq = opt.find('=');
+  if (eq == std::string::npos) return opt;
+  const auto value = opt.substr(eq + 1);
+  if (value == "on" || value == "yes" || value == "true") return opt.substr(0, eq + 1) + "true";
+  if (value == "off" || value == "no" || value == "false") return opt.substr(0, eq + 1) + "false";
+  return opt;
+}
+
+inline std::vector<std::string> index_options(const json& body) {
+  std::vector<std::string> out;
+  const auto w = body.value("with", json::object());
+  for (auto it = w.begin(); it != w.end(); ++it) {
+    const auto& v = it.value();
+    std::string text = v.is_string() ? v.get<std::string>()
+                       : v.is_boolean() ? (v.get<bool>() ? "true" : "false")
+                                        : v.dump();
+    out.push_back(normalize_reloption(it.key() + "=" + text));
+  }
+  std::sort(out.begin(), out.end());
+  return out;
+}
+
+inline std::vector<std::string> catalog_index_options(const json& index) {
+  std::vector<std::string> out;
+  for (const auto& o : index.value("options", json::array())) {
+    out.push_back(normalize_reloption(o.get<std::string>()));
+  }
+  std::sort(out.begin(), out.end());
+  return out;
+}
+
+// " WITH (name = value, ...)", or nothing. Words are passed as literals, which
+// every reloption accepts; numbers and booleans as themselves.
+inline std::string index_with_sql(const json& body) {
+  const auto w = body.value("with", json::object());
+  if (w.empty()) return "";
+  std::vector<std::string> parts;
+  for (auto it = w.begin(); it != w.end(); ++it) {
+    const auto& v = it.value();
+    const std::string value = v.is_string() ? detail::quote_literal(v.get<std::string>())
+                              : v.is_boolean() ? (v.get<bool>() ? "true" : "false")
+                                               : v.dump();
+    parts.push_back(detail::quote_identifier(it.key()) + " = " + value);
+  }
+  return " WITH (" + detail::join(parts, ", ") + ")";
+}
+
 // How this spec's key columns sort, in the vocabulary the catalog reports
 // (`column_order`), so the two can be compared directly. PostgreSQL's defaults
 // are ASC NULLS LAST and DESC NULLS FIRST -- stated here rather than left
@@ -395,6 +451,7 @@ inline void project(const Intent& in, const Step& step, Observations& projected)
                {"column_opclasses", opclasses},
                {"method", in.body.value("method", "btree")},
                {"predicate", in.body.value("where", "")},
+               {"options", index_options(in.body)},
                {"has_expressions", has_expr},
                {"definition", "(planned by step " + std::to_string(step.ordinal) + ")"},
                {"projected_by_step", step.ordinal}};
@@ -690,6 +747,21 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
       step.action = Action::kSatisfied;
       step.why = "index already present and valid";
       step.detail["existing_definition"] = existing.value("definition", "");
+      // Present under the declared name but built with other storage
+      // parameters: satisfied, because the name is the identity -- and said,
+      // because an HNSW index built with the default m is not the one a spec
+      // asking for m = 32 describes. Changing them is a rebuild, which is a
+      // decision for the author, not something to do on a re-run.
+      if (in.body.contains("with") && existing.contains("options") &&
+          catalog_index_options(existing) != index_options(in.body)) {
+        plan.warnings.push_back(
+            "the index " + name + " on " + qualified + " exists with storage "
+            "parameters [" + detail::join(catalog_index_options(existing), ", ") +
+            "], not the [" + detail::join(index_options(in.body), ", ") +
+            "] this specification asks for. It is left as it is: changing them "
+            "means rebuilding it, so drop it and create it again in a later "
+            "specification if they matter.");
+      }
       return;
     }
   }
@@ -852,8 +924,27 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
         continue;
       }
 
+      // Storage parameters are part of what was asked for: an HNSW index with
+      // m = 16 and one with m = 32 answer the same queries at different recall
+      // and size, so adopting or renaming one as the other would report the
+      // spec satisfied with the wrong index. The catalog always reports
+      // `options`; a reading without it (a hand-written one) means none.
+      const bool same_options = catalog_index_options(ex) == index_options(in.body);
+      if (comparable && same_columns && same_include && same_opclasses &&
+          same_order && ex.value("is_unique", false) == unique && !same_options &&
+          ex_pred == want_pred) {
+        plan.warnings.push_back(
+            "\"" + name + "\" has the same columns, method and predicate as the "
+            "existing index \"" + it.key() + "\" on " + qualified +
+            ", but different storage parameters ([" +
+            detail::join(catalog_index_options(ex), ", ") + "] there, [" +
+            detail::join(index_options(in.body), ", ") +
+            "] here), so it is built as a second index. Drop the other one "
+            "afterwards if this replaces it.");
+        continue;
+      }
       const bool same_shape = comparable && same_columns && same_include &&
-                              same_opclasses && same_order &&
+                              same_opclasses && same_order && same_options &&
                               ex.value("is_unique", false) == unique;
 
       // Same columns, predicates that did not normalise to the same string.
@@ -1000,8 +1091,9 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
     }
     include_sql = " INCLUDE (" + detail::join(quoted_include, ", ") + ")";
   }
+  // WITH sits after INCLUDE and before WHERE, which is the grammar's order.
   const std::string tail = " ON " + sql_rel + " USING " + method + " (" +
-                           columns_sql + ")" + include_sql +
+                           columns_sql + ")" + include_sql + index_with_sql(in.body) +
                            (where.empty() ? "" : " WHERE " + where) + ";";
 
   // The rule that replaces a hardcoded size ceiling (S12). A plain build takes
@@ -1094,6 +1186,7 @@ inline void plan_partitioned_index(const Intent& in, const json& t, Plan& plan,
   for (const auto& c : columns) quoted_columns.push_back(detail::quote_identifier(c));
   const std::string cols = detail::join(quoted_columns, ", ");
   const std::string tail = " USING " + method + " (" + cols + ")" +
+                           index_with_sql(in.body) +
                            (where.empty() ? "" : " WHERE " + where);
 
   const auto partitions = t.value("partitions", json::array());

@@ -75,7 +75,7 @@ cmake --build cpp/build -j
 ctest --test-dir cpp/build --output-on-failure
 ```
 
-`ctest` registers, with the Citus module built in:
+`ctest` registers, with the modules built in:
 
 | Entry | What it runs |
 |---|---|
@@ -87,9 +87,10 @@ ctest --test-dir cpp/build --output-on-failure
 | `plans` | the plan renderer against committed transcripts |
 | `replication` | the replication suite; it needs a second cluster and skips without one |
 | `call_mode` | the binaries' `--call` mode |
-| `citus_tests` | the live Citus suite, only in a build with the module; it skips without `CITUS_URL` |
+| `citus_tests` | the live Citus suite, only in a build with modules; it skips without `CITUS_URL` |
+| `extensions_tests` | the live pg_cron and pgvector suite, only in a build with modules; it skips without `EXT_CENTRAL_URL` and `EXT_LOCAL_URL` |
 
-A build without the module registers the same list minus `citus_tests`.
+A build without modules registers the same list minus those two.
 
 ### Tests and the database
 
@@ -112,11 +113,11 @@ A skip nobody notices is a test that silently stopped running, so CI sets
 A vendor module is compiled in, never loaded at runtime:
 
 ```bash
-cmake -S cpp -B cpp/build -DPGLASWELL_MODULES=citus
+cmake -S cpp -B cpp/build -DPGLASWELL_MODULES="citus;pg_cron;pgvector"
 ```
 
 The released package is built this way, and `pg_laswell --version` prints
-`modules: citus`. Without the option the binary is PostgreSQL-only, and CI builds
+`modules: citus,pg_cron,pgvector`. Without the option the binary is PostgreSQL-only, and CI builds
 both: the plain builds prove core needs no module, the module builds prove the
 module. A module's kinds are refused by a binary without it, as a whole
 specification, never skipped.
@@ -128,6 +129,18 @@ docker compose -f examples/docker/citus/compose.yml up -d
 ./examples/docker/citus/run.sh                   # the example, and a database the suite uses
 CITUS_URL=postgresql://postgres:laswell@127.0.0.1:55440/citus_example \
   ctest --test-dir cpp/build -R citus_tests --output-on-failure
+```
+
+The pg_cron and pgvector suite needs PostgreSQL with both extensions, twice --
+pg_cron kept in `postgres` on one server and in the application database on the
+other, the two layouts the module supports:
+
+```bash
+docker compose -f examples/docker/extensions/compose.yml up -d --build
+./examples/docker/extensions/run.sh              # the example, both layouts
+EXT_CENTRAL_URL=postgresql://postgres:laswell@127.0.0.1:55450 \
+EXT_LOCAL_URL=postgresql://postgres:laswell@127.0.0.1:55451 \
+  ctest --test-dir cpp/build -R extensions_tests --output-on-failure
 ```
 
 How a module is written is in `cpp/src/modules/README.md`.
@@ -178,7 +191,7 @@ portable suite; see the README there. Do not "clean up" after them with
 
 ```bash
 cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
-      -DPGLASWELL_MODULES=citus
+      -DPGLASWELL_MODULES="citus;pg_cron;pgvector"
 cmake --build cpp/build --target pg_laswell pg_laswell_mcp
 cd cpp/build && cpack -G DEB    # or RPM
 ```

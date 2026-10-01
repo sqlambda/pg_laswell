@@ -115,6 +115,11 @@ SELECT COALESCE(
                    'definition', pg_get_indexdef(i.indexrelid),
                    'method', am.amname,
                    'predicate', COALESCE(pg_get_expr(i.indpred, i.indrelid), ''),
+                   -- Storage parameters as "name=value", exactly as written at
+                   -- creation (pg_class.reloptions). Part of what makes two
+                   -- indexes the same: an HNSW index with m = 16 is not the one
+                   -- a spec asking for m = 32 describes.
+                   'options', COALESCE(TO_JSONB(ic.reloptions), '[]'::jsonb),
                    -- Column names in index order. An expression column has
                    -- attnum 0 and cannot be named, so has_expressions marks the
                    -- index as one this tool must not reason about: comparing a
@@ -652,12 +657,23 @@ class Catalog {
   // A planner that cannot tell "not installed" from "installed and reporting
   // nothing" refuses the wrong things in both directions, which is why this
   // costs a probe query per module rather than a COALESCE.
+  //
+  // absent_sql is what a module reads where its extension is NOT installed, or
+  // nullptr for nothing (the key then stays absent). It exists because an
+  // extension can be loaded on a server without being installed in the
+  // database at hand: pg_cron lives in ONE database per cluster, and in every
+  // other database the module still has to say which one that is -- and its
+  // observation query cannot be used there, because a statement naming
+  // cron.job does not even parse where the cron schema does not exist. A NULL
+  // result leaves the key absent, as for an extension the server lacks.
   void observe_extensions(pqxx::work& txn, Observations& obs) {
-#define PGLASWELL_OBSERVE(module_name, present_sql, observation_sql)         \
+#define PGLASWELL_OBSERVE(module_name, present_sql, observation_sql, absent_sql) \
     do {                                                                      \
       const auto probe = txn.exec(present_sql);                               \
-      if (probe.empty() || !probe[0][0].as<bool>()) break;                    \
-      const auto r = txn.exec(observation_sql);                               \
+      const bool present = !probe.empty() && probe[0][0].as<bool>();          \
+      const char* const sql = present ? (observation_sql) : (absent_sql);     \
+      if (sql == nullptr) break;                                              \
+      const auto r = txn.exec(sql);                                           \
       if (!r.empty() && !r[0][0].is_null()) {                                 \
         obs.extensions[module_name] = json::parse(r[0][0].as<std::string>()); \
       }                                                                       \
