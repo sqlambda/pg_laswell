@@ -687,6 +687,59 @@ A shard-ordered walk measured about 16% better per row than a key-ordered one,
 not the eightfold a first measurement suggested.
 The reason to have it is that on a distributed table the alternative is not a
 slower walk, it is no walk at all.
+.Ss Pacing on a cluster
+The pacing defaults \(em
+.Va batch_rows
+1000,
+.Va commit_interval_ms
+1000,
+.Va batch_cap_rows
+10000,
+.Va max_waiter_wait_ms
+5000
+.Pq Xr pg_laswell_mcp 1 , Sx PACING
+\(em were derived on single-node PostgreSQL.
+.Sy They have not been re-derived for a Citus cluster ,
+and nothing on this page should be read as saying they suit one.
+What is known, and what is not:
+.Bl -bullet
+.It
+Measured: a batch of a grouped walk touches one distribution value, so one
+shard on one worker, and its write plans as
+.Li Task Count: 1 .
+Its commit is that worker's commit, not a two-phase commit across the cluster,
+so the per-batch cost the defaults assume is the right shape \(em executed
+remotely, plus a coordinator-to-worker round trip per statement whose size has
+not been measured.
+.It
+Measured: lock waiters are counted cluster-wide
+.Pq Sx READINGS ,
+and the
+.Va max_waiter_wait_ms
+breaker can fire on a wait that is only on a worker, from the start of the
+waiting query \(em an upper bound on the wait's age, which is the safe direction
+for a breaker.
+.It
+Not measured: a walk over a
+.Em reference
+table.
+Every write to one is a two-phase commit across every node, so each batch
+commit costs as many prepared transactions as there are nodes, and
+.Va commit_interval_ms
+was not chosen with that in mind.
+.It
+Not measured: how the defaults behave as the worker count grows, or under a
+rebalance moving the shards being walked.
+.El
+.Pp
+Until they are, treat the defaults as a starting point on a cluster: set them
+per connection in the configuration, watch
+.Ic jobStatus
+for commits by
+.Cm lock_waiter
+against
+.Cm interval ,
+and adjust.
 .Ss citus.multi_shard_modify_mode
 A write spanning several shards runs under this setting:
 .Cm parallel

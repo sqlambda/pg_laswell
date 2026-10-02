@@ -38,7 +38,7 @@ runs:
     # the install path exactly.
     - name: Cache libpqxx
       id: pqxx
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: ~/pqxx
         key: pqxx-${{ inputs.version }}-${{ runner.os }}-${{ runner.arch }}-libpq-${{ env.LIBPQ_VERSION }}

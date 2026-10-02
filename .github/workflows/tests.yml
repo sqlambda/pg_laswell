@@ -12,6 +12,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# Runners are pinned to ubuntu-24.04, not ubuntu-latest: the label moves to
+# Ubuntu 26 on 2026-10-19, and a test matrix should change image when someone
+# decides to, in a commit that says so -- not in the middle of a release.
 env:
   DEBIAN_FRONTEND: noninteractive
   # Pinned, and built from source by .github/actions/libpqxx rather than taken
@@ -36,7 +39,7 @@ jobs:
   # beyond libpq.
   build:
     name: build-${{ matrix.config }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     strategy:
       fail-fast: false
@@ -79,7 +82,7 @@ jobs:
             tools: false
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install dependencies
         run: |
           sudo apt-get update -o DPkg::Lock::Timeout=300
@@ -113,13 +116,13 @@ jobs:
         if: matrix.tools
         run: ctest --test-dir build -R 'manpage_lint|no_dangling_items|plans' --output-on-failure
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: test-binary-${{ matrix.config }}
           path: build/pg_laswell_mcp_test
           retention-days: 1
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: matrix.tools
         with:
           name: tools-plain
@@ -134,7 +137,7 @@ jobs:
   test:
     name: ${{ matrix.config }} / PostgreSQL ${{ matrix.pg }}
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -164,12 +167,12 @@ jobs:
       # The suite shells out to psql to install the ledger, and reads
       # sql/bootstrap.sql through a path baked in at compile time, so the source
       # tree has to be present even though nothing here is compiled.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install runtime dependencies
         run: |
           sudo apt-get update -o DPkg::Lock::Timeout=300
           sudo apt-get install -y --no-install-recommends libpq5 postgresql-client
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: test-binary-${{ matrix.config }}
           path: build
@@ -186,7 +189,7 @@ jobs:
   sanitizers:
     name: ${{ matrix.config }}
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -202,12 +205,12 @@ jobs:
           --health-timeout 5s --health-retries 10
         ports: ['5432:5432']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install runtime dependencies
         run: |
           sudo apt-get update -o DPkg::Lock::Timeout=300
           sudo apt-get install -y --no-install-recommends libpq5 postgresql-client
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: test-binary-${{ matrix.config }}
           path: build
@@ -226,7 +229,7 @@ jobs:
   # EVP handle lifetimes are the one place with manual C resource management.
   valgrind:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 40
     # Sharded because it ran serially for 12 minutes while every other job had
     # been finished for ten of them, and it is embarrassingly parallel: four
@@ -250,12 +253,12 @@ jobs:
           --health-timeout 5s --health-retries 10
         ports: ['5432:5432']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install runtime dependencies
         run: |
           sudo apt-get update -o DPkg::Lock::Timeout=300
           sudo apt-get install -y --no-install-recommends libpq5 valgrind postgresql-client
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: test-binary-plain-gcc
           path: build
@@ -293,7 +296,7 @@ jobs:
   # code is the whole point of it. Runs once: it does not vary by server major.
   call_mode:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     services:
       postgres:
@@ -305,12 +308,12 @@ jobs:
           --health-timeout 5s --health-retries 10
         ports: ['5432:5432']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install runtime dependencies
         run: |
           sudo apt-get update -o DPkg::Lock::Timeout=300
           sudo apt-get install -y --no-install-recommends libpq5 postgresql-client
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: tools-plain
           path: build
@@ -326,10 +329,10 @@ jobs:
   # service container.
   replication:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install runtime dependencies
         run: |
           sudo apt-get update -o DPkg::Lock::Timeout=300
@@ -344,7 +347,7 @@ jobs:
   # that the refusal HAPPENS -- not that the incompatibility is absent.
   pooled:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     services:
       postgres:
@@ -356,12 +359,12 @@ jobs:
           --health-timeout 5s --health-retries 10
         ports: ['5432:5432']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install runtime dependencies
         run: |
           sudo apt-get update -o DPkg::Lock::Timeout=300
           sudo apt-get install -y --no-install-recommends libpq5 pgbouncer postgresql-client
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: tools-plain
           path: build
@@ -373,10 +376,10 @@ jobs:
   # Independent of the fan-out: a package is built from a Release tree with
   # testing off, which is a different configuration from any of the four above.
   packages:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install dependencies
         run: |
           sudo apt-get update -o DPkg::Lock::Timeout=300
@@ -457,7 +460,7 @@ jobs:
           set +e; pg_laswell >/dev/null 2>&1; rc=$?; set -e
           [ "$rc" -eq 3 ] || {
             echo "::error::pg_laswell with no --repo exited $rc, expected 3"; exit 1; }
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: packages
           path: |
@@ -493,7 +496,7 @@ jobs:
   twin_clusters:
     name: twin clusters
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     services:
       postgres:
@@ -514,12 +517,12 @@ jobs:
           --health-timeout 5s --health-retries 10
         ports: ['5433:5432']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install runtime dependencies
         run: |
           sudo apt-get update -o DPkg::Lock::Timeout=300
           sudo apt-get install -y --no-install-recommends libpq5 postgresql-client
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: test-binary-plain-gcc
           path: build
@@ -544,7 +547,7 @@ jobs:
   # fetch-depth: 0 because the script reads that script out of git.
   ledger_upgrade:
     name: ledger upgrade
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     services:
       postgres:
@@ -556,7 +559,7 @@ jobs:
           --health-timeout 5s --health-retries 10
         ports: ['5432:5432']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Install runtime dependencies
@@ -590,10 +593,10 @@ jobs:
   examples:
     name: examples
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install runtime dependencies
         run: |
           sudo apt-get update -o DPkg::Lock::Timeout=300
@@ -603,7 +606,7 @@ jobs:
       # pg_laswell, and that split is the thing the tool exists to keep. The
       # test artifact carries pg_laswell_mcp_test and neither of them, which is
       # how this job first failed on `chmod: cannot access build/pg_laswell`.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: tools-plain
           path: build
@@ -662,10 +665,10 @@ jobs:
   #     reporting every function "already distributed" while routing nothing.
   citus:
     name: citus
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install dependencies
         run: |
           sudo apt-get update -o DPkg::Lock::Timeout=300
@@ -741,10 +744,10 @@ jobs:
   #     cannot read cron.database_name (measured: it needs pg_read_all_settings).
   extensions:
     name: extensions
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install dependencies
         run: |
           sudo apt-get update -o DPkg::Lock::Timeout=300
@@ -797,6 +800,50 @@ jobs:
         if: always()
         run: docker compose -f examples/docker/extensions/compose.yml down -v
 
+  # macOS, built with every module and the suite that needs no database.
+  #
+  # The first macOS compile in this project's life happened on a release tag,
+  # and failed: libc++ deprecates char_traits<T> for non-character T, so a
+  # bytea read as std::basic_string<std::byte> stopped -Werror at the first
+  # instantiation (fixed with pqxx::bytes). Nothing in this workflow would have
+  # caught it, because every job here is Linux and libstdc++. This one is, and
+  # it builds what release.yml's macOS target builds -- Apple clang, libc++,
+  # Homebrew's libpq and OpenSSL 3 -- before a tag is pushed rather than after.
+  # No database: the database jobs above already cover the server side.
+  macos:
+    name: macos
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      # The same dependencies, and for the same reasons, as release.yml's macOS
+      # step: Apple ships LibreSSL headers, which are not a drop-in for
+      # Ed25519 EVP_DigestVerify, so OpenSSL 3 is named explicitly.
+      - name: Install dependencies
+        run: |
+          brew install cmake ninja libpq nlohmann-json pkg-config openssl@3 googletest mandoc
+          echo "PKG_CONFIG_PATH=$(brew --prefix libpq)/lib/pkgconfig:/usr/local/lib/pkgconfig" >> $GITHUB_ENV
+          echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> $GITHUB_ENV
+      - name: Build libpqxx from source
+        run: |
+          sh .github/scripts/build-libpqxx.sh \
+            "${PQXX_VERSION}" "${PQXX_SHA256}" "" \
+            -DCMAKE_PREFIX_PATH="$(brew --prefix libpq)"
+      - name: Configure with every module
+        run: |
+          cmake -S cpp -B build -G Ninja \
+            "-DPGLASWELL_MODULES=citus;pg_cron;pgvector" \
+            -DCMAKE_PREFIX_PATH="$(brew --prefix libpq);$(brew --prefix googletest)"
+      - name: Build everything
+        run: cmake --build build
+      - name: The binary says which modules it carries
+        run: |
+          ./build/pg_laswell_mcp --version | tee /dev/stderr | grep -q '^modules: citus,pg_cron,pgvector$'
+      - name: The suite that needs no database
+        run: ./build/pg_laswell_mcp_test
+      - name: Manuals and source checks
+        run: ctest --test-dir build -R 'manpage_lint|manpage_kinds|no_dangling_items|plans' --output-on-failure
+
   ci-ok:
     name: ci-ok
     if: always()
@@ -813,8 +860,9 @@ jobs:
       - examples
       - citus
       - extensions
+      - macos
       - packages
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Every job must have succeeded

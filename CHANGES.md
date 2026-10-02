@@ -153,6 +153,50 @@ Both modules are tested against real servers in CI (the `extensions` job), and
 every refusal is checked to pre-empt an error the server really raises: the
 refused statement is run by hand too, and must fail with the quoted message.
 
+### A role the bootstrap did not name gets an answer, not an error
+
+On PostgreSQL 18 every name-based probe of the ledger -- `to_regclass('laswell.x')`,
+`has_table_privilege('laswell.x', ...)` -- RAISES "permission denied for schema
+laswell" for a role without USAGE on the schema rather than answering. Measured
+while testing pg_cron, and it was in core too: the ledger status, the repository
+listing and `checkPrivileges` -- the tool whose job is exactly that answer --
+all failed with the error instead of explaining it. They now look the ledger up
+through `pg_class` by OID. The ledger status says "installed, but this role has
+no USAGE on the laswell schema" and names the bootstrap option that grants it;
+`checkPrivileges` reports `schemaUsable` and a `denied` note. Tested on
+PostgreSQL 15 to 18 with such a role.
+
+### The partition test counts the scan instead of timing it
+
+The test proving that a validated CHECK lets `ATTACH PARTITION` skip its scan
+asserted the attach was at least 3x faster. It failed on CI at 6.0 ms against
+15.9 ms -- a fixed round-trip cost on both sides squeezes the ratio on a fast
+runner while the scan stays exactly as skipped -- and it had to be skipped under
+the sanitizers, taking the test's catalog checks with it. It now reads the
+transaction's own statistics before and after the ATTACH: no scan with the
+CHECK, one scan of 400 000 rows without. Deterministic, and it runs everywhere.
+
+### CI
+
+- The actions move to their Node 24 releases (checkout v7, upload-artifact v7,
+  download-artifact v8, cache v6, upload-pages-artifact v5, deploy-pages v5).
+  download-artifact v8 fails on a digest mismatch, which is the behaviour a
+  release wants.
+- Runners are pinned to `ubuntu-24.04` instead of `ubuntu-latest`, which moves
+  to Ubuntu 26 on 2026-10-19: an image change should be a commit, not a
+  surprise mid-release.
+- A `macos` job builds with every module on Apple clang and libc++ and runs the
+  suite that needs no database. The first macOS compile used to happen on a
+  release tag, which is how a libc++-only error was first found.
+
+### Pacing on a Citus cluster, stated
+
+`pg_laswell_citus(7)` now says plainly that the pacing defaults were derived on
+single-node PostgreSQL and have not been re-derived for a cluster, what is
+measured (a grouped-walk batch is a single-shard commit; worker waits reach the
+breaker) and what is not (walks over reference tables, where each commit is a
+two-phase commit across every node; larger worker counts).
+
 ### FreeBSD
 
 pg_laswell builds and passes its suite on FreeBSD 14.5 and 15.1 (511 of 513

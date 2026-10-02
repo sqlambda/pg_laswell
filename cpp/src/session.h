@@ -24,6 +24,28 @@
 
 namespace pglaswell {
 
+// The OID of a relation in the laswell schema, or NULL -- as a SQL scalar
+// subquery, looked up through the catalogs rather than by name.
+//
+// Every name-based form RAISES for a role without USAGE on the schema rather
+// than answering. Measured on PostgreSQL 18.6, as such a role:
+// to_regclass('laswell.job') and has_table_privilege('laswell.job', ...) both
+// fail "permission denied for schema laswell". So "is the ledger here, and may
+// I read it" has to be asked by OID, or a role the bootstrap did not name gets
+// an error where it should get an answer -- and checkPrivileges, whose whole
+// job is that answer, failed with it.
+inline std::string laswell_relation_oid_sql(const std::string& relname) {
+  return "(SELECT c.oid FROM pg_catalog.pg_class c"
+         " JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace"
+         " WHERE n.nspname = 'laswell' AND c.relname = '" + relname + "')";
+}
+
+// Whether the current role has USAGE on the laswell schema, false when there
+// is no such schema. By OID, for the reason above.
+inline const char* kLaswellSchemaUsableSql =
+    "COALESCE((SELECT has_schema_privilege(oid, 'USAGE')"
+    "            FROM pg_catalog.pg_namespace WHERE nspname = 'laswell'), false)";
+
 // A keyed pool of IDLE connections, with a reaper.
 //
 // The map holds only idle connections: take() erases the entry and transfers

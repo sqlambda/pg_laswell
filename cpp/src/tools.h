@@ -106,7 +106,18 @@ inline json spec_error_payload(const SpecError& e) {
 // backends' identities still sees their ungranted locks, so pacing works while
 // the reported waiter is anonymous. That is `degraded`, not `denied`, and
 // saying so is the whole point of the tool.
-inline const char* kCheckPrivilegesSql = R"SQL(
+// The ledger part is asked by OID (session.h): by name, every one of these
+// raised "permission denied for schema laswell" for a role without USAGE on the
+// schema -- so the tool meant to say "this role cannot use the ledger" failed
+// instead of saying it. A table privilege without the schema's USAGE is not
+// one the role can use, so both are required for true -- except for
+// canWriteTrustedKey, which reports the table privilege alone: it feeds the
+// "can grant itself trust" warning, and one GRANT USAGE would complete it.
+inline std::string check_privileges_sql() {
+  const auto tk = laswell_relation_oid_sql("trusted_key");
+  const auto job = laswell_relation_oid_sql("job");
+  const std::string usage = kLaswellSchemaUsableSql;
+  return R"SQL(
 SELECT JSONB_BUILD_OBJECT(
   'role', current_user,
   'isSuperuser', (SELECT usesuper FROM pg_user WHERE usename = current_user),
@@ -114,21 +125,23 @@ SELECT JSONB_BUILD_OBJECT(
      'pg_monitor',        pg_has_role(current_user, 'pg_monitor', 'MEMBER'),
      'pg_read_all_stats', pg_has_role(current_user, 'pg_read_all_stats', 'MEMBER')),
   'ledger', JSONB_BUILD_OBJECT(
-     'schemaPresent', to_regclass('laswell.trusted_key') IS NOT NULL,
-     'canReadTrustedKey', CASE WHEN to_regclass('laswell.trusted_key') IS NULL
-        THEN NULL ELSE has_table_privilege('laswell.trusted_key', 'SELECT') END,
-     'canWriteTrustedKey', CASE WHEN to_regclass('laswell.trusted_key') IS NULL
-        THEN NULL ELSE has_table_privilege('laswell.trusted_key', 'INSERT') END,
-     'canWriteJob', CASE WHEN to_regclass('laswell.job') IS NULL
-        THEN NULL ELSE has_table_privilege('laswell.job', 'INSERT') END),
+     'schemaPresent', )SQL" + tk + R"SQL( IS NOT NULL,
+     'schemaUsable', )SQL" + usage + R"SQL(,
+     'canReadTrustedKey', CASE WHEN )SQL" + tk + R"SQL( IS NULL THEN NULL
+        ELSE )SQL" + usage + R"SQL( AND has_table_privilege()SQL" + tk + R"SQL(, 'SELECT') END,
+     'canWriteTrustedKey', CASE WHEN )SQL" + tk + R"SQL( IS NULL THEN NULL
+        ELSE has_table_privilege()SQL" + tk + R"SQL(, 'INSERT') END,
+     'canWriteJob', CASE WHEN )SQL" + job + R"SQL( IS NULL THEN NULL
+        ELSE )SQL" + usage + R"SQL( AND has_table_privilege()SQL" + job + R"SQL(, 'INSERT') END),
   'isStandby', pg_is_in_recovery()
 )
 )SQL";
+}
 
 inline json check_privileges(ToolContext& ctx, const json& args) {
   const auto& cfg = ctx.connection(args);
   ReadSession s(cfg, std::nullopt, ctx.cache, 2000);
-  const auto r = s.txn().exec(kCheckPrivilegesSql);
+  const auto r = s.txn().exec(check_privileges_sql());
   json out = json::parse(r[0][0].as<std::string>());
   out["serverVersion"] = s.server_version();
 
@@ -141,6 +154,15 @@ inline json check_privileges(ToolContext& ctx, const json& args) {
         "counted -- pg_locks and pg_blocking_pids() are visible to any role -- "
         "so pacing works, but a waiter will be reported anonymously. Do not "
         "read that as 'nobody is waiting'.");
+  }
+  if (out["ledger"].value("schemaPresent", false) &&
+      !out["ledger"].value("schemaUsable", false)) {
+    notes.push_back(
+        "denied: the ledger is installed, but this role has no USAGE on the "
+        "laswell schema, so it can neither read what was applied nor record a "
+        "migration. bootstrap.sql grants the ledger to the role named in "
+        "laswell_role; re-run it with -v laswell_role=" +
+        out.value("role", std::string("<this role>")) + ", or apply as that role.");
   }
   if (out["ledger"].value("schemaPresent", false) &&
       out["ledger"].value("canWriteTrustedKey", false)) {

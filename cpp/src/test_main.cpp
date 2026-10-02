@@ -2572,6 +2572,53 @@ TEST_F(BootstrappedTest, StatusReportsAUsableLedgerAndItsTrustedKeys) {
   EXPECT_EQ(st.trusted_key_ids[0], test_key().key_id);
 }
 
+// A role the bootstrap did not name: the ledger is there, and this role has no
+// USAGE on its schema. Found 2026-10-01 while testing pg_cron: on PostgreSQL 18
+// every NAME-based probe -- to_regclass('laswell.x'), has_table_privilege(
+// 'laswell.x', ...) -- RAISES "permission denied for schema laswell" for such a
+// role rather than answering. So status() threw where it should have said what
+// was wrong, the repository listing threw, and checkPrivileges -- the tool
+// whose job is exactly this answer -- failed with the error it exists to explain.
+TEST_F(BootstrappedTest, ARoleWithoutUsageOnTheLedgerGetsAnAnswerNotAnError) {
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/no-usage-role");
+    w.txn().exec("DROP ROLE IF EXISTS laswell_no_usage");
+    w.txn().exec("CREATE ROLE laswell_no_usage LOGIN PASSWORD 'laswell_no_usage'");
+    w.commit();
+  }
+  pglaswell::ConnConfig as_role = cfg();
+  as_role.conninfo =
+      pglaswell::detail::is_conninfo_uri(url_)
+          ? url_ + (url_.find('?') == std::string::npos ? "?" : "&") +
+                "user=laswell_no_usage&password=laswell_no_usage"
+          : url_ + " user=laswell_no_usage password=laswell_no_usage";
+
+  {
+    pglaswell::Ledger ledger(as_role);
+    const auto st = ledger.status();
+    EXPECT_TRUE(st.installed);
+    EXPECT_FALSE(st.usable);
+    EXPECT_NE(st.error.find("no USAGE on the laswell schema"), std::string::npos) << st.error;
+    EXPECT_NE(st.hint.find("laswell_role=laswell_no_usage"), std::string::npos) << st.hint;
+  }
+  {
+    pglaswell::ReadSession r(as_role);
+    const auto out = json::parse(
+        r.txn().exec(pglaswell::check_privileges_sql())[0][0].as<std::string>());
+    const auto& l = out["ledger"];
+    EXPECT_TRUE(l.value("schemaPresent", false)) << out.dump();
+    EXPECT_FALSE(l.value("schemaUsable", true)) << out.dump();
+    EXPECT_FALSE(l.value("canReadTrustedKey", true)) << out.dump();
+    EXPECT_FALSE(l.value("canWriteJob", true)) << out.dump();
+  }
+
+  pglaswell::WriteSession w(cfg());
+  w.begin("pg_laswell/test/no-usage-role-drop");
+  w.txn().exec("DROP ROLE laswell_no_usage");
+  w.commit();
+}
+
 TEST_F(BootstrappedTest, AnAbsentSchemaIsAnAnswerNotAnException) {
   // "You have not bootstrapped" and "your signer is not trusted" are very
   // different things for an operator to read, and collapsing them would be the
@@ -9149,30 +9196,66 @@ TEST_F(DatabaseTest, ThePartitionRecipesRunAndTheCheckReallyRemovesTheScan) {
     w.commit();
   }
 
-  // A loaded CI box can make any single timing meaningless, so this is a
-  // bounded claim: the proven attach must be clearly cheaper, not merely
-  // faster by a hair. If it is not, the recipe is not earning its four steps.
-  if (without_check_best < 5.0) {
-    GTEST_SKIP() << "the unproven attach was too fast to compare ("
-                 << without_check_best << "ms); the machine is faster than the "
-                                          "measurement needs";
-  }
-#ifdef PGLASWELL_SANITIZER_ACTIVE
-  // The CORRECTNESS above still ran and still asserted -- the CHECK was
-  // accepted, the attach succeeded, the catalog agrees. Only the RATIO is
-  // skipped, because an instrumented build measures the sanitizer as much as it
-  // measures PostgreSQL: observed on CI at 31ms against 62ms, a real
-  // improvement that fails a 3x claim. Asserting it anyway would teach people
-  // to ignore the sanitizer jobs, which is a worse outcome than not measuring
-  // speed in a build that was never built to measure speed.
-  GTEST_SKIP() << "timing ratio not asserted under a sanitizer: "
-               << with_check_best << "ms against " << without_check_best
-               << "ms measures the instrumentation as much as the server";
-#endif
-  EXPECT_LT(with_check_best * 3, without_check_best)
-      << "attach with a validated CHECK took " << with_check_best
-      << "ms, without took " << without_check_best
-      << "ms -- the CHECK is supposed to remove the scan entirely";
+  // THE CLAIM, COUNTED RATHER THAN TIMED. The recipe's point is that a
+  // validated CHECK lets ATTACH skip the scan of the partition entirely, and
+  // whether a scan happened is a fact PostgreSQL records: the session's own
+  // pending statistics, read inside the attaching transaction before and after
+  // the ATTACH. Proven: no scan. Unproven: one scan of every row.
+  //
+  // This replaced a timing ratio (proven attach at least 3x faster), which
+  // failed on CI on 2026-10-01 at 6.0ms against 15.9ms: both sides carry a
+  // fixed round-trip cost, so on a fast runner the ratio shrinks toward 1 while
+  // the scan it is about stays exactly as skipped. It also had to be skipped
+  // outright under the sanitizers and on fast machines -- and the skips took
+  // the catalog assertions below with them. Measured on 18.6: the deltas are
+  // 0/0 and 1/400000, and PostgreSQL's DEBUG1 agrees ("partition constraint
+  // for table ... is implied by existing constraints" / "verifying table").
+  // The timings above are kept as information.
+  auto scans_during_attach = [&](const char* child, const char* from, const char* to,
+                                 bool proven) {
+    {
+      pglaswell::WriteSession w(cfg);
+      w.begin("pg_laswell/test/part-scan-setup");
+      w.txn().exec(std::string("ALTER TABLE laswell_ev DETACH PARTITION ") + child);
+      w.txn().exec(std::string("ALTER TABLE ") + child + " DROP CONSTRAINT IF EXISTS scan_ck");
+      if (proven) {
+        w.txn().exec(std::string("ALTER TABLE ") + child +
+                     " ADD CONSTRAINT scan_ck CHECK (at >= '" + from + "' AND at < '" +
+                     to + "')");
+      }
+      w.commit();
+    }
+    pglaswell::WriteSession a(cfg);
+    a.begin("pg_laswell/test/part-scan-attach");
+    const auto read = [&] {
+      const auto r = a.txn().exec(std::string("SELECT pg_stat_get_xact_numscans('") + child +
+                                  "'::regclass), pg_stat_get_xact_tuples_returned('" + child +
+                                  "'::regclass)");
+      return std::pair<long long, long long>{r[0][0].as<long long>(), r[0][1].as<long long>()};
+    };
+    const auto before = read();
+    a.txn().exec(std::string("ALTER TABLE laswell_ev ATTACH PARTITION ") + child +
+                 " FOR VALUES FROM ('" + from + "') TO ('" + to + "')");
+    const auto after = read();
+    a.txn().exec(std::string("ALTER TABLE ") + child + " DROP CONSTRAINT IF EXISTS scan_ck");
+    a.commit();
+    return std::pair<long long, long long>{after.first - before.first,
+                                           after.second - before.second};
+  };
+  const auto proven_scan =
+      scans_during_attach("laswell_ev_a", "2026-01-01", "2027-01-01", true);
+  const auto unproven_scan =
+      scans_during_attach("laswell_ev_b", "2027-01-01", "2028-01-01", false);
+  EXPECT_EQ(proven_scan.first, 0)
+      << "an ATTACH whose bounds a validated CHECK already proves scanned the "
+         "partition anyway; timings were " << with_check_best << "ms with the "
+         "CHECK and " << without_check_best << "ms without";
+  EXPECT_EQ(proven_scan.second, 0);
+  EXPECT_EQ(unproven_scan.first, 1)
+      << "the control: an ATTACH with no CHECK must scan, or this measures nothing";
+  EXPECT_EQ(unproven_scan.second, 400000);
+  RecordProperty("attach_ms_with_check", std::to_string(with_check_best));
+  RecordProperty("attach_ms_without_check", std::to_string(without_check_best));
 
   {
     pglaswell::ReadSession r(cfg);
