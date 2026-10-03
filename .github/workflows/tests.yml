@@ -94,6 +94,7 @@ jobs:
         with:
           version: ${{ env.PQXX_VERSION }}
           sha256: ${{ env.PQXX_SHA256 }}
+          compiler: ${{ matrix.compiler }}
 
       - name: Configure
         run: |
@@ -399,6 +400,11 @@ jobs:
           # binary would not be noticed until somebody tried to deploy with it.
           cmake --build build --target pg_laswell pg_laswell_mcp
           cd build && cpack -G DEB && cpack -G RPM && cpack -G TGZ
+      # What reached the binaries, read from the ELF, on the same Release
+      # configuration the release builds -- the test jobs build without a
+      # build type, where _FORTIFY_SOURCE does not apply.
+      - name: Both binaries carry the hardening that was asked for
+        run: bash cpp/test/hardening-check.sh build/pg_laswell build/pg_laswell_mcp
       - name: The package must carry both binaries, both manuals and bootstrap.sql
         shell: bash
         run: |

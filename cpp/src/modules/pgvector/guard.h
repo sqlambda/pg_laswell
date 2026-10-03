@@ -131,19 +131,77 @@ inline std::optional<long long> pgvector_int(const json& v) {
 // CAST(embedding AS halfvec(3072)). Anything else is "" and goes unchecked: its
 // type is the server's to know, and a guess here would refuse what works.
 inline std::string pgvector_cast_type(const std::string& expression) {
-  static const std::string inner =
-      R"((?:"?[A-Za-z_]\w*"?|[A-Za-z_][\w.]*\s*\(\s*"?[A-Za-z_]\w*"?\s*\)))";
-  static const std::string type = R"(([A-Za-z_][\w.]*\s*(?:\(\s*\d+\s*\))?))";
-  static const std::regex postfix(R"(^\s*\(?\s*)" + inner + R"(\s*\)?\s*::\s*)" + type +
-                                  R"(\s*$)");
-  static const std::regex cast(R"(^\s*cast\s*\(\s*)" + inner + R"(\s+as\s+)" + type +
-                                   R"(\s*\)\s*$)",
-                               std::regex::icase);
-  std::smatch m;
-  if (std::regex_match(expression, m, postfix) || std::regex_match(expression, m, cast)) {
-    return m[1].str();
+  // Parsed by hand rather than with std::regex, for the reason
+  // per_part_option_sql gives in planner.h.
+  const auto trim = [](std::string v) {
+    while (!v.empty() && std::isspace(static_cast<unsigned char>(v.front()))) v.erase(v.begin());
+    while (!v.empty() && std::isspace(static_cast<unsigned char>(v.back()))) v.pop_back();
+    return v;
+  };
+  const auto word = [](char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '_'; };
+  // identifier, optionally double-quoted
+  const auto ident = [&](std::string v) {
+    v = trim(v);
+    if (v.size() >= 2 && v.front() == '"' && v.back() == '"') v = v.substr(1, v.size() - 2);
+    return !v.empty() && !std::isdigit(static_cast<unsigned char>(v[0])) &&
+           std::all_of(v.begin(), v.end(), word);
+  };
+  // a column, or one function over a column: binary_quantize(embedding)
+  const auto operand = [&](std::string v) {
+    v = trim(v);
+    if (ident(v)) return true;
+    const auto open = v.find('(');
+    if (open == std::string::npos || v.back() != ')') return false;
+    const auto fn = trim(v.substr(0, open));
+    return !fn.empty() && std::all_of(fn.begin(), fn.end(), [&](char c) { return word(c) || c == '.'; }) &&
+           ident(v.substr(open + 1, v.size() - open - 2));
+  };
+  // a type name, optionally schema-qualified, optionally with one (n)
+  const auto type_name = [&](std::string v) -> std::string {
+    v = trim(v);
+    std::string base = v;
+    const auto open = v.find('(');
+    if (open != std::string::npos) {
+      if (v.back() != ')') return "";
+      const auto n = trim(v.substr(open + 1, v.size() - open - 2));
+      if (n.empty() || !std::all_of(n.begin(), n.end(),
+                                    [](char c) { return std::isdigit(static_cast<unsigned char>(c)); })) {
+        return "";
+      }
+      base = trim(v.substr(0, open));
+    }
+    if (base.empty() || std::isdigit(static_cast<unsigned char>(base[0])) ||
+        !std::all_of(base.begin(), base.end(), [&](char c) { return word(c) || c == '.'; })) {
+      return "";
+    }
+    return v;
+  };
+
+  std::string e = trim(expression);
+  std::string lower = e;
+  for (auto& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  // CAST(x AS type)
+  if (lower.rfind("cast", 0) == 0 && e.back() == ')') {
+    const auto open = e.find('(');
+    const auto as = lower.rfind(" as ");
+    if (open != std::string::npos && as != std::string::npos && as > open &&
+        trim(lower.substr(4, open - 4)).empty()) {
+      if (operand(e.substr(open + 1, as - open - 1))) {
+        return type_name(e.substr(as + 4, e.size() - as - 5));
+      }
+    }
+    return "";
   }
-  return "";
+  // x::type, (x)::type
+  const auto cast = e.rfind("::");
+  if (cast == std::string::npos) return "";
+  std::string inner = trim(e.substr(0, cast));
+  if (inner.size() >= 2 && inner.front() == '(' && inner.back() == ')' &&
+      operand(inner.substr(1, inner.size() - 2))) {
+    inner = inner.substr(1, inner.size() - 2);
+  }
+  if (!operand(inner)) return "";
+  return type_name(e.substr(cast + 2));
 }
 
 // Returns the key column's type as pgvector reads it, for the advisories --

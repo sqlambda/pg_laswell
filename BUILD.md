@@ -180,6 +180,31 @@ How a module is written is in `cpp/src/modules/README.md`.
 to write explicit `static_cast`s for any `size_t`/`int`/`pqxx::result::size_type`
 conversion.
 
+`-Werror` is on everywhere, including a build from a release tarball. That is
+deliberate: this tool changes production schemas, and a build that is not
+warning-clean is not the build that was tested. If a compiler newer than any
+this project has seen raises a new diagnostic, use a released package, or fix
+the diagnostic.
+
+## Binary hardening
+
+Both binaries are built with stack canaries (`-fstack-protector-strong`),
+stack-clash protection, `_FORTIFY_SOURCE` (3 on Linux, 2 elsewhere; optimised
+builds without a sanitizer only), full RELRO (`-z relro -z now`), a
+non-executable stack, PIE, and CET (`-fcf-protection`) on x86. Each flag is
+probed, because the three systems this builds on do not all take all of them.
+
+What was requested is not what is trusted. `cpp/test/hardening-check.sh` reads
+the ELF of both binaries and fails unless the hardening reached them; it runs as
+the `hardening_check` ctest entry in an optimised build without a sanitizer, in
+the `packages` CI job, and in every release job that produces an ELF:
+
+```bash
+cmake -S cpp -B cpp/build_release -DCMAKE_BUILD_TYPE=Release
+cmake --build cpp/build_release
+cpp/test/hardening-check.sh cpp/build_release/pg_laswell cpp/build_release/pg_laswell_mcp
+```
+
 Build with **both** compilers before proposing a change; they disagree about
 `-Wconversion` in places, particularly around the OpenSSL C boundary:
 

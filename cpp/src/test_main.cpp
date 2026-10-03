@@ -12578,8 +12578,12 @@ class TwinNamedDatabaseTest : public RepoTest {
     // define. On the first cluster it already exists, because the suite
     // bootstrapped a database there; the second cluster has never been touched.
     // Getting this wrong is what the second cluster is for.
-    (void)std::system(("psql -X -q -c 'CREATE ROLE laswell_runner NOLOGIN' \"" +
-                       url + "\" >/dev/null 2>&1").c_str());
+    // An if rather than a (void) cast: glibc marks system() warn_unused_result
+    // under _FORTIFY_SOURCE, and GCC does not let a cast silence that.
+    if (std::system(("psql -X -q -c 'CREATE ROLE laswell_runner NOLOGIN' \"" +
+                     url + "\" >/dev/null 2>&1").c_str()) != 0) {
+      // Already exists: fine.
+    }
     const std::string key_b64 = pglaswell::Registry::base64_encode(test_key().pub);
     const std::string cmd =
         "PSQLRC=/dev/null psql -X -q -v ON_ERROR_STOP=1 "

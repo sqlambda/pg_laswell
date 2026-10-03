@@ -244,8 +244,16 @@ foreach(_t pg_laswell pg_laswell_mcp)
     target_include_directories(${_t} PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR}/generated)
 endforeach()
-pglaswell_harden(pg_laswell_mcp)
-pglaswell_apply_sanitizers(pg_laswell_mcp)
+# BOTH binaries. Until 2026-10-03 only pg_laswell_mcp was hardened: the
+# deployment binary -- the one that applies migrations -- compiled without the
+# warning flags, without -Werror and without sanitizer instrumentation, so the
+# sanitizer jobs never exercised deploy_main.cpp at all. Found applying the
+# shared build standard, which asks what reached the binary, not what was
+# requested for one of them.
+foreach(_t pg_laswell pg_laswell_mcp)
+    pglaswell_harden(${_t})
+    pglaswell_apply_sanitizers(${_t})
+endforeach()
 
 install(TARGETS pg_laswell pg_laswell_mcp RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 # The man page is checked in rather than generated: the release containers carry
@@ -334,6 +342,18 @@ if(BUILD_TESTING)
     # emits. That gap cost a defect -- a correct decision whose statement the
     # dry run could not verify -- so the seam gets a test against a real
     # cluster. It SKIPs loudly without one rather than passing quietly.
+    # The binary hardening from SafetyFlags.cmake, checked on the artifacts
+    # rather than trusted from the flags. Only for an optimised build without a
+    # sanitizer (FORTIFY is off otherwise), and only where there is an ELF to
+    # read: not on macOS.
+    find_program(READELF_EXECUTABLE readelf)
+    if(READELF_EXECUTABLE AND NOT APPLE AND PGLASWELL_SANITIZER STREQUAL "NONE"
+       AND CMAKE_BUILD_TYPE MATCHES "^(Release|RelWithDebInfo|MinSizeRel)$")
+        add_test(NAME hardening_check
+                 COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/hardening-check.sh
+                         $<TARGET_FILE:pg_laswell> $<TARGET_FILE:pg_laswell_mcp>)
+    endif()
+
     if(PGLASWELL_MODULES)
         add_test(NAME citus_tests
                  COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/citus-tests.sh

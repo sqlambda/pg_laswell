@@ -58,6 +58,16 @@ for b in pg_laswell pg_laswell_mcp; do
   fi
 done
 
+# The hardening that reached the binaries, read from the ELF. In sh, because
+# the base system has no bash for cpp/test/hardening-check.sh; and without the
+# fortify line, whose symbols are glibc's.
+for b in pg_laswell pg_laswell_mcp; do
+  readelf -h "build/$b" | grep -q 'Type:.*DYN' || { echo "$b is not PIE" >&2; exit 1; }
+  readelf -lW "build/$b" | grep -q GNU_RELRO || { echo "$b has no RELRO" >&2; exit 1; }
+  readelf -dW "build/$b" | grep -Eq 'BIND_NOW|FLAGS_1.*NOW' || { echo "$b is not BIND_NOW" >&2; exit 1; }
+  readelf -W --dyn-syms "build/$b" | grep -q __stack_chk_fail || { echo "$b has no stack protector" >&2; exit 1; }
+done
+
 # A native package. pkg records the shared libraries the binaries need
 # (shlibs_required) by itself, from the ELF -- derived, as the deb's and rpm's
 # dependencies are, never listed by hand.
@@ -65,6 +75,14 @@ done
 mv build/pg-laswell-*.pkg "./${ARTIFACT}.pkg"
 pkg info -F "./${ARTIFACT}.pkg"
 pkg info -R -F "./${ARTIFACT}.pkg" 2>/dev/null || true
+# The package's own version is the project's, read back from the package.
+WANT=$(grep -oE 'project\(pg_laswell_mcp VERSION [0-9.]+' cpp/CMakeLists.txt | grep -oE '[0-9.]+$')
+GOT=$(pkg query -F "./${ARTIFACT}.pkg" '%v')
+echo "package version: $GOT   project version: $WANT"
+case "$GOT" in
+  "$WANT"|"$WANT"_*|"$WANT",*) ;;
+  *) echo "the package says $GOT and the project says $WANT" >&2; exit 1 ;;
+esac
 
 # Installed, and run -- metadata is not evidence a package works.
 pkg add "./${ARTIFACT}.pkg"

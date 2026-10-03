@@ -154,8 +154,8 @@ SELECT JSONB_BUILD_OBJECT(
                   -- serialised node tree, not pg_node_tree, so pg_get_expr
                   -- does not accept it. Found by running against a real
                   -- cluster -- "function pg_get_expr(text, regclass) does not
-                  -- exist" -- which is why CITUS.md marks catalog shapes as
-                  -- verify-before-encoding.
+                  -- exist" -- which is why a catalog shape is verified against
+                  -- a real cluster before it is encoded here.
                   --
                   -- A reference table has an empty partkey, and asking for its
                   -- column name raises rather than returning NULL, so the
@@ -220,7 +220,7 @@ SELECT JSONB_BUILD_OBJECT(
        JOIN pg_namespace n ON n.oid = pr.pronamespace
       WHERE o.classid = 'pg_proc'::regclass), '{}'::jsonb),
   -- WHICH CALLS THIS CITUS ACTUALLY HAS, which is a fact rather than a version
-  -- comparison. CITUS.md suggests gating on citus_version() against a
+  -- comparison. The obvious alternative is gating on citus_version() against a
   -- remembered minimum -- believed 11.1 for the concurrent form -- but a
   -- remembered minimum is exactly the kind of number this project refuses to
   -- state: it cannot be derived, only recalled, and it is wrong the moment a

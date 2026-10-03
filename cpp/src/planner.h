@@ -709,8 +709,22 @@ inline IndexTraits index_traits(const Observations& obs, const std::string& qual
 // SQL. A module handing anything else is a bug; the build is refused loudly
 // rather than emitting it.
 inline std::string per_part_option_sql(const std::string& option) {
-  static const std::regex ok(R"(^[a-z_][a-z0-9_]*(\.[a-z_][a-z0-9_]*)?$)");
-  if (!std::regex_match(option, ok)) {
+  // One or two labels of [a-z_][a-z0-9_]*, joined by a dot. Written out rather
+  // than as a std::regex: GCC 14 raises a false -Wmaybe-uninitialized inside
+  // libstdc++'s <regex> in an optimised sanitizer build, and -Werror makes that
+  // a build failure.
+  const auto label = [](const std::string& l) {
+    if (l.empty() || !(std::islower(static_cast<unsigned char>(l[0])) || l[0] == '_')) return false;
+    return std::all_of(l.begin(), l.end(), [](char c) {
+      return std::islower(static_cast<unsigned char>(c)) ||
+             std::isdigit(static_cast<unsigned char>(c)) || c == '_';
+    });
+  };
+  const auto dot = option.find('.');
+  const bool ok = dot == std::string::npos
+                      ? label(option)
+                      : label(option.substr(0, dot)) && label(option.substr(dot + 1));
+  if (!ok) {
     throw std::logic_error("a module answered with an index option that is not a "
                            "(namespaced) identifier: " + option);
   }

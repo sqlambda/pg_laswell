@@ -8,6 +8,20 @@ on:
       tag:
         description: 'tag to build (must already exist)'
         required: true
+  # Validating THIS workflow without publishing: a pull request that changes
+  # the release workflow, or a script it runs, builds and verifies every
+  # package and stops there. Without it a release job is first exercised by a
+  # tag -- which is how the FreeBSD job's missing pkg-config path was found
+  # only after it had been pushed. Path-filtered, because nine packages on
+  # every pull request would be minutes spent re-proving what did not change.
+  # Nothing is published and the site is not deployed: both are gated below.
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - '.github/scripts/**'
+      - '.github/actions/**'
+      - 'cpp/CMakeLists.txt'
+      - 'cpp/cmake/**'
 
 permissions:
   contents: write
@@ -190,6 +204,7 @@ jobs:
       # and the two could never be string-equal. The suffix is what marks the
       # GitHub release as a pre-release, in the publish job below.
       - name: The tag must match the project version
+        if: github.event_name != 'pull_request'
         run: |
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
           # Shape checked before it is taken apart. Without this a typo like
@@ -231,6 +246,14 @@ jobs:
       # silent fall back to the platform's shared copy would produce a package
       # that installs and then cannot start. Assert it where it is actually
       # visible: the linker's own record.
+      # The hardening SafetyFlags.cmake asks for, read back from the ELF: full
+      # RELRO, a non-executable stack, stack canaries, fortified calls, PIE.
+      # After strip, because that is the binary that ships. Not on macOS:
+      # Mach-O is not ELF, and ld64 takes none of the -z flags.
+      - name: Both binaries carry the hardening that was asked for
+        if: matrix.distro != 'macos'
+        run: bash cpp/test/hardening-check.sh build/pg_laswell build/pg_laswell_mcp
+
       - name: libpqxx must be linked statically
         run: |
           # Both binaries link it, so both are checked: they are separate link
@@ -285,6 +308,26 @@ jobs:
           cd build && cpack -G RPM
           rpm -qp --requires ./*.rpm | grep -vE 'rpmlib|GLIBC|CXXABI|GLIBCXX|GCC_'
           mv pg-laswell-*.rpm ../${{ matrix.artifact }}.rpm
+
+      # An artifact's version is the project's declared version, read back from
+      # the package rather than trusted: the tag is checked against
+      # CMakeLists.txt above, and this closes the other half -- that what CPack
+      # wrote inside the package is that same number. A tarball carries none.
+      - name: The package's own version is the project's
+        if: matrix.extension != 'tar.gz'
+        run: |
+          WANT=$(grep -oE 'project\(pg_laswell_mcp VERSION [0-9.]+' cpp/CMakeLists.txt | grep -oE '[0-9.]+$')
+          case "${{ matrix.extension }}" in
+            deb) GOT=$(dpkg-deb -f ${{ matrix.artifact }}.deb Version) ;;
+            rpm) GOT=$(rpm -qp --queryformat '%{VERSION}' ${{ matrix.artifact }}.rpm) ;;
+          esac
+          echo "package version: $GOT   project version: $WANT"
+          # A packaging revision may follow the version (0.1.3-1); nothing
+          # may precede or replace it.
+          case "$GOT" in
+            "$WANT"|"$WANT"-*) ;;
+            *) echo "::error::the package says $GOT and the project says $WANT"; exit 1 ;;
+          esac
 
       # The listing is captured ONCE and then grepped, rather than piped into
       # `grep -q` three times. `grep -q` exits at the first match and closes the
@@ -475,6 +518,8 @@ jobs:
 
   publish:
     needs: [build, freebsd]
+    # Never on a pull request: that run exists to prove the packages build.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:

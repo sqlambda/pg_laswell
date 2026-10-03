@@ -23,6 +23,15 @@ inputs:
       default is the one thing that would let a caller forget it and still
       build -- which is the state this input exists to end.
     required: true
+  compiler:
+    description: >
+      The C++ compiler libpqxx is built with -- the one the caller will link it
+      with. Part of the cache key: a library built by one front end and linked
+      by another is the failure pg_licht met (constrained-template mangling,
+      at link time), and a cache keyed on the OS alone hands the clang job
+      whatever the gcc job built first.
+    required: false
+    default: c++
 
 runs:
   using: composite
@@ -41,7 +50,7 @@ runs:
       uses: actions/cache@v6
       with:
         path: ~/pqxx
-        key: pqxx-${{ inputs.version }}-${{ runner.os }}-${{ runner.arch }}-libpq-${{ env.LIBPQ_VERSION }}
+        key: pqxx-${{ inputs.version }}-${{ runner.os }}-${{ runner.arch }}-${{ inputs.compiler }}-libpq-${{ env.LIBPQ_VERSION }}
 
     - name: Build libpqxx ${{ inputs.version }}
       if: steps.pqxx.outputs.cache-hit != 'true'
@@ -55,7 +64,8 @@ runs:
         # generated libpqxx.pc bakes in its prefix, so the restore path has
         # to match the install path exactly.
         sh .github/scripts/build-libpqxx.sh \
-          "${{ inputs.version }}" "${{ inputs.sha256 }}" "$HOME/pqxx"
+          "${{ inputs.version }}" "${{ inputs.sha256 }}" "$HOME/pqxx" \
+          "-DCMAKE_CXX_COMPILER=${{ inputs.compiler }}"
 
     # lib64 as well as lib: CMake picks the directory, not this action.
     - name: Point pkg-config at it

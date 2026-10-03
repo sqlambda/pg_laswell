@@ -173,6 +173,30 @@ run ran them inside a transaction with the server's setting instead. They now
 `SET LOCAL` it for the step and put it back after; a test proves it with a CHECK
 that validates only under the planned value.
 
+### Binary hardening, asserted on the binary
+
+Both binaries are now built with stack canaries, stack-clash protection,
+`_FORTIFY_SOURCE`, full RELRO, a non-executable stack, PIE, and CET on x86 --
+each flag probed, since not every toolchain this builds on takes every one.
+`cpp/test/hardening-check.sh` then reads the ELF and fails unless they reached
+both binaries: in ctest, in the `packages` CI job and in the release. Requested
+flags are an intention; the headers are the fact. Measured before: PIE and
+partial RELRO from distribution defaults, and nothing else.
+
+Found doing it: **only `pg_laswell_mcp` had ever been built with the warning
+flags, `-Werror` and the sanitizers.** The deployment binary -- the one that
+applies migrations -- had none, so the sanitizer jobs never instrumented it.
+Both now go through the same two functions.
+
+### The release workflow can be checked before a tag
+
+- A pull request that changes the release workflow, its scripts or the CMake
+  files now runs it: every package is built, installed and run, and nothing is
+  published. Until now a release job was first exercised by a tag.
+- The version inside each `.deb`, `.rpm` and FreeBSD `.pkg` is read back and
+  must be the project's.
+- libpqxx is built with, and cached per, the compiler of the job that links it.
+
 ### FreeBSD packages
 
 Releases now carry `pg_laswell-freebsd14-amd64.pkg` and
@@ -180,9 +204,9 @@ Releases now carry `pg_laswell-freebsd14-amd64.pkg` and
 `.github/scripts/freebsd-build.sh`. The same script runs on every pull request
 (the `freebsd` job): it builds with every module, runs the suite that needs no
 database, packages with `cpack -G FREEBSD`, installs with `pkg add` and runs
-both binaries. Prompted by the pgshard field report: a lab that runs FreeBSD 15.1
-guests several times a day gave the FreeBSD build no coverage, because with no
-package to install it ran pg_laswell from the host.
+both binaries. The reason: a lab that runs FreeBSD 15.1 guests several times a
+day gave the FreeBSD build no coverage, because with no package to install it ran
+pg_laswell from the host.
 
 ### Two refusals that now say more
 
