@@ -65,7 +65,9 @@ for b in pg_laswell pg_laswell_mcp; do
   readelf -h "build/$b" | grep -q 'Type:.*DYN' || { echo "$b is not PIE" >&2; exit 1; }
   readelf -lW "build/$b" | grep -q GNU_RELRO || { echo "$b has no RELRO" >&2; exit 1; }
   readelf -dW "build/$b" | grep -Eq 'BIND_NOW|FLAGS_1.*NOW' || { echo "$b is not BIND_NOW" >&2; exit 1; }
-  readelf -W --dyn-syms "build/$b" | grep -q __stack_chk_fail || { echo "$b has no stack protector" >&2; exit 1; }
+  # -s, not --dyn-syms: FreeBSD 14's readelf (elftoolchain) has no such option
+  # and prints its usage instead, which read as "no stack protector".
+  readelf -sW "build/$b" | grep -q __stack_chk_fail || { echo "$b has no stack protector" >&2; exit 1; }
 done
 
 # A native package. pkg records the shared libraries the binaries need
