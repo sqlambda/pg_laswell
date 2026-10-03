@@ -11,9 +11,70 @@
 template <typename Refuse, typename Advise>
 inline void timescaledb_plan_refusals(const Spec& spec, const Observations& obs,
                                       const json& /*budget*/, const Refuse& refuse,
-                                      const Advise& /*advise*/) {
+                                      const Advise& advise) {
   const auto& ts = obs.extension("timescaledb");
   if (ts.empty()) return;
+
+  // A POLICY CHANGED BY HAND. The ledger's applied steps (read by core, newest
+  // first) say what each policy was last declared to be; TimescaleDB's jobs say
+  // what it is. A policy is a row anyone with the rights can remove, re-add or
+  // pause -- remove_retention_policy, alter_job -- with no migration involved,
+  // and a retention policy that quietly stopped, or started dropping sooner, is
+  // worth saying on ANY plan against this database. An advisory: the reading
+  // is volatile, and the plan in hand may have nothing to do with it.
+  {
+    static const char* const kWords[][2] = {{"columnstore", "columnstore policy"},
+                                            {"retention", "retention policy"},
+                                            {"refresh", "refresh policy"}};
+    const auto& policies = ts_member(ts, "policies");
+    std::set<std::string> seen;
+    for (const auto& st : ts.value("applied_steps", json::array())) {
+      const auto action = st.value("action", "");
+      if (action != "apply" && action != "satisfied") continue;
+      const auto d = st.value("detail", json::object());
+      // A step from before policies were recorded cannot be compared, and
+      // saying nothing about it is the honest answer.
+      if (!d.contains("policy")) continue;
+      const auto& p = d["policy"];
+      const auto target = p.value("target", "");
+      const auto which = p.value("which", "");
+      if (target.empty() || !seen.insert(target + "/" + which).second) continue;  // newest only
+      std::string words = which + " policy";
+      for (const auto& w : kWords) if (which == w[0]) words = w[1];
+      const auto t = policies.find(target);
+      const bool exists = t != policies.end() && t->contains(which);
+      const json declared = p.value("declared", json());
+      if (declared.is_null()) {
+        if (exists) {
+          advise(target + "'s " + words + " was removed by an applied specification and "
+                 "exists again: added by hand since.");
+        }
+        continue;
+      }
+      if (!exists) {
+        advise(target + "'s " + words + " was added by an applied specification and is no "
+               "longer there: removed by hand since. Re-applying will not restore it; a "
+               "specification that adds it again will.");
+        continue;
+      }
+      const auto& have = (*t)[which];
+      std::vector<std::string> changed;
+      for (const auto& [key, text] : declared.items()) {
+        // The reading keeps the columnstore interval under "after" as declared.
+        const auto want = text.is_string() ? ts_parse_interval(text.get<std::string>())
+                                           : std::nullopt;
+        const auto got = ts_reading_interval(have.value(key, json()));
+        if (want && got && !(*want == *got)) {
+          changed.push_back(key + " is no longer " + text.get<std::string>());
+        }
+      }
+      if (!have.value("scheduled", true)) changed.push_back("the job is paused");
+      if (!changed.empty()) {
+        advise(target + "'s " + words + " differs from what an applied specification "
+               "declared: " + detail::join(changed, ", ") + ", changed by hand since.");
+      }
+    }
+  }
 
   struct Hyper {
     std::vector<std::string> dims;  // every partitioning column, in order

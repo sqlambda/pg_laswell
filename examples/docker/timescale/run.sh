@@ -80,3 +80,26 @@ for s in d["steps"]:
 say "6. Run both again: nothing to do"
 run "$PG_LASWELL" --repo "$build" "$(url "$APACHE_PORT" metrics)"
 run "$PG_LASWELL" --repo "$build" "$(url "$TSL_PORT" metrics)"
+
+say "7. A policy changed by hand"
+echo "  A policy is a row: anyone with the rights can pause or remove it, with no"
+echo "  migration involved. The ledger says what each was last declared to be, so"
+echo "  any plan against this database says when one no longer is. Here the"
+echo "  retention job is paused by hand, and an unrelated plan is asked for:"
+psql -X -q -t -A -c "SELECT alter_job(job_id, scheduled => false) IS NOT NULL
+                       FROM timescaledb_information.jobs WHERE proc_name = 'policy_retention'" \
+  "$(url "$TSL_PORT" metrics)" >/dev/null
+notes=$("$PG_LASWELL_MCP" --call planMigration --args '{"spec":{"laswell_spec_version":1,
+   "id":"unrelated","description":"an unrelated schema",
+   "intents":[{"kind":"create_schema","schema":"other","comment":"Unrelated."}]},
+   "skipTrustChecks":true}' "$(url "$TSL_PORT" metrics)" \
+  | python3 -c 'import json,sys
+for a in json.load(sys.stdin).get("advisories", []): print("  note:", a)')
+echo "$notes"
+echo "$notes" | grep -q "retention policy differs from what an applied specification declared: the job is paused" || {
+  echo "  The paused policy was not noticed."
+  exit 1
+}
+psql -X -q -t -A -c "SELECT alter_job(job_id, scheduled => true) IS NOT NULL
+                       FROM timescaledb_information.jobs WHERE proc_name = 'policy_retention'" \
+  "$(url "$TSL_PORT" metrics)" >/dev/null

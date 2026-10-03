@@ -309,10 +309,38 @@ the columnstore is enabled and how it segments and orders, and its size and
 approximate row count.
 .It Va policies
 Columnstore, retention and refresh jobs, by the hypertable or continuous
-aggregate they act on, with their intervals.
+aggregate they act on, with their intervals and whether each is scheduled or
+paused.
 .It Va caggs
 Continuous aggregates, and the hypertable each reads.
 .El
+.Sh A POLICY CHANGED BY HAND
+A policy is a job TimescaleDB keeps as a row, and anyone with the rights can
+change it with no migration involved:
+.Fn remove_retention_policy ,
+a second
+.Fn add_retention_policy
+with another interval,
+.Fn alter_job
+to pause it.
+A retention policy that quietly stopped, or started dropping sooner, is worth
+knowing about.
+.Pp
+Each policy step records what it declared, applied or found already so, and
+the ledger keeps it.
+On any plan against the database \(em not only one that touches the policy
+\(em the newest applied step for each policy is compared with TimescaleDB's
+jobs, and a difference is shown as a
+.Ql note:
+line: the policy is no longer there, exists again after a specification removed it,
+has another interval, or its job is paused.
+Like every advisory it is shown and not part of
+.Va planDigest
+.Pq Xr pg_laswell_mcp 1 , Sx planMigration .
+It needs a ledger this role can read, and looks at the newest 500 applied
+TimescaleDB steps.
+Steps applied by a release before 0.1.3-alpha5 recorded no declaration and are
+passed over.
 .Sh REFUSALS
 Of core kinds, on a hypertable \(em including one made a hypertable earlier in
 the same specification:

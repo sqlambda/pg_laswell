@@ -301,6 +301,15 @@ warning say so, with the size it scans. The step records
 `validated_in_one_step_by`. A hypertable without the columnstore, and every
 other table, keeps the two-step recipe, and a test says so.
 
+**A policy changed by hand.** A policy is a row TimescaleDB keeps, and
+`remove_retention_policy`, a second `add_retention_policy` or `alter_job` changes
+it with no migration involved. Each policy step now records what it declared,
+and on any plan against the database the newest applied step for each policy is
+compared with TimescaleDB's jobs: a policy that is gone, back after a
+specification removed it, on another interval, or paused is shown as a `note:`.
+An advisory, so not part of the plan digest. The example pauses the retention
+job by hand and shows the note on an unrelated plan.
+
 **Refusals for core kinds on a hypertable**, including one made a hypertable
 earlier in the same specification: a unique key without the partitioning
 column; `alter_column_type` once a chunk is in the columnstore. Each quotes the

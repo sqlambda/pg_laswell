@@ -33,6 +33,12 @@ struct TsInterval {
   bool operator==(const TsInterval&) const = default;
 };
 
+// An interval as the reading carries it: [months, days, seconds].
+inline std::optional<TsInterval> ts_reading_interval(const json& v) {
+  if (!v.is_array() || v.size() != 3) return std::nullopt;
+  return TsInterval{v[0].get<long long>(), v[1].get<long long>(), v[2].get<long long>()};
+}
+
 inline std::optional<TsInterval> ts_parse_interval(const std::string& text) {
   TsInterval out;
   std::istringstream in(text);

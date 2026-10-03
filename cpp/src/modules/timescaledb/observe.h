@@ -86,6 +86,7 @@ SELECT JSONB_BUILD_OBJECT(
                                                ELSE 'refresh' END,
                JSONB_BUILD_OBJECT(
                  'job_id', j.job_id,
+                 'scheduled', j.scheduled,
                  'after', )SQL" + timescaledb_config_interval_sql("compress_after") + R"SQL(,
                  'drop_after', )SQL" + timescaledb_config_interval_sql("drop_after") + R"SQL(,
                  'start_offset', )SQL" + timescaledb_config_interval_sql("start_offset") + R"SQL(,
@@ -103,4 +104,7 @@ SELECT JSONB_BUILD_OBJECT(
 
 inline const char* ktimescaledbObservationSql = kTimescaledbObservationText.c_str();
 inline const char* ktimescaledbAbsentSql = nullptr;
-inline constexpr bool ktimescaledbReadsAppliedSteps = false;
+// The steps this database's ledger records as applied, so a policy changed by
+// hand -- removed, re-added with another interval, paused -- is said on any
+// plan against this database (guard.h).
+inline constexpr bool ktimescaledbReadsAppliedSteps = true;

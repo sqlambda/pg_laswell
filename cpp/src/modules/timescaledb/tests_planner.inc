@@ -264,6 +264,66 @@ TEST(TimescaledbPlanner, WithoutTheColumnstoreTheTwoStepRecipeIsUnchanged) {
   EXPECT_NE(hyper.steps[1].sql.at(0).find("VALIDATE CONSTRAINT"), std::string::npos);
 }
 
+// A policy step records what it declared -- applied or already satisfied -- so
+// the ledger can later be compared with TimescaleDB's jobs.
+TEST(TimescaledbPlanner, APolicyStepRecordsWhatItDeclares) {
+  const json in = {{"kind", "timescaledb_add_retention_policy"}, {"schema", "public"},
+                   {"table", "m"}, {"drop_after", "90 days"}, {"acknowledge_data_loss", true}};
+  const auto p = ts_plan(in, ts_hypertable_obs());
+  ASSERT_TRUE(p.ok) << p.render();
+  const auto pol = p.steps[0].detail.value("policy", json());
+  EXPECT_EQ(pol.value("target", ""), "public.m");
+  EXPECT_EQ(pol.value("which", ""), "retention");
+  EXPECT_EQ(pol["declared"].value("drop_after", ""), "90 days");
+  const json rm = {{"kind", "timescaledb_remove_retention_policy"}, {"schema", "public"},
+                   {"table", "m"}};
+  const auto q = ts_plan(rm, ts_hypertable_obs());
+  ASSERT_TRUE(q.ok) << q.render();
+  EXPECT_TRUE(q.steps[0].detail["policy"]["declared"].is_null());
+}
+
+TEST(TimescaledbPlanner, APolicyChangedByHandIsNoticedOnAnyPlanAgainstTheDatabase) {
+  const auto applied = [](const char* kind, json declared) {
+    return json{{"kind", kind}, {"action", "apply"},
+                {"detail", {{"policy", {{"target", "public.m"}, {"which", "retention"},
+                                        {"declared", std::move(declared)}}}}}};
+  };
+  const auto advised = [](const pglaswell::Plan& p, const std::string& needle) {
+    for (const auto& a : p.advisories) if (a.find(needle) != std::string::npos) return true;
+    return false;
+  };
+  // An unrelated specification, so the advisory is not about the plan in hand.
+  const json unrelated = {{"kind", "create_schema"}, {"schema", "other"}, {"comment", "Unrelated."}};
+  auto obs = ts_hypertable_obs();
+  auto& r = obs.extensions["timescaledb"];
+  // Newest first, as core reads them: last declared at 90 days.
+  r["applied_steps"] = json::array(
+      {applied("timescaledb_add_retention_policy", json{{"drop_after", "90 days"}}),
+       applied("timescaledb_add_retention_policy", json{{"drop_after", "30 days"}})});
+
+  // Removed by hand.
+  EXPECT_TRUE(advised(ts_plan(unrelated, obs), "is no longer there: removed by hand"));
+  // Re-added with another interval.
+  r["policies"]["public.m"]["retention"] =
+      json{{"job_id", 1002}, {"scheduled", true}, {"drop_after", json::array({0, 30, 0})}};
+  EXPECT_TRUE(advised(ts_plan(unrelated, obs), "drop_after is no longer 90 days"));
+  // Paused.
+  r["policies"]["public.m"]["retention"] =
+      json{{"job_id", 1002}, {"scheduled", false}, {"drop_after", json::array({0, 90, 0})}};
+  EXPECT_TRUE(advised(ts_plan(unrelated, obs), "the job is paused"));
+  // As declared -- and "90 days" is not "3 months", but it is 90 days however written.
+  r["policies"]["public.m"]["retention"]["scheduled"] = true;
+  EXPECT_TRUE(ts_plan(unrelated, obs).advisories.empty());
+  // Removed by a specification, and there again.
+  r["applied_steps"] = json::array({applied("timescaledb_remove_retention_policy", json())});
+  EXPECT_TRUE(advised(ts_plan(unrelated, obs), "exists again: added by hand"));
+  // A step from before policies were recorded says nothing.
+  r["applied_steps"] = json::array({json{{"kind", "timescaledb_add_retention_policy"},
+                                         {"action", "apply"}, {"detail", json::object()}}});
+  r["policies"] = json::object();
+  EXPECT_TRUE(ts_plan(unrelated, obs).advisories.empty());
+}
+
 TEST(TimescaledbPlanner, CompressedChunksBlockATypeChange) {
   const auto cs = ts_hypertable_obs(ts_hyper(512LL << 20, 4000000, true, 7));
   EXPECT_TRUE(ts_conflict(ts_plan(json{{"kind", "alter_column_type"}, {"schema", "public"},

@@ -5,11 +5,6 @@
 // Measured on TimescaleDB 2.30.2 (PostgreSQL 18, both editions) and 2.28.3
 // (PostgreSQL 15), 2026-10-02. Each refusal quotes the error it pre-empts.
 
-inline std::optional<TsInterval> ts_reading_interval(const json& v) {
-  if (!v.is_array() || v.size() != 3) return std::nullopt;
-  return TsInterval{v[0].get<long long>(), v[1].get<long long>(), v[2].get<long long>()};
-}
-
 inline std::string ts_qualified(const Intent& in, const char* name_key = "table") {
   return in.body.value("schema", "") + "." + in.body.value(name_key, "");
 }
@@ -359,6 +354,16 @@ inline const json& ts_policy(const json& ts, const std::string& target, const ch
   return (*it)[which];
 }
 
+// What a policy step declared, recorded with the step whether it applied or
+// found the policy already as declared: the ledger then says what each policy
+// was last declared to be, and guard.h compares that with what the server has
+// now (a policy changed by hand).
+inline void ts_declare_policy(Step& step, const std::string& target, const char* which,
+                              json declared) {
+  step.detail["policy"] = json{{"target", target}, {"which", which},
+                               {"declared", std::move(declared)}};
+}
+
 inline void plan_timescaledb_add_columnstore_policy(const Intent& in, const Observations& obs,
                                                     const ExecutorConfig& cfg, Plan& plan,
                                                     std::vector<Step>& out) {
@@ -380,6 +385,7 @@ inline void plan_timescaledb_add_columnstore_policy(const Intent& in, const Obse
   }
   const auto text = in.body.value("after", "");
   const auto& existing = ts_policy(ts, qualified, "columnstore");
+  ts_declare_policy(step, qualified, "columnstore", json{{"after", text}});
   const auto have = ts_reading_interval(existing.value("after", json()));
   if (!existing.empty() && have && *have == *ts_parse_interval(text)) {
     step.action = Action::kSatisfied;
@@ -420,6 +426,7 @@ inline void plan_timescaledb_remove_columnstore_policy(const Intent& in, const O
   const auto& ts = obs.extension("timescaledb");
   if (!ts_present(in, s, ts) || !ts_tsl(in, s, ts)) return;
   const auto qualified = ts_qualified(in);
+  ts_declare_policy(step, qualified, "columnstore", json());
   if (ts_policy(ts, qualified, "columnstore").empty()) {
     step.action = Action::kSatisfied;
     step.why = qualified + " has no columnstore policy";
@@ -449,6 +456,7 @@ inline void plan_timescaledb_add_retention_policy(const Intent& in, const Observ
   if (!ts_require_hypertable(in, s, ts, qualified)) return;
   const auto text = in.body.value("drop_after", "");
   const auto& existing = ts_policy(ts, qualified, "retention");
+  ts_declare_policy(step, qualified, "retention", json{{"drop_after", text}});
   const auto have = ts_reading_interval(existing.value("drop_after", json()));
   if (!existing.empty() && have && *have == *ts_parse_interval(text)) {
     step.action = Action::kSatisfied;
@@ -486,6 +494,7 @@ inline void plan_timescaledb_remove_retention_policy(const Intent& in, const Obs
   const auto qualified = ts_qualified(in);
   // Measured: without if_exists an absent policy RAISES ("retention policy not
   // found"), so absent is read as done here instead.
+  ts_declare_policy(step, qualified, "retention", json());
   if (ts_policy(ts, qualified, "retention").empty()) {
     step.action = Action::kSatisfied;
     step.why = qualified + " has no retention policy";
@@ -585,6 +594,9 @@ inline void plan_timescaledb_add_continuous_aggregate_policy(const Intent& in, c
   const auto end = in.body.value("end_offset", "");
   const auto every = in.body.value("schedule_interval", "");
   const auto& existing = ts_policy(ts, qualified, "refresh");
+  ts_declare_policy(step, qualified, "refresh",
+                    json{{"start_offset", start}, {"end_offset", end},
+                         {"schedule_interval", every}});
   const auto same = [&](const char* key, const std::string& text) {
     const auto have = ts_reading_interval(existing.value(key, json()));
     return have && *have == *ts_parse_interval(text);
