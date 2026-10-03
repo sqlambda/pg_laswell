@@ -122,7 +122,9 @@ briefly: settings only.
 Chunks already converted keep their old settings.
 Once enabled, TimescaleDB refuses
 .Ic VALIDATE CONSTRAINT
-on the table, and a column type change once a chunk is converted; see
+on the table, which changes how a constraint is added; see
+.Sx CONSTRAINTS WITH THE COLUMNSTORE .
+It also refuses a column type change once a chunk is converted; see
 .Sx REFUSALS .
 .Ss Cm timescaledb_add_columnstore_policy
 Timescale License.
@@ -245,6 +247,56 @@ The step records
 .Va index_build_by
 as
 .Cm timescaledb .
+.Sh CONSTRAINTS WITH THE COLUMNSTORE
+On any other table
+.Cm set_not_null ,
+.Cm add_check_constraint
+and
+.Cm add_foreign_key
+add the constraint
+.Ic NOT VALID
+and validate it in a second step, under a lock that blocks neither reads nor
+writes.
+On a hypertable with the columnstore enabled that second step is refused
+.Pq Qq operation not supported on hypertables that have columnstore enabled ,
+after the first has committed.
+.Pp
+So there the statement that adds the constraint validates it too: one step, in
+its own transaction.
+Measured on 2.30.2 and 2.28.3 with 137 of 140 chunks converted, each of the
+three reads the converted chunks and fails on a violating row that exists only
+in one, and the dry run, which executes the step, reports it.
+.Pp
+What it costs is the lock, held for the whole scan:
+.Bl -bullet
+.It
+.Cm add_check_constraint
+and
+.Cm set_not_null :
+.Va AccessExclusiveLock
+on the hypertable and every chunk.
+Reads and writes block.
+.Cm set_not_null
+is a bare
+.Ic SET NOT NULL ;
+no temporary check is added.
+.It
+.Cm add_foreign_key :
+.Va ShareRowExclusiveLock
+on the hypertable and every chunk, and on the referenced table.
+Writes block; reads do not.
+.El
+.Pp
+The step states the lock and the size it scans, records
+.Va validated_in_one_step_by ,
+and the plan carries a warning to schedule it for a quiet window.
+This applies as well when the columnstore is enabled by an earlier intent of
+the same specification.
+A hypertable without the columnstore keeps the two-step recipe.
+So does a foreign key on another table that references such a hypertable:
+there
+.Ic VALIDATE CONSTRAINT
+runs on the referencing table, and it reads the converted chunks (measured).
 .Sh READINGS
 Taken only where the extension is installed in the target database.
 .Bl -tag -width Ds
@@ -268,17 +320,6 @@ the same specification:
 .It
 A UNIQUE index, primary key or unique constraint that leaves out a partitioning
 column.
-.It
-.Cm set_not_null ,
-.Cm add_check_constraint
-and
-.Cm add_foreign_key
-when the columnstore is enabled: each validates in a second step, and
-TimescaleDB refuses
-.Ic VALIDATE CONSTRAINT
-then
-.Pq Qq operation not supported on hypertables that have columnstore enabled .
-There is no recipe for them here yet.
 .It
 .Cm alter_column_type
 once a chunk is in the columnstore

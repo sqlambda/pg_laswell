@@ -194,12 +194,56 @@ for edition in tsl apache oldest; do
   else
     bad "a changed policy should be removed and added" "$sql"
   fi
-  refused "set_not_null with the columnstore" "$U" \
-    '{"kind":"set_not_null","schema":"public","table":"m","column":"v"}' \
-    "refuses VALIDATE CONSTRAINT" \
-    "ALTER TABLE public.m ADD CONSTRAINT v_nn CHECK (v IS NOT NULL) NOT VALID; ALTER TABLE public.m VALIDATE CONSTRAINT v_nn" \
-    "operation not supported on hypertables that have columnstore enabled"
   q "$U" "SELECT compress_chunk(c) FROM show_chunks('public.m', older_than => INTERVAL '2 days') c" >/dev/null
+
+  # VALIDATE CONSTRAINT is refused with the columnstore, so each constraint is
+  # validated by the statement that adds it -- and that statement reads the
+  # converted chunks, which is what makes the one-step form safe to plan.
+  raw=$(q "$U" "BEGIN; ALTER TABLE public.m ADD CONSTRAINT v_nn CHECK (v IS NOT NULL) NOT VALID; ALTER TABLE public.m VALIDATE CONSTRAINT v_nn; ROLLBACK;")
+  echo "$raw" | grep -qF "operation not supported on hypertables that have columnstore enabled" \
+    && ok "VALIDATE CONSTRAINT is refused with the columnstore" \
+    || bad "the server no longer refuses VALIDATE CONSTRAINT; the one-step recipe may be unnecessary" "$raw"
+  q "$U" "CREATE TABLE public.d (id int PRIMARY KEY); INSERT INTO public.d SELECT g FROM generate_series(0, 9) g" >/dev/null
+  nn='{"kind":"set_not_null","schema":"public","table":"m","column":"v"}'
+  ck='{"kind":"add_check_constraint","schema":"public","table":"m","name":"m_v_ck","expression":"v >= 0"}'
+  fk='{"kind":"add_foreign_key","schema":"public","table":"m","name":"m_dev_fk","columns":["dev"],"references_schema":"public","references_table":"d","references_columns":["id"]}'
+  clean "set_not_null, a check and a foreign key with the columnstore" "$U" "$nn,$ck,$fk"
+  sql=$(plan_sql "$U" "$nn,$ck,$fk")
+  if [ "$(echo "$sql" | grep -c .)" = 3 ] && ! echo "$sql" | grep -q "NOT VALID\|VALIDATE"; then
+    ok "each is one validating statement"
+  else
+    bad "expected three statements and neither NOT VALID nor VALIDATE" "$sql"
+  fi
+  plan "$U" "$ck" | grep -q "validated in one statement" \
+    && ok "and the plan says what the lock costs" || bad "the one-step warning is missing" "$(plan "$U" "$ck")"
+  # A violating row written into a converted chunk is found in the dry run.
+  q "$U" "INSERT INTO public.m VALUES (0, now() - INTERVAL '6 days', 99, -1)" >/dev/null
+  q "$U" "SELECT compress_chunk(c, if_not_compressed => true) FROM show_chunks('public.m', older_than => INTERVAL '2 days') c" >/dev/null
+  out=$(plan "$U" "$ck")
+  echo "$out" | grep -q "is violated by some row" \
+    && ok "a check violated in a converted chunk is caught in the dry run" \
+    || bad "the dry run should report the violated check" "$out"
+  out=$(plan "$U" "$fk")
+  echo "$out" | grep -q "violates foreign key constraint" \
+    && ok "a foreign key violated in a converted chunk is caught in the dry run" \
+    || bad "the dry run should report the violated foreign key" "$out"
+  # The other direction: a plain table referencing a columnstore hypertable.
+  # VALIDATE runs on the plain table, so the two-step recipe stands (measured).
+  q "$U" "CREATE TABLE public.h2 (ts timestamptz NOT NULL, dev int NOT NULL, PRIMARY KEY (dev, ts));
+          SELECT create_hypertable('public.h2', by_range('ts', INTERVAL '1 day'));
+          INSERT INTO public.h2 SELECT '2026-01-01'::timestamptz + (g || ' min')::interval, g % 10 FROM generate_series(1, 5000) g;
+          ALTER TABLE public.h2 SET (timescaledb.enable_columnstore = true, timescaledb.segmentby = 'dev');
+          SELECT compress_chunk(c) FROM show_chunks('public.h2') c;
+          CREATE TABLE public.r2 (dev int, ts timestamptz);
+          INSERT INTO public.r2 SELECT g % 10, '2026-01-01'::timestamptz + (g || ' min')::interval FROM generate_series(1, 100) g" >/dev/null
+  fk2='{"kind":"add_foreign_key","schema":"public","table":"r2","name":"r2_fk","columns":["dev","ts"],"references_schema":"public","references_table":"h2","references_columns":["dev","ts"]}'
+  sql=$(plan_sql "$U" "$fk2")
+  echo "$sql" | grep -q "NOT VALID" && echo "$sql" | grep -q "VALIDATE CONSTRAINT" \
+    && ok "a foreign key TO a columnstore hypertable keeps the two-step recipe" \
+    || bad "expected NOT VALID then VALIDATE" "$sql"
+  raw=$(q "$U" "ALTER TABLE public.r2 ADD CONSTRAINT r2_fk FOREIGN KEY (dev, ts) REFERENCES public.h2 (dev, ts) NOT VALID; ALTER TABLE public.r2 VALIDATE CONSTRAINT r2_fk; SELECT convalidated FROM pg_constraint WHERE conname = 'r2_fk'; ALTER TABLE public.r2 DROP CONSTRAINT r2_fk")
+  [ "$(echo "$raw" | tail -1)" = t ] && ok "and the server validates it against converted chunks" \
+    || bad "VALIDATE on the referencing table should succeed" "$raw"
   refused "a type change with chunks in the columnstore" "$U" \
     '{"kind":"alter_column_type","schema":"public","table":"m","column":"v","type":"numeric"}' \
     "compressed chunks" \

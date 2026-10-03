@@ -342,8 +342,9 @@ inline void plan_timescaledb_set_columnstore(const Intent& in, const Observation
   plan.warnings.push_back(
       "with the columnstore enabled on " + qualified + ", TimescaleDB refuses VALIDATE "
       "CONSTRAINT on it, and ALTER COLUMN TYPE once a chunk is converted (measured). "
-      "pg_laswell's recipes for set_not_null, add_check_constraint and add_foreign_key "
-      "validate in a second step, so they are refused on this table from here on.");
+      "From here on set_not_null, add_check_constraint and add_foreign_key on this table "
+      "validate in the statement that adds the constraint, holding its lock for the whole "
+      "scan, and alter_column_type is refused once a chunk is converted.");
 }
 
 // --- policies -------------------------------------------------------------------

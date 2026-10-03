@@ -704,6 +704,53 @@ inline IndexTraits index_traits(const Observations& obs, const std::string& qual
   return {};
 }
 
+// Every enabled module's answer to: can a constraint on this table be
+// validated in a step of its own? (planner_base.h, ConstraintTraits). The
+// first module to answer wins; `decided_by` names it.
+#include "modules/enabled_constraint_headers.h"
+inline ConstraintTraits constraint_traits(const Observations& obs, const std::string& qualified,
+                                          std::string& decided_by) {
+#define PGLASWELL_CONSTRAINT_TRAITS(module_name, traits_fn) \
+  {                                                          \
+    auto t = traits_fn(obs, qualified);                      \
+    if (t.answered) {                                        \
+      decided_by = module_name;                              \
+      return t;                                              \
+    }                                                        \
+  }
+#include "modules/enabled_constraint_traits.h"
+#undef PGLASWELL_CONSTRAINT_TRAITS
+  (void)obs;
+  (void)qualified;
+  decided_by.clear();
+  return {};
+}
+
+// Where VALIDATE CONSTRAINT is not available, the statement that adds the
+// constraint validates it too, and its lock is held for the scan. This fills
+// in what every such step says: who decided, over how much data, and the
+// warning that the lock is not the brief one the two-step recipe would take.
+inline void validate_in_one_step(Step& step, Plan& plan, const ConstraintTraits& traits,
+                                 const std::string& by, const std::string& qualified,
+                                 const std::string& what, const std::string& lock,
+                                 const std::string& blocks) {
+  const std::string scope = traits.scope.empty() ? qualified : traits.scope;
+  const std::string over =
+      traits.size_bytes >= 0 ? ", over " + detail::human_bytes(traits.size_bytes) : "";
+  step.txn_class = TxnClass::kRequired;
+  step.own_transaction = true;
+  step.lock = lock + " on " + scope + ", held for the whole scan";
+  step.why = by + " refuses VALIDATE CONSTRAINT on " + qualified + " (\"" + traits.reason +
+             "\"), so NOT VALID followed by VALIDATE would commit the first step and "
+             "fail on the second -> validated by the statement that adds it" + over;
+  step.detail["validated_in_one_step_by"] = by;
+  if (traits.rows >= 0) step.detail["rows"] = traits.rows;
+  plan.warnings.push_back(
+      what + " on " + qualified + " is validated in one statement: " + by +
+      " allows no separate VALIDATE CONSTRAINT here. " + blocks + " " + scope +
+      " block for the whole scan" + over + ". Schedule it for a quiet window.");
+}
+
 // The per-part option as SQL: "name" or "namespace.name", unquoted because a
 // namespaced reloption is two labels, and validated here because it reaches
 // SQL. A module handing anything else is a bug; the build is refused loudly
@@ -1471,6 +1518,21 @@ inline void plan_add_check_constraint(const Intent& in, const Observations& obs,
     s.why = qualified + " does not exist";
     plan.conflicts.push_back(s.why);
     out.push_back(std::move(s));
+    return;
+  }
+
+  std::string traits_by;
+  const auto traits = constraint_traits(obs, qualified, traits_by);
+  if (traits.answered && !traits.separate_validation) {
+    Step one;
+    one.kind = in.kind_name;
+    one.sql.push_back("ALTER TABLE " + sql_rel + " ADD CONSTRAINT " +
+                      detail::quote_identifier(name) + " CHECK (" + expression + ");");
+    validate_in_one_step(one, plan, traits, traits_by, qualified,
+                         "check constraint \"" + name + "\"", "AccessExclusiveLock",
+                         "Reads and writes on");
+    one.detail["constraint"] = name;
+    out.push_back(std::move(one));
     return;
   }
 
@@ -5619,6 +5681,25 @@ inline void plan_set_not_null(const Intent& in, const Observations& obs, Plan& p
     out.push_back(std::move(s));
   };
 
+  // The four steps below lean on VALIDATE CONSTRAINT to do the scan under a
+  // weak lock. Where that is refused, the scan can only happen inside SET NOT
+  // NULL itself, under its AccessExclusiveLock, and no check is added at all.
+  std::string traits_by;
+  const auto traits = constraint_traits(obs, qualified, traits_by);
+  if (traits.answered && !traits.separate_validation) {
+    Step one;
+    one.kind = in.kind_name;
+    one.sql.push_back("ALTER TABLE " + sql_rel + " ALTER COLUMN " +
+                      detail::quote_identifier(column) + " SET NOT NULL;");
+    validate_in_one_step(one, plan, traits, traits_by, qualified,
+                         "NOT NULL on column \"" + column + "\"", "AccessExclusiveLock",
+                         "Reads and writes on");
+    one.detail["column"] = column;
+    one.detail["qualified"] = qualified;
+    out.push_back(std::move(one));
+    return;
+  }
+
   make(TxnClass::kRequired,
        "ALTER TABLE " + sql_rel + " ADD CONSTRAINT " +
            detail::quote_identifier(check) + " CHECK (" +
@@ -5717,6 +5798,23 @@ inline void plan_add_foreign_key(const Intent& in, const Observations& obs,
   }
   if (in.body.contains("on_update")) {
     clause += " ON UPDATE " + in.body.value("on_update", "");
+  }
+
+  std::string traits_by;
+  const auto traits = constraint_traits(obs, qualified, traits_by);
+  if (traits.answered && !traits.separate_validation) {
+    Step one;
+    one.kind = in.kind_name;
+    one.sql.push_back("ALTER TABLE " + sql_rel + " ADD CONSTRAINT " +
+                      detail::quote_identifier(name) + " " + clause + ";");
+    validate_in_one_step(one, plan, traits, traits_by, qualified,
+                         "foreign key \"" + name + "\"", "ShareRowExclusiveLock",
+                         "Writes to " + parent + " and to");
+    one.lock += "; ShareRowExclusiveLock on " + parent + " for as long";
+    one.detail["constraint"] = name;
+    one.detail["references"] = parent;
+    out.push_back(std::move(one));
+    return;
   }
 
   Step add;
@@ -6033,6 +6131,8 @@ inline Plan plan_migration(const Spec& spec, const Observations& obs,
         if (sql.find("CREATE INDEX") != std::string::npos ||
             sql.find("CREATE UNIQUE INDEX") != std::string::npos ||
             sql.find("VALIDATE CONSTRAINT") != std::string::npos ||
+            (sql.find(" FOREIGN KEY ") != std::string::npos &&
+             sql.find(" NOT VALID;") == std::string::npos) ||
             sql.find("ALTER COLUMN") != std::string::npos) {
           step.detail["maintenance_work_mem_mb"] = maintenance_mb;
           step.why += "; maintenance_work_mem raised to " +

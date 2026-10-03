@@ -282,6 +282,26 @@ struct IndexTraits {
   long long memory_wanted = 0;
 };
 
+// What a module tells core about validating a constraint on one table. Facts
+// only, as IndexTraits is: core decides the recipe and writes every statement.
+//
+//   separate_validation  whether VALIDATE CONSTRAINT works here. Where it does
+//                        not, NOT VALID followed by VALIDATE would commit the
+//                        first step and fail on the second, so core validates
+//                        in the statement that adds the constraint instead and
+//                        says what that lock costs.
+//   reason               the vendor's refusal, in its own words.
+//   size_bytes, rows     the data that validation reads; -1 when unknown.
+//   scope                what "the table" is for its locks, in words.
+struct ConstraintTraits {
+  bool answered = false;
+  bool separate_validation = true;
+  std::string reason;
+  long long size_bytes = -1;
+  long long rows = -1;
+  std::string scope;
+};
+
 namespace detail {
 
 // Records an out-of-band prerequisite. Every field is required because a

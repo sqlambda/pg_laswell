@@ -192,12 +192,80 @@ TEST(TimescaledbPlanner, AnOrdinaryTableInATimescaleDatabaseIsPlannedExactlyAsBe
   EXPECT_NE(ts_sql(with).find("CONCURRENTLY"), std::string::npos);
 }
 
-TEST(TimescaledbPlanner, TheColumnstoreBlocksTheValidatingRecipesAndCompressedChunksTypeChanges) {
+// VALIDATE CONSTRAINT is refused once the columnstore is enabled (measured), so
+// core validates in the statement that adds the constraint: one step, no NOT
+// VALID, and the lock it holds for the scan said in the step and in a warning.
+TEST(TimescaledbPlanner, WithTheColumnstoreAConstraintIsValidatedByTheStatementThatAddsIt) {
   const auto cs = ts_hypertable_obs(ts_hyper(512LL << 20, 4000000, true, 7));
-  EXPECT_TRUE(ts_conflict(ts_plan(json{{"kind", "set_not_null"}, {"schema", "public"},
-                                       {"table", "m"}, {"column", "v"}},
-                                  cs),
-                          "refuses VALIDATE CONSTRAINT"));
+  struct Case { json intent; const char* sql; const char* lock; };
+  const std::vector<Case> cases = {
+      {json{{"kind", "set_not_null"}, {"schema", "public"}, {"table", "m"}, {"column", "v"}},
+       "ALTER TABLE \"public\".\"m\" ALTER COLUMN \"v\" SET NOT NULL;",
+       "AccessExclusiveLock on public.m and each of its 15 chunks, held for the whole scan"},
+      {json{{"kind", "add_check_constraint"}, {"schema", "public"}, {"table", "m"},
+            {"name", "m_v_ck"}, {"expression", "v >= 0"}},
+       "ALTER TABLE \"public\".\"m\" ADD CONSTRAINT \"m_v_ck\" CHECK (v >= 0);",
+       "AccessExclusiveLock on public.m and each of its 15 chunks, held for the whole scan"},
+      {json{{"kind", "add_foreign_key"}, {"schema", "public"}, {"table", "m"},
+            {"name", "m_dev_fk"}, {"columns", json::array({"dev"})},
+            {"references_schema", "public"}, {"references_table", "d"},
+            {"references_columns", json::array({"id"})}},
+       "ALTER TABLE \"public\".\"m\" ADD CONSTRAINT \"m_dev_fk\" FOREIGN KEY (dev) "
+       "REFERENCES public.d (id);",
+       "ShareRowExclusiveLock on public.m and each of its 15 chunks, held for the whole scan; "
+       "ShareRowExclusiveLock on public.d for as long"}};
+  for (const auto& c : cases) {
+    const auto p = ts_plan(c.intent, cs);
+    ASSERT_TRUE(p.ok) << c.intent.dump();
+    ASSERT_EQ(p.steps.size(), 1u) << ts_sql(p);
+    EXPECT_EQ(p.steps[0].sql.at(0), c.sql);
+    EXPECT_EQ(p.steps[0].lock, c.lock);
+    EXPECT_TRUE(p.steps[0].own_transaction);
+    EXPECT_EQ(p.steps[0].detail.value("validated_in_one_step_by", ""), "timescaledb");
+    EXPECT_NE(p.steps[0].why.find("operation not supported on hypertables that have "
+                                  "columnstore enabled"), std::string::npos);
+    EXPECT_NE(p.steps[0].why.find("512"), std::string::npos) << p.steps[0].why;
+    bool warned = false;
+    for (const auto& w : p.warnings) {
+      if (w.find("validated in one statement") != std::string::npos &&
+          w.find("quiet window") != std::string::npos) warned = true;
+    }
+    EXPECT_TRUE(warned) << c.intent.dump();
+  }
+}
+
+// The columnstore enabled by an earlier intent of the same specification
+// counts: a NOT VALID add planned against the reading taken before it would
+// commit and then fail to validate.
+TEST(TimescaledbPlanner, AColumnstoreEnabledEarlierInTheSpecificationDecidesTheRecipeToo) {
+  const json intents = json::array(
+      {json{{"kind", "timescaledb_set_columnstore"}, {"schema", "public"}, {"table", "m"},
+            {"segment_by", json::array({"dev"})}},
+       json{{"kind", "add_check_constraint"}, {"schema", "public"}, {"table", "m"},
+            {"name", "m_v_ck"}, {"expression", "v >= 0"}}});
+  const auto sql = ts_sql(ts_plan(intents, ts_hypertable_obs()));
+  EXPECT_NE(sql.find("CHECK (v >= 0);"), std::string::npos) << sql;
+  EXPECT_EQ(sql.find("NOT VALID"), std::string::npos) << sql;
+  EXPECT_EQ(sql.find("VALIDATE CONSTRAINT"), std::string::npos) << sql;
+}
+
+// THE RULE: a hypertable without the columnstore, and a plain table, keep the
+// two-step recipe exactly as it was.
+TEST(TimescaledbPlanner, WithoutTheColumnstoreTheTwoStepRecipeIsUnchanged) {
+  const json in = {{"kind", "add_check_constraint"}, {"schema", "public"}, {"table", "m"},
+                   {"name", "m_v_ck"}, {"expression", "v >= 0"}};
+  const auto hyper = ts_plan(in, ts_hypertable_obs());
+  auto obs = ts_hypertable_obs();
+  obs.extensions.erase("timescaledb");
+  const auto plain = ts_plan(in, obs);
+  EXPECT_EQ(hyper.digest(), plain.digest());
+  ASSERT_EQ(hyper.steps.size(), 2u);
+  EXPECT_NE(hyper.steps[0].sql.at(0).find("NOT VALID;"), std::string::npos);
+  EXPECT_NE(hyper.steps[1].sql.at(0).find("VALIDATE CONSTRAINT"), std::string::npos);
+}
+
+TEST(TimescaledbPlanner, CompressedChunksBlockATypeChange) {
+  const auto cs = ts_hypertable_obs(ts_hyper(512LL << 20, 4000000, true, 7));
   EXPECT_TRUE(ts_conflict(ts_plan(json{{"kind", "alter_column_type"}, {"schema", "public"},
                                        {"table", "m"}, {"column", "v"}, {"type", "numeric"}},
                                   cs),

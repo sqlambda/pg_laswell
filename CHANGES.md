@@ -266,11 +266,26 @@ exists it is used. Intervals are compared as PostgreSQL keeps them, so "1 week"
 is "7 days" and "168 hours" is not. A retention policy needs
 `"acknowledge_data_loss": true`: it deletes data on a schedule from then on.
 
+**Constraints with the columnstore.** Once the columnstore is enabled,
+TimescaleDB refuses `VALIDATE CONSTRAINT` ("operation not supported on
+hypertables that have columnstore enabled"), which is the step the recipes for
+`set_not_null`, `add_check_constraint` and `add_foreign_key` end with: the `NOT
+VALID` add would commit and the validation fail. Core asks a module a third
+question -- *can a constraint on this table be validated in a step of its own?*
+-- and where the answer is no, the statement that adds the constraint validates
+it too: one step, in its own transaction. Measured with 137 of 140 chunks
+converted: each of the three reads the converted chunks and fails on a violating
+row that exists only there, so nothing is left unchecked. The cost is the lock,
+held for the scan rather than for a catalog change -- AccessExclusiveLock on the
+hypertable and every chunk for a check and for NOT NULL, ShareRowExclusiveLock
+on them and on the referenced table for a foreign key -- and the step and a
+warning say so, with the size it scans. The step records
+`validated_in_one_step_by`. A hypertable without the columnstore, and every
+other table, keeps the two-step recipe, and a test says so.
+
 **Refusals for core kinds on a hypertable**, including one made a hypertable
 earlier in the same specification: a unique key without the partitioning
-column; `set_not_null`, `add_check_constraint` and `add_foreign_key` once the
-columnstore is enabled, because TimescaleDB refuses the `VALIDATE` their recipes
-end with; `alter_column_type` once a chunk is in the columnstore. Each quotes the
+column; `alter_column_type` once a chunk is in the columnstore. Each quotes the
 error it pre-empts, and the live suite runs each refused statement to prove the
 server still raises it.
 

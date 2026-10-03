@@ -76,18 +76,9 @@ inline void timescaledb_plan_refusals(const Spec& spec, const Observations& obs,
       }
     }
 
-    // With the columnstore enabled, VALIDATE CONSTRAINT is refused: "operation
-    // not supported on hypertables that have columnstore enabled". Each of
-    // these recipes adds NOT VALID and validates in a second step.
-    if (h.columnstore && (in.kind == IntentKind::kSetNotNull ||
-                          in.kind == IntentKind::kAddCheckConstraint ||
-                          in.kind == IntentKind::kAddForeignKey)) {
-      refuse(what + ": " + q + " has the TimescaleDB columnstore enabled, and TimescaleDB "
-             "refuses VALIDATE CONSTRAINT on it (\"operation not supported on hypertables "
-             "that have columnstore enabled\"). pg_laswell adds this NOT VALID and "
-             "validates in a second step, so the second step would fail after the first "
-             "committed. There is no recipe for it here yet.");
-    }
+    // VALIDATE CONSTRAINT is refused once the columnstore is enabled. That is
+    // not a refusal here: constraint.h tells core, which validates in the
+    // statement that adds the constraint.
 
     // ALTER COLUMN TYPE once any chunk is converted: "operation not supported on
     // hypertables with compressed chunks".
