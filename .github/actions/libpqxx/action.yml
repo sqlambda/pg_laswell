@@ -50,7 +50,9 @@ runs:
       uses: actions/cache@v6
       with:
         path: ~/pqxx
-        key: pqxx-${{ inputs.version }}-${{ runner.os }}-${{ runner.arch }}-${{ inputs.compiler }}-libpq-${{ env.LIBPQ_VERSION }}
+        # "pic": built position-independent, for PIE executables. In the key
+        # so a copy cached before that flag is not restored in its place.
+        key: pqxx-${{ inputs.version }}-${{ runner.os }}-${{ runner.arch }}-${{ inputs.compiler }}-pic-libpq-${{ env.LIBPQ_VERSION }}
 
     - name: Build libpqxx ${{ inputs.version }}
       if: steps.pqxx.outputs.cache-hit != 'true'

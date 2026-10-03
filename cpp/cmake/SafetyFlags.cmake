@@ -45,14 +45,21 @@ if(NOT CMAKE_CXX_LINK_PIE_SUPPORTED)
 endif()
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# Probed UNDER -Werror, because that is how the flag will be used. Apple clang
+# accepts -fstack-clash-protection with only "argument unused during
+# compilation" -- a warning, so a plain probe says yes, and the real build,
+# which has -Werror, then fails on every file. Found on the first macOS build.
 set(_pglaswell_hardening_compile_flags "")
+set(_pglaswell_saved_required_flags "${CMAKE_REQUIRED_FLAGS}")
+set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} -Werror")
 foreach(_flag -fstack-protector-strong -fstack-clash-protection -fcf-protection)
-    string(MAKE_C_IDENTIFIER "PGLASWELL_HAS${_flag}" _var)
+    string(MAKE_C_IDENTIFIER "PGLASWELL_HAS_WERROR${_flag}" _var)
     check_cxx_compiler_flag(${_flag} ${_var})
     if(${_var})
         list(APPEND _pglaswell_hardening_compile_flags ${_flag})
     endif()
 endforeach()
+set(CMAKE_REQUIRED_FLAGS "${_pglaswell_saved_required_flags}")
 set(_pglaswell_hardening_link_flags "")
 foreach(_flag -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack)
     string(MAKE_C_IDENTIFIER "PGLASWELL_HAS${_flag}" _var)
