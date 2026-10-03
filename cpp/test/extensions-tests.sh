@@ -334,6 +334,32 @@ q "$V" "REVOKE CREATE, USAGE ON SCHEMA public FROM ext_runner" >/dev/null
 q "$CENTRAL/postgres" "DROP ROLE ext_runner" >/dev/null
 q "$CENTRAL/postgres" "DROP DATABASE ext_test WITH (FORCE)" >/dev/null
 
+echo "pg_cron: the zone a schedule is read in, and how the job connects"
+out=$(plan "$LOCAL/docs" "$(cmd zone 'SELECT 1')")
+zone=$(q "$LOCAL/docs" "SHOW cron.timezone")
+echo "$out" | grep -qF "the schedule is read in $zone (cron.timezone)" \
+  && ok "the step names cron.timezone ($zone)" || bad "the step should name the zone $zone" "$out"
+q "$CENTRAL/postgres" "CREATE DATABASE ext_conn" >/dev/null
+# No job has run in ext_conn: nothing is known, and the plan says so.
+out=$(plan "$CENTRAL/postgres" "$(cmd conn-unknown 'SELECT 1' '"database":"ext_conn"')")
+echo "$out" | grep -qF "whether pg_cron can connect is not known here" \
+  && ok "with no history, the connection is reported as unknown" \
+  || bad "expected the unknown-connection note" "$out"
+# Let a job run there, then ask again. Unscheduled by id: by name, pg_cron
+# looks only among the caller's own jobs.
+q "$CENTRAL/postgres" "SELECT cron.schedule_in_database('ext-test-conn-probe', '2 seconds', 'SELECT 1', 'ext_conn')" >/dev/null
+for _ in $(seq 1 20); do
+  [ "$(q "$CENTRAL/postgres" "SELECT count(*) FROM cron.job_run_details WHERE database = 'ext_conn' AND status = 'succeeded'")" -gt 0 ] && break
+  sleep 1
+done
+q "$CENTRAL/postgres" "SELECT cron.unschedule(jobid) FROM cron.job WHERE jobname = 'ext-test-conn-probe'" >/dev/null
+out=$(plan "$CENTRAL/postgres" "$(cmd conn-known 'SELECT 1' '"database":"ext_conn"')")
+echo "$out" | grep -qF "a job has connected to ext_conn as postgres" \
+  && ok "after a job has run there, the history is the evidence" \
+  || bad "expected the connected note" "$out"
+q "$CENTRAL/postgres" "DELETE FROM cron.job_run_details WHERE database = 'ext_conn'" >/dev/null
+q "$CENTRAL/postgres" "DROP DATABASE ext_conn WITH (FORCE)" >/dev/null
+
 echo
 echo "extensions: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

@@ -113,9 +113,21 @@ or
 for N from 1 to 59.
 Checked by pg_cron itself, which the dry run executes:
 .Qq invalid schedule .
-Times are in
-.Va cron.timezone
-.Pq GMT unless set .
+A cron expression names an hour, and which hour belongs to
+.Va cron.timezone ,
+a server setting
+.Pq GMT unless set
+that is neither the database's nor the session's
+.Va TimeZone .
+The step says which zone that is, and it is part of the plan: on a server with
+another zone the same specification schedules another moment, and its
+.Va planDigest
+differs.
+A role without
+.Li pg_read_all_settings
+cannot read the setting
+.Pq Qq permission denied to examine \(dqcron.timezone\(dq ,
+and the step says that instead.
 .It Va command
 Required.
 SQL, run as given at the schedule.
@@ -215,6 +227,41 @@ A job that runs as another
 has that role's privileges and
 .Va search_path ,
 and the plan says so.
+.Pp
+.Sy How the job will connect.
+When a job is scheduled pg_cron refuses a role that cannot log in, a database
+that does not exist and a role without
+.Li CONNECT ,
+and so does this module, first.
+What neither can check is authentication.
+Unless
+.Va cron.use_background_workers
+is on, pg_cron connects to
+.Va cron.host
+as the job's role, and a role
+.Pa pg_hba.conf
+does not let in without a password is found at the first run, as
+.Qq connection failed
+in
+.Li cron.job_run_details
+and nothing more (measured).
+.Pa pg_hba.conf
+is not read here: matching its rules against a host name would be a guess.
+The plan says what is known instead:
+.Bl -bullet
+.It
+with background workers, that no connection is made;
+.It
+that a job has lately run in that database as that role, which is the evidence
+that it can;
+.It
+that none has, so it is not known \(em both as a
+.Ql note:
+\(em or
+.It
+as a warning, that the last one could not connect, and this job would fail the
+same way.
+.El
 .Ss Cm pg_cron_unschedule
 Removes a job, by
 .Va name
@@ -257,6 +304,11 @@ applying role can see keyed by role and name, and:
 .It Va roles
 For a superuser only, since only a superuser may schedule for another role:
 every role, whether it may log in, and the databases it may connect to.
+.It Va timezone , host , use_background_workers
+The three settings above, for a role that may read them.
+.It Va connections
+For each database and role, the newest of the most recent 1000 runs: whether a
+job has lately connected there as that role.
 .It Va last_runs
 Each job's last run, from the most recent 1000 runs only:
 .Li cron.job_run_details
@@ -347,6 +399,11 @@ compared.
 .It A job whose last run failed
 For each job the specification schedules or unschedules: the failure message,
 and how many of its runs among the most recent 1000 failed.
+.It Whether the job can connect
+See
+.Sx How the job will connect
+under
+.Cm pg_cron_schedule .
 .El
 .Sh WHY THERE IS NO ALTER_JOB KIND
 .Cm pg_cron_schedule
@@ -367,3 +424,18 @@ false.
 .Xr pg_laswell_pgvector 7
 .Sh AUTHORS
 .An Daniel Cristian Cruz
+.Sh CAVEATS
+A role that still has a job must not be dropped.
+Measured on pg_cron 1.6 with PostgreSQL 18: after
+.Ic DROP ROLE
+of a role named in
+.Li cron.job ,
+the pg_cron launcher exits with
+.Qq role does not exist
+and is restarted every second, and no job of any role runs until that row is
+removed.
+.Fn cron.unschedule
+by name looks only among the caller's own jobs, so another role's job is
+removed by its
+.Va jobid .
+pg_laswell has no kind that drops a role, so nothing here can refuse it.

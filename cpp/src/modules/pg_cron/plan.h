@@ -221,6 +221,76 @@ inline void plan_pg_cron_schedule(const Intent& in, const Observations& obs,
     step.why = "schedules job " + name + " (" + schedule + ") to run in " + database +
                " as " + username + (active ? "" : ", inactive");
   }
+  // THE ZONE THE SCHEDULE IS READ IN. A cron expression names an hour, and
+  // which hour that is belongs to cron.timezone, a server setting (GMT unless
+  // set) that has nothing to do with the database's or the session's TimeZone.
+  // Part of the step, and so of the plan's digest: on a server with another
+  // zone the same specification schedules another moment. An interval
+  // schedule ("30 seconds") names no hour and gets no zone.
+  const bool interval_schedule = schedule.find("second") != std::string::npos;
+  if (!interval_schedule) {
+    if (!cron.value("settings_readable", true)) {
+      step.why += "; the zone the schedule is read in (cron.timezone) could not be read: " +
+                  me + " lacks pg_read_all_settings";
+    } else {
+      const auto& tz = cron.contains("timezone") ? cron["timezone"] : json();
+      const std::string zone = tz.is_string() ? tz.get<std::string>() : "GMT";
+      step.detail["timezone"] = zone;
+      step.why += "; the schedule is read in " + zone +
+                  (tz.is_string() ? " (cron.timezone)"
+                                  : " (this pg_cron has no cron.timezone setting)");
+    }
+  }
+
+  // HOW THE JOB WILL REACH ITS DATABASE. pg_cron refuses, when the job is
+  // scheduled, a role that cannot log in, a database that does not exist and a
+  // role without CONNECT -- all refused above, first. What it cannot check is
+  // authentication: it connects to cron.host as the job's role, and a role
+  // pg_hba does not let in is found at the first run, as "connection failed"
+  // and nothing more (measured). pg_hba is not read here -- matching its rules
+  // against a host name is a guess -- so what is said is what is known: the
+  // setting, and whether a job has lately connected as this role to this
+  // database. The history is volatile, so it is an advisory; a connection
+  // that last FAILED is a warning.
+  if (cron.contains("use_background_workers") && cron["use_background_workers"].is_boolean() &&
+      cron["use_background_workers"].get<bool>()) {
+    step.why += "; it runs in a background worker (cron.use_background_workers), so "
+                "no connection is made and pg_hba is not involved";
+  } else if (active) {
+    const auto host = cron.contains("host") && cron["host"].is_string()
+                          ? cron["host"].get<std::string>() : std::string();
+    const std::string to = host.empty() ? "cron.host" : host + " (cron.host)";
+    const auto& seen = cron.contains("connections") ? cron["connections"] : json();
+    const auto pair = database + "/" + username;
+    if (seen.is_object() && seen.contains(pair)) {
+      const auto& c = seen[pair];
+      std::string message = c.value("message", "");
+      while (!message.empty() && (message.back() == '\n' || message.back() == ' ')) {
+        message.pop_back();
+      }
+      if (c.value("status", "") == "failed" && message == "connection failed") {
+        plan.warnings.push_back(
+            "job " + name + ": the last job that ran in " + database + " as " + username +
+            " could not connect (\"connection failed\", " + c.value("start_time", "") +
+            "). pg_cron connects to " + to + " as that role; pg_hba.conf must let it "
+            "in without a password, or the server's .pgpass must hold one. This job "
+            "would fail the same way.");
+      } else {
+        plan.advisories.push_back(
+            "job " + name + ": a job has connected to " + database + " as " + username +
+            " (last run " + c.value("start_time", "") + "), so pg_cron can reach it "
+            "through " + to + ".");
+      }
+    } else {
+      plan.advisories.push_back(
+          "job " + name + ": no job has run in " + database + " as " + username +
+          " in the recent history, so whether pg_cron can connect is not known here. "
+          "It connects to " + to + " as that role; pg_hba.conf must let it in without "
+          "a password, or the server's .pgpass must hold one. A refused connection "
+          "shows as \"connection failed\" in cron.job_run_details at the first run.");
+    }
+  }
+
   if (plain_call) {
     step.sql.push_back("SELECT cron.schedule(" + detail::quote_literal(name) + ", " +
                        detail::quote_literal(schedule) + ", " +

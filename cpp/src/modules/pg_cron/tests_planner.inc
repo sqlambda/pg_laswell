@@ -308,6 +308,83 @@ TEST(PgCronPlanner, AJobEditedByHandIsNoticedOnAnyPlanAgainstTheDatabase) {
   EXPECT_TRUE(cron_plan(cron_job(), cron_observations(c)).advisories.empty());
 }
 
+// A cron expression names an hour; cron.timezone says which. Part of the
+// step, so of the digest: another zone is another moment.
+TEST(PgCronPlanner, TheScheduleStepSaysWhichZoneItIsReadIn) {
+  auto c = cron_home();
+  c["settings_readable"] = true;
+  c["timezone"] = "GMT";
+  const auto gmt = cron_plan(cron_job(), cron_observations(c));
+  ASSERT_TRUE(gmt.ok) << gmt.render();
+  EXPECT_NE(gmt.steps[0].why.find("the schedule is read in GMT (cron.timezone)"),
+            std::string::npos) << gmt.steps[0].why;
+  EXPECT_EQ(gmt.steps[0].detail.value("timezone", ""), "GMT");
+  c["timezone"] = "America/Sao_Paulo";
+  const auto sp = cron_plan(cron_job(), cron_observations(c));
+  EXPECT_NE(sp.steps[0].why.find("read in America/Sao_Paulo"), std::string::npos);
+  EXPECT_NE(gmt.digest(), sp.digest());
+
+  // A pg_cron without the setting reads schedules in GMT.
+  c.erase("timezone");
+  EXPECT_NE(cron_plan(cron_job(), cron_observations(c)).steps[0].why.find(
+                "read in GMT (this pg_cron has no cron.timezone setting)"),
+            std::string::npos);
+  // Measured: the setting is refused to a role without pg_read_all_settings.
+  c["settings_readable"] = false;
+  const auto blind = cron_plan(cron_job(), cron_observations(c));
+  EXPECT_NE(blind.steps[0].why.find("could not be read: postgres lacks pg_read_all_settings"),
+            std::string::npos) << blind.steps[0].why;
+  EXPECT_FALSE(blind.steps[0].detail.contains("timezone"));
+  // An interval schedule names no hour.
+  c["settings_readable"] = true;
+  const auto every = cron_plan(cron_job("tick", "30 seconds"), cron_observations(c));
+  ASSERT_TRUE(every.ok) << every.render();
+  EXPECT_EQ(every.steps[0].why.find("read in"), std::string::npos) << every.steps[0].why;
+}
+
+// What pg_cron cannot check when a job is scheduled is whether it will be let
+// in. The plan says what is known: the setting, and the run history.
+TEST(PgCronPlanner, TheScheduleStepSaysWhatIsKnownAboutTheJobsConnection) {
+  const auto warned = [](const pglaswell::Plan& p, const std::string& needle) {
+    for (const auto& w : p.warnings) if (w.find(needle) != std::string::npos) return true;
+    return false;
+  };
+  auto c = cron_home();
+  c["host"] = "localhost";
+  c["use_background_workers"] = false;
+  c["connections"] = json::object();
+  // No history: unknown, and said so.
+  const auto unknown = cron_plan(cron_job(), cron_observations(c));
+  ASSERT_TRUE(unknown.ok) << unknown.render();
+  EXPECT_TRUE(cron_advised(unknown, "whether pg_cron can connect is not known here"));
+  EXPECT_TRUE(cron_advised(unknown, "localhost (cron.host)"));
+  // A job has run there as that role.
+  c["connections"] = json{{"app/postgres", {{"status", "succeeded"}, {"message", "1 row"},
+                                            {"start_time", "2026-10-03T03:00:00+00:00"}}}};
+  const auto fine = cron_plan(cron_job(), cron_observations(c));
+  EXPECT_TRUE(cron_advised(fine, "a job has connected to app as postgres"));
+  EXPECT_FALSE(cron_advised(fine, "not known here"));
+  // History is volatile: it does not move the digest.
+  EXPECT_EQ(fine.digest(), unknown.digest());
+  // A job that ran and failed for its own reasons still connected.
+  c["connections"]["app/postgres"] = json{{"status", "failed"},
+                                          {"message", "ERROR:  division by zero\n"},
+                                          {"start_time", "2026-10-03T03:00:00+00:00"}};
+  EXPECT_TRUE(cron_advised(cron_plan(cron_job(), cron_observations(c)), "a job has connected"));
+  // Measured: a role pg_hba refuses shows as exactly this.
+  c["connections"]["app/postgres"]["message"] = "connection failed";
+  const auto refused = cron_plan(cron_job(), cron_observations(c));
+  EXPECT_TRUE(refused.ok);
+  EXPECT_TRUE(warned(refused, "could not connect (\"connection failed\""));
+  EXPECT_TRUE(warned(refused, "This job would fail the same way"));
+  // Background workers: no connection, nothing to say about pg_hba.
+  c["use_background_workers"] = true;
+  const auto bgw = cron_plan(cron_job(), cron_observations(c));
+  EXPECT_NE(bgw.steps[0].why.find("no connection is made"), std::string::npos);
+  EXPECT_FALSE(warned(bgw, "could not connect"));
+  EXPECT_TRUE(bgw.advisories.empty());
+}
+
 TEST(PgCronPlanner, ATouchedJobWhoseLastRunFailedSaysWhy) {
   auto c = cron_home("app", true,
                      json{{"postgres/nightly", {{"jobid", 7}, {"schedule", "0 3 * * *"},

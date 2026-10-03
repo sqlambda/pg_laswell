@@ -47,6 +47,19 @@ SELECT JSONB_BUILD_OBJECT(
   'current_database', current_database(),
   'current_user', current_user,
   'superuser', (SELECT rolsuper FROM pg_roles WHERE rolname = current_user),
+  -- The zone a cron expression is read in, and how a job reaches its
+  -- database. All three are refused to a role without pg_read_all_settings
+  -- (measured: "permission denied to examine \"cron.timezone\""), so they are
+  -- absent then, and settings_readable says why. With background workers no
+  -- connection is made at all; otherwise pg_cron connects to cron.host as the
+  -- job's role, and pg_hba decides whether that works.
+  'timezone', CASE WHEN pg_has_role('pg_read_all_settings', 'USAGE')
+                   THEN current_setting('cron.timezone', true) END,
+  'host', CASE WHEN pg_has_role('pg_read_all_settings', 'USAGE')
+               THEN current_setting('cron.host', true) END,
+  'use_background_workers',
+     CASE WHEN pg_has_role('pg_read_all_settings', 'USAGE')
+          THEN current_setting('cron.use_background_workers', true) = 'on' END,
   -- Not granted to PUBLIC, unlike cron.schedule (measured: "permission denied
   -- for function schedule_in_database" until GRANT EXECUTE). Guarded by
   -- to_regprocedure because releases before 1.4 do not have it.
@@ -91,6 +104,21 @@ SELECT JSONB_BUILD_OBJECT(
                                  FROM cron.job_run_details
                                 ORDER BY runid DESC LIMIT 1000) recent
                         ORDER BY jobid, runid DESC) x), '{}'::jsonb),
+  -- Whether a job has lately connected as a role to a database, from the same
+  -- most recent 1000 runs: the newest run for each pair. A role pg_hba does
+  -- not let in shows only here, and only once a job has run (measured:
+  -- status failed, return_message "connection failed", nothing more).
+  'connections', COALESCE((SELECT JSONB_OBJECT_AGG(x.database || '/' || x.username,
+                     JSONB_BUILD_OBJECT('status', x.status, 'message', x.return_message,
+                                        'start_time', x.start_time))
+                   FROM (SELECT DISTINCT ON (database, username)
+                                database, username, status, return_message, start_time
+                           FROM (SELECT database, username, runid, status, return_message,
+                                        start_time
+                                   FROM cron.job_run_details
+                                  WHERE status IN ('succeeded', 'failed')
+                                  ORDER BY runid DESC LIMIT 1000) recent
+                          ORDER BY database, username, runid DESC) x), '{}'::jsonb),
   'jobs', COALESCE((SELECT JSONB_OBJECT_AGG(username || '/' || jobname,
                              JSONB_BUILD_OBJECT(
                                'jobid', jobid, 'schedule', schedule,

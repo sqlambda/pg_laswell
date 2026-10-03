@@ -168,6 +168,28 @@ where it runs in another, the dry run checks there over a second connection.
 A step may now carry statements for the rehearsal only (`rehearse_only`,
 `rehearse_elsewhere`): run by the dry run, never by the real one.
 
+### pg_cron: the zone a schedule is read in, and whether the job can connect
+
+A cron expression names an hour, and which hour belongs to `cron.timezone` --
+a server setting, GMT unless set, unrelated to the database's `TimeZone`. A
+`pg_cron_schedule` step now says which zone its schedule is read in, as part of
+the plan: the same specification on a server with another zone schedules
+another moment, and its digest differs. A role that cannot read the setting is
+told so.
+
+pg_cron checks, when a job is scheduled, that its role can log in and may
+connect; it cannot check that the role will be let in. It connects to
+`cron.host` as the job's role, and a role `pg_hba.conf` refuses shows at the
+first run as "connection failed" and nothing more. `pg_hba.conf` is not read --
+matching its rules against a host name would be a guess -- so the plan says
+what is known: that background workers make no connection; that a job has
+lately run in that database as that role; that none has, so it is unknown; or,
+as a warning, that the last one could not connect.
+
+Found while measuring, and now in the man page: dropping a role that still has
+a job makes the pg_cron launcher exit and restart every second, and no job runs
+until the row is removed.
+
 ### pgvector: an HNSW build gets the memory it needs, within a deduced limit
 
 pgvector now tells core how much `maintenance_work_mem` an HNSW graph needs, by
