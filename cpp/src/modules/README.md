@@ -270,6 +270,12 @@ it. Say the vendor is called `acme`.
    do what is already done), is it refused (`kConflict`, with the vendor's own
    error quoted and what to do instead), or what exactly runs (`kApply`).
    Then classify it honestly:
+   - `detail["rehearse_only"]`, a list of statements the dry run runs after
+     the step's own, in the same rolled-back transaction, and the real run
+     never does -- a check, not a change. pg_cron uses it to have PostgreSQL
+     analyse a job's command without running it. `detail["rehearse_elsewhere"]`
+     (`{database, sql}`) is the same check made in another database of the
+     same server, over a second connection, for a job that runs elsewhere.
    - `TxnClass::kRequired` plus `detail["rehearse_by"] = "execution"` when the
      call is a `SELECT` that changes the catalog and rolls back cleanly --
      measured, not assumed. The dry run then executes it and rolls it back.

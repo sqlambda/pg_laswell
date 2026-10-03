@@ -233,10 +233,46 @@ inline void plan_pg_cron_schedule(const Intent& in, const Observations& obs,
                        detail::quote_literal(username) + ", " +
                        (active ? "true" : "false") + ");");
   }
-  plan.warnings.push_back(
-      "job " + name + ": pg_cron stores the command as text and first runs it at "
-      "its schedule, so nothing here checks it. A failure is recorded in "
-      "cron.job_run_details, not in this plan.");
+  // THE COMMAND, CHECKED WITHOUT BEING RUN. pg_cron stores it as text and
+  // first runs it at its schedule, so a misspelt procedure is otherwise found
+  // at 03:00. A SQL-language procedure with the command as its body is parsed
+  // and analysed when it is created (check_function_bodies), and never called:
+  // measured, that catches a syntax error, a table a DML statement names that
+  // does not exist, and a procedure a CALL names that does not exist, with
+  // PostgreSQL's own message. PREPARE cannot do it (it rejects CALL and every
+  // utility command), and a BEGIN ATOMIC body rejects CALL. A utility command
+  // (VACUUM, REFRESH) is checked for syntax only. In pg_temp, in the dry run's
+  // transaction, rolled back.
+  //
+  // Where the job runs in THIS database the check is part of the rehearsal,
+  // so it sees what this specification, and in a chain the ones before it,
+  // create. Where it runs in another, the dry run connects there as the same
+  // role and checks against that database as it is now.
+  if (in.body.value("validate_command", true)) {
+    std::string tag = "laswell_cmd";
+    while (command.find("$" + tag + "$") != std::string::npos) tag += "_";
+    const json check = json::array(
+        {"SET LOCAL check_function_bodies = on;",
+         "CREATE OR REPLACE PROCEDURE pg_temp.laswell_cron_check() LANGUAGE sql AS $" + tag +
+             "$ " + command + " $" + tag + "$;"});
+    if (database == here) {
+      step.detail["rehearse_only"] = check;
+    } else {
+      step.detail["rehearse_elsewhere"] = json{{"database", database}, {"sql", check}};
+    }
+    plan.warnings.push_back(
+        "job " + name + ": the dry run checks its command in " + database +
+        " -- syntax, and that the tables, functions and procedures it names exist"
+        " -- as " + me + ", without running it. It first RUNS at its schedule" +
+        (username != me ? ", as " + username + ", whose privileges and search_path are "
+                              "not what was checked" : std::string()) +
+        "; a failure then is recorded in cron.job_run_details.");
+  } else {
+    plan.warnings.push_back(
+        "job " + name + ": validate_command is false, so nothing here checks the "
+        "command. pg_cron stores it as text and first runs it at its schedule; a "
+        "failure is recorded in cron.job_run_details, not in this plan.");
+  }
 }
 
 inline void plan_pg_cron_unschedule(const Intent& in, const Observations& obs,

@@ -153,6 +153,21 @@ Both modules are tested against real servers in CI (the `extensions` job), and
 every refusal is checked to pre-empt an error the server really raises: the
 refused statement is run by hand too, and must fail with the quoted message.
 
+### pg_cron: a job's command is checked before it is scheduled
+
+pg_cron stores a job's command as text and first runs it at its schedule, so a
+misspelt procedure was found at 03:00. The dry run now has PostgreSQL analyse
+the command without running it -- as the body of a SQL-language procedure in
+`pg_temp`, which is checked when it is created and never called. That reports a
+syntax error, a missing table, a missing function or procedure, in PostgreSQL's
+own words. Where the job runs in the database the specification targets, the
+check is part of the rehearsal and sees what the same specification creates;
+where it runs in another, the dry run checks there over a second connection.
+`"validate_command": false` schedules a command unchecked.
+
+A step may now carry statements for the rehearsal only (`rehearse_only`,
+`rehearse_elsewhere`): run by the dry run, never by the real one.
+
 ### pgvector: an HNSW build gets the memory it needs, within a deduced limit
 
 pgvector now tells core how much `maintenance_work_mem` an HNSW graph needs, by

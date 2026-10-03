@@ -256,6 +256,39 @@ clean "unscheduling it plans, and its dry run runs cron.unschedule" \
   "$LOCAL/docs" '{"kind":"pg_cron_unschedule","name":"ext-test-kept"}'
 q "$LOCAL/docs" "SELECT cron.unschedule('ext-test-kept')" >/dev/null
 
+echo "pg_cron: the command is checked without being run"
+q "$LOCAL/docs" "CREATE TABLE IF NOT EXISTS public.cmd_t (id int, ts timestamptz)" >/dev/null
+q "$LOCAL/docs" "CREATE OR REPLACE PROCEDURE public.cmd_purge(days int) LANGUAGE sql AS \$\$ DELETE FROM public.cmd_t WHERE ts < now() - make_interval(days => days) \$\$" >/dev/null
+q "$CENTRAL/postgres" "CREATE DATABASE cmd_db" >/dev/null 2>&1 || true
+q "$CENTRAL/cmd_db" "CREATE TABLE IF NOT EXISTS public.cmd_t (id int, ts timestamptz)" >/dev/null
+cmd() {  # cmd <name> <command> [extra]
+  echo "{\"kind\":\"pg_cron_schedule\",\"name\":\"ext-test-$1\",\"schedule\":\"0 3 * * *\",
+         \"command\":\"$2\"${3:+,$3}}"
+}
+problem() {  # problem <label> <url> <intent> <needle>
+  local out; out=$(plan "$2" "$3")
+  if echo "$out" | grep -q '"problems"' && echo "$out" | grep -qF -- "$4"; then ok "$1"
+  else bad "$1 -- expected the dry run to report: $4" "$out"; fi
+}
+clean "a command that can run passes, in the job's own database" \
+  "$LOCAL/docs" "$(cmd c1 'CALL public.cmd_purge(7)')"
+problem "a procedure that does not exist is found before it is scheduled" \
+  "$LOCAL/docs" "$(cmd c2 'CALL public.cmd_nope(7)')" "procedure public.cmd_nope(integer) does not exist"
+problem "a table that does not exist" \
+  "$LOCAL/docs" "$(cmd c3 'DELETE FROM public.cmd_nope')" 'relation \"public.cmd_nope\" does not exist'
+problem "a syntax error" \
+  "$LOCAL/docs" "$(cmd c4 'SELEC 1')" 'syntax error at or near \"SELEC\"'
+clean "a job that runs in another database is checked there, over a second connection" \
+  "$CENTRAL/postgres" "$(cmd c5 'DELETE FROM public.cmd_t WHERE ts < now()' '"database":"cmd_db"')"
+problem "and a command that cannot work there is found there" \
+  "$CENTRAL/postgres" "$(cmd c6 'DELETE FROM public.cmd_nope' '"database":"cmd_db"')" "in database cmd_db"
+clean "validate_command false schedules it unchecked" \
+  "$LOCAL/docs" "$(cmd c7 'CALL public.cmd_nope(7)' '"validate_command":false')"
+[ "$(q "$LOCAL/docs" "SELECT count(*) FROM cron.job WHERE jobname LIKE 'ext-test-c%'")" = 0 ] \
+  && ok "and none of it left a job, or a procedure, behind" \
+  || bad "the checks should leave nothing" "$(q "$LOCAL/docs" "SELECT jobname FROM cron.job")"
+q "$CENTRAL/postgres" "DROP DATABASE cmd_db WITH (FORCE)" >/dev/null
+
 echo "pg_cron: a role that is not a superuser"
 q "$CENTRAL/postgres" "DROP ROLE IF EXISTS ext_runner" >/dev/null
 q "$CENTRAL/postgres" "CREATE ROLE ext_runner LOGIN PASSWORD 'laswell'" >/dev/null

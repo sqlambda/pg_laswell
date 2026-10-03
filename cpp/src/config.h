@@ -351,6 +351,20 @@ inline std::string with_application_name(const std::string& url,
   return url + sep + "application_name=" + percent_encode(app_name);
 }
 
+// The same connection, to another database on the same server. Both spellings
+// let a later dbname override an earlier one (measured with psql: a URI with a
+// path and ?dbname=, and a keyword string naming dbname twice, both connect to
+// the last). Used to CHECK something in the database a scheduled job will run
+// in, with the credentials the specification is already applied with -- never
+// to apply anything there.
+inline std::string with_dbname(const std::string& conninfo, const std::string& dbname) {
+  if (!is_conninfo_uri(conninfo)) {
+    return conninfo + " dbname=" + quote_conninfo(dbname);
+  }
+  const auto sep = conninfo.find('?') == std::string::npos ? '?' : '&';
+  return conninfo + sep + "dbname=" + percent_encode(dbname);
+}
+
 }  // namespace detail
 
 // Applies one `key = value` pair to an ExecutorConfig. Returns false if the key

@@ -137,6 +137,13 @@ Default
 .Li true .
 .Li false
 schedules the job without running it.
+.It Va validate_command
+Default
+.Li true :
+the dry run checks the command, below.
+.Li false
+schedules it unchecked, for a command naming what does not exist yet and is not
+this repository's to create.
 .El
 .Pp
 Already scheduled with the same schedule, command, database and
@@ -163,11 +170,51 @@ and the plan says so beforehand.
 The role must also be allowed to connect to the job's database:
 .Qq User runner does not have CONNECT privilege on app .
 .Pp
-The command itself is not checked: pg_cron stores it as text and first runs it
-at its schedule.
-A failure is recorded in
-.Li cron.job_run_details ,
-not in the plan, and the plan warns that this is so.
+.Sy The command is checked without being run.
+pg_cron stores it as text and first runs it at its schedule, so a misspelt
+procedure would otherwise be found at 03:00, in
+.Li cron.job_run_details .
+The dry run instead creates a SQL-language procedure in
+.Li pg_temp
+whose body is the command: PostgreSQL parses and analyses a body when the
+procedure is created, and nothing calls it.
+Measured, that reports, in PostgreSQL's own words:
+.Bl -bullet -compact
+.It
+a syntax error;
+.It
+a table a statement names that does not exist;
+.It
+a function or a procedure it calls that does not exist, with its argument
+types \(em
+.Qq procedure public.purge(integer) does not exist .
+.El
+.Pp
+A utility command
+.Pq Ic VACUUM , Ic REFRESH
+is checked for syntax only.
+.Ic PREPARE
+could not do this: it rejects
+.Ic CALL
+and every utility command.
+.Pp
+Where the job runs in the database the specification targets, the check is part
+of the rehearsal, so it sees what the same specification, and in a chained dry
+run the ones before it, create \(em a function and the job that calls it can be
+one specification.
+Where it runs in another database, the dry run opens a second connection to it,
+on the same server and as the same role, and checks against that database as it
+is; in a chained dry run that check is listed as unverified, because what it
+looks for may be in an uncommitted transaction of the same chain.
+Nothing is left behind either way.
+.Pp
+What it does not check: the command is analysed as the role applying the
+specification.
+A job that runs as another
+.Va username
+has that role's privileges and
+.Va search_path ,
+and the plan says so.
 .Ss Cm pg_cron_unschedule
 Removes a job, by
 .Va name

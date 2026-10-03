@@ -329,3 +329,70 @@ TEST(PgCronPlanner, AScheduleStepRecordsWhatItDeclares) {
   EXPECT_EQ(p.steps[0].detail.value("command", ""), "CALL app.purge_expired()");
   EXPECT_TRUE(p.steps[0].detail.value("active", false));
 }
+
+// --- 2026-10-03: the command is checked without being run --------------------
+
+TEST(PgCronPlanner, TheCommandIsCheckedInTheRehearsalWhereTheJobRunsHere) {
+  const auto p = cron_plan(cron_job(), cron_observations(cron_home()));
+  ASSERT_TRUE(p.ok);
+  const auto& s = p.steps[0];
+  // What runs is unchanged: one statement. The check is rehearsal-only.
+  ASSERT_EQ(s.sql.size(), 1u);
+  ASSERT_TRUE(s.detail.contains("rehearse_only")) << s.detail.dump();
+  EXPECT_FALSE(s.detail.contains("rehearse_elsewhere"));
+  const auto check = s.detail["rehearse_only"];
+  ASSERT_EQ(check.size(), 2u);
+  EXPECT_EQ(check[0], "SET LOCAL check_function_bodies = on;");
+  EXPECT_EQ(check[1],
+            "CREATE OR REPLACE PROCEDURE pg_temp.laswell_cron_check() LANGUAGE sql AS "
+            "$laswell_cmd$ CALL app.purge_expired() $laswell_cmd$;");
+
+  // The rehearsal runs the step's statement and then the check; the real run
+  // has only the first.
+  const auto inputs = pglaswell::detail::rehearsal_inputs(p);
+  ASSERT_EQ(inputs.steps.size(), 1u);
+  ASSERT_EQ(inputs.steps[0].second.size(), 3u);
+  EXPECT_NE(inputs.steps[0].second[2].find("pg_temp.laswell_cron_check"), std::string::npos);
+  EXPECT_TRUE(inputs.elsewhere.empty());
+}
+
+TEST(PgCronPlanner, AJobForAnotherDatabaseIsCheckedThere) {
+  auto job = cron_job();
+  job["database"] = "app";
+  const auto p = cron_plan(job, cron_observations(cron_home("postgres")));
+  ASSERT_TRUE(p.ok);
+  const auto& s = p.steps[0];
+  EXPECT_FALSE(s.detail.contains("rehearse_only"));
+  ASSERT_TRUE(s.detail.contains("rehearse_elsewhere"));
+  EXPECT_EQ(s.detail["rehearse_elsewhere"].value("database", ""), "app");
+  const auto inputs = pglaswell::detail::rehearsal_inputs(p);
+  ASSERT_EQ(inputs.elsewhere.size(), 1u);
+  EXPECT_EQ(inputs.elsewhere[0].value("step", -1), s.ordinal);
+  EXPECT_EQ(inputs.steps[0].second.size(), 1u) << "nothing extra runs in the spec's own database";
+}
+
+TEST(PgCronPlanner, ValidateCommandFalseSchedulesItUncheckedAndSaysSo) {
+  auto job = cron_job();
+  job["validate_command"] = false;
+  const auto p = cron_plan(job, cron_observations(cron_home()));
+  ASSERT_TRUE(p.ok);
+  EXPECT_FALSE(p.steps[0].detail.contains("rehearse_only"));
+  bool said = false;
+  for (const auto& w : p.warnings) {
+    if (w.find("validate_command is false") != std::string::npos) said = true;
+  }
+  EXPECT_TRUE(said);
+}
+
+TEST(PgCronPlanner, ACommandCannotCloseTheQuotingItIsCheckedIn) {
+  // The command is the body of a dollar-quoted string. One that contains the
+  // tag would end the string early and run whatever followed it.
+  auto job = cron_job();
+  job["command"] = "SELECT 1 $laswell_cmd$; DROP TABLE x; --";
+  const auto p = cron_plan(job, cron_observations(cron_home()));
+  ASSERT_TRUE(p.ok);
+  const auto check = p.steps[0].detail["rehearse_only"][1].get<std::string>();
+  EXPECT_NE(check.find("AS $laswell_cmd_$ SELECT 1 $laswell_cmd$; DROP TABLE x; -- $laswell_cmd_$;"),
+            std::string::npos)
+      << check;
+}

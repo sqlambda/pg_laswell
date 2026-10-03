@@ -353,7 +353,42 @@ struct RehearsalInputs {
   // A step whose statements change the schema through a SELECT, and so must be
   // EXECUTED to be rehearsed. See Catalog::verify_statement.
   std::vector<bool> execute;
+  // Checks a step asks to have made in ANOTHER database of the same server
+  // (detail.rehearse_elsewhere): {step, database, sql[]}. A pg_cron job
+  // scheduled from the maintenance database runs somewhere else, and whether
+  // its command can work is only answerable there.
+  std::vector<json> elsewhere;
 };
+// One step's check in another database: connect there as the same role, run
+// the statements in a transaction, roll it back. A statement the server
+// refuses is a problem of that step; so is not being able to get there, said
+// as what it is rather than left to look like a clean check.
+inline void rehearse_elsewhere(const ConnConfig& cfg, const json& e, Catalog::DryRun& dry) {
+  const auto database = e.value("database", "");
+  const int step = e.value("step", -1);
+  ConnConfig there = cfg;
+  there.conninfo = with_dbname(cfg.conninfo, database);
+  there.dbname = database;
+  std::string current;
+  try {
+    WriteSession session(there);
+    session.begin("pg_laswell/dry-run elsewhere (rolled back)");
+    for (const auto& q : e.value("sql", json::array())) {
+      current = q.get<std::string>();
+      session.txn().exec(current);
+    }
+    session.rollback();
+  } catch (const pqxx::sql_error& err) {
+    dry.problems.push_back(Catalog::Problem{step, std::string(err.sqlstate()),
+                                            Catalog::server_message(err.what()),
+                                            "in database " + database + ": " + current});
+  } catch (const std::exception& err) {
+    dry.problems.push_back(Catalog::Problem{
+        step, "", std::string("could not check in database ") + database + ": " + err.what(),
+        current});
+  }
+}
+
 inline RehearsalInputs rehearsal_inputs(const Plan& plan) {
   RehearsalInputs r;
   for (const auto& step : plan.steps) {
@@ -371,6 +406,20 @@ inline RehearsalInputs rehearsal_inputs(const Plan& plan) {
       r.steps.emplace_back(step.ordinal, sql);
     } else {
       r.steps.emplace_back(step.ordinal, step.sql);
+    }
+    // Statements a step wants run in the REHEARSAL only, after its own, inside
+    // the same rolled-back transaction: a check that must see what the step
+    // and the ones before it made, and that has no business in the real run or
+    // in the ledger's record of it. Only for a step that is rehearsed at all.
+    if (step.txn_class != TxnClass::kForbidden && step.detail.contains("rehearse_only")) {
+      for (const auto& q : step.detail["rehearse_only"]) {
+        r.steps.back().second.push_back(q.get<std::string>());
+      }
+    }
+    if (step.detail.contains("rehearse_elsewhere")) {
+      json e = step.detail["rehearse_elsewhere"];
+      e["step"] = step.ordinal;
+      r.elsewhere.push_back(std::move(e));
     }
     r.forbidden.push_back(step.txn_class == TxnClass::kForbidden);
     r.copy_payloads.push_back(step.detail.contains("copy_rows") ? step.detail : json());
@@ -416,8 +465,16 @@ inline json plan_migration_tool(ToolContext& ctx, const json& args) {
   // be tried before it is trusted.
   if (plan.ok && args.value("dryRun", true)) {
     const auto inputs = detail::rehearsal_inputs(plan);
-    const auto dry = cat.dry_run(inputs.steps, inputs.forbidden, obs.server_version,
-                                 inputs.copy_payloads, inputs.execute);
+    auto dry = cat.dry_run(inputs.steps, inputs.forbidden, obs.server_version,
+                           inputs.copy_payloads, inputs.execute);
+    // Checks in another database of the same server, each in its own
+    // transaction there, rolled back. That database is read as it is NOW: this
+    // dry run's own changes are in a transaction it cannot see.
+    if (dry.ran) {
+      for (const auto& e : inputs.elsewhere) {
+        detail::rehearse_elsewhere(cfg, e, dry);
+      }
+    }
     json d{{"ran", dry.ran},
            {"unverifiedSteps", dry.unverified_steps},
            {"note",
@@ -595,6 +652,17 @@ class ChainRehearsal {
       const auto result = Catalog::rehearse_steps(
           txn, inputs.steps, inputs.forbidden, link.server_version,
           inputs.copy_payloads, dry, link.skipped_any, inputs.execute);
+      // A check in ANOTHER database is not made in a chain: what it would look
+      // for there may be something an earlier specification of this very chain
+      // creates, inside a transaction of its own that is not committed. Listed
+      // as unverified rather than failed on a database it cannot see.
+      for (const auto& e : inputs.elsewhere) {
+        const int ordinal = e.value("step", -1);
+        if (std::find(dry.unverified_steps.begin(), dry.unverified_steps.end(), ordinal) ==
+            dry.unverified_steps.end()) {
+          dry.unverified_steps.push_back(ordinal);
+        }
+      }
 
       json r{{"unverifiedSteps", dry.unverified_steps}};
       if (!dry.weak_verification.empty()) r["weakVerification"] = dry.weak_verification;
