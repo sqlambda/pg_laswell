@@ -634,6 +634,25 @@ class Deployment {
     if (st.contains("error")) {
       out << "      " << as_text(st["error"]) << "\n";
     }
+    // What a module found left behind after the failure (executor.h,
+    // left_behind): on Citus, prepared transactions still on the nodes. This
+    // IS printed here, gids and all, because it is not in laswell.step and it
+    // is what someone has to act on next.
+    if (st.contains("error") && st["error"].is_object()) {
+      const auto& e = st["error"];
+      // Copies, not references into temporaries: value() returns by value.
+      const json left = e.value("left_behind", json::object());
+      const json hints = e.value("left_behind_hint", json::object());
+      const json unread = e.value("left_behind_unread", json::object());
+      for (const auto& [module, found] : left.items()) {
+        out << "      left behind (" << module << "): " << found.dump() << "\n";
+        if (hints.contains(module)) out << "      " << as_text(hints[module]) << "\n";
+      }
+      for (const auto& [module, why] : unread.items()) {
+        out << "      what " << module << " may have left behind could not be read: "
+            << as_text(why) << "\n";
+      }
+    }
     for (const auto& s : st.value("steps", json::array())) {
       if (s.value("state", "") == "failed") {
         const auto detail = s.value("detail", json::object());

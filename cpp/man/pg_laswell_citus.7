@@ -901,6 +901,36 @@ Moving shards by logical replication when a worker is not at
 Rebalancing when fewer nodes may hold shards than the replication factor
 requires, where Citus cannot compute a plan at all.
 .El
+.Sh AFTER A FAILED JOB
+The refusal above speaks at the next plan, and only once a prepared transaction
+is old.
+A job that fails says it at once.
+When a job ends failed on a cluster with a worker, the coordinator and every
+worker are asked, over a connection of their own, for the prepared transactions
+they hold in this database, and what is found is added to the job's error as
+.Va left_behind
+\(em node, gid, owner and age \(em kept in
+.Li laswell.job
+and printed by
+.Xr pg_laswell 1
+under the failure:
+.Bd -literal -offset indent
+left behind (citus): {"workers": {"worker1:5432":
+  [{"gid": "citus_0_1234_5_6", "owner": "app", "age_s": 0}]}}
+.Ed
+.Pp
+A statement that fails is rolled back on every node and leaves nothing, so most
+failed jobs show nothing here; what leaves one is a connection lost between
+PREPARE and COMMIT.
+The reading does not tell this job's transactions from another session's, and
+says so.
+It is a reading only: nothing is resolved.
+.Fn recover_prepared_transactions
+on the coordinator resolves Citus's own, and any other gid belongs to whoever
+prepared it.
+A worker that cannot be asked is reported as unreadable rather than as clean,
+and if the reading itself fails the error says that and the job's failure is
+unchanged.
 .Sh EXAMPLES
 Distribute a parent, then colocate a child with it, in one specification.
 The second intent is planned against the state the first will have produced, so

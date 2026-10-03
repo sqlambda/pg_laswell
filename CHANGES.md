@@ -379,6 +379,20 @@ CHECK, one scan of 400 000 rows without. Deterministic, and it runs everywhere.
   suite that needs no database. The first macOS compile used to happen on a
   release tag, which is how a libc++-only error was first found.
 
+### Citus: a failed job says what it left prepared
+
+A multi-shard write is a two-phase commit, and one that loses its connection
+between PREPARE and COMMIT leaves a prepared transaction on a worker, holding
+its locks and that node's xmin horizon. The plan guard refuses the next plan
+once such a transaction is older than twice `citus.recover_2pc_interval`; until
+then nothing said so. Now, when a job fails on a cluster, the coordinator and
+every worker are asked for the prepared transactions they hold, on a connection
+of their own, and what is found goes into the job's error as `left_behind` --
+node, gid, owner, age -- in the ledger and under the failure `pg_laswell`
+prints. A reading only: nothing is resolved, and it does not claim the
+transactions are this job's. Modules get this through a new optional file,
+`after_failure.h`.
+
 ### Pacing on a Citus cluster, stated
 
 `pg_laswell_citus(7)` now says plainly that the pacing defaults were derived on
