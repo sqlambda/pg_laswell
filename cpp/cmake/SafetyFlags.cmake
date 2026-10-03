@@ -93,6 +93,8 @@ function(pglaswell_harden target)
     target_compile_options(${target} PRIVATE
         -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion
         -Wuninitialized -Wshadow
+        -Wdouble-promotion -Wnull-dereference -Wformat=2 -Wimplicit-fallthrough
+        -Wold-style-cast -Wcast-qual -Wnon-virtual-dtor -Woverloaded-virtual
     )
     if(PGLASWELL_WERROR)
         target_compile_options(${target} PRIVATE -Werror)

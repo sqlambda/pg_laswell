@@ -188,7 +188,16 @@ run ran them inside a transaction with the server's setting instead. They now
 `SET LOCAL` it for the step and put it back after; a test proves it with a CHECK
 that validates only under the planned value.
 
-### `-Werror` follows the source
+### Warnings: eight more, and `-Werror` follows the source
+
+Eight warnings join the seven: `-Wdouble-promotion`, `-Wnull-dereference`,
+`-Wformat=2`, `-Wimplicit-fallthrough`, `-Wold-style-cast`, `-Wcast-qual`,
+`-Wnon-virtual-dtor` and `-Woverloaded-virtual`. `-Wnull-dereference` fired
+twice, in optimised GCC 14 builds only, and both times on something inlined from
+a library header rather than on a null: reading `--args @file` through
+`istreambuf_iterator`, which now goes through `rdbuf()`, and a JSON lookup
+through an iterator's `operator->` in the Citus module, which now holds a
+reference. Neither is suppressed.
 
 `-Werror` is now `PGLASWELL_WERROR`: on by default in a git checkout, off when
 there is no `.git` beside the sources -- a release tarball, built on someone
