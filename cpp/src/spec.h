@@ -18,8 +18,11 @@
 // fully applied.
 
 #include <algorithm>
+#include <cctype>
 #include <map>
+#include <optional>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -303,6 +306,10 @@ inline std::vector<std::string> conflict_keys(const Intent& in) {
       return keys;
     }
     case IntentKind::kCreateTable: {
+      // A partition names its parent: it is read to plan, and creating it takes
+      // AccessExclusiveLock on the parent (measured), so it conflicts with any
+      // other change to it.
+      if (in.body.contains("partition_of")) add(in.body.value("partition_of", ""));
       for (const auto& c : in.body.value("columns", json::array())) {
         const auto type = c.value("type", "");
         if (type.find('.') != std::string::npos) {
@@ -497,7 +504,10 @@ inline void reject_unknown_keys(const json& obj, const std::set<std::string>& al
            "Accepted keys here are: " + list +
                ". An unknown key is refused rather than ignored, because a key "
                "this binary skips and a newer one honours is a silent "
-               "difference between what was reviewed and what ran.");
+               "difference between what was reviewed and what ran. This is "
+               "pg_laswell " PGLASWELL_VERSION
+               ": if the specification was written for a later release, the key "
+               "may be one this binary predates -- run that release instead.");
     }
   }
 }
@@ -632,7 +642,7 @@ inline void parse_create_index(Intent& in) {
   detail::reject_unknown_keys(
       in.body,
       {"kind", "schema", "table", "name", "columns", "include", "unique",
-       "method", "where", "comment", "on_equivalent_index"},
+       "method", "where", "with", "comment", "on_equivalent_index"},
       at);
   detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
   detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
@@ -733,6 +743,41 @@ inline void parse_create_index(Intent& in) {
   }
   (void)detail::require_string(in.body, "comment", at);
 
+  // Storage parameters: WITH (...). Every access method that has them reads
+  // them here -- btree fillfactor, gin fastupdate, brin pages_per_range, and
+  // the ones an extension's method declares (hnsw m and ef_construction,
+  // ivfflat lists). Which names a method accepts, and their ranges, are the
+  // method's to say: PostgreSQL refuses an unknown one with "unrecognized
+  // parameter", and a module that knows the method may refuse it earlier. This
+  // checks only the shape, so the value reaches SQL as a value and nothing
+  // else.
+  if (in.body.contains("with")) {
+    const auto& w = in.body["with"];
+    if (!w.is_object() || w.empty()) {
+      detail::fail(at + ".with must be a non-empty object",
+                   "Each key is a storage parameter of the index's method and "
+                   "each value a number, a boolean or a short word: "
+                   "{\"fillfactor\": 70}, {\"m\": 16, \"ef_construction\": 64}.");
+    }
+    for (auto it = w.begin(); it != w.end(); ++it) {
+      detail::require_identifier(it.key(), "with", in.ordinal);
+      const auto& v = it.value();
+      const bool word =
+          v.is_string() && !v.get<std::string>().empty() &&
+          std::all_of(v.get_ref<const std::string&>().begin(),
+                      v.get_ref<const std::string&>().end(), [](char c) {
+                        return std::isalnum(static_cast<unsigned char>(c)) ||
+                               c == '_' || c == '.';
+                      });
+      if (!(v.is_number() || v.is_boolean() || word)) {
+        detail::fail(at + ".with." + it.key() +
+                         " must be a number, a boolean or a short word",
+                     "Storage parameters take scalar values; a word may hold "
+                     "letters, digits, '_' and '.'.");
+      }
+    }
+  }
+
   // What to do when an index equivalent to this one already exists under a
   // DIFFERENT name -- the common shape of a database where somebody built it by
   // hand. Default is to rename it, so the same spec converges every database on
@@ -774,13 +819,31 @@ inline void parse_set_not_null(Intent& in) {
   }
 }
 
+// An optional `comment` on a kind that creates a named object: the object is
+// documented by the intent that creates it, as create_table and create_index
+// document theirs. Optional rather than required, because requiring it would
+// refuse every existing repository that uses these kinds; set_comment remains
+// the way to document or re-document one that already exists.
+inline void optional_creation_comment(const Intent& in, const std::string& at) {
+  if (!in.body.contains("comment")) return;
+  if (!in.body["comment"].is_string() ||
+      in.body["comment"].get<std::string>().empty()) {
+    detail::fail(at + ".comment must be a non-empty string",
+                 "It becomes the object's COMMENT ON, in the same transaction "
+                 "that creates it. Omit the key to leave the object "
+                 "uncommented.");
+  }
+}
+
 inline void parse_add_foreign_key(Intent& in) {
   const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
   detail::reject_unknown_keys(
       in.body,
       {"kind", "schema", "table", "name", "columns", "references_schema",
-       "references_table", "references_columns", "on_delete", "on_update"},
+       "references_table", "references_columns", "on_delete", "on_update",
+       "comment"},
       at);
+  optional_creation_comment(in, at);
   detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
   detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
   // Named rather than derived, for the same reason an index is: a derived name
@@ -826,8 +889,9 @@ inline void parse_add_foreign_key(Intent& in) {
 
 inline void parse_add_check_constraint(Intent& in) {
   const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
-  detail::reject_unknown_keys(in.body,
-                              {"kind", "schema", "table", "name", "expression"}, at);
+  detail::reject_unknown_keys(
+      in.body, {"kind", "schema", "table", "name", "expression", "comment"}, at);
+  optional_creation_comment(in, at);
   detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
   detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
   detail::require_identifier(detail::require_string(in.body, "name", at), "name", in.ordinal);
@@ -878,9 +942,14 @@ inline void parse_replication_name(Intent& in) {
 
 inline void parse_publication(Intent& in) {
   const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
-  detail::reject_unknown_keys(
-      in.body, {"kind", "name", "tables", "all_tables", "operations", "add_tables",
-                "drop_tables", "publish_via_partition_root"}, at);
+  // `comment` only when CREATING: alter_publication shares this parser, and an
+  // alter that takes a comment it never applies would be a key read and ignored.
+  std::set<std::string> keys = {"kind", "name", "tables", "all_tables", "operations",
+                                "add_tables", "drop_tables",
+                                "publish_via_partition_root"};
+  if (in.kind == IntentKind::kCreatePublication) keys.insert("comment");
+  detail::reject_unknown_keys(in.body, keys, at);
+  optional_creation_comment(in, at);
   if (in.body.contains("publish_via_partition_root") &&
       !in.body["publish_via_partition_root"].is_boolean()) {
     detail::fail(at + ".publish_via_partition_root must be a boolean",
@@ -908,9 +977,12 @@ inline void parse_publication(Intent& in) {
 
 inline void parse_subscription(Intent& in) {
   const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
-  detail::reject_unknown_keys(
-      in.body, {"kind", "name", "connection", "publications", "enabled",
-                "connect", "slot_name", "refresh"}, at);
+  // `comment` only when CREATING, as for publications.
+  std::set<std::string> keys = {"kind", "name", "connection", "publications", "enabled",
+                                "connect", "slot_name", "refresh"};
+  if (in.kind == IntentKind::kCreateSubscription) keys.insert("comment");
+  detail::reject_unknown_keys(in.body, keys, at);
+  optional_creation_comment(in, at);
   detail::require_identifier(detail::require_string(in.body, "name", at), "name", in.ordinal);
   if (in.body.contains("connection")) {
     const auto conn = detail::require_string(in.body, "connection", at);
@@ -931,10 +1003,13 @@ inline void parse_subscription(Intent& in) {
           "A subscription's connection string is stored in pg_subscription in "
           "the clear, and pg_laswell stores every statement it runs verbatim in "
           "the ledger -- so a password here would be in the signed spec, in "
-          "git and in laswell.step.sql. Put the credential in the server's "
-          "~/.pgpass or a connection service file and name the service here. "
-          "It is refused rather than redacted because a redacted ledger entry "
-          "would no longer be what ran.");
+          "git and in laswell.step.sql. The connection is made by the "
+          "SUBSCRIBER's server process, not by pg_laswell: put the credential "
+          "in the ~/.pgpass of the operating-system user that server runs as "
+          "(usually postgres), on the subscriber's host -- or in a connection "
+          "service file there, and name the service here. It is refused rather "
+          "than redacted because a redacted ledger entry would no longer be "
+          "what ran.");
     }
   }
   if (in.kind == IntentKind::kCreateSubscription) {
@@ -1123,7 +1198,8 @@ inline void parse_create_rule(Intent& in) {
   const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
   detail::reject_unknown_keys(
       in.body, {"kind", "schema", "table", "name", "event", "instead", "action",
-                "where"}, at);
+                "where", "comment"}, at);
+  optional_creation_comment(in, at);
   detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
   detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
   detail::require_identifier(detail::require_string(in.body, "name", at), "name", in.ordinal);
@@ -1402,7 +1478,7 @@ inline const std::set<std::string>& commentable_object_types() {
   static const std::set<std::string> kTypes = {
       "TABLE", "COLUMN", "VIEW", "MATERIALIZED VIEW", "INDEX", "SEQUENCE",
       "SCHEMA", "TYPE", "DOMAIN", "FUNCTION", "TRIGGER", "CONSTRAINT",
-      "POLICY", "EXTENSION"};
+      "POLICY", "RULE", "EXTENSION", "PUBLICATION", "SUBSCRIPTION"};
   return kTypes;
 }
 
@@ -1415,17 +1491,21 @@ inline void parse_set_comment(Intent& in) {
     detail::fail(at + ".object_type is not one this tool comments on: " + ot,
                  "Upper case, one of TABLE, COLUMN, VIEW, MATERIALIZED VIEW, "
                  "INDEX, SEQUENCE, SCHEMA, TYPE, DOMAIN, FUNCTION, TRIGGER, "
-                 "CONSTRAINT, POLICY, EXTENSION. Not passed through unchecked: "
-                 "it becomes DDL verbatim.");
+                 "CONSTRAINT, POLICY, RULE, EXTENSION, PUBLICATION, "
+                 "SUBSCRIPTION. Not passed through unchecked: it becomes DDL "
+                 "verbatim.");
   }
   detail::require_identifier(detail::require_string(in.body, "name", at), "name", in.ordinal);
   detail::require_string(in.body, "comment", at);
   // Three different shapes, and mixing them up produces valid SQL for the
   // wrong object rather than an error:
   //   most types      "schema" + "name"   -> COMMENT ON TABLE shop.orders
-  //   SCHEMA/EXTENSION "name" alone       -> COMMENT ON SCHEMA reporting
-  //   COLUMN/TRIGGER/CONSTRAINT/POLICY    -> named relative to "table"
-  if ((ot == "SCHEMA" || ot == "EXTENSION") && in.body.contains("schema")) {
+  //   SCHEMA/EXTENSION/PUBLICATION/SUBSCRIPTION
+  //                    "name" alone       -> COMMENT ON SCHEMA reporting
+  //   COLUMN/TRIGGER/CONSTRAINT/POLICY/RULE -> named relative to "table"
+  if ((ot == "SCHEMA" || ot == "EXTENSION" || ot == "PUBLICATION" ||
+       ot == "SUBSCRIPTION") &&
+      in.body.contains("schema")) {
     detail::fail(at + " should not carry \"schema\" for a " + ot + " comment",
                  "A schema or extension IS the object: put its name in "
                  "\"name\". Passing both produces a comment on whatever "
@@ -1434,7 +1514,8 @@ inline void parse_set_comment(Intent& in) {
   }
   // COLUMN, TRIGGER, CONSTRAINT and POLICY are qualified BY a table, which is
   // a different shape from the rest and easy to leave out.
-  if ((ot == "COLUMN" || ot == "TRIGGER" || ot == "CONSTRAINT" || ot == "POLICY") &&
+  if ((ot == "COLUMN" || ot == "TRIGGER" || ot == "CONSTRAINT" || ot == "POLICY" ||
+       ot == "RULE") &&
       !in.body.contains("table")) {
     detail::fail(at + " needs \"table\" for a " + ot + " comment",
                  "A column, trigger, constraint or policy is named relative to "
@@ -1469,7 +1550,9 @@ inline void parse_schema_like(Intent& in, bool creating) {
 
 inline void parse_create_extension(Intent& in) {
   const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
-  detail::reject_unknown_keys(in.body, {"kind", "name", "schema", "version"}, at);
+  detail::reject_unknown_keys(in.body, {"kind", "name", "schema", "version", "comment"},
+                              at);
+  optional_creation_comment(in, at);
   detail::require_identifier(detail::require_string(in.body, "name", at), "name", in.ordinal);
   // The schema is optional but strongly wanted, and the plan says why: an
   // extension's objects land wherever search_path pointed at install time, and
@@ -1593,7 +1676,8 @@ inline void parse_create_trigger(Intent& in) {
   const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
   detail::reject_unknown_keys(
       in.body, {"kind", "schema", "table", "name", "timing", "events",
-                "function", "for_each", "when"}, at);
+                "function", "for_each", "when", "comment"}, at);
+  optional_creation_comment(in, at);
   detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
   detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
   detail::require_identifier(detail::require_string(in.body, "name", at), "name", in.ordinal);
@@ -1660,7 +1744,8 @@ inline void parse_create_policy(Intent& in) {
   const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
   detail::reject_unknown_keys(
       in.body, {"kind", "schema", "table", "name", "command", "roles", "using",
-                "check"}, at);
+                "check", "comment"}, at);
+  optional_creation_comment(in, at);
   detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
   detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
   detail::require_identifier(detail::require_string(in.body, "name", at), "name", in.ordinal);
@@ -2367,7 +2452,8 @@ inline void parse_create_table(Intent& in) {
   const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
   detail::reject_unknown_keys(
       in.body, {"kind", "schema", "table", "columns", "comment", "primary_key",
-                "partition_by", "unlogged", "options"}, at);
+                "partition_by", "unlogged", "options", "partition_of", "from", "to",
+                "values", "default", "modulus", "remainder"}, at);
   detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
   detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
   detail::require_string(in.body, "comment", at);
@@ -2396,6 +2482,76 @@ inline void parse_create_table(Intent& in) {
                    "leaf partitions -- each is its own create_table -- or drop "
                    "partition_by.");
     }
+  }
+  // A PARTITION: created as `CREATE TABLE child PARTITION OF parent`, which
+  // takes its columns, their types and nullability, and the parent's key from
+  // the parent. Restating them was the only way before, and a restated copy
+  // is one that can drift from its parent. Reported from pgshard, where both
+  // partitioned tables in the repository fell back to SQL at this point.
+  const bool range = in.body.contains("from") || in.body.contains("to");
+  const bool list = in.body.contains("values");
+  const bool hash = in.body.contains("modulus") || in.body.contains("remainder");
+  const bool deflt = in.body.value("default", false);
+  if (in.body.contains("partition_of")) {
+    const auto parent = detail::require_string(in.body, "partition_of", at);
+    const auto dot = parent.find('.');
+    if (dot == std::string::npos) {
+      detail::fail(at + ".partition_of must be \"schema.table\"",
+                   "The parent may be in another schema, so it is always named "
+                   "in full.");
+    }
+    detail::require_identifier(parent.substr(0, dot), "partition_of", in.ordinal);
+    detail::require_identifier(parent.substr(dot + 1), "partition_of", in.ordinal);
+    for (const char* k : {"columns", "primary_key"}) {
+      if (in.body.contains(k)) {
+        detail::fail(at + " gives " + k + " to a partition",
+                     "A partition takes its columns and its parent's keys from "
+                     "the parent: that is what PARTITION OF is for. Change the "
+                     "parent, and every partition follows.");
+      }
+    }
+    if (static_cast<int>(range) + static_cast<int>(list) + static_cast<int>(hash) +
+            static_cast<int>(deflt) != 1) {
+      detail::fail(at + " must state exactly one kind of bound",
+                   "\"from\" and \"to\" for a range partition, \"values\" for "
+                   "a list partition, \"modulus\" and \"remainder\" for a hash "
+                   "partition, or \"default\": true.");
+    }
+    if (range) {
+      detail::require_string(in.body, "from", at);
+      detail::require_string(in.body, "to", at);
+    }
+    if (list) {
+      if (!in.body["values"].is_array() || in.body["values"].empty()) {
+        detail::fail(at + ".values must be a non-empty array",
+                     "List the key values this partition accepts.");
+      }
+      for (const auto& v : in.body["values"]) {
+        if (!v.is_string()) {
+          detail::fail(at + ".values must be strings",
+                       "Write each value as it would appear in SQL, quotes "
+                       "included, so the spec is what is executed.");
+        }
+      }
+    }
+    if (hash) {
+      if (!in.body.contains("modulus") || !in.body["modulus"].is_number_integer() ||
+          in.body["modulus"].get<int>() < 1 || !in.body.contains("remainder") ||
+          !in.body["remainder"].is_number_integer() ||
+          in.body["remainder"].get<int>() < 0 ||
+          in.body["remainder"].get<int>() >= in.body["modulus"].get<int>()) {
+        detail::fail(at + " needs an integer modulus of at least 1 and a "
+                          "remainder from 0 to modulus - 1",
+                     "FOR VALUES WITH (MODULUS m, REMAINDER r), as PostgreSQL "
+                     "writes it.");
+      }
+    }
+    return;
+  }
+  if (range || list || hash || in.body.contains("default")) {
+    detail::fail(at + " states a partition bound without partition_of",
+                 "from, to, values, modulus, remainder and default describe a "
+                 "partition, and belong with \"partition_of\".");
   }
   if (!in.body.contains("columns") || !in.body["columns"].is_array() ||
       in.body["columns"].empty()) {
@@ -2502,7 +2658,9 @@ inline void parse_detach_partition(Intent& in) {
 
 inline void parse_unique_like(Intent& in) {
   const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
-  detail::reject_unknown_keys(in.body, {"kind", "schema", "table", "name", "columns"}, at);
+  detail::reject_unknown_keys(in.body, {"kind", "schema", "table", "name", "columns",
+                                       "comment"}, at);
+  optional_creation_comment(in, at);
   detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
   detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
   // The name is required rather than derived. PostgreSQL renames the backing
@@ -2612,7 +2770,11 @@ inline Spec parse_spec(const json& doc) {
                    "Accepted top-level keys are: " + allowed +
                        ", signatures. Unknown keys are refused rather than "
                        "ignored: a key outside the signed projection that the "
-                       "parser honoured would be a signature bypass.");
+                       "parser honoured would be a signature bypass. This is "
+                       "pg_laswell " PGLASWELL_VERSION
+                       ": a key added by a later release is unknown to an "
+                       "older binary, so check which one runs the "
+                       "specification.");
     }
   }
 

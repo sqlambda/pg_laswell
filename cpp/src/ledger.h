@@ -129,9 +129,24 @@ class Ledger {
     }
 
     const auto probe = s.txn().exec(
-        "SELECT to_regclass('laswell.schema_version') IS NOT NULL,"
-        "       to_regclass('laswell.trusted_key') IS NOT NULL");
+        "SELECT " + laswell_relation_oid_sql("schema_version") + " IS NOT NULL,"
+        "       " + laswell_relation_oid_sql("trusted_key") + " IS NOT NULL,"
+        "       " + kLaswellSchemaUsableSql + ", current_user");
     st.installed = !probe.empty() && probe[0][0].as<bool>() && probe[0][1].as<bool>();
+    // Installed, and this role may not even look inside it. Said as what it is,
+    // because the alternative was "permission denied for schema laswell" from
+    // the next query -- true, and no help with what to do.
+    if (st.installed && !probe[0][2].as<bool>()) {
+      const auto role = probe[0][3].as<std::string>();
+      st.error = "the laswell ledger is installed, but " + role +
+                 " has no USAGE on the laswell schema";
+      st.hint = "bootstrap.sql grants the ledger to the role named in "
+                "laswell_role. Apply as that role, or, as the ledger's owner: "
+                "GRANT USAGE ON SCHEMA laswell TO \"" + role +
+                "\"; and the table grants bootstrap.sql gives it -- re-running "
+                "bootstrap.sql with -v laswell_role=" + role + " does both.";
+      return st;
+    }
     if (!st.installed) {
       st.error = "the laswell schema is not installed in this database";
       st.hint =

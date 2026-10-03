@@ -164,7 +164,10 @@ def main():
     subprocess.run([sys.executable, os.path.join(ROOT, 'tools', 'gen-manual.py'), ref],
                    check=True)
 
-    # Served as-is: no Jekyll pass over generated files.
+    # Served as-is: no Jekyll pass over generated files. Belt and braces only:
+    # the site is deployed by actions/deploy-pages, which runs no Jekyll, and
+    # upload-pages-artifact v4+ leaves dotfiles out of the artifact anyway --
+    # so this file matters only to someone serving _site/ from a branch.
     open(os.path.join(out, '.nojekyll'), 'w').close()
 
     print('site: %s' % out)

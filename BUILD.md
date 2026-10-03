@@ -45,6 +45,38 @@ stops and says which libpqxx it found instead.
 It is built as a static library, as in the release, so the binaries carry it and
 need no libpqxx at run time.
 
+### FreeBSD
+
+Builds and passes on FreeBSD 14.5 (base clang 21) and 15.1 (base clang 19),
+amd64, checked on both with the full suite against a local PostgreSQL 18.6: 511
+of 513, the two skips being the second cluster and Citus. Clang, OpenSSL, `tar`
+and `mandoc` come with the base system; the rest from packages:
+
+```sh
+pkg install cmake pkgconf curl postgresql18-client nlohmann-json googletest
+pkg install postgresql18-server postgresql18-contrib   # for the database tests
+```
+
+`postgresql18-contrib` is needed by the tests, not the tool: the conformance
+suite creates `pg_trgm`, and without contrib the planner correctly refuses it as
+not available on the server. libpqxx is built exactly as above, with the same
+script; its `libpqxx.pc` lands in `/usr/local/lib/pkgconfig`, which FreeBSD's
+pkgconf does not search, so export
+`PKG_CONFIG_PATH=/usr/local/lib/pkgconfig` before configuring. `cpack -G FREEBSD` produces a native package that installs under
+`/usr/local`; pkg records the libraries it needs (`libpq.so.5`, from
+`postgresql18-client`) from the binaries themselves.
+
+Releases carry `pg_laswell-freebsd14-amd64.pkg` and
+`pg_laswell-freebsd15-amd64.pkg`, built in a FreeBSD VM by
+`.github/scripts/freebsd-build.sh`, which also runs in CI on every pull request:
+it builds, runs the suite that needs no database, packages, installs the
+package with `pkg add` and runs both binaries. To install one:
+
+```sh
+pkg install postgresql18-client
+pkg add ./pg_laswell-freebsd15-amd64.pkg
+```
+
 OpenSSL is linked for `OpenSSL::Crypto` only — Ed25519 signature verification,
 never TLS. It adds no new *runtime* package: `libpq5` already depends on
 libcrypto, which is why libsodium was not used despite its nicer API.
@@ -57,7 +89,7 @@ cmake --build cpp/build -j
 ctest --test-dir cpp/build --output-on-failure
 ```
 
-`ctest` registers, with the Citus module built in:
+`ctest` registers, with the modules built in:
 
 | Entry | What it runs |
 |---|---|
@@ -69,9 +101,11 @@ ctest --test-dir cpp/build --output-on-failure
 | `plans` | the plan renderer against committed transcripts |
 | `replication` | the replication suite; it needs a second cluster and skips without one |
 | `call_mode` | the binaries' `--call` mode |
-| `citus_tests` | the live Citus suite, only in a build with the module; it skips without `CITUS_URL` |
+| `citus_tests` | the live Citus suite, only in a build with modules; it skips without `CITUS_URL` |
+| `extensions_tests` | the live pg_cron and pgvector suite, only in a build with modules; it skips without `EXT_CENTRAL_URL` and `EXT_LOCAL_URL` |
+| `timescaledb_tests` | the live TimescaleDB suite, only in a build with modules; it skips without `TS_TSL_URL`, `TS_APACHE_URL` and `TS_OLDEST_URL` |
 
-A build without the module registers the same list minus `citus_tests`.
+A build without modules registers the same list minus those three.
 
 ### Tests and the database
 
@@ -94,11 +128,11 @@ A skip nobody notices is a test that silently stopped running, so CI sets
 A vendor module is compiled in, never loaded at runtime:
 
 ```bash
-cmake -S cpp -B cpp/build -DPGLASWELL_MODULES=citus
+cmake -S cpp -B cpp/build -DPGLASWELL_MODULES="citus;pg_cron;pgvector;timescaledb"
 ```
 
 The released package is built this way, and `pg_laswell --version` prints
-`modules: citus`. Without the option the binary is PostgreSQL-only, and CI builds
+`modules: citus,pg_cron,pgvector,timescaledb`. Without the option the binary is PostgreSQL-only, and CI builds
 both: the plain builds prove core needs no module, the module builds prove the
 module. A module's kinds are refused by a binary without it, as a whole
 specification, never skipped.
@@ -112,6 +146,30 @@ CITUS_URL=postgresql://postgres:laswell@127.0.0.1:55440/citus_example \
   ctest --test-dir cpp/build -R citus_tests --output-on-failure
 ```
 
+The pg_cron and pgvector suite needs PostgreSQL with both extensions, twice --
+pg_cron kept in `postgres` on one server and in the application database on the
+other, the two layouts the module supports:
+
+```bash
+docker compose -f examples/docker/extensions/compose.yml up -d --build
+./examples/docker/extensions/run.sh              # the example, both layouts
+EXT_CENTRAL_URL=postgresql://postgres:laswell@127.0.0.1:55450 \
+EXT_LOCAL_URL=postgresql://postgres:laswell@127.0.0.1:55451 \
+  ctest --test-dir cpp/build -R extensions_tests --output-on-failure
+```
+
+The TimescaleDB suite needs three servers -- the Timescale License build, the
+Apache build, and the oldest supported line -- all official images:
+
+```bash
+docker compose -f examples/docker/timescale/compose.yml up -d
+./examples/docker/timescale/run.sh               # one repository, both editions
+TS_TSL_URL=postgresql://postgres:laswell@127.0.0.1:55470 \
+TS_APACHE_URL=postgresql://postgres:laswell@127.0.0.1:55471 \
+TS_OLDEST_URL=postgresql://postgres:laswell@127.0.0.1:55472 \
+  ctest --test-dir cpp/build -R timescaledb_tests --output-on-failure
+```
+
 How a module is written is in `cpp/src/modules/README.md`.
 
 ## Warnings are errors
@@ -121,6 +179,31 @@ How a module is written is in `cpp/src/modules/README.md`.
 (`_GLIBCXX_ASSERTIONS` on GCC, `_LIBCPP_HARDENING_MODE_FAST` on Clang). Expect
 to write explicit `static_cast`s for any `size_t`/`int`/`pqxx::result::size_type`
 conversion.
+
+`-Werror` is on everywhere, including a build from a release tarball. That is
+deliberate: this tool changes production schemas, and a build that is not
+warning-clean is not the build that was tested. If a compiler newer than any
+this project has seen raises a new diagnostic, use a released package, or fix
+the diagnostic.
+
+## Binary hardening
+
+Both binaries are built with stack canaries (`-fstack-protector-strong`),
+stack-clash protection, `_FORTIFY_SOURCE` (3 on Linux, 2 elsewhere; optimised
+builds without a sanitizer only), full RELRO (`-z relro -z now`), a
+non-executable stack, PIE, and CET (`-fcf-protection`) on x86. Each flag is
+probed, because the three systems this builds on do not all take all of them.
+
+What was requested is not what is trusted. `cpp/test/hardening-check.sh` reads
+the ELF of both binaries and fails unless the hardening reached them; it runs as
+the `hardening_check` ctest entry in an optimised build without a sanitizer, in
+the `packages` CI job, and in every release job that produces an ELF:
+
+```bash
+cmake -S cpp -B cpp/build_release -DCMAKE_BUILD_TYPE=Release
+cmake --build cpp/build_release
+cpp/test/hardening-check.sh cpp/build_release/pg_laswell cpp/build_release/pg_laswell_mcp
+```
 
 Build with **both** compilers before proposing a change; they disagree about
 `-Wconversion` in places, particularly around the OpenSSL C boundary:
@@ -160,7 +243,7 @@ portable suite; see the README there. Do not "clean up" after them with
 
 ```bash
 cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
-      -DPGLASWELL_MODULES=citus
+      -DPGLASWELL_MODULES="citus;pg_cron;pgvector;timescaledb"
 cmake --build cpp/build --target pg_laswell pg_laswell_mcp
 cd cpp/build && cpack -G DEB    # or RPM
 ```

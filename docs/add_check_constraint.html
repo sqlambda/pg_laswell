@@ -78,7 +78,8 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
   &quot;schema&quot;: &lt;required&gt;,
   &quot;table&quot;: &lt;required&gt;,
   &quot;name&quot;: &lt;required&gt;,
-  &quot;expression&quot;: &lt;required&gt;
+  &quot;expression&quot;: &lt;required&gt;,
+  &quot;comment&quot;: &lt;optional&gt;
 }</pre>
 <h2>Description</h2>
 <p>—- add_check_constraint —————————————————————————</p>
@@ -92,18 +93,21 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
 <dd>&nbsp;</dd>
 <dt>expression<span class="tag req">required</span></dt>
 <dd>&nbsp;</dd>
+<dt>comment<span class="tag opt">optional</span></dt>
+<dd>It becomes the object&#x27;s COMMENT ON, in the same transaction that creates it. Omit the key to leave the object uncommented.</dd>
 </dl>
 <div class="note">Any key not listed here is <strong>refused</strong>, not ignored: a key this binary skips and a newer one honours would be a silent difference between what was reviewed and what ran.</div>
 <h2>Examples</h2>
 <p>From the conformance suite, which plans this intent and <em>applies</em> it to a real PostgreSQL on every test run:</p>
 <pre>{
  &quot;kind&quot;: &quot;add_check_constraint&quot;,
+ &quot;comment&quot;: &quot;documented by add_check_constraint&quot;,
  &quot;schema&quot;: &quot;cf&quot;,
  &quot;table&quot;: &quot;t&quot;,
  &quot;name&quot;: &quot;t_amount_ck&quot;,
  &quot;expression&quot;: &quot;amount IS NULL OR amount &gt;= 0&quot;
 }</pre>
-<p>Afterwards, <code>SELECT convalidated::text FROM pg_constraint WHERE conname=&#x27;t_amount_ck&#x27;</code> returns <code>true</code>.</p>
+<p>Afterwards, <code>SELECT convalidated::text || &#x27;:&#x27; || COALESCE(obj_description(oid, &#x27;pg_constraint&#x27;), &#x27;none&#x27;) FROM pg_constraint WHERE conname=&#x27;t_amount_ck&#x27;</code> returns <code>true:documented by add_check_constraint</code>.</p>
 <h2>See also</h2><p><a href="add_foreign_key.html"><code>add_foreign_key</code></a>, <a href="drop_constraint.html"><code>drop_constraint</code></a>, <a href="add_unique_constraint.html"><code>add_unique_constraint</code></a>, <a href="add_primary_key.html"><code>add_primary_key</code></a>, <a href="rename_constraint.html"><code>rename_constraint</code></a></p>
 <footer>Generated from <code>cpp/src/spec.h</code> and <code>cpp/src/conformance.inc</code> by <code>tools/gen-manual.py</code>. The manual page <code>pg_laswell_mcp(1)</code> remains the authoritative reference for everything that is not a per-kind option.</footer>
 </div></body></html>

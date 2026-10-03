@@ -3,9 +3,9 @@
 // The row-level DML planners: backfill, insert_rows, update_rows, delete_rows,
 // merge_rows and copy_rows.
 //
-// Split out of planner.h under the plan in docs/ROADMAP.md 6.7. planner.h
-// includes this and keeps the single plan_migration() entry point; nothing here
-// is called from anywhere else.
+// Split out of planner.h, which had grown past what one file can be read as.
+// planner.h includes this and keeps the single plan_migration() entry point;
+// nothing here is called from anywhere else.
 //
 // WHAT THESE SIX SHARE, and why they are one family rather than six unrelated
 // kinds: every one of them has to answer "which rows", and the answer decides

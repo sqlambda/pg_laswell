@@ -134,8 +134,8 @@ inline int citus_shard_holders(const json& citus) {
   return n;
 }
 
-// THE EMPTY-CLUSTER TRAP, which CITUS.md calls the highest-value refusal for a
-// lab. Measured on a database with nothing in pg_dist_node:
+// THE EMPTY-CLUSTER TRAP: the highest-value refusal for a lab, where clusters
+// are built from nothing. Measured on a database with nothing in pg_dist_node:
 // create_distributed_table, create_reference_table and
 // citus_add_local_table_to_metadata all SUCCEED -- each registers the
 // coordinator as "localhost" taking shards, and a distributed table's 32 shards

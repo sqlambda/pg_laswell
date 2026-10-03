@@ -84,6 +84,62 @@ inline std::string index_column_sql(const IndexColumn& k) {
   return out;
 }
 
+// An index's storage parameters, as `name=value` strings in name order -- the
+// vocabulary pg_class.reloptions reports, so a planned index and a built one
+// compare directly. Booleans are spelled true/false whichever of PostgreSQL's
+// spellings was used (on, yes, 1 ...), because the server stores a reloption
+// exactly as written: measured, WITH (fastupdate = off) reads back as
+// "fastupdate=off", and the same index written with false would otherwise look
+// different.
+inline std::string normalize_reloption(std::string opt) {
+  for (auto& c : opt) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  const auto eq = opt.find('=');
+  if (eq == std::string::npos) return opt;
+  const auto value = opt.substr(eq + 1);
+  if (value == "on" || value == "yes" || value == "true") return opt.substr(0, eq + 1) + "true";
+  if (value == "off" || value == "no" || value == "false") return opt.substr(0, eq + 1) + "false";
+  return opt;
+}
+
+inline std::vector<std::string> index_options(const json& body) {
+  std::vector<std::string> out;
+  const auto w = body.value("with", json::object());
+  for (auto it = w.begin(); it != w.end(); ++it) {
+    const auto& v = it.value();
+    std::string text = v.is_string() ? v.get<std::string>()
+                       : v.is_boolean() ? (v.get<bool>() ? "true" : "false")
+                                        : v.dump();
+    out.push_back(normalize_reloption(it.key() + "=" + text));
+  }
+  std::sort(out.begin(), out.end());
+  return out;
+}
+
+inline std::vector<std::string> catalog_index_options(const json& index) {
+  std::vector<std::string> out;
+  for (const auto& o : index.value("options", json::array())) {
+    out.push_back(normalize_reloption(o.get<std::string>()));
+  }
+  std::sort(out.begin(), out.end());
+  return out;
+}
+
+// " WITH (name = value, ...)", or nothing. Words are passed as literals, which
+// every reloption accepts; numbers and booleans as themselves.
+inline std::string index_with_sql(const json& body) {
+  const auto w = body.value("with", json::object());
+  if (w.empty()) return "";
+  std::vector<std::string> parts;
+  for (auto it = w.begin(); it != w.end(); ++it) {
+    const auto& v = it.value();
+    const std::string value = v.is_string() ? detail::quote_literal(v.get<std::string>())
+                              : v.is_boolean() ? (v.get<bool>() ? "true" : "false")
+                                               : v.dump();
+    parts.push_back(detail::quote_identifier(it.key()) + " = " + value);
+  }
+  return " WITH (" + detail::join(parts, ", ") + ")";
+}
+
 // How this spec's key columns sort, in the vocabulary the catalog reports
 // (`column_order`), so the two can be compared directly. PostgreSQL's defaults
 // are ASC NULLS LAST and DESC NULLS FIRST -- stated here rather than left
@@ -395,6 +451,7 @@ inline void project(const Intent& in, const Step& step, Observations& projected)
                {"column_opclasses", opclasses},
                {"method", in.body.value("method", "btree")},
                {"predicate", in.body.value("where", "")},
+               {"options", index_options(in.body)},
                {"has_expressions", has_expr},
                {"definition", "(planned by step " + std::to_string(step.ordinal) + ")"},
                {"projected_by_step", step.ordinal}};
@@ -429,11 +486,31 @@ inline void project(const Intent& in, const Step& step, Observations& projected)
             json{{"type", c.value("type", "")},
                  {"not_null", !c.value("nullable", true)}};
       }
-      projected.tables[qualified] =
-          json{{"exists", true}, {"kind", "table"}, {"columns", cols},
-               {"indexes", json::object()}, {"constraints", json::object()},
-               {"dependent_views", json::object()},
-               {"referenced_by", json::array()}, {"size_estimate", 0}};
+      // A partition's columns are its parent's, and the parent learns of it.
+      const auto parent = in.body.value("partition_of", "");
+      if (!parent.empty() && projected.tables.contains(parent)) {
+        cols = projected.tables[parent].value("columns", json::object());
+        auto& pp = projected.tables[parent];
+        if (!pp["partitions"].is_array()) pp["partitions"] = json::array();
+        pp["partitions"].push_back(qualified);
+        if (in.body.value("default", false)) {
+          pp["default_partition"] = qualified;
+          pp["default_partition_rows"] = 0;
+        }
+      }
+      json entry{{"exists", true},
+                 {"kind", in.body.contains("partition_by") ? "partitioned_table"
+                                                           : "table"},
+                 {"columns", cols},
+                 {"indexes", json::object()}, {"constraints", json::object()},
+                 {"dependent_views", json::object()},
+                 {"referenced_by", json::array()}, {"size_estimate", 0}};
+      if (in.body.contains("partition_by")) {
+        entry["partition_by"] = in.body.value("partition_by", "");
+        entry["partitions"] = json::array();
+      }
+      if (!parent.empty()) entry["is_partition"] = true;
+      projected.tables[qualified] = entry;
       return;
     }
     case IntentKind::kDropTable:
@@ -602,6 +679,58 @@ inline void project(const Intent& in, const Step& step, Observations& projected)
   }
 }
 
+// Every enabled module's answer to: how may an index be built and dropped on
+// this table? (planner_base.h, IndexTraits). The first module to answer wins,
+// for the reason required_confinement() gives. `decided_by` names it.
+#include "modules/enabled_index_headers.h"
+// `in` is the intent being planned, read-only, so a module can say how much
+// memory THIS index would like (an HNSW graph depends on its columns and m).
+inline IndexTraits index_traits(const Observations& obs, const std::string& qualified,
+                                const Intent& in, std::string& decided_by) {
+#define PGLASWELL_INDEX_TRAITS(module_name, traits_fn)      \
+  {                                                          \
+    auto t = traits_fn(obs, qualified, in);                  \
+    if (t.answered) {                                        \
+      decided_by = module_name;                              \
+      return t;                                              \
+    }                                                        \
+  }
+#include "modules/enabled_index_traits.h"
+#undef PGLASWELL_INDEX_TRAITS
+  (void)obs;
+  (void)qualified;
+  (void)in;
+  decided_by.clear();
+  return {};
+}
+
+// The per-part option as SQL: "name" or "namespace.name", unquoted because a
+// namespaced reloption is two labels, and validated here because it reaches
+// SQL. A module handing anything else is a bug; the build is refused loudly
+// rather than emitting it.
+inline std::string per_part_option_sql(const std::string& option) {
+  // One or two labels of [a-z_][a-z0-9_]*, joined by a dot. Written out rather
+  // than as a std::regex: GCC 14 raises a false -Wmaybe-uninitialized inside
+  // libstdc++'s <regex> in an optimised sanitizer build, and -Werror makes that
+  // a build failure.
+  const auto label = [](const std::string& l) {
+    if (l.empty() || !(std::islower(static_cast<unsigned char>(l[0])) || l[0] == '_')) return false;
+    return std::all_of(l.begin(), l.end(), [](char c) {
+      return std::islower(static_cast<unsigned char>(c)) ||
+             std::isdigit(static_cast<unsigned char>(c)) || c == '_';
+    });
+  };
+  const auto dot = option.find('.');
+  const bool ok = dot == std::string::npos
+                      ? label(option)
+                      : label(option.substr(0, dot)) && label(option.substr(dot + 1));
+  if (!ok) {
+    throw std::logic_error("a module answered with an index option that is not a "
+                           "(namespaced) identifier: " + option);
+  }
+  return option;
+}
+
 inline void plan_create_index(const Intent& in, const Observations& obs,
                               const ExecutorConfig& cfg, Plan& plan,
                               std::vector<Step>& out) {
@@ -670,6 +799,21 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
       step.action = Action::kSatisfied;
       step.why = "index already present and valid";
       step.detail["existing_definition"] = existing.value("definition", "");
+      // Present under the declared name but built with other storage
+      // parameters: satisfied, because the name is the identity -- and said,
+      // because an HNSW index built with the default m is not the one a spec
+      // asking for m = 32 describes. Changing them is a rebuild, which is a
+      // decision for the author, not something to do on a re-run.
+      if (in.body.contains("with") && existing.contains("options") &&
+          catalog_index_options(existing) != index_options(in.body)) {
+        plan.warnings.push_back(
+            "the index " + name + " on " + qualified + " exists with storage "
+            "parameters [" + detail::join(catalog_index_options(existing), ", ") +
+            "], not the [" + detail::join(index_options(in.body), ", ") +
+            "] this specification asks for. It is left as it is: changing them "
+            "means rebuilding it, so drop it and create it again in a later "
+            "specification if they matter.");
+      }
       return;
     }
   }
@@ -832,8 +976,27 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
         continue;
       }
 
+      // Storage parameters are part of what was asked for: an HNSW index with
+      // m = 16 and one with m = 32 answer the same queries at different recall
+      // and size, so adopting or renaming one as the other would report the
+      // spec satisfied with the wrong index. The catalog always reports
+      // `options`; a reading without it (a hand-written one) means none.
+      const bool same_options = catalog_index_options(ex) == index_options(in.body);
+      if (comparable && same_columns && same_include && same_opclasses &&
+          same_order && ex.value("is_unique", false) == unique && !same_options &&
+          ex_pred == want_pred) {
+        plan.warnings.push_back(
+            "\"" + name + "\" has the same columns, method and predicate as the "
+            "existing index \"" + it.key() + "\" on " + qualified +
+            ", but different storage parameters ([" +
+            detail::join(catalog_index_options(ex), ", ") + "] there, [" +
+            detail::join(index_options(in.body), ", ") +
+            "] here), so it is built as a second index. Drop the other one "
+            "afterwards if this replaces it.");
+        continue;
+      }
       const bool same_shape = comparable && same_columns && same_include &&
-                              same_opclasses && same_order &&
+                              same_opclasses && same_order && same_options &&
                               ex.value("is_unique", false) == unique;
 
       // Same columns, predicates that did not normalise to the same string.
@@ -946,8 +1109,18 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
     }
   }
 
-  const long long size = t.value("size_measured", t.value("size_estimate", 0LL));
-  const bool measured = t.contains("size_measured");
+  long long size = t.value("size_measured", t.value("size_estimate", 0LL));
+  bool measured = t.contains("size_measured");
+  // A module may know the data better than the relation's own reading: a
+  // TimescaleDB hypertable's parent holds no rows, so relpages says 0 and the
+  // build would be planned as a tiny one -- measured, a plain build then holds
+  // ShareLock on the parent and every chunk until it ends.
+  std::string traits_by;
+  const auto traits = index_traits(obs, qualified, in, traits_by);
+  if (traits.answered && traits.size_bytes >= 0) {
+    size = traits.size_bytes;
+    measured = true;
+  }
   const int waiters = t.value("lock_waiters", 0);
   const bool partitioned = t.value("kind", "") == "partitioned_table";
 
@@ -980,8 +1153,9 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
     }
     include_sql = " INCLUDE (" + detail::join(quoted_include, ", ") + ")";
   }
+  // WITH sits after INCLUDE and before WHERE, which is the grammar's order.
   const std::string tail = " ON " + sql_rel + " USING " + method + " (" +
-                           columns_sql + ")" + include_sql +
+                           columns_sql + ")" + include_sql + index_with_sql(in.body) +
                            (where.empty() ? "" : " WHERE " + where) + ";";
 
   // The rule that replaces a hardcoded size ceiling (S12). A plain build takes
@@ -996,11 +1170,78 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
   const bool plain = small_enough && quiet && !unique;
 
   if (rebuild_after_drop) {
-    step.sql.push_back("DROP INDEX CONCURRENTLY " + detail::quote_identifier(in.schema()) + "." + detail::quote_identifier(name) + ";");
+    // Where a concurrent drop is not possible (a hypertable: measured, "DROP
+    // INDEX CONCURRENTLY does not support dropping multiple objects"), the
+    // invalid index goes with a plain DROP.
+    step.sql.push_back(std::string(traits.answered && !traits.concurrent
+                                       ? "DROP INDEX "
+                                       : "DROP INDEX CONCURRENTLY ") +
+                       detail::quote_identifier(in.schema()) + "." +
+                       detail::quote_identifier(name) + ";");
     step.detail["recovering_invalid_index"] = true;
   }
 
-  if (plain) {
+  // Recorded when the module changed the BUILD -- no concurrency, or the size
+  // that decides plain against concurrent -- not when it only asked for memory
+  // (memory_wanted_by, below), which leaves the build as core chose it.
+  if (traits.answered && (!traits.concurrent || traits.size_bytes >= 0)) {
+    step.detail["index_build_by"] = traits_by;
+    if (traits.rows >= 0) step.detail["rows"] = traits.rows;
+  }
+  const std::string scope = traits.scope.empty() ? qualified : traits.scope;
+
+  if (traits.answered && !traits.concurrent && !plain) {
+    // No concurrent build here. Two ways remain, and the reading says which.
+    const bool per_part = !traits.per_part_option.empty() &&
+                          (!unique || traits.per_part_unique);
+    if (per_part) {
+      // One part at a time, each in its own transaction: ShareLock on one
+      // chunk while it builds, the rest writable. Cannot run in a transaction
+      // block (measured), and a failure partway leaves the parent index
+      // INVALID with some parts built -- the same shape as a failed CIC, so the
+      // same verification and recovery apply.
+      std::string with_sql = index_with_sql(in.body);
+      const auto opt = per_part_option_sql(traits.per_part_option);
+      with_sql = with_sql.empty() ? " WITH (" + opt + ")"
+                                  : with_sql.substr(0, with_sql.size() - 1) + ", " + opt + ")";
+      step.txn_class = TxnClass::kForbidden;
+      step.lock = "ShareLock on one part at a time, each in its own transaction (" +
+                  scope + ")";
+      step.sql.push_back("CREATE " + std::string(unique ? "UNIQUE " : "") + "INDEX " +
+                         detail::quote_identifier(name) + " ON " + sql_rel + " USING " +
+                         method + " (" + columns_sql + ")" + include_sql + with_sql +
+                         (where.empty() ? "" : " WHERE " + where) + ";");
+      step.why = "size " + detail::human_bytes(size) + (waiters > 0 ? ", " +
+                 std::to_string(waiters) + " lock waiters" : "") +
+                 ", and " + traits_by + " says a concurrent build is not possible "
+                 "here -> built one part at a time (" + opt + ")";
+      step.detail["must_verify_valid"] = true;
+      step.detail["failure_mode"] =
+          "a build that fails partway leaves the index INVALID with some parts "
+          "built; the next step reads indisvalid, and a re-plan drops it with a "
+          "plain DROP INDEX before rebuilding";
+    } else {
+      // Unique, where the per-part option refuses UNIQUE (measured on
+      // TimescaleDB: "cannot use timescaledb.transaction_per_chunk with UNIQUE
+      // or PRIMARY KEY"): only a plain build remains, and it blocks writes on
+      // all of it for as long as it runs. Said, not hidden.
+      step.txn_class = TxnClass::kOptional;
+      step.lock = "ShareLock on " + scope + " (blocks writes for the whole build)";
+      step.sql.push_back("CREATE " + std::string(unique ? "UNIQUE " : "") + "INDEX " +
+                         detail::quote_identifier(name) + tail);
+      step.why = "size " + detail::human_bytes(size) + ", and " + traits_by +
+                 " says neither a concurrent build nor a per-part one can build "
+                 "this index here -> plain build";
+      plan.warnings.push_back(
+          "\"" + name + "\" on " + qualified + " can only be built plainly: " +
+          traits_by + " allows no concurrent build here" +
+          (unique && !traits.per_part_option.empty()
+               ? ", and its per-part build refuses a UNIQUE index"
+               : "") +
+          ". Writes to " + scope + " block for the whole build, over " +
+          detail::human_bytes(size) + ". Schedule it for a quiet window.");
+    }
+  } else if (plain) {
     step.txn_class = TxnClass::kOptional;
     step.lock = "ShareLock (blocks writes for the whole build)";
     step.sql.push_back("CREATE INDEX " + detail::quote_identifier(name) + tail);
@@ -1027,13 +1268,42 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
         "will DROP INDEX CONCURRENTLY before rebuilding";
   }
 
+  // A build that says how much memory it wants (an HNSW graph, from pgvector)
+  // is raised toward it when no ceiling is configured -- the configured case
+  // is applied to every index step below, and wins. The limit is deduced from
+  // shared_buffers (index_build_mwm_bytes), so the raise is bounded by the one
+  // memory figure every server is tuned by.
+  if (traits.answered && traits.memory_wanted > 0 && cfg.maintenance_work_mem_mb == 0) {
+    const auto budget = detail::compute_budget(obs, cfg);
+    const long long server =
+        budget["maintenanceWorkMem"].value("serverDefaultKb", 0LL) * 1024;
+    const long long eff = index_build_mwm_bytes(budget, traits.memory_wanted);
+    if (eff > server) {
+      const long long mb = (eff + (1LL << 20) - 1) >> 20;
+      const auto human = [](long long b) { return detail::human_bytes(b); };
+      step.detail["maintenance_work_mem_mb"] = mb;
+      step.detail["memory_wanted_by"] = traits_by;
+      step.why += "; maintenance_work_mem raised to " + std::to_string(mb) +
+                  "MB for this build: " + traits_by + " says it needs about " +
+                  human(traits.memory_wanted) +
+                  (eff < traits.memory_wanted
+                       ? ", limited to " +
+                             budget["maintenanceWorkMem"].value("derivedFrom", std::string())
+                       : std::string()) +
+                  " (no maintenance_work_mem_mb configured)";
+    }
+  }
+
   step.sql.push_back("COMMENT ON INDEX " + detail::quote_identifier(in.schema()) + "." + detail::quote_identifier(name) + " IS " +
                      detail::quote_literal(in.body.value("comment", "")) + ";");
   step.detail["schema"] = in.schema();
   step.detail["index"] = name;
   step.detail["qualified"] = qualified;
   step.detail["size_bytes"] = size;
-  step.detail["size_source"] = measured ? "measured" : "estimate";
+  step.detail["size_source"] =
+      traits.answered && traits.size_bytes >= 0 ? traits_by
+      : measured                                ? "measured"
+                                                : "estimate";
   step.detail["estimated_from"] = t.value("estimated_from", json());
   step.detail["lock_waiters"] = waiters;
   (void)cfg;
@@ -1074,6 +1344,7 @@ inline void plan_partitioned_index(const Intent& in, const json& t, Plan& plan,
   for (const auto& c : columns) quoted_columns.push_back(detail::quote_identifier(c));
   const std::string cols = detail::join(quoted_columns, ", ");
   const std::string tail = " USING " + method + " (" + cols + ")" +
+                           index_with_sql(in.body) +
                            (where.empty() ? "" : " WHERE " + where);
 
   const auto partitions = t.value("partitions", json::array());
@@ -2824,17 +3095,38 @@ inline void plan_alter_misc(const Intent& in, const Observations& obs,
       if (ot == "COLUMN") {
         stmt = "COMMENT ON COLUMN " + sql_rel_tbl + "." +
                detail::quote_identifier(name) + " IS ";
-      } else if (ot == "TRIGGER" || ot == "POLICY" || ot == "CONSTRAINT") {
+      } else if (ot == "TRIGGER" || ot == "POLICY" || ot == "CONSTRAINT" ||
+                 ot == "RULE") {
         stmt = "COMMENT ON " + ot + " " + detail::quote_identifier(name) +
                " ON " + sql_rel_tbl + " IS ";
-      } else if (ot == "SCHEMA" || ot == "EXTENSION") {
+      } else if (ot == "SCHEMA" || ot == "EXTENSION" || ot == "PUBLICATION" ||
+                 ot == "SUBSCRIPTION") {
         stmt = "COMMENT ON " + ot + " " + detail::quote_identifier(name) + " IS ";
       } else {
         stmt = "COMMENT ON " + ot + " " + target + " IS ";
       }
+      // The lock, measured per shape on 18.6. This said "AccessShareLock -- a
+      // comment blocks nothing", which was never measured and is not what
+      // PostgreSQL takes: a comment on a relation takes ShareUpdateExclusiveLock
+      // on it, which reads and writes pass but VACUUM, ANALYZE, CREATE INDEX
+      // CONCURRENTLY and other DDL on that relation wait for.
+      std::string lock;
+      if (ot == "TABLE" || ot == "COLUMN" || ot == "VIEW" ||
+          ot == "MATERIALIZED VIEW" || ot == "INDEX" || ot == "SEQUENCE") {
+        lock = "ShareUpdateExclusiveLock on the relation -- reads and writes "
+               "continue; VACUUM, ANALYZE and other DDL on it wait";
+      } else if (ot == "TRIGGER" || ot == "POLICY" || ot == "CONSTRAINT" ||
+                 ot == "RULE") {
+        lock = "AccessShareLock on " + qualified_tbl +
+               ", and ShareUpdateExclusiveLock on the " + ot +
+               " itself -- nothing that touches rows waits";
+      } else {
+        lock = "ShareUpdateExclusiveLock on the " + ot +
+               " itself -- no table is locked";
+      }
       emit(TxnClass::kRequired,
            {stmt + detail::quote_literal(in.body.value("comment", "")) + ";"},
-           "AccessShareLock -- a comment blocks nothing",
+           lock,
            "documentation is a change to schema state like any other, and this "
            "is the intent that changes one without recreating the object",
            /*own=*/false);
@@ -3674,6 +3966,159 @@ inline void plan_security(const Intent& in, const Observations& obs, Plan& plan,
 // state applied exactly once, and creating a table is the clearest example
 // there is. A repository that cannot express the tables it depends on describes
 // a database that does not exist.
+namespace detail {
+// Defined below with attach_partition, whose bound syntax this shares: the two
+// kinds must not disagree about how a bound is written.
+inline std::string bounds_as_for_values(const Intent& in);
+}  // namespace detail
+
+// create_table with partition_of: CREATE TABLE child PARTITION OF parent.
+//
+// Measured on 18.6, and the measurements are the plan:
+//   - it takes AccessExclusiveLock on the PARENT (and on its DEFAULT
+//     partition, if there is one): every read and write on the parent waits
+//     until it commits -- a SELECT on the parent timed out behind it. ATTACH
+//     PARTITION takes only ShareUpdateExclusiveLock on the parent, which is
+//     the lighter route for a busy one.
+//   - beside a DEFAULT partition it reads every row of the default to prove
+//     none belongs to the new bound (47 ms for 1M rows), and a row that does
+//     fails the statement: "updated partition constraint for default
+//     partition would be violated by some row". The dry run executes it, so
+//     that is found before anything commits.
+//   - refused by PostgreSQL, and so here where the reading shows it first: a
+//     parent that is not partitioned, a second DEFAULT. An overlapping bound
+//     is refused too ("would overlap partition"), and is left to the dry run:
+//     the bounds of existing partitions are not read.
+//   - accepted: hash bounds, an UNLOGGED child of a logged parent, a child
+//     that is itself partitioned, storage options.
+inline void plan_create_partition(const Intent& in, const Observations& obs,
+                                  Plan& plan, Step& step) {
+  const auto qualified = in.qualified_table();
+  const auto sql_rel = detail::quote_qualified(qualified);
+  const auto parent = in.body.value("partition_of", "");
+  const auto& t = obs.table(qualified);
+  const auto& p = obs.table(parent);
+  const auto refuse = [&](const std::string& why, const std::string& more) {
+    step.action = Action::kConflict;
+    step.why = why;
+    plan.conflicts.push_back(why + (more.empty() ? "" : ". " + more));
+  };
+
+  if (t.value("exists", false)) {
+    for (const auto& already : p.value("partitions", json::array())) {
+      if (already.is_string() && already.get<std::string>() == qualified) {
+        step.action = Action::kSatisfied;
+        step.why = qualified + " is already a partition of " + parent;
+        return;
+      }
+    }
+    refuse(qualified + " exists and is not a partition of " + parent,
+           "attach_partition adopts an existing table as a partition, and takes "
+           "only ShareUpdateExclusiveLock on the parent to do it");
+    return;
+  }
+  if (!p.value("exists", false)) {
+    refuse(parent + " does not exist, so nothing can be a partition of it",
+           "Create it with create_table and partition_by, in an earlier intent.");
+    return;
+  }
+  if (p.value("kind", "") != "partitioned_table") {
+    refuse(parent + " is a " + p.value("kind", std::string("relation")) +
+               ", not a partitioned table",
+           "PostgreSQL refuses it (\"is not partitioned\"). A table is "
+           "partitioned when it is created, with partition_by.");
+    return;
+  }
+  // The strategy is the first word of the key: RANGE, LIST or HASH. A parent
+  // projected from an earlier intent carries its partition_by text instead.
+  std::string key = p.value("partition_key", std::string());
+  if (key.empty()) key = p.value("partition_by", std::string());
+  std::string strategy = key.substr(0, key.find_first_of(" ("));
+  for (auto& ch : strategy) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+  const bool deflt = in.body.value("default", false);
+  const char* bound = in.body.contains("modulus") ? "HASH"
+                      : in.body.contains("values") ? "LIST"
+                      : deflt ? "DEFAULT" : "RANGE";
+  if (!strategy.empty()) {
+    if (deflt && strategy == "HASH") {
+      refuse(parent + " is hash partitioned, and a hash-partitioned table has "
+                      "no DEFAULT partition",
+             "Every value hashes to some remainder, so there is nothing for a "
+             "default to hold. Create one partition per remainder.");
+      return;
+    }
+    if (!deflt && strategy != bound) {
+      refuse(parent + " is partitioned by " + strategy + ", and this bound is " + bound,
+             std::string("Use ") +
+                 (strategy == "RANGE" ? "\"from\" and \"to\""
+                  : strategy == "LIST" ? "\"values\""
+                                       : "\"modulus\" and \"remainder\"") +
+                 " for a partition of " + parent + ".");
+      return;
+    }
+  }
+  const auto existing_default = p.value("default_partition", json(nullptr));
+  if (deflt && existing_default.is_string()) {
+    refuse(parent + " already has a DEFAULT partition, " +
+               existing_default.get<std::string>(),
+           "PostgreSQL refuses a second one (\"conflicts with existing default "
+           "partition\").");
+    return;
+  }
+
+  std::string sql = std::string("CREATE ") +
+                    (in.body.value("unlogged", false) ? "UNLOGGED " : "") +
+                    "TABLE " + sql_rel + " PARTITION OF " +
+                    detail::quote_qualified(parent) + " " +
+                    detail::bounds_as_for_values(in);
+  if (in.body.contains("partition_by")) {
+    sql += " PARTITION BY " + in.body.value("partition_by", "");
+  }
+  const json options = in.body.value("options", json::object());
+  if (!options.empty()) sql += " WITH (" + storage_parameters(options) + ")";
+  step.sql.push_back(sql + ";");
+  step.sql.push_back("COMMENT ON TABLE " + sql_rel + " IS " +
+                     detail::quote_literal(in.body.value("comment", "")) + ";");
+
+  step.action = Action::kApply;
+  step.txn_class = TxnClass::kRequired;
+  step.detail["partition_of"] = parent;
+  step.detail["bound"] = detail::bounds_as_for_values(in);
+  std::string locked = parent;
+  if (existing_default.is_string()) locked += " and " + existing_default.get<std::string>();
+  step.lock = "AccessExclusiveLock on " + locked +
+              " -- measured: reads and writes on the parent wait until this "
+              "commits";
+  step.why = qualified + " is created as a partition of " + parent +
+             ", taking its columns from it rather than restating them";
+  plan.warnings.push_back(
+      "Creating a partition locks " + parent + " against every read and write "
+      "until the step commits. It is brief -- the new table is empty -- but it "
+      "queues behind any long transaction on " + parent + " (lock_timeout "
+      "bounds that). On a busy parent the lighter route is create_table without "
+      "partition_of, then attach_partition, which takes only "
+      "ShareUpdateExclusiveLock on the parent.");
+  if (existing_default.is_string()) {
+    const auto rows = p.value("default_partition_rows", json(nullptr));
+    step.detail["default_partition"] = existing_default;
+    step.detail["default_partition_rows"] = rows;
+    plan.warnings.push_back(
+        "Beside the DEFAULT partition " + existing_default.get<std::string>() +
+        (rows.is_number() ? " (" + std::to_string(rows.get<long long>()) +
+                                " estimated rows)"
+                          : std::string()) +
+        ", every row of it is read under lock to prove none belongs to the new "
+        "bound -- measured, 47 ms for 1M rows. One that does fails the step; "
+        "the dry run executes it, so that is found before anything commits.");
+  }
+  if (in.body.value("unlogged", false)) {
+    plan.warnings.push_back(
+        qualified + " is UNLOGGED: it is not written to WAL, so it is not "
+        "replicated to any standby and its rows do not survive a crash. That is "
+        "a durability decision, not a performance setting.");
+  }
+}
+
 inline void plan_create_table(const Intent& in, const Observations& obs,
                               Plan& plan, std::vector<Step>& out) {
   Step step;
@@ -3683,6 +4128,11 @@ inline void plan_create_table(const Intent& in, const Observations& obs,
   const auto qualified = in.qualified_table();
   const auto sql_rel = detail::quote_qualified(qualified);
   const auto& t = obs.table(qualified);
+
+  if (in.body.contains("partition_of")) {
+    plan_create_partition(in, obs, plan, step);
+    return;
+  }
 
   if (t.value("exists", false)) {
     // Deliberately NOT compared column by column. A table that exists with a
@@ -4005,6 +4455,13 @@ inline std::string bounds_as_check(const Intent& in, const std::string& key) {
 }
 
 inline std::string bounds_as_for_values(const Intent& in) {
+  // Hash bounds come only from create_table's partition_of: attach_partition
+  // does not accept them, because it derives a CHECK from the bound to avoid
+  // the scan, and a hash bound has no such CHECK.
+  if (in.body.contains("modulus")) {
+    return "FOR VALUES WITH (MODULUS " + std::to_string(in.body.value("modulus", 1)) +
+           ", REMAINDER " + std::to_string(in.body.value("remainder", 0)) + ")";
+  }
   if (in.body.contains("from")) {
     return "FOR VALUES FROM (" + in.body.value("from", "") + ") TO (" +
            in.body.value("to", "") + ")";
@@ -4435,9 +4892,26 @@ inline void plan_unique_like(const Intent& in, const Observations& obs,
     if (icols == columns) { backing = iname; break; }
   }
 
-  const long long size = t.value("size_estimate", 0LL);
+  long long size = t.value("size_estimate", 0LL);
   const int waiters = t.value("lock_waiters", 0);
-  const bool small_and_quiet = size < (64LL << 20) && waiters == 0;
+  // Where a module says no concurrent build is possible (a hypertable), the
+  // CIC + USING INDEX recipe below cannot run at all -- so the one statement
+  // is the only way, whatever the size, and the size it states is the
+  // module's, because the parent's own relpages says 0.
+  std::string traits_by;
+  const auto traits = index_traits(obs, qualified, in, traits_by);
+  if (traits.answered && traits.size_bytes >= 0) size = traits.size_bytes;
+  const bool no_concurrent = traits.answered && !traits.concurrent;
+  const bool small_and_quiet = (size < (64LL << 20) && waiters == 0) || no_concurrent;
+  if (no_concurrent && !(size < (64LL << 20) && waiters == 0)) {
+    plan.warnings.push_back(
+        "the constraint on " + qualified + " is added in one statement although "
+        "the data is " + detail::human_bytes(size) +
+        (waiters > 0 ? " and sessions are waiting" : "") + ": " + traits_by +
+        " allows no concurrent index build here, so AccessExclusiveLock is held on " +
+        (traits.scope.empty() ? qualified : traits.scope) +
+        " while the unique index builds. Schedule it for a quiet window.");
+  }
 
   auto emit = [&](TxnClass klass, std::vector<std::string> sql,
                   const std::string& lock, const std::string& why, bool own) {
@@ -5027,7 +5501,27 @@ inline void plan_drop_index(const Intent& in, const Observations& obs, Plan& pla
   }
 
   const int waiters = t.value("lock_waiters", 0);
-  if (waiters == 0) {
+  std::string traits_by;
+  const auto traits = index_traits(obs, qualified, in, traits_by);
+  if (traits.answered && !traits.concurrent) {
+    // No concurrent drop here (a hypertable: measured, "DROP INDEX
+    // CONCURRENTLY does not support dropping multiple objects"), so a plain
+    // one whatever the waiters -- and it locks every part, which is said.
+    step.txn_class = TxnClass::kOptional;
+    step.lock = "AccessExclusiveLock on " +
+                (traits.scope.empty() ? qualified : traits.scope) + ", briefly";
+    step.sql.push_back("DROP INDEX " + detail::quote_identifier(in.schema()) + "." +
+                       detail::quote_identifier(name) + ";");
+    step.why = traits_by + " says a concurrent drop is not possible here -> plain DROP";
+    step.detail["index_build_by"] = traits_by;
+    if (waiters > 0) {
+      plan.warnings.push_back(
+          "\"" + name + "\" is dropped plainly although " + std::to_string(waiters) +
+          " session(s) already wait on " + qualified + ": a concurrent drop is not "
+          "possible there, so this one queues behind them, and everything after it "
+          "queues behind it.");
+    }
+  } else if (waiters == 0) {
     step.txn_class = TxnClass::kOptional;
     step.lock = "AccessExclusiveLock, briefly";
     step.sql.push_back("DROP INDEX " + detail::quote_identifier(in.schema()) + "." + detail::quote_identifier(name) + ";");
@@ -5261,6 +5755,52 @@ inline void plan_add_foreign_key(const Intent& in, const Observations& obs,
 
 // --- the planner ----------------------------------------------------------
 
+namespace detail {
+// The COMMENT ON a creating kind's optional `comment` becomes, appended to the
+// step that leaves the object in place: the LAST step the plan applies. For a
+// foreign key or a check that is the VALIDATE after the NOT VALID add, for a
+// unique constraint the ADD ... USING INDEX after the concurrent build, and
+// for the rest the one statement that creates it -- in every case the object
+// exists by then, and the comment commits with it.
+//
+// Nothing is appended when no step applies: an object that already exists is
+// reported satisfied without comparing its comment, as create_table does, and
+// set_comment is the kind that changes one.
+//
+// Measured on 18.6: each COMMENT ON below succeeds in the transaction that
+// created the object. A comment on a constraint, trigger, policy or rule takes
+// AccessShareLock on its table and ShareUpdateExclusiveLock on the object; on
+// an extension, publication or subscription, ShareUpdateExclusiveLock on the
+// object only. Both are weaker than what creating the object already holds.
+inline void append_creation_comment(const Intent& in, std::vector<Step>& steps) {
+  if (!in.body.contains("comment")) return;
+  const auto name = quote_identifier(in.body.value("name", ""));
+  const auto on_table = [&] { return " ON " + quote_qualified(in.qualified_table()); };
+  std::string target;
+  switch (in.kind) {
+    case IntentKind::kAddForeignKey:
+    case IntentKind::kAddCheckConstraint:
+    case IntentKind::kAddUniqueConstraint:
+    case IntentKind::kAddPrimaryKey:
+      target = "CONSTRAINT " + name + on_table();
+      break;
+    case IntentKind::kCreateTrigger: target = "TRIGGER " + name + on_table(); break;
+    case IntentKind::kCreatePolicy:  target = "POLICY " + name + on_table(); break;
+    case IntentKind::kCreateRule:    target = "RULE " + name + on_table(); break;
+    case IntentKind::kCreateExtension:    target = "EXTENSION " + name; break;
+    case IntentKind::kCreatePublication:  target = "PUBLICATION " + name; break;
+    case IntentKind::kCreateSubscription: target = "SUBSCRIPTION " + name; break;
+    default: return;  // kinds that document themselves, or create nothing named
+  }
+  for (auto it = steps.rbegin(); it != steps.rend(); ++it) {
+    if (it->action != Action::kApply || it->sql.empty()) continue;
+    it->sql.push_back("COMMENT ON " + target + " IS " +
+                      quote_literal(in.body.value("comment", "")) + ";");
+    return;
+  }
+}
+}  // namespace detail
+
 inline Plan plan_migration(const Spec& spec, const Observations& obs,
                            const ExecutorConfig& cfg) {
   Plan plan;
@@ -5301,9 +5841,10 @@ inline Plan plan_migration(const Spec& spec, const Observations& obs,
   // fabricated a step. That is the forbidden shape -- a module altering what
   // core emits -- available by accident.
   //
-  // A module now provides a FUNCTION, and core calls it with (spec, obs) and a
-  // refuse callback. `plan` is not passed, so a guard cannot reach it: the only
-  // thing it can do is say no, and say why.
+  // A module now provides a FUNCTION, and core calls it with (spec, obs), the
+  // budget read-only, and two callbacks: refuse, and advise. `plan` is not
+  // passed, so a guard cannot reach it: it can say no and say why, or add an
+  // advisory -- a sentence outside planDigest that changes no statement.
   {
     std::vector<std::string> refusals;
     // maybe_unused because a PostgreSQL-only build has no guard to call it, and
@@ -5311,7 +5852,17 @@ inline Plan plan_migration(const Spec& spec, const Observations& obs,
     [[maybe_unused]] const auto refuse = [&refusals](std::string why) {
       refusals.push_back(std::move(why));
     };
-#define PGLASWELL_PLAN_GUARD(guard_fn) guard_fn(spec, obs, refuse);
+    // The one other thing a guard may do: add an ADVISORY, a sentence that is
+    // shown and never hashed and never changes a statement. Same shape as
+    // refuse, and the same reason for it -- a callback that appends a string
+    // cannot reach the plan.
+    [[maybe_unused]] const auto advise = [&plan](std::string note) {
+      plan.advisories.push_back(std::move(note));
+    };
+    // The budget is passed read-only so a guard can say what maintenance_work_mem
+    // a step will run with, which core decides there; it is outside planDigest.
+    [[maybe_unused]] const json& budget = plan.budget;
+#define PGLASWELL_PLAN_GUARD(guard_fn) guard_fn(spec, obs, budget, refuse, advise);
 #include "modules/enabled_guards.h"
 #undef PGLASWELL_PLAN_GUARD
     if (!refusals.empty()) {
@@ -5467,6 +6018,7 @@ inline Plan plan_migration(const Spec& spec, const Observations& obs,
       case IntentKind::kRevoke:
         plan_security(in, projected, plan, emitted); break;
     }
+    detail::append_creation_comment(in, emitted);
     if (!emitted.empty()) project(in, emitted.front(), projected);
 
     for (auto& step : emitted) {
@@ -5567,6 +6119,9 @@ inline std::string Plan::render() const {
     if (!s.why.empty()) out += "    why:  " + s.why + "\n";
   }
   for (const auto& w : warnings) out += "\n warn: " + w + "\n";
+  // Not part of planDigest (see Plan::advisories), and labelled so a reader
+  // comparing two renderings knows these lines may differ between them.
+  for (const auto& a : advisories) out += "\n note: " + a + "\n";
   // Prerequisites last and set apart, because they are the only lines here
   // that ask somebody to go and DO something -- often on another machine --
   // rather than to know something.

@@ -59,9 +59,15 @@ tar -xzf "$TARBALL" -C /tmp
 # runs slowly beats one that fails parsing the job count.
 JOBS="$( (nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2) | head -1)"
 
+# Position-independent, because it is linked into PIE executables. Debian's
+# and Ubuntu's compilers default to that; Rocky's and FreeBSD's do not, and
+# there the link fails -- "relocation R_X86_64_32 ... can not be used when
+# making a PIE object; recompile with -fPIE" -- which is how this was found,
+# on the first release build after the binaries were hardened.
 set -- -DCMAKE_BUILD_TYPE=Release \
        -DBUILD_SHARED_LIBS=OFF \
        -DSKIP_BUILD_TEST=ON \
+       -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
        "$@"
 if [ -n "$PREFIX" ]; then
   set -- "$@" -DCMAKE_INSTALL_PREFIX="$PREFIX"

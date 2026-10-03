@@ -759,9 +759,21 @@ class MigrationRepository {
   // spec_id -> {digest -> best state}
   json applied_index(const ConnConfig& cfg) {
     ReadSession s(cfg, std::nullopt, cache_, 2000);
-    const auto probe =
-        s.txn().exec("SELECT to_regclass('laswell.migration') IS NOT NULL");
+    // By OID: a name-based probe raises for a role without USAGE on the
+    // schema (session.h). Such a role cannot know what was applied, and
+    // listing every spec as pending would be a lie -- so it is said.
+    const auto probe = s.txn().exec(
+        "SELECT " + laswell_relation_oid_sql("migration") + " IS NOT NULL, " +
+        kLaswellSchemaUsableSql + ", current_user, current_database()");
     if (probe.empty() || !probe[0][0].as<bool>()) return json::object();
+    if (!probe[0][1].as<bool>()) {
+      throw std::runtime_error(
+          "cannot read what was applied to " + probe[0][3].as<std::string>() + ": " +
+          probe[0][2].as<std::string>() +
+          " has no USAGE on the laswell schema. Apply as the role bootstrap.sql "
+          "named in laswell_role, or re-run bootstrap.sql with -v laswell_role=" +
+          probe[0][2].as<std::string>() + ".");
+    }
 
     const auto r = s.txn().exec(R"SQL(
       SELECT COALESCE(JSONB_OBJECT_AGG(epoch, by_id), '{}'::jsonb) FROM (

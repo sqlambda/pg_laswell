@@ -30,8 +30,55 @@ find_program(VALGRIND_EXECUTABLE valgrind)
 # a safety check, so the path is fixed at include time and its absence is fatal.
 set(PGLASWELL_CMAKE_DIR "${CMAKE_CURRENT_LIST_DIR}")
 
-# Always-on static hygiene: warnings-as-errors + hardened standard library.
+# Binary hardening, probed once here rather than per target (each probe is a
+# compile). Probed, not assumed, because this project builds on three systems
+# and the flags are not all everywhere: -fcf-protection is x86 only, and ld64
+# on macOS refuses -z. A flag the toolchain cannot take is dropped; what
+# actually reached the binary is then ASSERTED, by test/hardening-check.sh --
+# requested flags are an intention, the ELF headers are the fact.
+include(CheckCXXCompilerFlag)
+include(CheckLinkerFlag)
+include(CheckPIESupported)
+check_pie_supported(OUTPUT_VARIABLE _pglaswell_pie_msg LANGUAGES CXX)
+if(NOT CMAKE_CXX_LINK_PIE_SUPPORTED)
+    message(WARNING "PIE is not supported by this toolchain: ${_pglaswell_pie_msg}")
+endif()
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+# Probed UNDER -Werror, because that is how the flag will be used. Apple clang
+# accepts -fstack-clash-protection with only "argument unused during
+# compilation" -- a warning, so a plain probe says yes, and the real build,
+# which has -Werror, then fails on every file. Found on the first macOS build.
+set(_pglaswell_hardening_compile_flags "")
+set(_pglaswell_saved_required_flags "${CMAKE_REQUIRED_FLAGS}")
+set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} -Werror")
+foreach(_flag -fstack-protector-strong -fstack-clash-protection -fcf-protection)
+    string(MAKE_C_IDENTIFIER "PGLASWELL_HAS_WERROR${_flag}" _var)
+    check_cxx_compiler_flag(${_flag} ${_var})
+    if(${_var})
+        list(APPEND _pglaswell_hardening_compile_flags ${_flag})
+    endif()
+endforeach()
+set(CMAKE_REQUIRED_FLAGS "${_pglaswell_saved_required_flags}")
+set(_pglaswell_hardening_link_flags "")
+foreach(_flag -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack)
+    string(MAKE_C_IDENTIFIER "PGLASWELL_HAS${_flag}" _var)
+    check_linker_flag(CXX ${_flag} ${_var})
+    if(${_var})
+        list(APPEND _pglaswell_hardening_link_flags ${_flag})
+    endif()
+endforeach()
+
+# Always on: warnings as errors, hardened standard library, hardened binary.
 function(pglaswell_harden target)
+    # -Werror is UNCONDITIONAL, and that is a deliberate deviation from the
+    # shared standard, which turns it off when building from a release tarball
+    # so that a newer compiler's new diagnostic cannot lock a user out. Decided
+    # 2026-10-03 to keep it on everywhere: this tool changes production
+    # schemas, and a build that is not warning-clean is not the build that was
+    # tested. Someone on a compiler newer than any CI has seen is better served
+    # by the released packages, or by a build that stops and says why, than by
+    # one that compiles past a diagnostic nobody has read.
     target_compile_options(${target} PRIVATE
         -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion
         -Wuninitialized -Wshadow -Werror
@@ -42,6 +89,24 @@ function(pglaswell_harden target)
     elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
         target_compile_definitions(${target} PRIVATE _LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_FAST)
     endif()
+
+    # _FORTIFY_SOURCE needs optimisation (glibc emits a #warning at -O0, fatal
+    # under -Werror) and fights the sanitizers' interceptors, so it is applied
+    # only to optimised builds without one. -U first, so a packager's own
+    # -D_FORTIFY_SOURCE=2 does not trip a redefinition warning. Level 3 on
+    # Linux, where glibc has it; 2 elsewhere, which every libc here understands.
+    if(PGLASWELL_SANITIZER STREQUAL "NONE")
+        if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            set(_fortify 3)
+        else()
+            set(_fortify 2)
+        endif()
+        target_compile_options(${target} PRIVATE
+            $<$<CONFIG:Release,RelWithDebInfo,MinSizeRel>:-U_FORTIFY_SOURCE>
+            $<$<CONFIG:Release,RelWithDebInfo,MinSizeRel>:-D_FORTIFY_SOURCE=${_fortify}>)
+    endif()
+    target_compile_options(${target} PRIVATE ${_pglaswell_hardening_compile_flags})
+    target_link_options(${target} PRIVATE ${_pglaswell_hardening_link_flags})
 endfunction()
 
 # Opt-in dynamic bug detection, selected via -DPGLASWELL_SANITIZER=<value>.

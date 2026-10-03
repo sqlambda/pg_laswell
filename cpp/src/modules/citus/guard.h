@@ -12,9 +12,10 @@
 // do, and foreign keys by the kinds of table at their two ends. Every
 // refusal quotes the Citus error it pre-empts, so the author reads the rule
 // they would otherwise have hit at execution.
-template <typename Refuse>
+template <typename Refuse, typename Advise>
 inline void citus_plan_refusals(const Spec& spec, const Observations& obs,
-                                const Refuse& refuse) {
+                                const json& /*budget*/, const Refuse& refuse,
+                                const Advise& /*advise*/) {
   const auto& citus = obs.extension("citus");
   if (citus.empty()) return;
   const auto tables = citus.value("tables", json::object());
@@ -34,8 +35,9 @@ inline void citus_plan_refusals(const Spec& spec, const Observations& obs,
     return it->value("repmodel", "") == "t" ? "reference" : "local";
   };
 
-  // 1. DDL PROPAGATION. DECIDED: a hard refusal, not a warning -- CITUS.md §10
-  // asked for the decision and this is it, with the reason.
+  // 1. DDL PROPAGATION. DECIDED: a hard refusal, not a warning. Whether it
+  // should refuse or warn was an open question; this is the decision, with
+  // the reason.
   //
   // With citus.enable_ddl_propagation off, DDL runs on the coordinator and NOT
   // on the workers. The coordinator's catalog and the workers' then diverge --

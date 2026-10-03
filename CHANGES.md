@@ -1,5 +1,333 @@
 # Changes
 
+## 0.1.3
+
+Two gaps reported from pgshard while writing specifications for an audit
+application, one wrong lock found fixing them, and three more modules in the one
+package: pg_cron, pgvector and TimescaleDB. No ledger schema change.
+
+### An object is documented by the intent that creates it
+
+`comment` was accepted by thirteen core kinds and absent from the rest, and the
+line was nearly but not quite "does this create a named object": `create_index`
+required one and `create_trigger` refused one. A house rule of "every object
+documented where it is created" took a second, `set_comment` intent restating
+the schema, table and name of the first -- and a rename in one and not the
+other documents the wrong object.
+
+`comment` is now accepted, optionally, by every kind that creates a named object
+and did not take one: `add_foreign_key`, `add_check_constraint`,
+`add_unique_constraint`, `add_primary_key`, `create_trigger`, `create_policy`,
+`create_rule`, `create_extension`, `create_publication` and
+`create_subscription`. Optional, because requiring it would refuse every
+repository written before it. It becomes the object's `COMMENT ON`, appended to
+the step that leaves the object in place -- the VALIDATE after a `NOT VALID`
+foreign key, the `ADD ... USING INDEX` after a concurrent unique build -- so it
+commits with the object. `alter_publication` and `alter_subscription`, which
+share a parser with the create kinds, refuse it rather than ignore it.
+`add_enum_value` stays without one: PostgreSQL has no `COMMENT ON` for an enum
+label.
+
+`set_comment` also takes `RULE`, `PUBLICATION` and `SUBSCRIPTION`.
+
+### A partition can be created, not only adopted
+
+`create_table` took `partition_by`, which makes a parent, and `attach_partition`
+adopted an existing table as a child. Nothing created a child, so a partition
+was `create_table` restating every column of its parent -- seventeen, for the
+audit table -- followed by an attach, and a restated copy is one that can drift.
+
+`create_table` with `partition_of` creates it: `CREATE TABLE ... PARTITION OF`,
+taking the parent's columns and keys, with one bound -- `from`/`to`, `values`,
+`modulus`/`remainder` (new: hash) or `default`. Measured on PostgreSQL 18.6 and
+stated in the plan:
+
+- it takes **AccessExclusiveLock on the parent**, and on its DEFAULT partition
+  if it has one: a SELECT on the parent waited behind it. `attach_partition`
+  takes only ShareUpdateExclusiveLock on the parent, and the plan names it as
+  the lighter route for a busy one;
+- beside a DEFAULT partition, every row of the default is read to prove none
+  belongs to the new bound (47 ms for 1M rows), and the plan states the
+  default's row count. A row that does belong fails the statement, which the
+  dry run executes, so it is found before anything commits;
+- refused first where the reading shows it: a parent that is not partitioned,
+  a bound of the wrong kind for the parent, a DEFAULT for a hash parent or a
+  second DEFAULT, and a table of that name that exists and is not already its
+  partition. One that already is, is satisfied.
+
+`attach_partition` keeps its meaning, for a table that already exists.
+
+### Storage parameters on an index
+
+`create_index` takes `with`: the index's storage parameters, emitted as
+`WITH (...)` -- btree `fillfactor`, gin `fastupdate`, brin `pages_per_range`,
+and the ones an extension's method declares, such as HNSW's `m` and
+`ef_construction` and IVFFlat's `lists`. Values are numbers, booleans or short
+words. The parameters are now part of what makes two indexes the same: they are
+read back from `pg_class.reloptions` (with `off` and `false` alike), and an
+index matching in everything but its parameters is built as a second index,
+with a warning naming both, instead of being adopted or renamed. One already
+present under the declared name with other parameters is satisfied, and the plan
+says so.
+
+### pg_cron: scheduled jobs as intents
+
+`pg_cron_schedule` and `pg_cron_unschedule`, in a module of their own. A job is
+named, never numbered, and identified as pg_cron identifies it, by name and role.
+Both ways a server keeps pg_cron are supported, and the specification does not
+choose: in the application database, a job commits with the rest of the
+specification and its ledger row; in a maintenance database (the default,
+`postgres`), a specification targets a connection to it and names the database
+each job runs in. The example applies one set of signed specifications to both.
+A job scheduled from the wrong database, a `create_extension` of pg_cron
+outside `cron.database_name`, a job for another role by a role that is not a
+superuser, and `schedule_in_database` without its grant are refused before
+anything runs, each quoting the error it pre-empts. A schedule pg_cron cannot
+read is caught by the dry run, which executes the call and rolls it back.
+
+Measured on the way: `cron.database_name` is readable only with the privileges
+of `pg_read_all_settings`, and a role without them gets an error even from
+`current_setting(..., true)`. The module's reading runs on every plan against a
+server that loads pg_cron, so it checks first: an ordinary specification plans
+for any role, and a pg_cron kind from such a role names the grant it needs.
+
+The module reads, where its extension is not installed, what it needs to say
+where it is: a module's `observe.h` now declares an absent reading too
+(`nullptr` for Citus and pgvector).
+
+### pgvector: the indexes it would refuse, refused first
+
+No kinds of its own: a vector column is a `create_table` type, and an HNSW or
+IVFFlat index is a `create_index` with a method, an operator class and `with`.
+The module refuses what pgvector would: more dimensions than the method
+indexes (2000 for `vector`, 4000 for `halfvec`, 64000 for `bit`), a column with
+none, no operator class where the method has no default, a class for another
+type, `sparsevec` on IVFFlat, UNIQUE or multicolumn, and storage parameters out
+of bounds -- including `m` above half the default `ef_construction`. The
+operator classes are read from the server. Said before an HNSW build starts,
+because a concurrent build cannot be rehearsed and one refused at execution has
+already scanned the table and left an invalid index.
+
+An expression key is checked when it is an explicit cast -- `embedding::halfvec(3072)`,
+`CAST(... AS ...)`, `binary_quantize(embedding)::bit(1536)` -- as the type it casts
+to, which is how a vector wider than 2000 is indexed.
+
+Three things pgvector does not refuse but a reader should know before a build
+are now **advisories**: an IVFFlat index on an empty table, or one with fewer
+rows than lists; an HNSW graph larger than the `maintenance_work_mem` the step
+will run with, sized from rows, dimensions and `m` by a rule measured on 0.8.6
+(the vector's bytes plus about 210 + 32·m a row, within 2% across four shapes),
+naming the setting to raise; and a parallel HNSW build that would allocate more
+shared memory than a container's default `/dev/shm`.
+
+### Advisories: shown, and not hashed
+
+A plan may now carry `advisories` beside its `warnings`, rendered as `note:`
+lines by both binaries. They hold facts that move on their own -- a row count
+autovacuum rewrites, a job's last run -- and are left out of `planDigest`, like
+the budget, so planMigration and startMigration a minute apart still agree. A
+plan with none serialises exactly as before. A module's guard may add them
+through a second callback beside `refuse`; it still cannot reach a step.
+
+### pg_cron, continued
+
+- A job for another role is checked as pg_cron checks it: the role exists, may
+  log in, and may connect to the job's database.
+- **A job edited by hand is noticed on any plan against pg_cron's database**,
+  not only when the specification that declared it is planned again. Each
+  `pg_cron_schedule` step records what it declared; a module may now ask core
+  for its own applied steps from the ledger, and pg_cron compares the newest
+  declaration of each job with `cron.job`. The example moves a job by hand and
+  shows the note on a plan for an unrelated schema.
+- A job a specification touches whose last run failed is named, with the
+  message, from the most recent 1000 runs.
+- No `alter_job` kind, deliberately: `pg_cron_schedule` already changes a job in
+  place and keeps its id, and `cron.alter_job` is not granted to PUBLIC.
+
+Found by the live suite: on PostgreSQL 18, `to_regclass('laswell.job')` and
+`has_table_privilege('laswell.job', ...)` RAISE for a role without USAGE on the
+schema instead of answering no. The ledger reading looks the table up through
+`pg_class` and tests by OID.
+
+Both modules are tested against real servers in CI (the `extensions` job), and
+every refusal is checked to pre-empt an error the server really raises: the
+refused statement is run by hand too, and must fail with the quoted message.
+
+### pgvector: an HNSW build gets the memory it needs, within a deduced limit
+
+pgvector now tells core how much `maintenance_work_mem` an HNSW graph needs, by
+the measured rule its advisory already used, and core raises the build toward
+it. A configured `maintenance_work_mem_mb` still decides outright. Without one,
+the limit is deduced from `shared_buffers` -- the figure PostgreSQL's
+documentation ties to about a quarter of the server's memory, so the one every
+server is tuned by: all concurrent builds together get one more
+`shared_buffers`, each `shared_buffers` divided by `max_concurrent_jobs`, never
+less than the server's own setting. An untuned 128MB server is not raised. The
+step says what it was raised to and why (`memory_wanted_by`), and the advisory
+remains when the limit leaves the build short.
+
+Found on the way, and fixed: **a step's `maintenance_work_mem` was applied only
+outside a transaction.** The planner has always marked plain index builds and
+`VALIDATE` steps with the configured value, and both the executor and the dry
+run ran them inside a transaction with the server's setting instead. They now
+`SET LOCAL` it for the step and put it back after; a test proves it with a CHECK
+that validates only under the planned value.
+
+### Binary hardening, asserted on the binary
+
+Both binaries are now built with stack canaries, stack-clash protection,
+`_FORTIFY_SOURCE`, full RELRO, a non-executable stack, PIE, and CET on x86 --
+each flag probed, since not every toolchain this builds on takes every one.
+`cpp/test/hardening-check.sh` then reads the ELF and fails unless they reached
+both binaries: in ctest, in the `packages` CI job and in the release. Requested
+flags are an intention; the headers are the fact. Measured before: PIE and
+partial RELRO from distribution defaults, and nothing else.
+
+Found doing it: **only `pg_laswell_mcp` had ever been built with the warning
+flags, `-Werror` and the sanitizers.** The deployment binary -- the one that
+applies migrations -- had none, so the sanitizer jobs never instrumented it.
+Both now go through the same two functions.
+
+### The release workflow can be checked before a tag
+
+- A pull request that changes the release workflow, its scripts or the CMake
+  files now runs it: every package is built, installed and run, and nothing is
+  published. Until now a release job was first exercised by a tag.
+- The version inside each `.deb`, `.rpm` and FreeBSD `.pkg` is read back and
+  must be the project's.
+- libpqxx is built with, and cached per, the compiler of the job that links it.
+
+### FreeBSD packages
+
+Releases now carry `pg_laswell-freebsd14-amd64.pkg` and
+`pg_laswell-freebsd15-amd64.pkg`, built in a FreeBSD VM on a Linux runner by
+`.github/scripts/freebsd-build.sh`. The same script runs on every pull request
+(the `freebsd` job): it builds with every module, runs the suite that needs no
+database, packages with `cpack -G FREEBSD`, installs with `pkg add` and runs
+both binaries. The reason: a lab that runs FreeBSD 15.1 guests several times a
+day gave the FreeBSD build no coverage, because with no package to install it ran
+pg_laswell from the host.
+
+### Two refusals that now say more
+
+- An unknown key names the binary's version, and says a later release may have
+  added it -- the pgshard lab met a stale 0.1.0 refusing `target.connection` and
+  read it as a typo.
+- A password in a subscription's connection string: the refusal and
+  `pg_laswell_mcp(1)` now say whose `~/.pgpass` the subscription reads -- the
+  operating-system user the SUBSCRIBER's server runs as, on that host -- not the
+  machine running pg_laswell.
+
+### TimescaleDB
+
+A module of nine kinds, and -- the reason it had to exist -- a correction to how
+core plans an index on a hypertable. Measured on TimescaleDB 2.30.2 with
+PostgreSQL 18 in both editions, and on 2.28.3 with PostgreSQL 15.
+
+**Indexes on a hypertable.** A hypertable's parent holds no rows: relpages and
+reltuples read 0 against the 125 MiB in its chunks. So core sized every index
+build on one as tiny and built it plainly, holding ShareLock on the parent and
+every chunk until it finished -- or, for a UNIQUE index or a table with waiters,
+reached for `CREATE INDEX CONCURRENTLY`, which TimescaleDB refuses ("hypertables
+do not support concurrent index creation"). Core now asks a module a second
+question, beside the one about row locking: *how may an index be built and
+dropped on this table?* TimescaleDB answers with facts -- no concurrent build or
+drop, a per-chunk option, the hypertable's own size -- and core decides: a plain
+build when it is small and quiet, `WITH (timescaledb.transaction_per_chunk)`
+otherwise, one chunk at a time in its own transaction, and for a UNIQUE index,
+which the per-chunk build refuses, the plain build with a warning that says what
+it blocks. Drops, and the recovery of an invalid index, are plain. The step
+records `index_build_by`. For any other table nothing changes, and a test says so.
+
+**Kinds.** `timescaledb_create_hypertable` and
+`timescaledb_set_chunk_time_interval`, in both editions; and in the Timescale
+License edition only, `timescaledb_set_columnstore`, the columnstore and
+retention policies (add and remove), `timescaledb_create_continuous_aggregate`
+and its refresh policy. The edition is read from `timescaledb.license`, and the
+Apache build -- what PGDG and Debian package, and the `-oss` images -- refuses
+those first, quoting its own "not supported under the current \"apache\"
+license". Which functions exist is read too; where only `add_compression_policy`
+exists it is used. Intervals are compared as PostgreSQL keeps them, so "1 week"
+is "7 days" and "168 hours" is not. A retention policy needs
+`"acknowledge_data_loss": true`: it deletes data on a schedule from then on.
+
+**Refusals for core kinds on a hypertable**, including one made a hypertable
+earlier in the same specification: a unique key without the partitioning
+column; `set_not_null`, `add_check_constraint` and `add_foreign_key` once the
+columnstore is enabled, because TimescaleDB refuses the `VALIDATE` their recipes
+end with; `alter_column_type` once a chunk is in the columnstore. Each quotes the
+error it pre-empts, and the live suite runs each refused statement to prove the
+server still raises it.
+
+The example applies one repository to both editions, the Timescale License
+specifications held on the Apache server by their epoch. The dry run found a
+defect before it shipped: a continuous aggregate is a view to `COMMENT ON`, not
+a materialized view.
+
+### A role the bootstrap did not name gets an answer, not an error
+
+On PostgreSQL 18 every name-based probe of the ledger -- `to_regclass('laswell.x')`,
+`has_table_privilege('laswell.x', ...)` -- RAISES "permission denied for schema
+laswell" for a role without USAGE on the schema rather than answering. Measured
+while testing pg_cron, and it was in core too: the ledger status, the repository
+listing and `checkPrivileges` -- the tool whose job is exactly that answer --
+all failed with the error instead of explaining it. They now look the ledger up
+through `pg_class` by OID. The ledger status says "installed, but this role has
+no USAGE on the laswell schema" and names the bootstrap option that grants it;
+`checkPrivileges` reports `schemaUsable` and a `denied` note. Tested on
+PostgreSQL 15 to 18 with such a role.
+
+### The partition test counts the scan instead of timing it
+
+The test proving that a validated CHECK lets `ATTACH PARTITION` skip its scan
+asserted the attach was at least 3x faster. It failed on CI at 6.0 ms against
+15.9 ms -- a fixed round-trip cost on both sides squeezes the ratio on a fast
+runner while the scan stays exactly as skipped -- and it had to be skipped under
+the sanitizers, taking the test's catalog checks with it. It now reads the
+transaction's own statistics before and after the ATTACH: no scan with the
+CHECK, one scan of 400 000 rows without. Deterministic, and it runs everywhere.
+
+### CI
+
+- The actions move to their Node 24 releases (checkout v7, upload-artifact v7,
+  download-artifact v8, cache v6, upload-pages-artifact v5, deploy-pages v5).
+  download-artifact v8 fails on a digest mismatch, which is the behaviour a
+  release wants.
+- Runners are pinned to `ubuntu-24.04` instead of `ubuntu-latest`, which moves
+  to Ubuntu 26 on 2026-10-19: an image change should be a commit, not a
+  surprise mid-release.
+- A `macos` job builds with every module on Apple clang and libc++ and runs the
+  suite that needs no database. The first macOS compile used to happen on a
+  release tag, which is how a libc++-only error was first found.
+
+### Pacing on a Citus cluster, stated
+
+`pg_laswell_citus(7)` now says plainly that the pacing defaults were derived on
+single-node PostgreSQL and have not been re-derived for a cluster, what is
+measured (a grouped-walk batch is a single-shard commit; worker waits reach the
+breaker) and what is not (walks over reference tables, where each commit is a
+two-phase commit across every node; larger worker counts).
+
+### FreeBSD
+
+pg_laswell builds and passes its suite on FreeBSD 14.5 and 15.1 (511 of 513
+against PostgreSQL 18.6; the two skips need a second cluster and Citus), and
+`cpack -G FREEBSD` makes a native package. One fix was needed: the threads
+library is now linked by name. On Linux it had linked only because glibc 2.34
+folded libpthread into libc; on FreeBSD every binary failed to link on
+`pthread_create`. BUILD.md lists the packages.
+
+### A comment's lock, measured
+
+`set_comment` said "AccessShareLock -- a comment blocks nothing". Measured, a
+comment on a table, column, index, view or sequence takes
+**ShareUpdateExclusiveLock** on it: reads and writes pass, but VACUUM, ANALYZE,
+`CREATE INDEX CONCURRENTLY` and other DDL on that relation wait. A comment on a
+constraint, trigger, policy or rule takes AccessShareLock on its table and
+ShareUpdateExclusiveLock on the object; on a schema, type, function, extension
+or publication, ShareUpdateExclusiveLock on the object only. The plan now says
+which.
+
 ## 0.1.2
 
 Two arcs. Vendor modules, with Citus as the first: one package that speaks plain
