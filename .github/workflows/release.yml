@@ -219,7 +219,7 @@ jobs:
       - name: Build
         run: |
           cmake -S cpp -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
-                "-DPGLASWELL_MODULES=citus;pg_cron;pgvector"
+                "-DPGLASWELL_MODULES=citus;pg_cron;pgvector;timescaledb"
           # BOTH binaries. The install rules name both, so a tree with only one
           # built either fails packaging or -- worse -- produces a package that
           # installs and has nothing to deploy with, which nobody would discover
@@ -314,7 +314,7 @@ jobs:
           for want in bin/pg_laswell bin/pg_laswell_mcp \
                       man1/pg_laswell.1 man1/pg_laswell_mcp.1 \
                       man7/pg_laswell_citus.7 man7/pg_laswell_pg_cron.7 \
-                      man7/pg_laswell_pgvector.7 \
+                      man7/pg_laswell_pgvector.7 man7/pg_laswell_timescaledb.7 \
                       share/pg_laswell/bootstrap.sql; do
             printf '%s\n' "$LIST" | grep -q "$want" || {
               echo "::error::$want is missing from the package"; exit 1; }
@@ -353,7 +353,7 @@ jobs:
           "$BIN" --version
           # The modules the package promises. A release built without them
           # would install, answer, and refuse every citus_* specification.
-          "$BIN" --version | grep -qx 'modules: citus,pg_cron,pgvector' || {
+          "$BIN" --version | grep -qx 'modules: citus,pg_cron,pgvector,timescaledb' || {
             echo "::error::the installed binary does not carry every module"; exit 1; }
           OUT=$("$BIN" --call getSpecDigest --args "$SPEC")
           printf '%s\n' "$OUT" | grep -q '"digest"' || {
@@ -374,6 +374,40 @@ jobs:
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}.${{ matrix.extension }}
+          if-no-files-found: error
+
+  # FreeBSD packages, built in a VM on a Linux runner by the same script the
+  # freebsd job in tests.yml runs on every pull request: built, checked for a
+  # static libpqxx, packaged with cpack -G FREEBSD, installed with pkg add and
+  # run. One per supported FreeBSD major, because a package records the ABI it
+  # was built for (FreeBSD:14:amd64, FreeBSD:15:amd64) and pkg refuses another.
+  freebsd:
+    name: ${{ matrix.artifact }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - release: "14.5"
+            artifact: pg_laswell-freebsd14-amd64
+          - release: "15.1"
+            artifact: pg_laswell-freebsd15-amd64
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - name: Build, package and install on FreeBSD ${{ matrix.release }}
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: ${{ matrix.release }}
+          envs: 'PQXX_VERSION PQXX_SHA256'
+          usesh: true
+          run: sh .github/scripts/freebsd-build.sh ${{ matrix.artifact }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.pkg
           if-no-files-found: error
 
   # The published site: the landing page, the generated reference, and both man
@@ -440,7 +474,7 @@ jobs:
         uses: actions/deploy-pages@v5
 
   publish:
-    needs: build
+    needs: [build, freebsd]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -474,7 +508,7 @@ jobs:
       # failure does not cancel the others, which means a partial release is
       # exactly what would otherwise get published -- silently, and looking
       # complete.
-      - name: All seven artifacts must be present
+      - name: All nine artifacts must be present
         run: |
           missing=0
           for f in pg_laswell-linux-x86_64.tar.gz \
@@ -483,7 +517,9 @@ jobs:
                    pg_laswell-linux-arm64-debian13.deb \
                    pg_laswell-linux-x86_64-rocky9.rpm \
                    pg_laswell-linux-arm64-rocky9.rpm \
-                   pg_laswell-macos-arm64.tar.gz; do
+                   pg_laswell-macos-arm64.tar.gz \
+                   pg_laswell-freebsd14-amd64.pkg \
+                   pg_laswell-freebsd15-amd64.pkg; do
             [ -f "dist/$f" ] || { echo "::error::missing artifact $f"; missing=1; }
           done
           ls -l dist

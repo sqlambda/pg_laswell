@@ -86,9 +86,9 @@ set(PGLASWELL_LIBS
 # within touching distance of the "recognized but unsupported" state spec.h
 # opens by forbidding. See src/modules/README.md.
 #
-#   cmake -S cpp -B cpp/build -DPGLASWELL_MODULES="citus;pg_cron;pgvector"
+#   cmake -S cpp -B cpp/build -DPGLASWELL_MODULES="citus;pg_cron;pgvector;timescaledb"
 # --------------------------------------------------------------------------
-set(PGLASWELL_MODULES "" CACHE STRING "Vendor modules to compile in, e.g. citus;pg_cron;pgvector")
+set(PGLASWELL_MODULES "" CACHE STRING "Vendor modules to compile in, e.g. citus;pg_cron;pgvector;timescaledb")
 set(_mod_names "")
 
 set(_gen_dir ${CMAKE_CURRENT_BINARY_DIR}/generated/modules)
@@ -106,6 +106,8 @@ set(_topo_inc  "// Generated from PGLASWELL_MODULES. Do not edit.\n")
 set(_guard_inc "// Generated from PGLASWELL_MODULES. Do not edit.\n")
 set(_guard_head "// Generated from PGLASWELL_MODULES. Do not edit.\n")
 set(_confine_inc  "// Generated from PGLASWELL_MODULES. Do not edit.\n")
+set(_index_inc  "// Generated from PGLASWELL_MODULES. Do not edit.\n")
+set(_index_head "// Generated from PGLASWELL_MODULES. Do not edit.\n")
 set(_confine_head "// Generated from PGLASWELL_MODULES. Do not edit.\n")
 set(_ptest_inc "// Generated from PGLASWELL_MODULES. Do not edit.\n")
 set(_body_inc  "// Generated from PGLASWELL_MODULES. Do not edit.\n")
@@ -167,6 +169,15 @@ foreach(_mod IN LISTS PGLASWELL_MODULES)
         string(APPEND _confine_inc
             "PGLASWELL_CONFINEMENT(\"${_mod}\", ${_mod}_required_confinement)\n")
     endif()
+    # index.h is optional: a module whose vendor changes how an index may be
+    # built or dropped on some tables answers that one question for core --
+    # can it be concurrent, what builds one part at a time, how big is the
+    # data really -- and core decides and emits every statement.
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/modules/${_mod}/index.h)
+        string(APPEND _index_head "#include \"modules/${_mod}/index.h\"\n")
+        string(APPEND _index_inc
+            "PGLASWELL_INDEX_TRAITS(\"${_mod}\", ${_mod}_index_traits)\n")
+    endif()
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/modules/${_mod}/guard.h)
         string(APPEND _guard_head "#include \"modules/${_mod}/guard.h\"\n")
         string(APPEND _guard_inc "PGLASWELL_PLAN_GUARD(${_mod}_plan_refusals)\n")
@@ -194,6 +205,10 @@ file(WRITE ${_gen_dir}/enabled_confinement_headers.h.tmp "${_confine_head}")
 configure_file(${_gen_dir}/enabled_confinement_headers.h.tmp ${_gen_dir}/enabled_confinement_headers.h COPYONLY)
 file(WRITE ${_gen_dir}/enabled_confinements.h.tmp "${_confine_inc}")
 configure_file(${_gen_dir}/enabled_confinements.h.tmp ${_gen_dir}/enabled_confinements.h COPYONLY)
+file(WRITE ${_gen_dir}/enabled_index_headers.h.tmp "${_index_head}")
+configure_file(${_gen_dir}/enabled_index_headers.h.tmp ${_gen_dir}/enabled_index_headers.h COPYONLY)
+file(WRITE ${_gen_dir}/enabled_index_traits.h.tmp "${_index_inc}")
+configure_file(${_gen_dir}/enabled_index_traits.h.tmp ${_gen_dir}/enabled_index_traits.h COPYONLY)
 file(WRITE ${_gen_dir}/enabled_guard_headers.h.tmp "${_guard_head}")
 configure_file(${_gen_dir}/enabled_guard_headers.h.tmp ${_gen_dir}/enabled_guard_headers.h COPYONLY)
 file(WRITE ${_gen_dir}/enabled_guards.h.tmp "${_guard_inc}")
@@ -329,6 +344,13 @@ if(BUILD_TESTING)
         # that lifts a limit fails here instead of being refused forever.
         add_test(NAME extensions_tests
                  COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/extensions-tests.sh
+                         $<TARGET_FILE:pg_laswell> $<TARGET_FILE:pg_laswell_mcp>)
+        # TimescaleDB, against both editions and the oldest supported line
+        # (examples/docker/timescale). Same rule: each refusal is checked to
+        # pre-empt an error the server really raises, and each index SQL the
+        # planner emits for a hypertable is run by hand.
+        add_test(NAME timescaledb_tests
+                 COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/timescaledb-tests.sh
                          $<TARGET_FILE:pg_laswell> $<TARGET_FILE:pg_laswell_mcp>)
     endif()
 

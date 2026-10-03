@@ -70,7 +70,7 @@ jobs:
           - config: address-undefined
             compiler: g++
             sanitizer: ADDRESS_UNDEFINED
-            modules: citus;pg_cron;pgvector
+            modules: citus;pg_cron;pgvector;timescaledb
             tools: false
           # THREAD is a gate for this project rather than belt-and-braces: a
           # worker thread per job plus one process-wide observer against a
@@ -78,7 +78,7 @@ jobs:
           - config: thread
             compiler: g++
             sanitizer: THREAD
-            modules: citus;pg_cron;pgvector
+            modules: citus;pg_cron;pgvector;timescaledb
             tools: false
 
     steps:
@@ -681,12 +681,12 @@ jobs:
           version: ${{ env.PQXX_VERSION }}
           sha256: ${{ env.PQXX_SHA256 }}
       - name: Configure with the citus module
-        run: cmake -S cpp -B build -G Ninja "-DPGLASWELL_MODULES=citus;pg_cron;pgvector"
+        run: cmake -S cpp -B build -G Ninja "-DPGLASWELL_MODULES=citus;pg_cron;pgvector;timescaledb"
       - name: Build everything
         run: cmake --build build
       - name: The binary says which modules it carries
         run: |
-          ./build/pg_laswell_mcp --version | tee /dev/stderr | grep -q '^modules: citus,pg_cron,pgvector$'
+          ./build/pg_laswell_mcp --version | tee /dev/stderr | grep -q '^modules: citus,pg_cron,pgvector,timescaledb$'
       - name: The suite that needs no database, with the module in it
         run: ./build/pg_laswell_mcp_test
       - name: Manuals, source checks and plan transcripts, with the module in it
@@ -760,7 +760,7 @@ jobs:
           version: ${{ env.PQXX_VERSION }}
           sha256: ${{ env.PQXX_SHA256 }}
       - name: Configure with every module
-        run: cmake -S cpp -B build -G Ninja "-DPGLASWELL_MODULES=citus;pg_cron;pgvector"
+        run: cmake -S cpp -B build -G Ninja "-DPGLASWELL_MODULES=citus;pg_cron;pgvector;timescaledb"
       - name: Build the binaries
         run: cmake --build build --target pg_laswell pg_laswell_mcp
       - name: Start PostgreSQL with pg_cron and pgvector
@@ -800,6 +800,96 @@ jobs:
         if: always()
         run: docker compose -f examples/docker/extensions/compose.yml down -v
 
+  # TimescaleDB, against both editions and the oldest supported line: the
+  # Timescale License build, the Apache build (-oss, what PGDG and Debian
+  # package), and 2.28.3 on PostgreSQL 15. Proves what only a server can:
+  #
+  #   - every refusal pre-empts an error the server really raises, the refused
+  #     statement run by hand and required to fail with the quoted message;
+  #   - the index SQL the planner emits for a hypertable -- one chunk at a time,
+  #     never CONCURRENTLY -- is taken out of the plan and run, because a
+  #     per-chunk build cannot run in the dry run's transaction;
+  #   - the example applies one repository to both editions, the Timescale
+  #     License specs held on the Apache server by their epoch.
+  timescaledb:
+    name: timescaledb
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -o DPkg::Lock::Timeout=300
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build libpq-dev nlohmann-json3-dev \
+            libgtest-dev libssl-dev mandoc postgresql-client openssl
+      - name: Build libpqxx from source, not from apt
+        uses: ./.github/actions/libpqxx
+        with:
+          version: ${{ env.PQXX_VERSION }}
+          sha256: ${{ env.PQXX_SHA256 }}
+      - name: Configure with every module
+        run: cmake -S cpp -B build -G Ninja "-DPGLASWELL_MODULES=citus;pg_cron;pgvector;timescaledb"
+      - name: Build the binaries
+        run: cmake --build build --target pg_laswell pg_laswell_mcp
+      - name: Start TimescaleDB, both editions and the oldest line
+        run: |
+          docker compose -f examples/docker/timescale/compose.yml up -d
+          for i in $(seq 1 90); do
+            ok=0
+            for c in laswell_ts_tsl laswell_ts_apache laswell_ts_oldest; do
+              docker exec "$c" pg_isready -U postgres -d app -q 2>/dev/null && ok=$((ok+1))
+            done
+            [ "$ok" = 3 ] && break
+            sleep 2
+          done
+          [ "$ok" = 3 ] || { echo "::error::the TimescaleDB servers did not come up"; exit 1; }
+      - name: The TimescaleDB example, both editions
+        env:
+          PG_LASWELL: ${{ github.workspace }}/build/pg_laswell
+          PG_LASWELL_MCP: ${{ github.workspace }}/build/pg_laswell_mcp
+          PGPASSWORD: laswell
+        run: |
+          ./examples/docker/timescale/run.sh | tee example.log
+          grep -q 'held_for_epoch' example.log \
+            || { echo "::error::the Apache server should hold the Timescale License specs"; exit 1; }
+          grep -q 'timescaledb.transaction_per_chunk' example.log \
+            || { echo "::error::the large hypertable's index was not planned per chunk"; exit 1; }
+          [ "$(grep -c 'repository : 0 pending' example.log)" = 2 ] \
+            || { echo "::error::the second run had something to do"; exit 1; }
+      - name: The module against the servers
+        env:
+          TS_TSL_URL: postgresql://postgres:laswell@127.0.0.1:55470
+          TS_APACHE_URL: postgresql://postgres:laswell@127.0.0.1:55471
+          TS_OLDEST_URL: postgresql://postgres:laswell@127.0.0.1:55472
+        run: |
+          ./cpp/test/timescaledb-tests.sh build/pg_laswell build/pg_laswell_mcp | tee ts.log
+          grep -q ', 0 failed' ts.log || exit 1
+          ! grep -q '^SKIP' ts.log || { echo "::error::the live tests skipped"; exit 1; }
+      - name: Stop the servers
+        if: always()
+        run: docker compose -f examples/docker/timescale/compose.yml down -v
+
+  # FreeBSD 15, in a VM on a Linux runner (GitHub has no FreeBSD runners):
+  # built with every module, the suite that needs no database run, then
+  # PACKAGED, installed with pkg add, and both binaries run -- the same script
+  # release.yml uses, so the package is proven on every pull request rather
+  # than first on a tag. The pgshard lab ran FreeBSD guests 92 times without
+  # once exercising this build, because there was no package to install.
+  freebsd:
+    name: freebsd
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build, test, package and install on FreeBSD 15
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "15.1"
+          envs: 'PQXX_VERSION PQXX_SHA256'
+          usesh: true
+          run: sh .github/scripts/freebsd-build.sh pg_laswell-freebsd15-amd64 tests
+
   # macOS, built with every module and the suite that needs no database.
   #
   # The first macOS compile in this project's life happened on a release tag,
@@ -832,13 +922,13 @@ jobs:
       - name: Configure with every module
         run: |
           cmake -S cpp -B build -G Ninja \
-            "-DPGLASWELL_MODULES=citus;pg_cron;pgvector" \
+            "-DPGLASWELL_MODULES=citus;pg_cron;pgvector;timescaledb" \
             -DCMAKE_PREFIX_PATH="$(brew --prefix libpq);$(brew --prefix googletest)"
       - name: Build everything
         run: cmake --build build
       - name: The binary says which modules it carries
         run: |
-          ./build/pg_laswell_mcp --version | tee /dev/stderr | grep -q '^modules: citus,pg_cron,pgvector$'
+          ./build/pg_laswell_mcp --version | tee /dev/stderr | grep -q '^modules: citus,pg_cron,pgvector,timescaledb$'
       - name: The suite that needs no database
         run: ./build/pg_laswell_mcp_test
       - name: Manuals and source checks
@@ -860,6 +950,8 @@ jobs:
       - examples
       - citus
       - extensions
+      - timescaledb
+      - freebsd
       - macos
       - packages
     runs-on: ubuntu-24.04

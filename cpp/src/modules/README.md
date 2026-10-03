@@ -49,6 +49,7 @@ required, and a build naming the module fails at configure time without them.
 | `project.h` + `project.inc` | no | What a step leaves for later steps in the same plan -- written into the module's OWN slot only |
 | `guard.h` | no | `<name>_plan_refusals(spec, obs, budget, refuse, advise)`: refusals true of the whole topology, and advisories |
 | `confine.h` | no | `<name>_required_confinement(obs, table)`: the one reading core's paced walks consult |
+| `index.h` | no | `<name>_index_traits(obs, table, intent) -> IndexTraits`: how an index may be built and dropped on this table -- concurrently or not, by a per-part option, and the data's real size |
 | `observer.h` | no | Where contention is visible when it is not in `pg_locks` (Citus: on the workers) |
 | `tests.inc` | no, in practice yes | Deferred-case reasons and one representative body per kind, for core's coverage tests |
 | `tests_planner.inc` | no, in practice yes | The module's planner tests, compiled into the test binary only when it is enabled |
@@ -88,6 +89,15 @@ keeps the design safe rather than merely tidy.
   core's `backfill` and `delete_rows` then walk it one value at a time, which is
   what makes their `FOR UPDATE` single-shard. The module contributes a column
   name. Every statement is core's.
+- **informing, again** -- the second question, asked through `index.h`
+  (2026-10-02, for TimescaleDB): *how may an index be built and dropped on this
+  table?* The answer is facts: whether CONCURRENTLY works there, the name of a
+  storage parameter that builds one part at a time and whether it takes UNIQUE,
+  and the data's real size when the relation's own relpages does not hold it.
+  Core decides from them -- plain, per-part or, for UNIQUE, plain with a warning
+  -- and emits every statement; the module contributes a parameter NAME, which
+  core validates as a (namespaced) identifier before it reaches SQL, the way
+  `confine.h` contributes a column name. The step records `index_build_by`.
 
 **Forbidden: a module may not emit or rewrite SQL for a CORE kind, and may not
 shape a plan for a table it has no reading about.**
@@ -158,6 +168,7 @@ weaker than "I tried to break it":
 | `TOPOLOGY` merge | counts only ever raised | compliant |
 | `OBSERVE` | writes only `extensions[<module>]` | compliant |
 | `CONFINEMENT` | a function `(const Observations&, table) -> column`; it cannot reach the plan or name another table | compliant by construction |
+| `INDEX_TRAITS` | a function `(const Observations&, table) -> IndexTraits`, a struct of facts; the one string in it that reaches SQL is validated by core as a (namespaced) identifier, and anything else throws | compliant by construction |
 
 Every close is the same move, and it is the only one worth making: **pass a hook
 what it may touch, and nothing else.** A block that expands inside someone
@@ -289,7 +300,7 @@ it. Say the vendor is called `acme`.
 
 The released package, `pg-laswell`, carries every module:
 
-    cmake -S cpp -B build -DPGLASWELL_MODULES="citus;pg_cron;pgvector"
+    cmake -S cpp -B build -DPGLASWELL_MODULES="citus;pg_cron;pgvector;timescaledb"
 
 A module is safe to carry on servers without its extension. Its kinds are
 prefixed with its vendor's name, its reading is absent when the extension is

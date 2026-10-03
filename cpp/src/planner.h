@@ -679,6 +679,44 @@ inline void project(const Intent& in, const Step& step, Observations& projected)
   }
 }
 
+// Every enabled module's answer to: how may an index be built and dropped on
+// this table? (planner_base.h, IndexTraits). The first module to answer wins,
+// for the reason required_confinement() gives. `decided_by` names it.
+#include "modules/enabled_index_headers.h"
+// `in` is the intent being planned, read-only, so a module can say how much
+// memory THIS index would like (an HNSW graph depends on its columns and m).
+inline IndexTraits index_traits(const Observations& obs, const std::string& qualified,
+                                const Intent& in, std::string& decided_by) {
+#define PGLASWELL_INDEX_TRAITS(module_name, traits_fn)      \
+  {                                                          \
+    auto t = traits_fn(obs, qualified, in);                  \
+    if (t.answered) {                                        \
+      decided_by = module_name;                              \
+      return t;                                              \
+    }                                                        \
+  }
+#include "modules/enabled_index_traits.h"
+#undef PGLASWELL_INDEX_TRAITS
+  (void)obs;
+  (void)qualified;
+  (void)in;
+  decided_by.clear();
+  return {};
+}
+
+// The per-part option as SQL: "name" or "namespace.name", unquoted because a
+// namespaced reloption is two labels, and validated here because it reaches
+// SQL. A module handing anything else is a bug; the build is refused loudly
+// rather than emitting it.
+inline std::string per_part_option_sql(const std::string& option) {
+  static const std::regex ok(R"(^[a-z_][a-z0-9_]*(\.[a-z_][a-z0-9_]*)?$)");
+  if (!std::regex_match(option, ok)) {
+    throw std::logic_error("a module answered with an index option that is not a "
+                           "(namespaced) identifier: " + option);
+  }
+  return option;
+}
+
 inline void plan_create_index(const Intent& in, const Observations& obs,
                               const ExecutorConfig& cfg, Plan& plan,
                               std::vector<Step>& out) {
@@ -1057,8 +1095,18 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
     }
   }
 
-  const long long size = t.value("size_measured", t.value("size_estimate", 0LL));
-  const bool measured = t.contains("size_measured");
+  long long size = t.value("size_measured", t.value("size_estimate", 0LL));
+  bool measured = t.contains("size_measured");
+  // A module may know the data better than the relation's own reading: a
+  // TimescaleDB hypertable's parent holds no rows, so relpages says 0 and the
+  // build would be planned as a tiny one -- measured, a plain build then holds
+  // ShareLock on the parent and every chunk until it ends.
+  std::string traits_by;
+  const auto traits = index_traits(obs, qualified, in, traits_by);
+  if (traits.answered && traits.size_bytes >= 0) {
+    size = traits.size_bytes;
+    measured = true;
+  }
   const int waiters = t.value("lock_waiters", 0);
   const bool partitioned = t.value("kind", "") == "partitioned_table";
 
@@ -1108,11 +1156,78 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
   const bool plain = small_enough && quiet && !unique;
 
   if (rebuild_after_drop) {
-    step.sql.push_back("DROP INDEX CONCURRENTLY " + detail::quote_identifier(in.schema()) + "." + detail::quote_identifier(name) + ";");
+    // Where a concurrent drop is not possible (a hypertable: measured, "DROP
+    // INDEX CONCURRENTLY does not support dropping multiple objects"), the
+    // invalid index goes with a plain DROP.
+    step.sql.push_back(std::string(traits.answered && !traits.concurrent
+                                       ? "DROP INDEX "
+                                       : "DROP INDEX CONCURRENTLY ") +
+                       detail::quote_identifier(in.schema()) + "." +
+                       detail::quote_identifier(name) + ";");
     step.detail["recovering_invalid_index"] = true;
   }
 
-  if (plain) {
+  // Recorded when the module changed the BUILD -- no concurrency, or the size
+  // that decides plain against concurrent -- not when it only asked for memory
+  // (memory_wanted_by, below), which leaves the build as core chose it.
+  if (traits.answered && (!traits.concurrent || traits.size_bytes >= 0)) {
+    step.detail["index_build_by"] = traits_by;
+    if (traits.rows >= 0) step.detail["rows"] = traits.rows;
+  }
+  const std::string scope = traits.scope.empty() ? qualified : traits.scope;
+
+  if (traits.answered && !traits.concurrent && !plain) {
+    // No concurrent build here. Two ways remain, and the reading says which.
+    const bool per_part = !traits.per_part_option.empty() &&
+                          (!unique || traits.per_part_unique);
+    if (per_part) {
+      // One part at a time, each in its own transaction: ShareLock on one
+      // chunk while it builds, the rest writable. Cannot run in a transaction
+      // block (measured), and a failure partway leaves the parent index
+      // INVALID with some parts built -- the same shape as a failed CIC, so the
+      // same verification and recovery apply.
+      std::string with_sql = index_with_sql(in.body);
+      const auto opt = per_part_option_sql(traits.per_part_option);
+      with_sql = with_sql.empty() ? " WITH (" + opt + ")"
+                                  : with_sql.substr(0, with_sql.size() - 1) + ", " + opt + ")";
+      step.txn_class = TxnClass::kForbidden;
+      step.lock = "ShareLock on one part at a time, each in its own transaction (" +
+                  scope + ")";
+      step.sql.push_back("CREATE " + std::string(unique ? "UNIQUE " : "") + "INDEX " +
+                         detail::quote_identifier(name) + " ON " + sql_rel + " USING " +
+                         method + " (" + columns_sql + ")" + include_sql + with_sql +
+                         (where.empty() ? "" : " WHERE " + where) + ";");
+      step.why = "size " + detail::human_bytes(size) + (waiters > 0 ? ", " +
+                 std::to_string(waiters) + " lock waiters" : "") +
+                 ", and " + traits_by + " says a concurrent build is not possible "
+                 "here -> built one part at a time (" + opt + ")";
+      step.detail["must_verify_valid"] = true;
+      step.detail["failure_mode"] =
+          "a build that fails partway leaves the index INVALID with some parts "
+          "built; the next step reads indisvalid, and a re-plan drops it with a "
+          "plain DROP INDEX before rebuilding";
+    } else {
+      // Unique, where the per-part option refuses UNIQUE (measured on
+      // TimescaleDB: "cannot use timescaledb.transaction_per_chunk with UNIQUE
+      // or PRIMARY KEY"): only a plain build remains, and it blocks writes on
+      // all of it for as long as it runs. Said, not hidden.
+      step.txn_class = TxnClass::kOptional;
+      step.lock = "ShareLock on " + scope + " (blocks writes for the whole build)";
+      step.sql.push_back("CREATE " + std::string(unique ? "UNIQUE " : "") + "INDEX " +
+                         detail::quote_identifier(name) + tail);
+      step.why = "size " + detail::human_bytes(size) + ", and " + traits_by +
+                 " says neither a concurrent build nor a per-part one can build "
+                 "this index here -> plain build";
+      plan.warnings.push_back(
+          "\"" + name + "\" on " + qualified + " can only be built plainly: " +
+          traits_by + " allows no concurrent build here" +
+          (unique && !traits.per_part_option.empty()
+               ? ", and its per-part build refuses a UNIQUE index"
+               : "") +
+          ". Writes to " + scope + " block for the whole build, over " +
+          detail::human_bytes(size) + ". Schedule it for a quiet window.");
+    }
+  } else if (plain) {
     step.txn_class = TxnClass::kOptional;
     step.lock = "ShareLock (blocks writes for the whole build)";
     step.sql.push_back("CREATE INDEX " + detail::quote_identifier(name) + tail);
@@ -1139,13 +1254,42 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
         "will DROP INDEX CONCURRENTLY before rebuilding";
   }
 
+  // A build that says how much memory it wants (an HNSW graph, from pgvector)
+  // is raised toward it when no ceiling is configured -- the configured case
+  // is applied to every index step below, and wins. The limit is deduced from
+  // shared_buffers (index_build_mwm_bytes), so the raise is bounded by the one
+  // memory figure every server is tuned by.
+  if (traits.answered && traits.memory_wanted > 0 && cfg.maintenance_work_mem_mb == 0) {
+    const auto budget = detail::compute_budget(obs, cfg);
+    const long long server =
+        budget["maintenanceWorkMem"].value("serverDefaultKb", 0LL) * 1024;
+    const long long eff = index_build_mwm_bytes(budget, traits.memory_wanted);
+    if (eff > server) {
+      const long long mb = (eff + (1LL << 20) - 1) >> 20;
+      const auto human = [](long long b) { return detail::human_bytes(b); };
+      step.detail["maintenance_work_mem_mb"] = mb;
+      step.detail["memory_wanted_by"] = traits_by;
+      step.why += "; maintenance_work_mem raised to " + std::to_string(mb) +
+                  "MB for this build: " + traits_by + " says it needs about " +
+                  human(traits.memory_wanted) +
+                  (eff < traits.memory_wanted
+                       ? ", limited to " +
+                             budget["maintenanceWorkMem"].value("derivedFrom", std::string())
+                       : std::string()) +
+                  " (no maintenance_work_mem_mb configured)";
+    }
+  }
+
   step.sql.push_back("COMMENT ON INDEX " + detail::quote_identifier(in.schema()) + "." + detail::quote_identifier(name) + " IS " +
                      detail::quote_literal(in.body.value("comment", "")) + ";");
   step.detail["schema"] = in.schema();
   step.detail["index"] = name;
   step.detail["qualified"] = qualified;
   step.detail["size_bytes"] = size;
-  step.detail["size_source"] = measured ? "measured" : "estimate";
+  step.detail["size_source"] =
+      traits.answered && traits.size_bytes >= 0 ? traits_by
+      : measured                                ? "measured"
+                                                : "estimate";
   step.detail["estimated_from"] = t.value("estimated_from", json());
   step.detail["lock_waiters"] = waiters;
   (void)cfg;
@@ -4734,9 +4878,26 @@ inline void plan_unique_like(const Intent& in, const Observations& obs,
     if (icols == columns) { backing = iname; break; }
   }
 
-  const long long size = t.value("size_estimate", 0LL);
+  long long size = t.value("size_estimate", 0LL);
   const int waiters = t.value("lock_waiters", 0);
-  const bool small_and_quiet = size < (64LL << 20) && waiters == 0;
+  // Where a module says no concurrent build is possible (a hypertable), the
+  // CIC + USING INDEX recipe below cannot run at all -- so the one statement
+  // is the only way, whatever the size, and the size it states is the
+  // module's, because the parent's own relpages says 0.
+  std::string traits_by;
+  const auto traits = index_traits(obs, qualified, in, traits_by);
+  if (traits.answered && traits.size_bytes >= 0) size = traits.size_bytes;
+  const bool no_concurrent = traits.answered && !traits.concurrent;
+  const bool small_and_quiet = (size < (64LL << 20) && waiters == 0) || no_concurrent;
+  if (no_concurrent && !(size < (64LL << 20) && waiters == 0)) {
+    plan.warnings.push_back(
+        "the constraint on " + qualified + " is added in one statement although "
+        "the data is " + detail::human_bytes(size) +
+        (waiters > 0 ? " and sessions are waiting" : "") + ": " + traits_by +
+        " allows no concurrent index build here, so AccessExclusiveLock is held on " +
+        (traits.scope.empty() ? qualified : traits.scope) +
+        " while the unique index builds. Schedule it for a quiet window.");
+  }
 
   auto emit = [&](TxnClass klass, std::vector<std::string> sql,
                   const std::string& lock, const std::string& why, bool own) {
@@ -5326,7 +5487,27 @@ inline void plan_drop_index(const Intent& in, const Observations& obs, Plan& pla
   }
 
   const int waiters = t.value("lock_waiters", 0);
-  if (waiters == 0) {
+  std::string traits_by;
+  const auto traits = index_traits(obs, qualified, in, traits_by);
+  if (traits.answered && !traits.concurrent) {
+    // No concurrent drop here (a hypertable: measured, "DROP INDEX
+    // CONCURRENTLY does not support dropping multiple objects"), so a plain
+    // one whatever the waiters -- and it locks every part, which is said.
+    step.txn_class = TxnClass::kOptional;
+    step.lock = "AccessExclusiveLock on " +
+                (traits.scope.empty() ? qualified : traits.scope) + ", briefly";
+    step.sql.push_back("DROP INDEX " + detail::quote_identifier(in.schema()) + "." +
+                       detail::quote_identifier(name) + ";");
+    step.why = traits_by + " says a concurrent drop is not possible here -> plain DROP";
+    step.detail["index_build_by"] = traits_by;
+    if (waiters > 0) {
+      plan.warnings.push_back(
+          "\"" + name + "\" is dropped plainly although " + std::to_string(waiters) +
+          " session(s) already wait on " + qualified + ": a concurrent drop is not "
+          "possible there, so this one queues behind them, and everything after it "
+          "queues behind it.");
+    }
+  } else if (waiters == 0) {
     step.txn_class = TxnClass::kOptional;
     step.lock = "AccessExclusiveLock, briefly";
     step.sql.push_back("DROP INDEX " + detail::quote_identifier(in.schema()) + "." + detail::quote_identifier(name) + ";");

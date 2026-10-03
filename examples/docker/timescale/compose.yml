@@ -1,0 +1,40 @@
+# TimescaleDB, both editions, because the same binary meets both in the field:
+#
+#   tsl     Timescale's own build (the Timescale License): hypertables plus
+#           columnstore/compression, continuous aggregates and policies.
+#   apache  the Apache-2.0 build (`-oss`) -- what PGDG and Debian package as
+#           postgresql-NN-timescaledb (+dfsg): hypertables and chunks only.
+#   oldest  the oldest TimescaleDB line on the oldest PostgreSQL this project
+#           supports (15), so the module's version checks meet a real old one.
+#
+# The module reads the edition and the functions present rather than assuming
+# them; these three are what proves it.
+#
+#   docker compose -f examples/docker/timescale/compose.yml up -d
+#   docker compose -f examples/docker/timescale/compose.yml down -v
+x-ts: &ts
+  environment:
+    POSTGRES_PASSWORD: laswell
+    POSTGRES_DB: app
+  healthcheck:
+    test: ['CMD-SHELL', 'pg_isready -U postgres -d app']
+    interval: 3s
+    timeout: 3s
+    retries: 30
+
+services:
+  tsl:
+    <<: *ts
+    image: timescale/timescaledb:2.30.2-pg18
+    container_name: laswell_ts_tsl
+    ports: ['55470:5432']
+  apache:
+    <<: *ts
+    image: timescale/timescaledb:2.30.2-pg18-oss
+    container_name: laswell_ts_apache
+    ports: ['55471:5432']
+  oldest:
+    <<: *ts
+    image: timescale/timescaledb:2.28.3-pg15
+    container_name: laswell_ts_oldest
+    ports: ['55472:5432']

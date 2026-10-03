@@ -3494,6 +3494,43 @@ TEST_F(ToolTest, CopyRowsTravelsThroughTheRealExecutorAndLandsInTheLedger) {
       << sql[0][0].as<std::string>();
 }
 
+// A step the planner marks with maintenance_work_mem runs with it -- inside a
+// transaction too. The planner has always marked VALIDATE and plain index
+// builds; only the non-transactional path applied the value, so a VALIDATE
+// ran with the server's setting while the plan said 77MB. Proved by a CHECK
+// whose function raises unless the setting is the planned one: it validates
+// only if the executor really applied it.
+TEST_F(ToolTest, AStepInATransactionRunsWithTheMaintenanceWorkMemItWasPlannedWith) {
+  ctx_->registry.mutable_get("default").executor.maintenance_work_mem_mb = 77;
+  ctx_->registry.mutable_get("default").executor.max_concurrent_jobs = 1;
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/mwm");
+    w.txn().exec("DROP SCHEMA IF EXISTS mwm CASCADE");
+    w.txn().exec("CREATE SCHEMA mwm");
+    w.txn().exec("CREATE TABLE mwm.t (id int)");
+    w.txn().exec("INSERT INTO mwm.t SELECT generate_series(1, 10)");
+    w.txn().exec(
+        "CREATE FUNCTION mwm.is_77(int) RETURNS boolean IMMUTABLE LANGUAGE plpgsql AS $$"
+        " BEGIN IF current_setting('maintenance_work_mem') <> '77MB' THEN"
+        "   RAISE EXCEPTION 'maintenance_work_mem is %', current_setting('maintenance_work_mem');"
+        " END IF; RETURN true; END $$");
+    w.commit();
+  }
+  json doc = minimal_spec();
+  doc["id"] = "0010-mwm";
+  doc["intents"] = json::array({json{{"kind", "add_check_constraint"}, {"schema", "mwm"},
+                                     {"table", "t"}, {"name", "t_77"},
+                                     {"expression", "mwm.is_77(id)"}}});
+  const auto p = payload(call("startMigration", json{{"spec", signed_doc(doc)}}));
+  ASSERT_TRUE(p.value("accepted", false)) << p.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, p["jobId"], [](const json& s) {
+    return s.value("state", "") == "succeeded" || s.value("state", "") == "failed";
+  }));
+  EXPECT_EQ(status_of(p["jobId"]).value("state", ""), "succeeded")
+      << status_of(p["jobId"]).dump(2);
+}
+
 TEST_F(ToolTest, TheExecutedPlanIsTheOneThatWasShown) {
   // "What ran is what you were shown" has to be checkable, not promised.
   make_shop(cfg());
@@ -5355,6 +5392,20 @@ TEST(Planner, AnIndexPresentByNameWithOtherParametersIsSatisfiedAndSaysSo) {
     if (w.find("not the [fillfactor=70]") != std::string::npos) warned = true;
   }
   EXPECT_TRUE(warned) << plan.render();
+}
+
+// The pgshard lab ran a stale 0.1.0 binary against a specification using
+// target.connection, and read the refusal as a typo. A key unknown to THIS
+// binary may be one a later release added, so the error says which binary it is.
+TEST(Spec, AnUnknownKeyNamesTheBinarysVersion) {
+  auto doc = minimal_spec();
+  doc["target"] = json{{"a_key_from_a_later_release", "x"}};
+  const auto err = spec_error(doc);
+  EXPECT_NE(err.find("pg_laswell " PGLASWELL_VERSION), std::string::npos) << err;
+  EXPECT_NE(err.find("a later release"), std::string::npos) << err;
+  auto top = minimal_spec();
+  top["a_top_level_key_from_later"] = 1;
+  EXPECT_NE(spec_error(top).find("pg_laswell " PGLASWELL_VERSION), std::string::npos);
 }
 
 TEST(Spec, AnUnknownOnEquivalentIndexPolicyIsRefused) {
@@ -7798,14 +7849,19 @@ TEST(Planner, MaintenanceWorkMemIsDividedByTheJobCountAndOnlyOnStepsThatUseIt) {
     }
   }
 
-  // Unconfigured leaves the server's setting alone and says so, rather than
-  // guessing at memory it cannot see.
+  // Unconfigured leaves the server's setting alone for an ordinary step, and
+  // says so -- naming the one exception, a build that says what it needs, and
+  // that its limit is deduced from shared_buffers rather than measured.
   pglaswell::ExecutorConfig bare;
   const auto quiet = pglaswell::plan_migration(
       pglaswell::parse_spec(minimal_spec()), obs_capacity(8, 0, 40), bare);
   EXPECT_EQ(quiet.budget["maintenanceWorkMem"].value("perStepMb", 0), 0);
-  EXPECT_NE(quiet.budget["maintenanceWorkMem"].value("why", "").find("will not guess"),
-            std::string::npos);
+  const auto why = quiet.budget["maintenanceWorkMem"].value("why", "");
+  EXPECT_NE(why.find("server's own setting is left alone"), std::string::npos) << why;
+  EXPECT_NE(why.find("deduced from shared_buffers"), std::string::npos) << why;
+  for (const auto& st : quiet.steps) {
+    EXPECT_FALSE(st.detail.contains("maintenance_work_mem_mb")) << st.kind;
+  }
 }
 
 // --- conflict keys ---------------------------------------------------------

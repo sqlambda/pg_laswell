@@ -3,8 +3,8 @@
 ## 0.1.3
 
 Two gaps reported from pgshard while writing specifications for an audit
-application, one wrong lock found fixing them, and two more modules in the one
-package: pg_cron and pgvector. No ledger schema change.
+application, one wrong lock found fixing them, and three more modules in the one
+package: pg_cron, pgvector and TimescaleDB. No ledger schema change.
 
 ### An object is documented by the intent that creates it
 
@@ -152,6 +152,93 @@ schema instead of answering no. The ledger reading looks the table up through
 Both modules are tested against real servers in CI (the `extensions` job), and
 every refusal is checked to pre-empt an error the server really raises: the
 refused statement is run by hand too, and must fail with the quoted message.
+
+### pgvector: an HNSW build gets the memory it needs, within a deduced limit
+
+pgvector now tells core how much `maintenance_work_mem` an HNSW graph needs, by
+the measured rule its advisory already used, and core raises the build toward
+it. A configured `maintenance_work_mem_mb` still decides outright. Without one,
+the limit is deduced from `shared_buffers` -- the figure PostgreSQL's
+documentation ties to about a quarter of the server's memory, so the one every
+server is tuned by: all concurrent builds together get one more
+`shared_buffers`, each `shared_buffers` divided by `max_concurrent_jobs`, never
+less than the server's own setting. An untuned 128MB server is not raised. The
+step says what it was raised to and why (`memory_wanted_by`), and the advisory
+remains when the limit leaves the build short.
+
+Found on the way, and fixed: **a step's `maintenance_work_mem` was applied only
+outside a transaction.** The planner has always marked plain index builds and
+`VALIDATE` steps with the configured value, and both the executor and the dry
+run ran them inside a transaction with the server's setting instead. They now
+`SET LOCAL` it for the step and put it back after; a test proves it with a CHECK
+that validates only under the planned value.
+
+### FreeBSD packages
+
+Releases now carry `pg_laswell-freebsd14-amd64.pkg` and
+`pg_laswell-freebsd15-amd64.pkg`, built in a FreeBSD VM on a Linux runner by
+`.github/scripts/freebsd-build.sh`. The same script runs on every pull request
+(the `freebsd` job): it builds with every module, runs the suite that needs no
+database, packages with `cpack -G FREEBSD`, installs with `pkg add` and runs
+both binaries. Prompted by the pgshard field report: a lab that runs FreeBSD 15.1
+guests several times a day gave the FreeBSD build no coverage, because with no
+package to install it ran pg_laswell from the host.
+
+### Two refusals that now say more
+
+- An unknown key names the binary's version, and says a later release may have
+  added it -- the pgshard lab met a stale 0.1.0 refusing `target.connection` and
+  read it as a typo.
+- A password in a subscription's connection string: the refusal and
+  `pg_laswell_mcp(1)` now say whose `~/.pgpass` the subscription reads -- the
+  operating-system user the SUBSCRIBER's server runs as, on that host -- not the
+  machine running pg_laswell.
+
+### TimescaleDB
+
+A module of nine kinds, and -- the reason it had to exist -- a correction to how
+core plans an index on a hypertable. Measured on TimescaleDB 2.30.2 with
+PostgreSQL 18 in both editions, and on 2.28.3 with PostgreSQL 15.
+
+**Indexes on a hypertable.** A hypertable's parent holds no rows: relpages and
+reltuples read 0 against the 125 MiB in its chunks. So core sized every index
+build on one as tiny and built it plainly, holding ShareLock on the parent and
+every chunk until it finished -- or, for a UNIQUE index or a table with waiters,
+reached for `CREATE INDEX CONCURRENTLY`, which TimescaleDB refuses ("hypertables
+do not support concurrent index creation"). Core now asks a module a second
+question, beside the one about row locking: *how may an index be built and
+dropped on this table?* TimescaleDB answers with facts -- no concurrent build or
+drop, a per-chunk option, the hypertable's own size -- and core decides: a plain
+build when it is small and quiet, `WITH (timescaledb.transaction_per_chunk)`
+otherwise, one chunk at a time in its own transaction, and for a UNIQUE index,
+which the per-chunk build refuses, the plain build with a warning that says what
+it blocks. Drops, and the recovery of an invalid index, are plain. The step
+records `index_build_by`. For any other table nothing changes, and a test says so.
+
+**Kinds.** `timescaledb_create_hypertable` and
+`timescaledb_set_chunk_time_interval`, in both editions; and in the Timescale
+License edition only, `timescaledb_set_columnstore`, the columnstore and
+retention policies (add and remove), `timescaledb_create_continuous_aggregate`
+and its refresh policy. The edition is read from `timescaledb.license`, and the
+Apache build -- what PGDG and Debian package, and the `-oss` images -- refuses
+those first, quoting its own "not supported under the current \"apache\"
+license". Which functions exist is read too; where only `add_compression_policy`
+exists it is used. Intervals are compared as PostgreSQL keeps them, so "1 week"
+is "7 days" and "168 hours" is not. A retention policy needs
+`"acknowledge_data_loss": true`: it deletes data on a schedule from then on.
+
+**Refusals for core kinds on a hypertable**, including one made a hypertable
+earlier in the same specification: a unique key without the partitioning
+column; `set_not_null`, `add_check_constraint` and `add_foreign_key` once the
+columnstore is enabled, because TimescaleDB refuses the `VALIDATE` their recipes
+end with; `alter_column_type` once a chunk is in the columnstore. Each quotes the
+error it pre-empts, and the live suite runs each refused statement to prove the
+server still raises it.
+
+The example applies one repository to both editions, the Timescale License
+specifications held on the Apache server by their epoch. The dry run found a
+defect before it shipped: a continuous aggregate is a view to `COMMENT ON`, not
+a materialized view.
 
 ### A role the bootstrap did not name gets an answer, not an error
 

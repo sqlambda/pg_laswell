@@ -481,6 +481,17 @@ class Executor {
   void run_in_transaction(WriteSession& w, int ordinal, const json& step) {
     const auto started = detail::steady_ms();
     long long rows = 0;
+    // maintenance_work_mem, when the planner decided this step uses it. The
+    // planner has always marked plain index builds and VALIDATE steps with it,
+    // and only the non-transactional path applied it -- so a step inside a
+    // transaction ran with the server's setting while the plan said
+    // otherwise (found 2026-10-02, adding pgvector's raise). SET LOCAL works
+    // here, unlike on a nontransaction; and it is put back after the step,
+    // because the steps after it share the transaction and do not use it.
+    const int mwm = step.value("detail", json::object()).value("maintenance_work_mem_mb", 0);
+    if (mwm > 0) {
+      w.txn().exec("SET LOCAL maintenance_work_mem = '" + std::to_string(mwm) + "MB'");
+    }
     for (const auto& raw : step.value("sql", json::array())) {
       const auto stmt = detail::strip_semicolon(raw.get<std::string>());
       if (stmt.empty()) continue;
@@ -507,6 +518,7 @@ class Executor {
         throw;
       }
     }
+    if (mwm > 0) w.txn().exec("SET LOCAL maintenance_work_mem TO DEFAULT");
     record_step(ordinal, step, "succeeded", rows,
                 json{{"elapsedMs", detail::steady_ms() - started}});
   }

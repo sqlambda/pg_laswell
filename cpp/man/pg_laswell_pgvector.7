@@ -56,7 +56,7 @@ A binary that carries the module says so:
 .Bd -literal -offset indent
 $ pg_laswell_mcp --version
 0.1.3
-modules: citus,pg_cron,pgvector
+modules: citus,pg_cron,pgvector,timescaledb
 .Ed
 .Pp
 .Sy Versions.
@@ -255,8 +255,39 @@ to
 and
 .Va m
 16 to 32, agree within 2%.
-The advisory names the size and the setting to raise,
-.Va maintenance_work_mem_mb .
+.Pp
+The estimate is also what the build is given.
+pgvector tells core how much memory the graph needs, and core raises the step's
+.Va maintenance_work_mem
+toward it \(em in the executor and in the dry run alike \(em within a limit:
+.Bl -bullet -compact
+.It
+With
+.Va maintenance_work_mem_mb
+configured, its per-step share is used and never exceeded: the operator decided,
+and giving one build more would spend memory the other jobs were promised.
+.It
+Without it, the limit is
+.Em deduced from
+.Va shared_buffers :
+PostgreSQL's documentation suggests about 25% of a dedicated server's memory for
+it, so it is the one figure on every server that says how big the server is.
+All concurrent builds together are held to one more
+.Va shared_buffers ,
+so each gets
+.Va shared_buffers
+divided by
+.Va max_concurrent_jobs ,
+and never less than the server's own setting.
+An untuned server (128MB) gets 64MB a job \(em no raise \(em which is the safe
+side of the guess.
+.El
+.Pp
+The step's reason names what it was raised to and why, and
+.Va memory_wanted_by
+names pgvector.
+The advisory remains when the limit leaves the build short, naming what it
+still needs and the setting that would give it all of it.
 Not given for
 .Li sparsevec ,
 whose size is its count of non-zero elements, a property of the data.
@@ -276,12 +307,15 @@ maintenance workers allowed,
 .Va dynamic_shared_memory_type
 .Ql posix ,
 and more than 64 MB of
-.Va maintenance_work_mem .
+.Va maintenance_work_mem
+\(em counted after the raise above, which is the figure the build really
+allocates, so a raise that makes this possible is never silent.
 .El
 .Sh SEE ALSO
 .Xr pg_laswell 1 ,
 .Xr pg_laswell_mcp 1 ,
 .Xr pg_laswell_citus 7 ,
-.Xr pg_laswell_pg_cron 7
+.Xr pg_laswell_pg_cron 7 ,
+.Xr pg_laswell_timescaledb 7
 .Sh AUTHORS
 .An Daniel Cristian Cruz

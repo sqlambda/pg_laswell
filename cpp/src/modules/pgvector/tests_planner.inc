@@ -294,3 +294,89 @@ TEST(PgvectorPlanner, AParallelBuildBiggerThanAContainersShmIsMentioned) {
   obs.server["max_parallel_maintenance_workers"] = 0;
   EXPECT_FALSE(pv_advised(pv_plan(pv_index(col), obs), "/dev/shm"));
 }
+
+// --- 2026-10-02: the HNSW build's memory, raised within a deduced limit -------
+
+namespace {
+pglaswell::Plan pv_plan_cfg(json intents, const pglaswell::Observations& obs,
+                            const pglaswell::ExecutorConfig& cfg) {
+  if (!intents.is_array()) intents = json::array({std::move(intents)});
+  const auto spec = pglaswell::parse_spec(json{{"laswell_spec_version", 1},
+                                              {"id", "pgvector-test"},
+                                              {"description", "a pgvector planner test"},
+                                              {"intents", std::move(intents)}});
+  return pglaswell::plan_migration(spec, obs, cfg);
+}
+}  // namespace
+
+TEST(PgvectorPlanner, AnHnswBuildIsGivenTheMemoryItNeedsUpToAShareOfSharedBuffers) {
+  // 100 000 rows of vector(1536), m 16: about 656 MB of graph. shared_buffers
+  // 4 GB, two concurrent jobs: the limit is 2048 MB, so it gets all 656.
+  auto obs = pv_observations();
+  obs.server["maintenance_work_mem_kb"] = 65536;
+  obs.server["shared_buffers_bytes"] = 4LL << 30;
+  pglaswell::ExecutorConfig cfg;
+  cfg.max_concurrent_jobs = 2;
+  const auto p = pv_plan_cfg(pv_index(json::array({pv_col("embedding", "vector_cosine_ops")})),
+                             obs, cfg);
+  ASSERT_TRUE(p.ok) << p.render();
+  const auto& s = p.steps[0];
+  EXPECT_EQ(s.detail.value("maintenance_work_mem_mb", 0), 656) << s.detail.dump();
+  EXPECT_EQ(s.detail.value("memory_wanted_by", ""), "pgvector");
+  EXPECT_FALSE(s.detail.contains("index_build_by"))
+      << "pgvector asked for memory; it did not change how the index is built";
+  EXPECT_NE(s.why.find("maintenance_work_mem raised to 656MB"), std::string::npos) << s.why;
+  for (const auto& a : p.advisories) {
+    EXPECT_EQ(a.find("graph needs"), std::string::npos) << "it got what it needs: " << a;
+  }
+}
+
+TEST(PgvectorPlanner, AboveTheLimitItIsRaisedAsFarAsAllowedAndTheRestIsSaid) {
+  // shared_buffers 512 MB over two jobs: 256 MB, short of 656.
+  auto obs = pv_observations();
+  obs.server["maintenance_work_mem_kb"] = 65536;
+  obs.server["shared_buffers_bytes"] = 512LL << 20;
+  pglaswell::ExecutorConfig cfg;
+  cfg.max_concurrent_jobs = 2;
+  const auto p = pv_plan_cfg(pv_index(json::array({pv_col("embedding", "vector_cosine_ops")})),
+                             obs, cfg);
+  ASSERT_TRUE(p.ok);
+  EXPECT_EQ(p.steps[0].detail.value("maintenance_work_mem_mb", 0), 256);
+  EXPECT_NE(p.steps[0].why.find("limited to shared_buffers 512MB divided by max_concurrent_jobs (2)"),
+            std::string::npos) << p.steps[0].why;
+  bool said = false;
+  for (const auto& a : p.advisories) {
+    if (a.find("already raised from the server's 64 MB") != std::string::npos) said = true;
+  }
+  EXPECT_TRUE(said) << p.render();
+}
+
+TEST(PgvectorPlanner, AConfiguredCeilingWinsAndAnUntunedServerIsNotRaised) {
+  auto obs = pv_observations();
+  obs.server["maintenance_work_mem_kb"] = 65536;
+  obs.server["shared_buffers_bytes"] = 4LL << 30;
+  pglaswell::ExecutorConfig cfg;
+  cfg.max_concurrent_jobs = 2;
+  cfg.maintenance_work_mem_mb = 200;  // 100 per step, the operator's decision
+  const auto c = pv_plan_cfg(pv_index(json::array({pv_col("embedding", "vector_cosine_ops")})),
+                             obs, cfg);
+  EXPECT_EQ(c.steps[0].detail.value("maintenance_work_mem_mb", 0), 100) << c.steps[0].detail.dump();
+  EXPECT_FALSE(c.steps[0].detail.contains("memory_wanted_by"));
+
+  // shared_buffers left at 128 MB: 64 MB a job, no more than the server's own.
+  obs.server["shared_buffers_bytes"] = 128LL << 20;
+  cfg.maintenance_work_mem_mb = 0;
+  const auto u = pv_plan_cfg(pv_index(json::array({pv_col("embedding", "vector_cosine_ops")})),
+                             obs, cfg);
+  EXPECT_FALSE(u.steps[0].detail.contains("maintenance_work_mem_mb")) << u.steps[0].detail.dump();
+}
+
+TEST(PgvectorPlanner, OnlyAnHnswBuildAsksForMemory) {
+  auto obs = pv_observations();
+  obs.server["maintenance_work_mem_kb"] = 65536;
+  obs.server["shared_buffers_bytes"] = 4LL << 30;
+  const auto ivf = pv_plan(pv_index(json::array({"embedding"}), "ivfflat"), obs);
+  EXPECT_FALSE(ivf.steps[0].detail.contains("maintenance_work_mem_mb"));
+  const auto bt = pv_plan(pv_index(json::array({"id"}), "btree"), obs);
+  EXPECT_FALSE(bt.steps[0].detail.contains("maintenance_work_mem_mb"));
+}

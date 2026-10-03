@@ -1718,14 +1718,15 @@ none of its assumptions.
 .Pp
 Modules are chosen when the binary is configured:
 .Bd -literal -offset indent
-cmake -S cpp -B build -DPGLASWELL_MODULES="citus;pg_cron;pgvector"
+cmake -S cpp -B build -DPGLASWELL_MODULES="citus;pg_cron;pgvector;timescaledb"
 .Ed
 .Pp
 The released package is built with every module, so
 .Xr pg_laswell_citus 7 ,
-.Xr pg_laswell_pg_cron 7
-and
+.Xr pg_laswell_pg_cron 7 ,
 .Xr pg_laswell_pgvector 7
+and
+.Xr pg_laswell_timescaledb 7
 are installed beside this page.
 A module's kinds are refused where its extension is absent, and a server without
 the extension plans exactly as a build without the module would.
@@ -1736,7 +1737,7 @@ none:
 .Bd -literal -offset indent
 $ pg_laswell_mcp --version
 0.1.3
-modules: citus,pg_cron,pgvector
+modules: citus,pg_cron,pgvector,timescaledb
 .Ed
 .Pp
 This matters because two binaries with the same version string accept different
@@ -1806,6 +1807,11 @@ pg_cron keeps its jobs in.
 pgvector: no kinds of its own; refusals for the HNSW and IVFFlat indexes
 pgvector would reject, said before a concurrent build starts.
 .Xr pg_laswell_pgvector 7
+.It Cm timescaledb
+TimescaleDB: hypertables, and in the Timescale License edition the columnstore,
+policies and continuous aggregates; and how core builds and drops an index on a
+hypertable, which it cannot do concurrently.
+.Xr pg_laswell_timescaledb 7
 .El
 .Sh PREREQUISITES
 Some migrations need something done that this program cannot do, often on a
@@ -1870,6 +1876,29 @@ lives in
 or
 .Pa ~/.pgpass ,
 and the prerequisite says what must be there and how to check it.
+.Pp
+.Em Whose
+.Pa ~/.pgpass
+is the part that is easy to get wrong.
+The subscription's connection is made by the subscriber's PostgreSQL server
+process, not by
+.Nm
+and not by the machine it runs on: the file that is read is the one in the home
+directory of the operating-system user that server runs as \(em usually
+.Li postgres
+\(em on the subscriber's host, or the service file there.
+A
+.Pa ~/.pgpass
+beside the deployment does nothing for it.
+.Pp
+This refusal is the kind a lab that rebuilds constantly might experience as
+friction and be tempted to relax.
+The pgshard lab met it 83 times in October 2026 and it cost nothing, because
+the subscriber's
+.Li postgres
+user already carried a wildcard entry,
+.Ql *:*:*:postgres:<password> .
+The right answer is that file, not a password in the specification.
 .Sh CAPACITY
 The migrations run inside PostgreSQL, not on the machine
 .Nm
@@ -2243,7 +2272,8 @@ pg_laswell_mcp --call planMigration --args @spec-args.json \e
 .Xr psql 1 ,
 .Xr pg_laswell_citus 7 ,
 .Xr pg_laswell_pg_cron 7 ,
-.Xr pg_laswell_pgvector 7
+.Xr pg_laswell_pgvector 7 ,
+.Xr pg_laswell_timescaledb 7
 .Sh STANDARDS
 Model Context Protocol, revisions 2024-11-05 through 2025-11-25, over stdio
 using JSON-RPC 2.0.

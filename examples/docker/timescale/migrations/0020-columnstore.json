@@ -1,0 +1,31 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0020-columnstore",
+  "description": "Readings older than a week move to the columnstore, segmented by device.",
+  "rationale": "Segmenting by device keeps one device's history together, which is how it is read.",
+  "target": {
+    "epoch": "timescale-license"
+  },
+  "depends_on": [
+    "0010-readings"
+  ],
+  "intents": [
+    {
+      "kind": "timescaledb_set_columnstore",
+      "schema": "public",
+      "table": "readings",
+      "segment_by": [
+        "device_id"
+      ],
+      "order_by": [
+        "ts DESC"
+      ]
+    },
+    {
+      "kind": "timescaledb_add_columnstore_policy",
+      "schema": "public",
+      "table": "readings",
+      "after": "7 days"
+    }
+  ]
+}

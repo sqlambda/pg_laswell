@@ -566,6 +566,10 @@ SELECT JSONB_BUILD_OBJECT(
   -- with units and does not cast to a number.
   'maintenance_work_mem_kb', (SELECT setting::bigint FROM pg_settings
                                WHERE name = 'maintenance_work_mem'),
+  -- In bytes, whatever unit it was set in. The one memory figure every server
+  -- is tuned by, and the basis of the limit an index build's memory is raised
+  -- to when no ceiling is configured (planner_base.h).
+  'shared_buffers_bytes', pg_size_bytes(current_setting('shared_buffers')),
   'is_in_recovery', pg_is_in_recovery(),
   'now', now()
 )

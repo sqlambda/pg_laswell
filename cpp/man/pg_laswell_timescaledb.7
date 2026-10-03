@@ -1,0 +1,304 @@
+.Dd October 2, 2026
+.Dt PG_LASWELL_TIMESCALEDB 7
+.Os
+.Sh NAME
+.Nm pg_laswell_timescaledb
+.Nd TimescaleDB support in pg_laswell: hypertables, the columnstore, policies and continuous aggregates
+.Sh DESCRIPTION
+TimescaleDB support is a
+.Em build-time module ,
+like Citus support
+.Pq Xr pg_laswell_citus 7 .
+It adds the kinds below, and it changes how core plans an index on a hypertable
+\(em which, without it, core plans wrongly: a hypertable's parent holds no rows,
+so core read it as tiny and built indexes on it with a lock on every chunk, or
+with
+.Ic CREATE INDEX CONCURRENTLY ,
+which TimescaleDB refuses.
+.Pp
+A binary that carries the module says so:
+.Bd -literal -offset indent
+$ pg_laswell_mcp --version
+0.1.3
+modules: citus,pg_cron,pgvector,timescaledb
+.Ed
+.Pp
+.Sy Versions and editions.
+Measured on TimescaleDB 2.30.2 with PostgreSQL 18, in both editions, and on
+2.28.3 with PostgreSQL 15, the oldest TimescaleDB line on the oldest PostgreSQL
+this project supports.
+Which functions exist is read from the server, not inferred from a version.
+.Pp
+TimescaleDB ships in two editions, and the same binary meets both.
+The
+.Em Apache
+build \(em what PGDG and Debian package as
+.Li postgresql-NN-timescaledb
+.Pq Li +dfsg ,
+and the
+.Li -oss
+images \(em has hypertables and chunks.
+The
+.Em Timescale License
+build \(em Timescale's own packages and images \(em adds the columnstore,
+continuous aggregates and policies.
+The module reads
+.Va timescaledb.license
+and refuses the second kind of intent on the first edition, before anything
+runs, quoting
+.Qq functionality not supported under the current \&"apache\&" license .
+.Pp
+TimescaleDB must be preloaded and created in the database before its kinds can
+be planned: a specification cannot both create the extension and use it.
+.Sh INTENT KINDS
+.\" BEGIN TIMESCALEDB KIND LIST -- checked by tools/check-manual.py against
+.\" cpp/src/modules/timescaledb/kinds.inc.
+Every kind accepts an optional
+.Va comment ,
+a note for whoever reads the specification.
+Intervals are written as one or more
+.Ql <number> <unit>
+pairs \(em year, month, week, day, hour, minute, second \(em and sent to
+PostgreSQL as written.
+They are compared as PostgreSQL keeps them, as months, days and seconds, so
+.Ql 1 week
+and
+.Ql 7 days
+are the same and
+.Ql 7 days
+and
+.Ql 168 hours
+are not.
+.Ss Cm timescaledb_create_hypertable
+.Va schema ,
+.Va table ,
+.Va time_column ,
+and optionally
+.Va chunk_time_interval
+(TimescaleDB's default is 7 days) and
+.Va migrate_data .
+The time column must be
+.Li timestamptz ,
+.Li timestamp
+or
+.Li date .
+Already a hypertable on that column: satisfied.
+Refused when it is one on another column, when a unique index or primary key
+leaves the time column out
+.Pq Qq cannot create a unique index without the column \&"ts\&" (used in partitioning) ,
+and when the table holds rows and
+.Va migrate_data
+is not true
+.Pq Qq table \&"t\&" is not empty .
+With
+.Va migrate_data ,
+the rows move into chunks under
+.Va AccessExclusiveLock
+on the table for the whole copy (measured: 200 000 rows in 300 ms), and the plan
+says so.
+A nullable time column is made NOT NULL by TimescaleDB without a word; the plan
+says that too.
+Rehearsed by execution: it rolls back, rows included.
+.Ss Cm timescaledb_set_chunk_time_interval
+.Va schema ,
+.Va table ,
+.Va chunk_time_interval .
+Applies to chunks created from now on.
+.Ss Cm timescaledb_set_columnstore
+Timescale License.
+.Va schema ,
+.Va table ,
+and optionally
+.Va segment_by ,
+a list of columns, and
+.Va order_by ,
+a list of
+.Ql column
+or
+.Ql column DESC .
+Satisfied when the columnstore is enabled with exactly those settings.
+.Va AccessExclusiveLock ,
+briefly: settings only.
+Chunks already converted keep their old settings.
+Once enabled, TimescaleDB refuses
+.Ic VALIDATE CONSTRAINT
+on the table, and a column type change once a chunk is converted; see
+.Sx REFUSALS .
+.Ss Cm timescaledb_add_columnstore_policy
+Timescale License.
+.Va schema ,
+.Va table ,
+.Va after :
+chunks older than this are converted on a schedule.
+The columnstore must be enabled first
+.Pq Qq columnstore not enabled on hypertable .
+A policy with another
+.Va after
+is removed and added again, in one transaction: TimescaleDB only warns, and
+changes nothing, when a second one is added.
+.Fn add_columnstore_policy
+is a procedure, so it is called with
+.Ic CALL ;
+where only its older name exists,
+.Fn add_compression_policy
+is used instead.
+.Ss Cm timescaledb_remove_columnstore_policy
+Timescale License.
+.Va schema ,
+.Va table .
+Absent: satisfied.
+.Ss Cm timescaledb_add_retention_policy
+Timescale License.
+.Va schema ,
+.Va table ,
+.Va drop_after ,
+and
+.Va acknowledge_data_loss ,
+which must be
+.Li true :
+from then on TimescaleDB drops every chunk older than
+.Va drop_after ,
+on a schedule, and the specification has to say it means it.
+The plan warns in those words.
+.Ss Cm timescaledb_remove_retention_policy
+Timescale License.
+Absent: satisfied \(em without
+.Va if_exists
+TimescaleDB raises
+.Qq retention policy not found .
+.Ss Cm timescaledb_create_continuous_aggregate
+Timescale License.
+.Va schema ,
+.Va name ,
+.Va query ,
+and optionally
+.Va materialized_only
+and
+.Va refresh .
+Created
+.Ic WITH NO DATA ,
+in a transaction, which the dry run executes and rolls back \(em checking the
+query as well
+.Pq Qq invalid continuous aggregate view .
+With
+.Va refresh
+true, a second step fills it with
+.Fn refresh_continuous_aggregate ,
+which cannot run inside a transaction block (measured) and reads the whole
+source.
+Already a continuous aggregate: satisfied, and its query is not compared.
+.Ss Cm timescaledb_add_continuous_aggregate_policy
+Timescale License.
+.Va schema ,
+.Va name ,
+.Va start_offset ,
+.Va end_offset ,
+.Va schedule_interval .
+A policy with other offsets is removed and added again
+.Pq Qq continuous aggregate refresh policy already exists .
+.\" END TIMESCALEDB KIND LIST
+.Sh INDEXES ON A HYPERTABLE
+Core's own
+.Cm create_index ,
+.Cm drop_index ,
+.Cm add_unique_constraint
+and
+.Cm add_primary_key
+ask this module how an index may be built and dropped on a table, and it answers
+for a hypertable with facts measured on both editions:
+.Bl -bullet
+.It
+.Ic CREATE INDEX CONCURRENTLY
+is refused:
+.Qq hypertables do not support concurrent index creation .
+.Ic DROP INDEX CONCURRENTLY
+is refused too.
+.It
+.Ic WITH (timescaledb.transaction_per_chunk)
+builds one chunk at a time, each in its own transaction, holding
+.Va ShareLock
+on that chunk only \(em but not inside a transaction block, and not for a
+UNIQUE index
+.Pq Qq cannot use timescaledb.transaction_per_chunk with UNIQUE or PRIMARY KEY .
+A failure partway leaves the index INVALID with some chunks built, which is the
+shape of a failed concurrent build, and is verified and recovered the same way.
+.It
+The parent's
+.Va relpages
+and
+.Va reltuples
+are 0; the data is in the chunks.
+The size and row count come from
+.Fn hypertable_size
+and
+.Fn approximate_row_count .
+.El
+.Pp
+So core plans, for an index on a hypertable:
+a plain build when the data is small and nothing waits, as for any table; a
+per-chunk build otherwise; and, for a UNIQUE index or constraint that is not
+small, the plain build anyway \(em the only one that exists \(em with a warning
+that writes to the hypertable and every chunk wait for the whole build.
+A drop is always a plain
+.Ic DROP INDEX .
+The step records
+.Va index_build_by
+as
+.Cm timescaledb .
+.Sh READINGS
+Taken only where the extension is installed in the target database.
+.Bl -tag -width Ds
+.It Va license , version , functions
+.Va timescaledb.license ;
+the extension version; which of the functions this module calls exist.
+.It Va hypertables
+For each: its partitioning columns and the time interval, chunk counts, whether
+the columnstore is enabled and how it segments and orders, and its size and
+approximate row count.
+.It Va policies
+Columnstore, retention and refresh jobs, by the hypertable or continuous
+aggregate they act on, with their intervals.
+.It Va caggs
+Continuous aggregates, and the hypertable each reads.
+.El
+.Sh REFUSALS
+Of core kinds, on a hypertable \(em including one made a hypertable earlier in
+the same specification:
+.Bl -bullet
+.It
+A UNIQUE index, primary key or unique constraint that leaves out a partitioning
+column.
+.It
+.Cm set_not_null ,
+.Cm add_check_constraint
+and
+.Cm add_foreign_key
+when the columnstore is enabled: each validates in a second step, and
+TimescaleDB refuses
+.Ic VALIDATE CONSTRAINT
+then
+.Pq Qq operation not supported on hypertables that have columnstore enabled .
+There is no recipe for them here yet.
+.It
+.Cm alter_column_type
+once a chunk is in the columnstore
+.Pq Qq operation not supported on hypertables with compressed chunks .
+.El
+.Pp
+Not refused, and caught by the dry run, which executes it: a column added with a
+non-constant default to a hypertable with the columnstore
+.Pq Qq cannot add column with non-constant default expression .
+.Sh SEE ALSO
+.Xr pg_laswell 1 ,
+.Xr pg_laswell_mcp 1 ,
+.Xr pg_laswell_citus 7 ,
+.Xr pg_laswell_pg_cron 7 ,
+.Xr pg_laswell_pgvector 7
+.Sh AUTHORS
+.An Daniel Cristian Cruz
+.Sh CAVEATS
+Policies are jobs, and a job edited by hand outside a specification is not
+noticed, as pg_cron's are
+.Pq Xr pg_laswell_pg_cron 7 .
+Integer time columns are not supported by
+.Cm timescaledb_create_hypertable .

@@ -1,6 +1,6 @@
 <!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>pg_cron_unschedule — pg_laswell</title>
+<title>timescaledb_remove_columnstore_policy — pg_laswell</title>
 <style>
 :root{--fg:#333;--bg:#fff;--muted:#666;--rule:#ddd;--link:#0066a4;
       --code-bg:#f7f7f7;--code-rule:#e0e0e0;--req:#a33;--accent:#0e6ba8;
@@ -70,26 +70,26 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
  --dd:#c2c2c2;--req-bg:#3a2526;--req-rule:#573537;--opt-bg:#1d2a33;
  --opt-rule:#2b3f4d;--note-bg:#1a2126;--warn-bg:#2a2119}
 </style></head><body><div class="wrap">
-<nav class="crumb"><div class="l"><a href="index.html">Intent kinds</a><span>Module: pg_cron</span></div><div class="r"><a href="pg_cron_schedule.html">← pg_cron_schedule</a><a href="timescaledb_create_hypertable.html">timescaledb_create_hypertable →</a></div></nav>
-<h1><code>pg_cron_unschedule</code></h1>
-<p class="purpose"><strong>A pg_cron module kind.</strong> Known only to a binary built with <code>-DPGLASWELL_MODULES=pg_cron</code> -- <code>--version</code> then prints <code>modules: pg_cron</code>. A PostgreSQL-only build refuses it as an unknown kind, and with it the whole specification. See <code>pg_laswell_pg_cron(7)</code>.</p>
+<nav class="crumb"><div class="l"><a href="index.html">Intent kinds</a><span>Module: timescaledb</span></div><div class="r"><a href="timescaledb_add_columnstore_policy.html">← timescaledb_add_columnstore_policy</a><a href="timescaledb_add_retention_policy.html">timescaledb_add_retention_policy →</a></div></nav>
+<h1><code>timescaledb_remove_columnstore_policy</code></h1>
+<p class="purpose"><strong>A timescaledb module kind.</strong> Known only to a binary built with <code>-DPGLASWELL_MODULES=timescaledb</code> -- <code>--version</code> then prints <code>modules: timescaledb</code>. A PostgreSQL-only build refuses it as an unknown kind, and with it the whole specification. See <code>pg_laswell_timescaledb(7)</code>.</p>
 <h2>Synopsis</h2><pre>{
-  &quot;kind&quot;: &quot;pg_cron_unschedule&quot;,
-  &quot;name&quot;: &lt;optional&gt;,
-  &quot;username&quot;: &lt;optional&gt;,
+  &quot;kind&quot;: &quot;timescaledb_remove_columnstore_policy&quot;,
+  &quot;schema&quot;: &lt;required&gt;,
+  &quot;table&quot;: &lt;required&gt;,
   &quot;comment&quot;: &lt;optional&gt;
 }</pre>
 <h2>Parameters</h2><dl class="params">
-<dt>name<span class="tag opt">optional</span></dt>
+<dt>schema<span class="tag req">required</span></dt>
 <dd>&nbsp;</dd>
-<dt>username<span class="tag opt">optional</span></dt>
+<dt>table<span class="tag req">required</span></dt>
 <dd>&nbsp;</dd>
 <dt>comment<span class="tag opt">optional</span></dt>
 <dd>&nbsp;</dd>
 </dl>
 <div class="note">Any key not listed here is <strong>refused</strong>, not ignored: a key this binary skips and a newer one honours would be a silent difference between what was reviewed and what ran.</div>
 <h2>Examples</h2>
-<div class="note warn">No single-database example: needs pg_cron in shared_preload_libraries and a job to remove. This kind is covered by <code>cpp/test/pg_cron-tests.sh</code>, which runs against a real cluster.</div>
-<h2>See also</h2><p><a href="pg_cron_schedule.html"><code>pg_cron_schedule</code></a></p>
+<div class="note warn">No single-database example: needs the Timescale License edition and a columnstore policy. This kind is covered by <code>cpp/test/timescaledb-tests.sh</code>, which runs against a real cluster.</div>
+<h2>See also</h2><p><a href="timescaledb_create_hypertable.html"><code>timescaledb_create_hypertable</code></a>, <a href="timescaledb_set_chunk_time_interval.html"><code>timescaledb_set_chunk_time_interval</code></a>, <a href="timescaledb_set_columnstore.html"><code>timescaledb_set_columnstore</code></a>, <a href="timescaledb_add_columnstore_policy.html"><code>timescaledb_add_columnstore_policy</code></a>, <a href="timescaledb_add_retention_policy.html"><code>timescaledb_add_retention_policy</code></a>, <a href="timescaledb_remove_retention_policy.html"><code>timescaledb_remove_retention_policy</code></a>, <a href="timescaledb_create_continuous_aggregate.html"><code>timescaledb_create_continuous_aggregate</code></a>, <a href="timescaledb_add_continuous_aggregate_policy.html"><code>timescaledb_add_continuous_aggregate_policy</code></a></p>
 <footer>Generated from <code>cpp/src/spec.h</code> and <code>cpp/src/conformance.inc</code> by <code>tools/gen-manual.py</code>. The manual page <code>pg_laswell_mcp(1)</code> remains the authoritative reference for everything that is not a per-kind option.</footer>
 </div></body></html>

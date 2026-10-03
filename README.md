@@ -15,13 +15,14 @@ says so plainly where it can prove nothing. It converges databases that have
 drifted. And it never states a number it cannot derive.
 
 **Status: 0.1.3, young and moving.** The whole path works — repository,
-signing, planning, dry run, paced execution, ledger — with 544 tests green on
-GCC and Clang, under AddressSanitizer/UBSan and ThreadSanitizer, plus 55 live
-cases against a Citus coordinator and two workers and 27 against PostgreSQL
-with pg_cron and pgvector. 102 intent kinds: 83 core, 17 from the Citus module
-and 2 from the pg_cron module; the pgvector module adds no kinds, only the
-refusals pgvector would otherwise raise mid-build. Packages build for seven
-targets — deb, rpm and tarball, x86_64 and arm64, plus macOS arm64 — each with
+signing, planning, dry run, paced execution, ledger — with 572 tests green on
+GCC and Clang, under AddressSanitizer/UBSan and ThreadSanitizer, plus live
+suites against a Citus coordinator and two workers, PostgreSQL with pg_cron and
+pgvector, and TimescaleDB in both editions. 111 intent kinds: 83 core, 17 from
+the Citus module, 2 from pg_cron and 9 from TimescaleDB; the pgvector module adds
+no kinds, only the refusals pgvector would otherwise raise mid-build. Packages build for nine
+targets — deb, rpm and tarball, x86_64 and arm64, macOS arm64, and FreeBSD 14
+and 15 amd64 — each with
 every module compiled in, and each installed and run inside the platform it
 targets before upload. Releases are on
 [GitHub](https://github.com/sqlambda/pg_laswell/releases); the manual is the
@@ -37,9 +38,11 @@ turn a bounded change into one long transaction. The unpaced merge, and every
 other kind, runs from 15. **The Citus module is measured against Citus 13.2 on
 PostgreSQL 17**; it reads which Citus calls exist rather than assuming a version
 ([pg_laswell_citus(7)](cpp/man/pg_laswell_citus.7)). **pg_cron 1.6.8 and
-pgvector 0.8.6 are measured on PostgreSQL 18.6**
+pgvector 0.8.6 are measured on PostgreSQL 18.6, TimescaleDB 2.30.2 on 18.6 in
+both editions and 2.28.3 on 15**
 ([pg_laswell_pg_cron(7)](cpp/man/pg_laswell_pg_cron.7),
-[pg_laswell_pgvector(7)](cpp/man/pg_laswell_pgvector.7)).
+[pg_laswell_pgvector(7)](cpp/man/pg_laswell_pgvector.7),
+[pg_laswell_timescaledb(7)](cpp/man/pg_laswell_timescaledb.7)).
 
 ## Why
 
@@ -238,7 +241,7 @@ cmake --build cpp/build
 ctest --test-dir cpp/build
 ```
 
-`-DPGLASWELL_MODULES="citus;pg_cron;pgvector"` builds what the release ships. How a module is
+`-DPGLASWELL_MODULES="citus;pg_cron;pgvector;timescaledb"` builds what the release ships. How a module is
 written, and why there is one package, is in
 [cpp/src/modules/README.md](cpp/src/modules/README.md).
 

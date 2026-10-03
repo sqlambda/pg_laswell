@@ -20,7 +20,9 @@
 #include <algorithm>
 #include <cctype>
 #include <map>
+#include <optional>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -502,7 +504,10 @@ inline void reject_unknown_keys(const json& obj, const std::set<std::string>& al
            "Accepted keys here are: " + list +
                ". An unknown key is refused rather than ignored, because a key "
                "this binary skips and a newer one honours is a silent "
-               "difference between what was reviewed and what ran.");
+               "difference between what was reviewed and what ran. This is "
+               "pg_laswell " PGLASWELL_VERSION
+               ": if the specification was written for a later release, the key "
+               "may be one this binary predates -- run that release instead.");
     }
   }
 }
@@ -998,10 +1003,13 @@ inline void parse_subscription(Intent& in) {
           "A subscription's connection string is stored in pg_subscription in "
           "the clear, and pg_laswell stores every statement it runs verbatim in "
           "the ledger -- so a password here would be in the signed spec, in "
-          "git and in laswell.step.sql. Put the credential in the server's "
-          "~/.pgpass or a connection service file and name the service here. "
-          "It is refused rather than redacted because a redacted ledger entry "
-          "would no longer be what ran.");
+          "git and in laswell.step.sql. The connection is made by the "
+          "SUBSCRIBER's server process, not by pg_laswell: put the credential "
+          "in the ~/.pgpass of the operating-system user that server runs as "
+          "(usually postgres), on the subscriber's host -- or in a connection "
+          "service file there, and name the service here. It is refused rather "
+          "than redacted because a redacted ledger entry would no longer be "
+          "what ran.");
     }
   }
   if (in.kind == IntentKind::kCreateSubscription) {
@@ -2762,7 +2770,11 @@ inline Spec parse_spec(const json& doc) {
                    "Accepted top-level keys are: " + allowed +
                        ", signatures. Unknown keys are refused rather than "
                        "ignored: a key outside the signed projection that the "
-                       "parser honoured would be a signature bypass.");
+                       "parser honoured would be a signature bypass. This is "
+                       "pg_laswell " PGLASWELL_VERSION
+                       ": a key added by a later release is unknown to an "
+                       "older binary, so check which one runs the "
+                       "specification.");
     }
   }
 

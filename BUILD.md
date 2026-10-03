@@ -61,7 +61,19 @@ pkg install postgresql18-server postgresql18-contrib   # for the database tests
 suite creates `pg_trgm`, and without contrib the planner correctly refuses it as
 not available on the server. libpqxx is built exactly as above, with the same
 script. `cpack -G FREEBSD` produces a native package that installs under
-`/usr/local` and depends on `postgresql18-client` for `libpq.so.5`.
+`/usr/local`; pkg records the libraries it needs (`libpq.so.5`, from
+`postgresql18-client`) from the binaries themselves.
+
+Releases carry `pg_laswell-freebsd14-amd64.pkg` and
+`pg_laswell-freebsd15-amd64.pkg`, built in a FreeBSD VM by
+`.github/scripts/freebsd-build.sh`, which also runs in CI on every pull request:
+it builds, runs the suite that needs no database, packages, installs the
+package with `pkg add` and runs both binaries. To install one:
+
+```sh
+pkg install postgresql18-client
+pkg add ./pg_laswell-freebsd15-amd64.pkg
+```
 
 OpenSSL is linked for `OpenSSL::Crypto` only — Ed25519 signature verification,
 never TLS. It adds no new *runtime* package: `libpq5` already depends on
@@ -89,8 +101,9 @@ ctest --test-dir cpp/build --output-on-failure
 | `call_mode` | the binaries' `--call` mode |
 | `citus_tests` | the live Citus suite, only in a build with modules; it skips without `CITUS_URL` |
 | `extensions_tests` | the live pg_cron and pgvector suite, only in a build with modules; it skips without `EXT_CENTRAL_URL` and `EXT_LOCAL_URL` |
+| `timescaledb_tests` | the live TimescaleDB suite, only in a build with modules; it skips without `TS_TSL_URL`, `TS_APACHE_URL` and `TS_OLDEST_URL` |
 
-A build without modules registers the same list minus those two.
+A build without modules registers the same list minus those three.
 
 ### Tests and the database
 
@@ -113,11 +126,11 @@ A skip nobody notices is a test that silently stopped running, so CI sets
 A vendor module is compiled in, never loaded at runtime:
 
 ```bash
-cmake -S cpp -B cpp/build -DPGLASWELL_MODULES="citus;pg_cron;pgvector"
+cmake -S cpp -B cpp/build -DPGLASWELL_MODULES="citus;pg_cron;pgvector;timescaledb"
 ```
 
 The released package is built this way, and `pg_laswell --version` prints
-`modules: citus,pg_cron,pgvector`. Without the option the binary is PostgreSQL-only, and CI builds
+`modules: citus,pg_cron,pgvector,timescaledb`. Without the option the binary is PostgreSQL-only, and CI builds
 both: the plain builds prove core needs no module, the module builds prove the
 module. A module's kinds are refused by a binary without it, as a whole
 specification, never skipped.
@@ -141,6 +154,18 @@ docker compose -f examples/docker/extensions/compose.yml up -d --build
 EXT_CENTRAL_URL=postgresql://postgres:laswell@127.0.0.1:55450 \
 EXT_LOCAL_URL=postgresql://postgres:laswell@127.0.0.1:55451 \
   ctest --test-dir cpp/build -R extensions_tests --output-on-failure
+```
+
+The TimescaleDB suite needs three servers -- the Timescale License build, the
+Apache build, and the oldest supported line -- all official images:
+
+```bash
+docker compose -f examples/docker/timescale/compose.yml up -d
+./examples/docker/timescale/run.sh               # one repository, both editions
+TS_TSL_URL=postgresql://postgres:laswell@127.0.0.1:55470 \
+TS_APACHE_URL=postgresql://postgres:laswell@127.0.0.1:55471 \
+TS_OLDEST_URL=postgresql://postgres:laswell@127.0.0.1:55472 \
+  ctest --test-dir cpp/build -R timescaledb_tests --output-on-failure
 ```
 
 How a module is written is in `cpp/src/modules/README.md`.
@@ -191,7 +216,7 @@ portable suite; see the README there. Do not "clean up" after them with
 
 ```bash
 cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
-      -DPGLASWELL_MODULES="citus;pg_cron;pgvector"
+      -DPGLASWELL_MODULES="citus;pg_cron;pgvector;timescaledb"
 cmake --build cpp/build --target pg_laswell pg_laswell_mcp
 cd cpp/build && cpack -G DEB    # or RPM
 ```

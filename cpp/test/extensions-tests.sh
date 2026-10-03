@@ -188,11 +188,16 @@ q "$V" "INSERT INTO public.v (id, e) SELECT g, (SELECT array_agg(random())::vect
         FROM generate_series(1,128) WHERE g > 0) FROM generate_series(1,3000) g" >/dev/null
 q "$V" "ANALYZE public.v" >/dev/null
 q "$CENTRAL/postgres" "ALTER DATABASE ext_test SET maintenance_work_mem = '1MB'" >/dev/null
+# The server's own setting is 1 MB; the graph needs about 4 MB. With no ceiling
+# configured, the build is raised to what it needs, within shared_buffers
+# divided by max_concurrent_jobs (128 MB / 2 here) -- so the step says so, and
+# the dry run, which runs it with that setting, comes back clean.
 out=$(plan "$V" "$(idx v_mem hnsw '[{"name":"e","opclass":"vector_l2_ops"}]')")
-if echo "$out" | grep -q 'its graph needs about 4 MB' && echo "$out" | grep -q 'maintenance_work_mem 1 MB'; then
-  ok "an hnsw graph larger than maintenance_work_mem is sized from rows, dims and m"
+if echo "$out" | grep -q 'maintenance_work_mem raised to 4MB for this build' \
+   && echo "$out" | grep -q '"memory_wanted_by":"pgvector"' && ! echo "$out" | grep -q '"problems"'; then
+  ok "an hnsw build is given the memory its graph needs, sized from rows, dims and m"
 else
-  bad "3000 rows of vector(128) should be sized at about 4 MB against 1 MB" "$out"
+  bad "3000 rows of vector(128) should be raised to about 4 MB from 1 MB" "$out"
 fi
 raw=$(q "$V" "SET maintenance_work_mem = '1MB'; SET max_parallel_maintenance_workers = 0;
               BEGIN; CREATE INDEX ON public.v USING hnsw (e vector_l2_ops); ROLLBACK;")

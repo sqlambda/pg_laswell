@@ -19,7 +19,7 @@ A binary that carries the module says so:
 .Bd -literal -offset indent
 $ pg_laswell_mcp --version
 0.1.3
-modules: citus,pg_cron,pgvector
+modules: citus,pg_cron,pgvector,timescaledb
 .Ed
 .Pp
 .Sy Versions.
@@ -293,7 +293,10 @@ differs, that has gone, or that came back after a
 is named.
 A role that is not a superuser sees only its own jobs, so only those are
 compared.
-Steps applied by 0.1.3-alpha1 recorded no declaration and are not compared.
+Every released binary records the declaration: pg_cron first shipped in
+0.1.3-alpha2, already recording it.
+A step without one \(em applied by a build between releases \(em is not
+compared.
 .It A job whose last run failed
 For each job the specification schedules or unschedules: the failure message,
 and how many of its runs among the most recent 1000 failed.

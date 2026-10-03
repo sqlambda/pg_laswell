@@ -349,31 +349,37 @@ inline void pgvector_advise(const Intent& in, const std::string& qualified,
   }
 
   if (method != "hnsw" || rows == 0) return;
-  // The maintenance_work_mem this step runs with: core's per-step share of a
-  // configured ceiling, or the server's own setting (planner_base.h).
-  const auto mwm = budget.value("maintenanceWorkMem", json::object());
-  const long long per_step_mb = mwm.value("perStepMb", 0LL);
-  const long long mwm_bytes = per_step_mb > 0 ? per_step_mb * 1024 * 1024
-                                              : mwm.value("serverDefaultKb", 0LL) * 1024;
+  const auto m_budget = budget.value("maintenanceWorkMem", json::object());
+  const long long per_step_mb = m_budget.value("perStepMb", 0LL);
+  const long long server_bytes = m_budget.value("serverDefaultKb", 0LL) * 1024;
   const auto mb = [](long long b) { return std::to_string((b + 1048575) / 1048576) + " MB"; };
   const long long m = with.contains("m") ? pgvector_int(with["m"]).value_or(16) : 16;
   const long long per_row = pgvector_graph_bytes_per_row(key_type, m);
-  if (per_row > 0 && mwm_bytes > 0 && key_type.dims > 0) {
-    const long long need = rows * per_row;
-    if (need > mwm_bytes) {
-      advise("hnsw index " + name + " on " + qualified + ": its graph needs about " +
-             mb(need) + " (" + std::to_string(rows) + " rows x ~" +
-             std::to_string(per_row) + " bytes for " + key_type.base + "(" +
-             std::to_string(key_type.dims) + ") with m = " + std::to_string(m) +
-             ", measured on pgvector 0.8.6), and this step runs with "
-             "maintenance_work_mem " + mb(mwm_bytes) + ". Past that the build "
-             "continues on disk, much more slowly -- measured 3.4x for 50 000 rows. " +
-             (per_step_mb > 0
-                  ? "Raise maintenance_work_mem_mb so each step gets at least " + mb(need) +
-                        " (it is divided by max_concurrent_jobs)."
-                  : "Set maintenance_work_mem_mb in the connection's configuration to "
-                    "at least " + mb(need) + " per step."));
-    }
+  const long long need = (per_row > 0 && key_type.dims > 0) ? rows * per_row : 0;
+  // The memory the step will REALLY run with: the same rule core applies
+  // (index_build_mwm_bytes), so this cannot say one thing while core does
+  // another. Without a ceiling, core raises the build toward `need`, up to
+  // shared_buffers divided by max_concurrent_jobs.
+  const long long mwm_bytes = index_build_mwm_bytes(budget, need);
+  if (need > 0 && need > mwm_bytes && mwm_bytes > 0) {
+    const bool raised = per_step_mb == 0 && mwm_bytes > server_bytes;
+    advise("hnsw index " + name + " on " + qualified + ": its graph needs about " +
+           mb(need) + " (" + std::to_string(rows) + " rows x ~" +
+           std::to_string(per_row) + " bytes for " + key_type.base + "(" +
+           std::to_string(key_type.dims) + ") with m = " + std::to_string(m) +
+           ", measured on pgvector 0.8.6), and this step runs with "
+           "maintenance_work_mem " + mb(mwm_bytes) +
+           (raised ? std::string(" -- already raised from the server's ") + mb(server_bytes) +
+                         ", as far as the limit deduced from shared_buffers ("
+                         + m_budget.value("derivedFrom", std::string()) + ") allows"
+                   : std::string()) +
+           ". Past that the build continues on disk, much more slowly -- measured "
+           "3.4x for 50 000 rows. " +
+           (per_step_mb > 0
+                ? "Raise maintenance_work_mem_mb so each step gets at least " + mb(need) +
+                      " (it is divided by max_concurrent_jobs)."
+                : "Set maintenance_work_mem_mb in the connection's configuration to "
+                  "at least " + mb(need) + " per step to give it all of it."));
   }
   // A parallel build allocates the WHOLE maintenance_work_mem in dynamic shared
   // memory. Measured in a container with the default 64 MB /dev/shm: 256 MB

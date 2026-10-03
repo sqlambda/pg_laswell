@@ -67,8 +67,10 @@ inline void pg_cron_plan_refusals(const Spec& spec, const Observations& obs,
       }
       continue;
     }
-    // A step recorded before the declared fields were (0.1.3-alpha1) cannot be
-    // compared, and saying nothing is the honest answer.
+    // A step without the declared fields cannot be compared. No release wrote
+    // one -- pg_cron shipped in 0.1.3-alpha2 already recording them -- but a
+    // build between releases did, and a ledger may hold its steps. Saying
+    // nothing about such a step is the honest answer.
     if (!d.contains("schedule")) continue;
     if (!exists) {
       advise("job " + job + " (" + user + ") was scheduled by an applied "

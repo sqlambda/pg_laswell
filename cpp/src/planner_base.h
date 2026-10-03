@@ -237,6 +237,52 @@ struct Plan {
   std::string render() const;
 };
 
+// The maintenance_work_mem an index build runs with, in bytes, given what it
+// wants (0: no particular need). One rule, used by core to decide and by a
+// module's guard to advise, so the two cannot disagree:
+//   - a configured ceiling: its per-step share, always -- the operator decided;
+//   - otherwise, a build that wants more than the server's setting is raised
+//     toward it, up to the limit deduced from shared_buffers
+//     (derivedCeilingMb), never below the server's own setting;
+//   - otherwise, the server's setting.
+inline long long index_build_mwm_bytes(const json& budget, long long wanted) {
+  const auto m = budget.value("maintenanceWorkMem", json::object());
+  const long long per_step = m.value("perStepMb", 0LL) * 1024 * 1024;
+  if (per_step > 0) return per_step;
+  const long long server = m.value("serverDefaultKb", 0LL) * 1024;
+  const long long limit = m.value("derivedCeilingMb", 0LL) * 1024 * 1024;
+  if (wanted > server && limit > server) return std::min(wanted, limit);
+  return server;
+}
+
+// A module's answer to the second question core asks of one (the first is in
+// planner_dml.h, about row locking): how may an index be built and dropped on
+// this table? Facts, not SQL -- core decides what to emit from them, and the
+// step names the module that answered (`index_build_by`).
+//
+//   concurrent        CREATE/DROP INDEX CONCURRENTLY works here at all.
+//   per_part_option   a storage parameter, namespaced and already validated,
+//                     that makes CREATE INDEX build one part of the table at a
+//                     time, each in its own transaction -- "" when there is
+//                     none. Never stored with the index.
+//   per_part_unique   whether that option accepts a UNIQUE index.
+//   size_bytes, rows  the data an index build reads, when the relation's own
+//                     relpages/reltuples do not hold it; -1 when they do.
+//   scope             what "the table" is for its locks, in words, for the
+//                     lock text: "public.m and each of its 15 chunks".
+//   memory_wanted     bytes this build would like in maintenance_work_mem
+//                     (an HNSW graph), or 0; see index_build_mwm_bytes.
+struct IndexTraits {
+  bool answered = false;
+  bool concurrent = true;
+  std::string per_part_option;
+  bool per_part_unique = false;
+  long long size_bytes = -1;
+  long long rows = -1;
+  std::string scope;
+  long long memory_wanted = 0;
+};
+
 namespace detail {
 
 // Records an out-of-band prerequisite. Every field is required because a
@@ -529,15 +575,31 @@ inline json compute_budget(const Observations& obs, const ExecutorConfig& cfg) {
                          "), because PostgreSQL limits it per operation and "
                          "not across concurrent ones"}};
   } else {
+    // No ceiling configured: nothing is raised by default. One exception is
+    // allowed, for a build that SAYS how much it needs (IndexTraits::
+    // memory_wanted_bytes -- an HNSW graph): it may be raised toward that,
+    // up to a limit DEDUCED from shared_buffers. PostgreSQL's documentation
+    // suggests shared_buffers of about 25% of a dedicated server's memory, so
+    // shared_buffers is the one figure on every server that says how big it
+    // is; holding all concurrent builds together to one more shared_buffers
+    // keeps them near another quarter. A deduction, stated as one: an
+    // untuned server (128MB) gets a small limit, which is the safe side.
+    const long long sb = obs.server.value("shared_buffers_bytes", 0LL);
+    const long long derived = sb > 0 ? sb / (1024 * 1024) / jobs : 0;
     b["maintenanceWorkMem"] =
         json{{"perStepMb", 0},
+             {"derivedCeilingMb", derived},
+             {"derivedFrom", "shared_buffers " + std::to_string(sb / (1024 * 1024)) +
+                                 "MB divided by max_concurrent_jobs (" +
+                                 std::to_string(jobs) + ")"},
              {"serverDefaultKb", obs.server.value("maintenance_work_mem_kb", 0)},
              {"why", "maintenance_work_mem_mb is not configured, so the "
-                     "server's own setting is left alone. Raising it is the "
-                     "cheapest speed-up available for an index build, a "
-                     "foreign-key validation or a table rewrite -- but the "
-                     "host's free memory is not visible from SQL, so this tool "
-                     "will not guess at it."}};
+                     "server's own setting is left alone -- except for a build "
+                     "that says how much it needs (an HNSW graph), which is "
+                     "raised toward that up to derivedCeilingMb. The host's "
+                     "free memory is not visible from SQL, so that limit is "
+                     "deduced from shared_buffers rather than measured; "
+                     "configure maintenance_work_mem_mb to decide it instead."}};
   }
   return b;
 }

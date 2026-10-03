@@ -358,7 +358,20 @@ inline RehearsalInputs rehearsal_inputs(const Plan& plan) {
   RehearsalInputs r;
   for (const auto& step : plan.steps) {
     if (step.action != Action::kApply) continue;
-    r.steps.emplace_back(step.ordinal, step.sql);
+    // Rehearsed with the maintenance_work_mem it will run with, exactly as the
+    // executor sets it on a transactional step -- a dry run that runs a step
+    // with other settings than the real one is not rehearsing it.
+    const int mwm = step.detail.value("maintenance_work_mem_mb", 0);
+    if (mwm > 0 && step.txn_class != TxnClass::kForbidden &&
+        !step.detail.contains("copy_rows")) {
+      std::vector<std::string> sql = {"SET LOCAL maintenance_work_mem = '" +
+                                      std::to_string(mwm) + "MB';"};
+      sql.insert(sql.end(), step.sql.begin(), step.sql.end());
+      sql.push_back("SET LOCAL maintenance_work_mem TO DEFAULT;");
+      r.steps.emplace_back(step.ordinal, sql);
+    } else {
+      r.steps.emplace_back(step.ordinal, step.sql);
+    }
     r.forbidden.push_back(step.txn_class == TxnClass::kForbidden);
     r.copy_payloads.push_back(step.detail.contains("copy_rows") ? step.detail : json());
     r.execute.push_back(step.detail.value("rehearse_by", "") == "execution");
