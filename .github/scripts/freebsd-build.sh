@@ -38,7 +38,7 @@ export PKG_CONFIG_PATH
 
 TESTING=OFF
 [ -n "$TESTS" ] && TESTING=ON
-cmake -S cpp -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING="$TESTING" \
+cmake -S cpp -B build -DPGLASWELL_WERROR=ON -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING="$TESTING" \
       "-DPGLASWELL_MODULES=citus;pg_cron;pgvector;timescaledb"
 if [ -n "$TESTS" ]; then
   cmake --build build

@@ -20,6 +20,24 @@ set(PGLASWELL_SANITIZER "NONE" CACHE STRING
 set_property(CACHE PGLASWELL_SANITIZER PROPERTY STRINGS
     NONE ADDRESS UNDEFINED ADDRESS_UNDEFINED THREAD)
 
+# Warnings are errors for anyone developing this, and for CI. The one exception
+# is a build from a release tarball: that happens on someone else's machine, with
+# a compiler possibly newer than any this project has seen, and a diagnostic
+# that compiler invented must not lock a user out of a release that was clean
+# when it was cut. So the default follows the source -- ON in a git checkout,
+# OFF without one -- and the warnings themselves stay on either way. CI, the
+# release workflow and the FreeBSD build script pass it explicitly: a build
+# that is green only because a default turned it off has not been checked.
+if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/../../.git")
+    set(_pglaswell_werror_default ON)
+else()
+    set(_pglaswell_werror_default OFF)
+endif()
+option(PGLASWELL_WERROR
+    "Treat warnings as errors (default: ON in a git checkout, OFF in a release tarball)"
+    ${_pglaswell_werror_default})
+message(STATUS "pg_laswell warnings as errors: ${PGLASWELL_WERROR}")
+
 find_program(VALGRIND_EXECUTABLE valgrind)
 
 # Captured HERE, at include time. CMAKE_CURRENT_LIST_DIR is dynamically scoped:
@@ -45,10 +63,11 @@ if(NOT CMAKE_CXX_LINK_PIE_SUPPORTED)
 endif()
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# Probed UNDER -Werror, because that is how the flag will be used. Apple clang
-# accepts -fstack-clash-protection with only "argument unused during
-# compilation" -- a warning, so a plain probe says yes, and the real build,
-# which has -Werror, then fails on every file. Found on the first macOS build.
+# Probed UNDER -Werror, whatever PGLASWELL_WERROR says. Apple clang accepts
+# -fstack-clash-protection with only "argument unused during compilation" -- a
+# warning, so a plain probe says yes, and a build with -Werror then fails on
+# every file. Found on the first macOS build. A flag the compiler ignores is
+# not hardening either way, so it is dropped in both cases.
 set(_pglaswell_hardening_compile_flags "")
 set(_pglaswell_saved_required_flags "${CMAKE_REQUIRED_FLAGS}")
 set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} -Werror")
@@ -71,18 +90,13 @@ endforeach()
 
 # Always on: warnings as errors, hardened standard library, hardened binary.
 function(pglaswell_harden target)
-    # -Werror is UNCONDITIONAL, and that is a deliberate deviation from the
-    # shared standard, which turns it off when building from a release tarball
-    # so that a newer compiler's new diagnostic cannot lock a user out. Decided
-    # 2026-10-03 to keep it on everywhere: this tool changes production
-    # schemas, and a build that is not warning-clean is not the build that was
-    # tested. Someone on a compiler newer than any CI has seen is better served
-    # by the released packages, or by a build that stops and says why, than by
-    # one that compiles past a diagnostic nobody has read.
     target_compile_options(${target} PRIVATE
         -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion
-        -Wuninitialized -Wshadow -Werror
+        -Wuninitialized -Wshadow
     )
+    if(PGLASWELL_WERROR)
+        target_compile_options(${target} PRIVATE -Werror)
+    endif()
     if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
         # ~zero-cost bounds/precondition checks in libstdc++ (e.g. vector::operator[]).
         target_compile_definitions(${target} PRIVATE _GLIBCXX_ASSERTIONS)

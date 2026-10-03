@@ -98,7 +98,7 @@ jobs:
 
       - name: Configure
         run: |
-          cmake -S cpp -B build -G Ninja \
+          cmake -S cpp -B build -DPGLASWELL_WERROR=ON -G Ninja \
             -DCMAKE_CXX_COMPILER=${{ matrix.compiler }} \
             -DPGLASWELL_SANITIZER=${{ matrix.sanitizer }} \
             "-DPGLASWELL_MODULES=${{ matrix.modules }}"
@@ -394,7 +394,7 @@ jobs:
           sha256: ${{ env.PQXX_SHA256 }}
       - name: Build packages
         run: |
-          cmake -S cpp -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+          cmake -S cpp -B build -DPGLASWELL_WERROR=ON -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
           # BOTH binaries: the install rules name both, so cpack fails on a tree
           # where only one was built -- and a package missing the deployment
           # binary would not be noticed until somebody tried to deploy with it.
@@ -687,7 +687,7 @@ jobs:
           version: ${{ env.PQXX_VERSION }}
           sha256: ${{ env.PQXX_SHA256 }}
       - name: Configure with the citus module
-        run: cmake -S cpp -B build -G Ninja "-DPGLASWELL_MODULES=citus;pg_cron;pgvector;timescaledb"
+        run: cmake -S cpp -B build -DPGLASWELL_WERROR=ON -G Ninja "-DPGLASWELL_MODULES=citus;pg_cron;pgvector;timescaledb"
       - name: Build everything
         run: cmake --build build
       - name: The binary says which modules it carries
@@ -766,7 +766,7 @@ jobs:
           version: ${{ env.PQXX_VERSION }}
           sha256: ${{ env.PQXX_SHA256 }}
       - name: Configure with every module
-        run: cmake -S cpp -B build -G Ninja "-DPGLASWELL_MODULES=citus;pg_cron;pgvector;timescaledb"
+        run: cmake -S cpp -B build -DPGLASWELL_WERROR=ON -G Ninja "-DPGLASWELL_MODULES=citus;pg_cron;pgvector;timescaledb"
       - name: Build the binaries
         run: cmake --build build --target pg_laswell pg_laswell_mcp
       - name: Start PostgreSQL with pg_cron and pgvector
@@ -835,7 +835,7 @@ jobs:
           version: ${{ env.PQXX_VERSION }}
           sha256: ${{ env.PQXX_SHA256 }}
       - name: Configure with every module
-        run: cmake -S cpp -B build -G Ninja "-DPGLASWELL_MODULES=citus;pg_cron;pgvector;timescaledb"
+        run: cmake -S cpp -B build -DPGLASWELL_WERROR=ON -G Ninja "-DPGLASWELL_MODULES=citus;pg_cron;pgvector;timescaledb"
       - name: Build the binaries
         run: cmake --build build --target pg_laswell pg_laswell_mcp
       - name: Start TimescaleDB, both editions and the oldest line
@@ -927,7 +927,7 @@ jobs:
             -DCMAKE_PREFIX_PATH="$(brew --prefix libpq)"
       - name: Configure with every module
         run: |
-          cmake -S cpp -B build -G Ninja \
+          cmake -S cpp -B build -DPGLASWELL_WERROR=ON -G Ninja \
             "-DPGLASWELL_MODULES=citus;pg_cron;pgvector;timescaledb" \
             -DCMAKE_PREFIX_PATH="$(brew --prefix libpq);$(brew --prefix googletest)"
       - name: Build everything

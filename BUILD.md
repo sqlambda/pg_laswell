@@ -175,16 +175,19 @@ How a module is written is in `cpp/src/modules/README.md`.
 ## Warnings are errors
 
 `-Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Wuninitialized
--Wshadow -Werror`, always, plus a hardened standard library
-(`_GLIBCXX_ASSERTIONS` on GCC, `_LIBCPP_HARDENING_MODE_FAST` on Clang). Expect
-to write explicit `static_cast`s for any `size_t`/`int`/`pqxx::result::size_type`
-conversion.
+-Wshadow`, always, plus a hardened standard library (`_GLIBCXX_ASSERTIONS` on
+GCC, `_LIBCPP_HARDENING_MODE_FAST` on Clang). Expect to write explicit
+`static_cast`s for any `size_t`/`int`/`pqxx::result::size_type` conversion.
 
-`-Werror` is on everywhere, including a build from a release tarball. That is
-deliberate: this tool changes production schemas, and a build that is not
-warning-clean is not the build that was tested. If a compiler newer than any
-this project has seen raises a new diagnostic, use a released package, or fix
-the diagnostic.
+`-Werror` is controlled by `PGLASWELL_WERROR`, whose default follows the
+source: **on** in a git checkout, **off** when there is no `.git` beside the
+sources -- a release tarball. The warnings stay on in both. The exception
+exists because a tarball is built on someone else's machine, perhaps with a
+compiler newer than any this project has seen, and a diagnostic that compiler
+added must not lock a user out of a release that was clean when it was cut.
+CI, the release workflow and the FreeBSD build script pass
+`-DPGLASWELL_WERROR=ON` explicitly rather than rely on the default. To get the
+checked build from a tarball, pass it yourself.
 
 ## Binary hardening
 

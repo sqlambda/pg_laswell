@@ -188,6 +188,15 @@ run ran them inside a transaction with the server's setting instead. They now
 `SET LOCAL` it for the step and put it back after; a test proves it with a CHECK
 that validates only under the planned value.
 
+### `-Werror` follows the source
+
+`-Werror` is now `PGLASWELL_WERROR`: on by default in a git checkout, off when
+there is no `.git` beside the sources -- a release tarball, built on someone
+else's machine by a compiler that may be newer than any this project has seen,
+whose new diagnostic must not lock a user out of a release that was clean when
+it was cut. The warnings stay on in both. CI, the release workflow and the
+FreeBSD build script pass it explicitly.
+
 ### Binary hardening, asserted on the binary
 
 Both binaries are now built with stack canaries, stack-clash protection,
