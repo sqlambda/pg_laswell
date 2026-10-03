@@ -60,7 +60,9 @@ pkg install postgresql18-server postgresql18-contrib   # for the database tests
 `postgresql18-contrib` is needed by the tests, not the tool: the conformance
 suite creates `pg_trgm`, and without contrib the planner correctly refuses it as
 not available on the server. libpqxx is built exactly as above, with the same
-script. `cpack -G FREEBSD` produces a native package that installs under
+script; its `libpqxx.pc` lands in `/usr/local/lib/pkgconfig`, which FreeBSD's
+pkgconf does not search, so export
+`PKG_CONFIG_PATH=/usr/local/lib/pkgconfig` before configuring. `cpack -G FREEBSD` produces a native package that installs under
 `/usr/local`; pkg records the libraries it needs (`libpq.so.5`, from
 `postgresql18-client`) from the binaries themselves.
 

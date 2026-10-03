@@ -29,6 +29,12 @@ env ASSUME_ALWAYS_YES=yes pkg install -y $PKGS
 # libpqxx exactly as every other target builds it: pinned, checksummed,
 # static, into /usr/local.
 sh .github/scripts/build-libpqxx.sh "${PQXX_VERSION}" "${PQXX_SHA256}" ""
+# Its CMake install writes libpqxx.pc to /usr/local/lib/pkgconfig, and
+# FreeBSD's pkgconf searches /usr/local/libdata/pkgconfig -- so without this
+# the configure below reports "Package 'libpqxx' not found" right after the
+# install succeeded (the first CI run, 2026-10-03).
+PKG_CONFIG_PATH="/usr/local/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+export PKG_CONFIG_PATH
 
 TESTING=OFF
 [ -n "$TESTS" ] && TESTING=ON
