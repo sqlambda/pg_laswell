@@ -1507,7 +1507,7 @@ TEST(CitusPlanner, AWorkerEnsureWorkersAddsIsSeenByTheNextIntent) {
   EXPECT_EQ(p.steps[1].action, pglaswell::Action::kApply) << p.steps[1].why;
 }
 
-// --- The pieces CITUS.md asked for, each from a measurement -----------------
+// --- The refusals a distributed topology needs, each from a measurement ------
 
 namespace {
 json distribute_intent(const char* table = "a") {

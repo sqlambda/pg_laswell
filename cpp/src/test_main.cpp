@@ -2572,6 +2572,53 @@ TEST_F(BootstrappedTest, StatusReportsAUsableLedgerAndItsTrustedKeys) {
   EXPECT_EQ(st.trusted_key_ids[0], test_key().key_id);
 }
 
+// A role the bootstrap did not name: the ledger is there, and this role has no
+// USAGE on its schema. Found 2026-10-01 while testing pg_cron: on PostgreSQL 18
+// every NAME-based probe -- to_regclass('laswell.x'), has_table_privilege(
+// 'laswell.x', ...) -- RAISES "permission denied for schema laswell" for such a
+// role rather than answering. So status() threw where it should have said what
+// was wrong, the repository listing threw, and checkPrivileges -- the tool
+// whose job is exactly this answer -- failed with the error it exists to explain.
+TEST_F(BootstrappedTest, ARoleWithoutUsageOnTheLedgerGetsAnAnswerNotAnError) {
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/no-usage-role");
+    w.txn().exec("DROP ROLE IF EXISTS laswell_no_usage");
+    w.txn().exec("CREATE ROLE laswell_no_usage LOGIN PASSWORD 'laswell_no_usage'");
+    w.commit();
+  }
+  pglaswell::ConnConfig as_role = cfg();
+  as_role.conninfo =
+      pglaswell::detail::is_conninfo_uri(url_)
+          ? url_ + (url_.find('?') == std::string::npos ? "?" : "&") +
+                "user=laswell_no_usage&password=laswell_no_usage"
+          : url_ + " user=laswell_no_usage password=laswell_no_usage";
+
+  {
+    pglaswell::Ledger ledger(as_role);
+    const auto st = ledger.status();
+    EXPECT_TRUE(st.installed);
+    EXPECT_FALSE(st.usable);
+    EXPECT_NE(st.error.find("no USAGE on the laswell schema"), std::string::npos) << st.error;
+    EXPECT_NE(st.hint.find("laswell_role=laswell_no_usage"), std::string::npos) << st.hint;
+  }
+  {
+    pglaswell::ReadSession r(as_role);
+    const auto out = json::parse(
+        r.txn().exec(pglaswell::check_privileges_sql())[0][0].as<std::string>());
+    const auto& l = out["ledger"];
+    EXPECT_TRUE(l.value("schemaPresent", false)) << out.dump();
+    EXPECT_FALSE(l.value("schemaUsable", true)) << out.dump();
+    EXPECT_FALSE(l.value("canReadTrustedKey", true)) << out.dump();
+    EXPECT_FALSE(l.value("canWriteJob", true)) << out.dump();
+  }
+
+  pglaswell::WriteSession w(cfg());
+  w.begin("pg_laswell/test/no-usage-role-drop");
+  w.txn().exec("DROP ROLE laswell_no_usage");
+  w.commit();
+}
+
 TEST_F(BootstrappedTest, AnAbsentSchemaIsAnAnswerNotAnException) {
   // "You have not bootstrapped" and "your signer is not trusted" are very
   // different things for an operator to read, and collapsing them would be the
@@ -3445,6 +3492,43 @@ TEST_F(ToolTest, CopyRowsTravelsThroughTheRealExecutorAndLandsInTheLedger) {
   EXPECT_NE(sql[0][0].as<std::string>().find("COPY \"shop\".\"region\""),
             std::string::npos)
       << sql[0][0].as<std::string>();
+}
+
+// A step the planner marks with maintenance_work_mem runs with it -- inside a
+// transaction too. The planner has always marked VALIDATE and plain index
+// builds; only the non-transactional path applied the value, so a VALIDATE
+// ran with the server's setting while the plan said 77MB. Proved by a CHECK
+// whose function raises unless the setting is the planned one: it validates
+// only if the executor really applied it.
+TEST_F(ToolTest, AStepInATransactionRunsWithTheMaintenanceWorkMemItWasPlannedWith) {
+  ctx_->registry.mutable_get("default").executor.maintenance_work_mem_mb = 77;
+  ctx_->registry.mutable_get("default").executor.max_concurrent_jobs = 1;
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/mwm");
+    w.txn().exec("DROP SCHEMA IF EXISTS mwm CASCADE");
+    w.txn().exec("CREATE SCHEMA mwm");
+    w.txn().exec("CREATE TABLE mwm.t (id int)");
+    w.txn().exec("INSERT INTO mwm.t SELECT generate_series(1, 10)");
+    w.txn().exec(
+        "CREATE FUNCTION mwm.is_77(int) RETURNS boolean IMMUTABLE LANGUAGE plpgsql AS $$"
+        " BEGIN IF current_setting('maintenance_work_mem') <> '77MB' THEN"
+        "   RAISE EXCEPTION 'maintenance_work_mem is %', current_setting('maintenance_work_mem');"
+        " END IF; RETURN true; END $$");
+    w.commit();
+  }
+  json doc = minimal_spec();
+  doc["id"] = "0010-mwm";
+  doc["intents"] = json::array({json{{"kind", "add_check_constraint"}, {"schema", "mwm"},
+                                     {"table", "t"}, {"name", "t_77"},
+                                     {"expression", "mwm.is_77(id)"}}});
+  const auto p = payload(call("startMigration", json{{"spec", signed_doc(doc)}}));
+  ASSERT_TRUE(p.value("accepted", false)) << p.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, p["jobId"], [](const json& s) {
+    return s.value("state", "") == "succeeded" || s.value("state", "") == "failed";
+  }));
+  EXPECT_EQ(status_of(p["jobId"]).value("state", ""), "succeeded")
+      << status_of(p["jobId"]).dump(2);
 }
 
 TEST_F(ToolTest, TheExecutedPlanIsTheOneThatWasShown) {
@@ -5183,6 +5267,145 @@ TEST(Planner, OnEquivalentIndexRefuseRestoresTheConflict) {
   const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(doc), obs, {});
   EXPECT_FALSE(plan.ok) << plan.render();
   EXPECT_NE(plan.conflicts[0].find("hand_built"), std::string::npos);
+}
+
+// Storage parameters: `with` on create_index. Core checks the shape only; which
+// names a method accepts is the method's (or its module's) to say.
+namespace {
+json index_with(json with) {
+  auto doc = minimal_spec();
+  for (auto& i : doc["intents"]) {
+    if (i["kind"] == "create_index") i["with"] = std::move(with);
+  }
+  return doc;
+}
+json hand_built_index(json options) {
+  return json{{"is_valid", true}, {"is_unique", false}, {"method", "btree"},
+              {"predicate", "(status = 'open'::text)"}, {"has_expressions", false},
+              {"columns", json::array({"fulfilment_region", "created_at"})},
+              {"key_column_count", 2},
+              {"column_order", json::array({"asc nulls last", "asc nulls last"})},
+              {"column_opclasses", json::array({"", ""})},
+              {"leading_column", "fulfilment_region"},
+              {"options", std::move(options)}};
+}
+}  // namespace
+
+TEST(Planner, StorageParametersAreEmittedBetweenIncludeAndWhere) {
+  const auto plan = pglaswell::plan_migration(
+      pglaswell::parse_spec(index_with(json{{"fillfactor", 70}, {"deduplicate_items", false}})),
+      observations(1024 * 1024, 500), {});
+  const auto* s = find_step(plan, "create_index");
+  ASSERT_NE(s, nullptr);
+  const auto sql = all_sql(*s);
+  // Name order, so the same object always renders the same statement.
+  EXPECT_NE(sql.find("(\"fulfilment_region\", \"created_at\") WITH "
+                     "(\"deduplicate_items\" = false, \"fillfactor\" = 70) WHERE "
+                     "status = 'open'"),
+            std::string::npos)
+      << sql;
+}
+
+TEST(Planner, StorageParametersReachEveryPartitionOfAPartitionedIndex) {
+  auto obs = observations(1024 * 1024, 500);
+  obs.tables["shop.orders"]["kind"] = "partitioned_table";
+  obs.tables["shop.orders"]["partitions"] = json::array({"shop.orders_2026"});
+  const auto plan = pglaswell::plan_migration(
+      pglaswell::parse_spec(index_with(json{{"fillfactor", 70}})), obs, {});
+  int with_count = 0;
+  for (const auto& st : plan.steps) {
+    for (const auto& q : st.sql) {
+      if (q.find("CREATE INDEX") != std::string::npos) {
+        EXPECT_NE(q.find("WITH (\"fillfactor\" = 70)"), std::string::npos) << q;
+        ++with_count;
+      }
+    }
+  }
+  EXPECT_GE(with_count, 1) << plan.render();
+}
+
+TEST(Spec, StorageParametersMustBeScalars) {
+  EXPECT_NE(spec_error(index_with(json::array())).find(".with must be a non-empty object"),
+            std::string::npos);
+  EXPECT_NE(spec_error(index_with(json::object())).find(".with must be a non-empty object"),
+            std::string::npos);
+  EXPECT_NE(spec_error(index_with(json{{"fillfactor", json::array({70})}}))
+                .find("must be a number, a boolean or a short word"),
+            std::string::npos);
+  // A word is a value, never a fragment of SQL.
+  EXPECT_NE(spec_error(index_with(json{{"buffering", "auto); DROP TABLE x; --"}}))
+                .find("must be a number, a boolean or a short word"),
+            std::string::npos);
+  EXPECT_NE(spec_error(index_with(json{{"Bad Name", 1}})).find("with"), std::string::npos);
+}
+
+TEST(Planner, AnEquivalentIndexWithOtherStorageParametersIsNotAdopted) {
+  // Same columns, method and predicate; different m, or here fillfactor. The
+  // two answer the same queries at different cost, so renaming the hand-built
+  // one to the declared name would report the spec satisfied with an index it
+  // did not describe.
+  auto obs = observations(1024, 10);
+  obs.tables["shop.orders"]["indexes"]["hand_built"] =
+      hand_built_index(json::array({"fillfactor=90"}));
+  const auto plan = pglaswell::plan_migration(
+      pglaswell::parse_spec(index_with(json{{"fillfactor", 70}})), obs, {});
+  const auto* s = find_step(plan, "create_index");
+  ASSERT_NE(s, nullptr);
+  EXPECT_EQ(all_sql(*s).find("RENAME"), std::string::npos) << all_sql(*s);
+  EXPECT_NE(all_sql(*s).find("CREATE INDEX"), std::string::npos);
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("different storage parameters") != std::string::npos &&
+        w.find("fillfactor=90") != std::string::npos) {
+      warned = true;
+    }
+  }
+  EXPECT_TRUE(warned) << plan.render();
+}
+
+TEST(Planner, TheSameStorageParametersSpelledDifferentlyAreTheSame) {
+  // PostgreSQL stores a reloption as written: WITH (fastupdate = off) reads
+  // back "fastupdate=off". A spec saying false means the same thing.
+  auto obs = observations(1024, 10);
+  obs.tables["shop.orders"]["indexes"]["hand_built"] =
+      hand_built_index(json::array({"fastupdate=off", "fillfactor=70"}));
+  const auto plan = pglaswell::plan_migration(
+      pglaswell::parse_spec(index_with(json{{"fillfactor", 70}, {"fastupdate", false}})),
+      obs, {});
+  const auto* s = find_step(plan, "create_index");
+  ASSERT_NE(s, nullptr);
+  EXPECT_NE(all_sql(*s).find("RENAME TO \"orders_open_by_region_idx\""), std::string::npos)
+      << plan.render();
+}
+
+TEST(Planner, AnIndexPresentByNameWithOtherParametersIsSatisfiedAndSaysSo) {
+  auto obs = observations(1024, 10);
+  obs.tables["shop.orders"]["indexes"]["orders_open_by_region_idx"] =
+      hand_built_index(json::array());
+  const auto plan = pglaswell::plan_migration(
+      pglaswell::parse_spec(index_with(json{{"fillfactor", 70}})), obs, {});
+  const auto* s = find_step(plan, "create_index");
+  ASSERT_NE(s, nullptr);
+  EXPECT_EQ(s->action, pglaswell::Action::kSatisfied);
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("not the [fillfactor=70]") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned) << plan.render();
+}
+
+// The pgshard lab ran a stale 0.1.0 binary against a specification using
+// target.connection, and read the refusal as a typo. A key unknown to THIS
+// binary may be one a later release added, so the error says which binary it is.
+TEST(Spec, AnUnknownKeyNamesTheBinarysVersion) {
+  auto doc = minimal_spec();
+  doc["target"] = json{{"a_key_from_a_later_release", "x"}};
+  const auto err = spec_error(doc);
+  EXPECT_NE(err.find("pg_laswell " PGLASWELL_VERSION), std::string::npos) << err;
+  EXPECT_NE(err.find("a later release"), std::string::npos) << err;
+  auto top = minimal_spec();
+  top["a_top_level_key_from_later"] = 1;
+  EXPECT_NE(spec_error(top).find("pg_laswell " PGLASWELL_VERSION), std::string::npos);
 }
 
 TEST(Spec, AnUnknownOnEquivalentIndexPolicyIsRefused) {
@@ -7626,14 +7849,19 @@ TEST(Planner, MaintenanceWorkMemIsDividedByTheJobCountAndOnlyOnStepsThatUseIt) {
     }
   }
 
-  // Unconfigured leaves the server's setting alone and says so, rather than
-  // guessing at memory it cannot see.
+  // Unconfigured leaves the server's setting alone for an ordinary step, and
+  // says so -- naming the one exception, a build that says what it needs, and
+  // that its limit is deduced from shared_buffers rather than measured.
   pglaswell::ExecutorConfig bare;
   const auto quiet = pglaswell::plan_migration(
       pglaswell::parse_spec(minimal_spec()), obs_capacity(8, 0, 40), bare);
   EXPECT_EQ(quiet.budget["maintenanceWorkMem"].value("perStepMb", 0), 0);
-  EXPECT_NE(quiet.budget["maintenanceWorkMem"].value("why", "").find("will not guess"),
-            std::string::npos);
+  const auto why = quiet.budget["maintenanceWorkMem"].value("why", "");
+  EXPECT_NE(why.find("server's own setting is left alone"), std::string::npos) << why;
+  EXPECT_NE(why.find("deduced from shared_buffers"), std::string::npos) << why;
+  for (const auto& st : quiet.steps) {
+    EXPECT_FALSE(st.detail.contains("maintenance_work_mem_mb")) << st.kind;
+  }
 }
 
 // --- conflict keys ---------------------------------------------------------
@@ -9024,30 +9252,66 @@ TEST_F(DatabaseTest, ThePartitionRecipesRunAndTheCheckReallyRemovesTheScan) {
     w.commit();
   }
 
-  // A loaded CI box can make any single timing meaningless, so this is a
-  // bounded claim: the proven attach must be clearly cheaper, not merely
-  // faster by a hair. If it is not, the recipe is not earning its four steps.
-  if (without_check_best < 5.0) {
-    GTEST_SKIP() << "the unproven attach was too fast to compare ("
-                 << without_check_best << "ms); the machine is faster than the "
-                                          "measurement needs";
-  }
-#ifdef PGLASWELL_SANITIZER_ACTIVE
-  // The CORRECTNESS above still ran and still asserted -- the CHECK was
-  // accepted, the attach succeeded, the catalog agrees. Only the RATIO is
-  // skipped, because an instrumented build measures the sanitizer as much as it
-  // measures PostgreSQL: observed on CI at 31ms against 62ms, a real
-  // improvement that fails a 3x claim. Asserting it anyway would teach people
-  // to ignore the sanitizer jobs, which is a worse outcome than not measuring
-  // speed in a build that was never built to measure speed.
-  GTEST_SKIP() << "timing ratio not asserted under a sanitizer: "
-               << with_check_best << "ms against " << without_check_best
-               << "ms measures the instrumentation as much as the server";
-#endif
-  EXPECT_LT(with_check_best * 3, without_check_best)
-      << "attach with a validated CHECK took " << with_check_best
-      << "ms, without took " << without_check_best
-      << "ms -- the CHECK is supposed to remove the scan entirely";
+  // THE CLAIM, COUNTED RATHER THAN TIMED. The recipe's point is that a
+  // validated CHECK lets ATTACH skip the scan of the partition entirely, and
+  // whether a scan happened is a fact PostgreSQL records: the session's own
+  // pending statistics, read inside the attaching transaction before and after
+  // the ATTACH. Proven: no scan. Unproven: one scan of every row.
+  //
+  // This replaced a timing ratio (proven attach at least 3x faster), which
+  // failed on CI on 2026-10-01 at 6.0ms against 15.9ms: both sides carry a
+  // fixed round-trip cost, so on a fast runner the ratio shrinks toward 1 while
+  // the scan it is about stays exactly as skipped. It also had to be skipped
+  // outright under the sanitizers and on fast machines -- and the skips took
+  // the catalog assertions below with them. Measured on 18.6: the deltas are
+  // 0/0 and 1/400000, and PostgreSQL's DEBUG1 agrees ("partition constraint
+  // for table ... is implied by existing constraints" / "verifying table").
+  // The timings above are kept as information.
+  auto scans_during_attach = [&](const char* child, const char* from, const char* to,
+                                 bool proven) {
+    {
+      pglaswell::WriteSession w(cfg);
+      w.begin("pg_laswell/test/part-scan-setup");
+      w.txn().exec(std::string("ALTER TABLE laswell_ev DETACH PARTITION ") + child);
+      w.txn().exec(std::string("ALTER TABLE ") + child + " DROP CONSTRAINT IF EXISTS scan_ck");
+      if (proven) {
+        w.txn().exec(std::string("ALTER TABLE ") + child +
+                     " ADD CONSTRAINT scan_ck CHECK (at >= '" + from + "' AND at < '" +
+                     to + "')");
+      }
+      w.commit();
+    }
+    pglaswell::WriteSession a(cfg);
+    a.begin("pg_laswell/test/part-scan-attach");
+    const auto read = [&] {
+      const auto r = a.txn().exec(std::string("SELECT pg_stat_get_xact_numscans('") + child +
+                                  "'::regclass), pg_stat_get_xact_tuples_returned('" + child +
+                                  "'::regclass)");
+      return std::pair<long long, long long>{r[0][0].as<long long>(), r[0][1].as<long long>()};
+    };
+    const auto before = read();
+    a.txn().exec(std::string("ALTER TABLE laswell_ev ATTACH PARTITION ") + child +
+                 " FOR VALUES FROM ('" + from + "') TO ('" + to + "')");
+    const auto after = read();
+    a.txn().exec(std::string("ALTER TABLE ") + child + " DROP CONSTRAINT IF EXISTS scan_ck");
+    a.commit();
+    return std::pair<long long, long long>{after.first - before.first,
+                                           after.second - before.second};
+  };
+  const auto proven_scan =
+      scans_during_attach("laswell_ev_a", "2026-01-01", "2027-01-01", true);
+  const auto unproven_scan =
+      scans_during_attach("laswell_ev_b", "2027-01-01", "2028-01-01", false);
+  EXPECT_EQ(proven_scan.first, 0)
+      << "an ATTACH whose bounds a validated CHECK already proves scanned the "
+         "partition anyway; timings were " << with_check_best << "ms with the "
+         "CHECK and " << without_check_best << "ms without";
+  EXPECT_EQ(proven_scan.second, 0);
+  EXPECT_EQ(unproven_scan.first, 1)
+      << "the control: an ATTACH with no CHECK must scan, or this measures nothing";
+  EXPECT_EQ(unproven_scan.second, 400000);
+  RecordProperty("attach_ms_with_check", std::to_string(with_check_best));
+  RecordProperty("attach_ms_without_check", std::to_string(without_check_best));
 
   {
     pglaswell::ReadSession r(cfg);
@@ -10803,6 +11067,229 @@ TEST(Spec, ASubscriptionPasswordIsRefusedRatherThanRedacted) {
       << "the refusal repeated the credential it was refusing: " << err;
 }
 
+namespace {
+json partition_intent(json extra) {
+  json in{{"kind", "create_table"}, {"schema", "shop"}, {"table", "orders_2027"},
+          {"partition_of", "shop.orders"}, {"comment", "Orders of 2027."}};
+  in.update(extra);
+  return in;
+}
+json range_2027() { return json{{"from", "'2027-01-01'"}, {"to", "'2028-01-01'"}}; }
+pglaswell::Observations partitioned_orders(const char* key = "RANGE (created_at)") {
+  auto obs = observations(2LL << 30, 8100000, 0, "partitioned_table");
+  obs.tables["shop.orders"]["partition_key"] = key;
+  obs.tables["shop.orders"]["partitions"] = json::array({"shop.orders_2026"});
+  return obs;
+}
+}  // namespace
+
+TEST(Planner, APartitionTakesItsColumnsFromItsParentAndSaysWhatItLocks) {
+  // Reported from pgshard: with no way to create a partition, a partition was
+  // create_table restating seventeen columns, then attach_partition.
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({partition_intent(range_2027())})), partitioned_orders(), {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto* step = only_step(plan, "create_table");
+  EXPECT_EQ(step->sql.front(),
+            "CREATE TABLE \"shop\".\"orders_2027\" PARTITION OF \"shop\".\"orders\" "
+            "FOR VALUES FROM ('2027-01-01') TO ('2028-01-01');");
+  // Measured: AccessExclusiveLock on the parent; a SELECT on it waited.
+  EXPECT_NE(step->lock.find("AccessExclusiveLock on shop.orders"), std::string::npos)
+      << step->lock;
+  bool lighter = false;
+  for (const auto& w : plan.warnings) lighter = lighter || w.find("attach_partition") != std::string::npos;
+  EXPECT_TRUE(lighter) << "the lighter route for a busy parent must be named";
+
+  // Beside a DEFAULT partition: that is locked too, and scanned.
+  auto obs = partitioned_orders();
+  obs.tables["shop.orders"]["default_partition"] = "shop.orders_default";
+  obs.tables["shop.orders"]["default_partition_rows"] = 1000000;
+  const auto with_default = pglaswell::plan_migration(
+      spec_of(json::array({partition_intent(range_2027())})), obs, {});
+  ASSERT_TRUE(with_default.ok) << with_default.render();
+  EXPECT_NE(only_step(with_default, "create_table")->lock.find("shop.orders_default"),
+            std::string::npos);
+  bool scan = false;
+  for (const auto& w : with_default.warnings) scan = scan || w.find("1000000 estimated rows") != std::string::npos;
+  EXPECT_TRUE(scan) << with_default.render();
+}
+
+TEST(Planner, APartitionPostgreSQLWouldRefuseIsRefusedFirst) {
+  auto refused = [](const json& intent, const pglaswell::Observations& obs,
+                    const std::string& needle) {
+    const auto plan = pglaswell::plan_migration(spec_of(json::array({intent})), obs, {});
+    EXPECT_FALSE(plan.ok) << plan.render();
+    bool found = false;
+    for (const auto& c : plan.conflicts) found = found || c.find(needle) != std::string::npos;
+    EXPECT_TRUE(found) << "expected a refusal naming \"" << needle << "\":\n" << plan.render();
+  };
+  // The parent is an ordinary table ("is not partitioned", measured).
+  refused(partition_intent(range_2027()),
+          observations(2LL << 30, 8100000, 0, "table"), "not a partitioned table");
+  // A bound of the wrong kind for the parent's strategy.
+  refused(partition_intent(json{{"values", json::array({"'eu'"})}}),
+          partitioned_orders(), "partitioned by RANGE");
+  // A hash-partitioned parent has no default.
+  refused(partition_intent(json{{"default", true}}), partitioned_orders("HASH (id)"),
+          "no DEFAULT partition");
+  // A second default ("conflicts with existing default partition", measured).
+  auto obs = partitioned_orders();
+  obs.tables["shop.orders"]["default_partition"] = "shop.orders_default";
+  refused(partition_intent(json{{"default", true}}), obs, "already has a DEFAULT");
+  // The table exists and is not a partition of this parent.
+  auto taken = partitioned_orders();
+  taken.tables["shop.orders_2027"] = json{{"exists", true}, {"kind", "table"}};
+  refused(partition_intent(range_2027()), taken, "attach_partition");
+
+  // It exists AS a partition of this parent: done.
+  auto done = partitioned_orders();
+  done.tables["shop.orders_2027"] = json{{"exists", true}, {"kind", "table"}};
+  done.tables["shop.orders"]["partitions"].push_back("shop.orders_2027");
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({partition_intent(range_2027())})), done, {});
+  ASSERT_TRUE(plan.ok);
+  EXPECT_EQ(only_step(plan, "create_table")->action, pglaswell::Action::kSatisfied);
+}
+
+TEST(Planner, APartitionOfAParentCreatedEarlierInTheSpecificationIsPlanned) {
+  // The parent does not exist yet: the projection of the first intent is what
+  // the second reads, strategy included.
+  json parent{{"kind", "create_table"}, {"schema", "shop"}, {"table", "events"},
+              {"comment", "Events."}, {"partition_by", "LIST (region)"},
+              {"columns", json::array({json{{"name", "region"}, {"type", "text"},
+                                            {"nullable", false}, {"comment", "r"}}})}};
+  json child{{"kind", "create_table"}, {"schema", "shop"}, {"table", "events_eu"},
+             {"partition_of", "shop.events"}, {"values", json::array({"'eu'"})},
+             {"comment", "Europe."}};
+  // As the catalog reports tables that do not exist yet: present, and absent.
+  auto obs = obs_alter();
+  obs.tables["shop.events"] = json{{"exists", false}};
+  obs.tables["shop.events_eu"] = json{{"exists", false}};
+  const auto plan = pglaswell::plan_migration(spec_of(json::array({parent, child})),
+                                              obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  bool created = false;
+  for (const auto& st : plan.steps) {
+    for (const auto& sql : st.sql) {
+      created = created || sql.find("PARTITION OF \"shop\".\"events\" FOR VALUES IN ('eu')") != std::string::npos;
+    }
+  }
+  EXPECT_TRUE(created) << plan.render();
+  // The child's columns are its parent's, and a later intent reads them there:
+  // adding `region` to the partition finds it already present.
+  json add{{"kind", "add_column"}, {"schema", "shop"}, {"table", "events_eu"},
+           {"column", "region"}, {"type", "text"}, {"nullable", false},
+           {"comment", "r"}};
+  const auto added = pglaswell::plan_migration(
+      spec_of(json::array({parent, child, add})), obs, {});
+  ASSERT_TRUE(added.ok) << added.render();
+  EXPECT_EQ(only_step(added, "add_column")->action, pglaswell::Action::kSatisfied)
+      << added.render();
+
+  // And a range bound on that LIST parent is refused from the projection alone.
+  child.erase("values");
+  child["from"] = "'a'";
+  child["to"] = "'b'";
+  EXPECT_FALSE(pglaswell::plan_migration(spec_of(json::array({parent, child})),
+                                         obs, {}).ok);
+}
+
+TEST(Spec, APartitionIsDeclaredByItsBoundAndNothingItsParentOwns) {
+  auto err = [](json intent) {
+    json doc = minimal_spec();
+    doc["intents"] = json::array({intent});
+    return spec_error(doc);
+  };
+  EXPECT_NE(err(partition_intent(json{{"columns", json::array()}, {"default", true}}))
+                .find("gives columns to a partition"), std::string::npos);
+  EXPECT_NE(err(partition_intent(json{{"default", true}, {"values", json::array({"'x'"})}}))
+                .find("exactly one kind of bound"), std::string::npos);
+  EXPECT_NE(err(partition_intent(json{{"modulus", 4}, {"remainder", 4}}))
+                .find("remainder from 0 to modulus - 1"), std::string::npos);
+  EXPECT_NE(err(partition_intent(json{{"partition_of", "orders"}, {"default", true}}))
+                .find("\"schema.table\""), std::string::npos);
+  json plain{{"kind", "create_table"}, {"schema", "shop"}, {"table", "t"}, {"comment", "c"},
+             {"columns", json::array({json{{"name", "id"}, {"type", "int"},
+                                           {"nullable", false}, {"comment", "c"}}})},
+             {"default", true}};
+  EXPECT_NE(err(plain).find("without partition_of"), std::string::npos) << err(plain);
+}
+
+TEST(Planner, AnObjectIsDocumentedByTheIntentThatCreatesIt) {
+  // Reported from pgshard: create_index takes a comment and create_trigger did
+  // not, so a house rule of "every object documented where it is created"
+  // needed a second, set_comment intent restating schema, table and name.
+  // The live conformance cases prove the COMMENT ON for nine kinds; a
+  // subscription needs a publisher, so its SQL is checked here.
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "create_subscription"}, {"name", "sub"},
+                                {"connection", "host=pub dbname=d user=rep"},
+                                {"publications", json::array({"p"})},
+                                {"comment", "Orders from the shop."}}})),
+      obs_alter(), {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto* step = only_step(plan, "create_subscription");
+  ASSERT_GE(step->sql.size(), 2u);
+  EXPECT_NE(step->sql.back().find("COMMENT ON SUBSCRIPTION"), std::string::npos)
+      << step->sql.back();
+  EXPECT_NE(step->sql.back().find("'Orders from the shop.'"), std::string::npos)
+      << step->sql.back();
+  // After the CREATE, never before it: the object has to exist.
+  EXPECT_NE(step->sql.front().find("CREATE SUBSCRIPTION"), std::string::npos)
+      << step->sql.front();
+
+  // Without the key, nothing changes: existing specifications plan as before.
+  const auto bare = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "create_subscription"}, {"name", "sub"},
+                                {"connection", "host=pub dbname=d user=rep"},
+                                {"publications", json::array({"p"})}}})),
+      obs_alter(), {});
+  for (const auto& sql : only_step(bare, "create_subscription")->sql) {
+    EXPECT_EQ(sql.find("COMMENT ON"), std::string::npos) << sql;
+  }
+}
+
+TEST(Planner, SetCommentNamesTheLockPostgreSQLActuallyTakes) {
+  // Measured on 18.6. The plan said "AccessShareLock -- a comment blocks
+  // nothing" for every type; a relation's comment takes ShareUpdateExclusive.
+  auto lock_for = [](const json& intent) {
+    const auto plan = pglaswell::plan_migration(spec_of(json::array({intent})),
+                                                obs_alter(), {});
+    const auto* step = only_step(plan, "set_comment");
+    return step ? step->lock + " || " + step->sql.front() : std::string("no step");
+  };
+  const auto table = lock_for(json{{"kind", "set_comment"}, {"object_type", "TABLE"},
+                                   {"schema", "shop"}, {"name", "orders"},
+                                   {"comment", "c"}});
+  EXPECT_NE(table.find("ShareUpdateExclusiveLock on the relation"), std::string::npos) << table;
+  const auto rule = lock_for(json{{"kind", "set_comment"}, {"object_type", "RULE"},
+                                  {"schema", "shop"}, {"table", "orders"},
+                                  {"name", "no_del"}, {"comment", "c"}});
+  EXPECT_NE(rule.find("AccessShareLock on shop.orders"), std::string::npos) << rule;
+  EXPECT_NE(rule.find("COMMENT ON RULE \"no_del\" ON"), std::string::npos) << rule;
+  const auto pub = lock_for(json{{"kind", "set_comment"}, {"object_type", "PUBLICATION"},
+                                 {"name", "orders_pub"}, {"comment", "c"}});
+  EXPECT_NE(pub.find("no table is locked"), std::string::npos) << pub;
+  EXPECT_NE(pub.find("COMMENT ON PUBLICATION"), std::string::npos) << pub;
+}
+
+TEST(Spec, ACreationCommentIsOnlyForCreatingAndIsNeverEmpty) {
+  // alter_publication shares create_publication's parser. A comment it would
+  // read and never apply is refused, like any other key a kind does not use.
+  json doc = minimal_spec();
+  doc["intents"] = json::array({json{{"kind", "alter_publication"}, {"name", "p"},
+                                     {"add_tables", json::array({"shop.orders"})},
+                                     {"comment", "x"}}});
+  EXPECT_NE(spec_error(doc).find("comment"), std::string::npos) << spec_error(doc);
+
+  doc["intents"] = json::array({json{{"kind", "create_trigger"}, {"schema", "shop"},
+                                     {"table", "orders"}, {"name", "t"},
+                                     {"timing", "AFTER"}, {"events", json::array({"INSERT"})},
+                                     {"for_each", "ROW"}, {"function", "shop.f()"},
+                                     {"comment", ""}}});
+  EXPECT_NE(spec_error(doc).find("non-empty"), std::string::npos) << spec_error(doc);
+}
+
 TEST(Planner, CreateSubscriptionOwnsItsTransactionAndNamesTheSlotHazard) {
   // Measured: CREATE SUBSCRIPTION with create_slot cannot run inside a
   // transaction block -- the same shape as CIC and DETACH CONCURRENTLY.
@@ -12091,8 +12578,12 @@ class TwinNamedDatabaseTest : public RepoTest {
     // define. On the first cluster it already exists, because the suite
     // bootstrapped a database there; the second cluster has never been touched.
     // Getting this wrong is what the second cluster is for.
-    (void)std::system(("psql -X -q -c 'CREATE ROLE laswell_runner NOLOGIN' \"" +
-                       url + "\" >/dev/null 2>&1").c_str());
+    // An if rather than a (void) cast: glibc marks system() warn_unused_result
+    // under _FORTIFY_SOURCE, and GCC does not let a cast silence that.
+    if (std::system(("psql -X -q -c 'CREATE ROLE laswell_runner NOLOGIN' \"" +
+                     url + "\" >/dev/null 2>&1").c_str()) != 0) {
+      // Already exists: fine.
+    }
     const std::string key_b64 = pglaswell::Registry::base64_encode(test_key().pub);
     const std::string cmd =
         "PSQLRC=/dev/null psql -X -q -v ON_ERROR_STOP=1 "

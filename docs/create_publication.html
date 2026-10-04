@@ -73,42 +73,22 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
 <nav class="crumb"><div class="l"><a href="index.html">Intent kinds</a><span>Replication</span></div><div class="r"><a href="drop_rule.html">← drop_rule</a><a href="alter_publication.html">alter_publication →</a></div></nav>
 <h1><code>create_publication</code></h1>
 <h2>Synopsis</h2><pre>{
-  &quot;kind&quot;: &quot;create_publication&quot;,
-  &quot;name&quot;: &lt;required&gt;,
-  &quot;tables&quot;: &lt;optional&gt;,
-  &quot;all_tables&quot;: &lt;optional&gt;,
-  &quot;operations&quot;: &lt;optional&gt;,
-  &quot;add_tables&quot;: &lt;optional&gt;,
-  &quot;drop_tables&quot;: &lt;optional&gt;,
-  &quot;publish_via_partition_root&quot;: &lt;optional&gt;
+  &quot;kind&quot;: &quot;create_publication&quot;
 }</pre>
 <h2>Parameters</h2><dl class="params">
-<dt>name<span class="tag req">required</span></dt>
-<dd>&nbsp;</dd>
-<dt>tables<span class="tag opt">optional</span></dt>
-<dd>&nbsp;</dd>
-<dt>all_tables<span class="tag opt">optional</span></dt>
-<dd>&nbsp;</dd>
-<dt>operations<span class="tag opt">optional</span></dt>
-<dd>Lower case, one of insert, update, delete, truncate.</dd>
-<dt>add_tables<span class="tag opt">optional</span></dt>
-<dd>&nbsp;</dd>
-<dt>drop_tables<span class="tag opt">optional</span></dt>
-<dd>&nbsp;</dd>
-<dt>publish_via_partition_root<span class="tag opt">optional</span></dt>
-<dd>true publishes a change as the PARTITIONED table&#x27;s own row, so a subscriber may be an ordinary table; false — the PostgreSQL default — publishes the leaf partition, and the subscriber must have a partition of the same name.</dd>
 </dl>
 <div class="note">Any key not listed here is <strong>refused</strong>, not ignored: a key this binary skips and a newer one honours would be a silent difference between what was reviewed and what ran.</div>
 <h2>Examples</h2>
 <p>From the conformance suite, which plans this intent and <em>applies</em> it to a real PostgreSQL on every test run:</p>
 <pre>{
  &quot;kind&quot;: &quot;create_publication&quot;,
+ &quot;comment&quot;: &quot;documented by create_publication&quot;,
  &quot;name&quot;: &quot;cf_pub&quot;,
  &quot;tables&quot;: [
   &quot;cf.t&quot;
  ]
 }</pre>
-<p>Afterwards, <code>SELECT count(*)::text FROM pg_publication WHERE pubname=&#x27;cf_pub&#x27;</code> returns <code>1</code>.</p>
+<p>Afterwards, <code>SELECT count(*)::text || &#x27;:&#x27; || COALESCE(max(obj_description(oid, &#x27;pg_publication&#x27;)), &#x27;none&#x27;) FROM pg_publication WHERE pubname=&#x27;cf_pub&#x27;</code> returns <code>1:documented by create_publication</code>.</p>
 <h2>See also</h2><p><a href="alter_publication.html"><code>alter_publication</code></a>, <a href="drop_publication.html"><code>drop_publication</code></a>, <a href="create_subscription.html"><code>create_subscription</code></a>, <a href="alter_subscription.html"><code>alter_subscription</code></a>, <a href="drop_subscription.html"><code>drop_subscription</code></a></p>
 <footer>Generated from <code>cpp/src/spec.h</code> and <code>cpp/src/conformance.inc</code> by <code>tools/gen-manual.py</code>. The manual page <code>pg_laswell_mcp(1)</code> remains the authoritative reference for everything that is not a per-kind option.</footer>
 </div></body></html>

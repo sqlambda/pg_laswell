@@ -73,30 +73,9 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
 <nav class="crumb"><div class="l"><a href="index.html">Intent kinds</a><span>Replication</span></div><div class="r"><a href="create_subscription.html">← create_subscription</a><a href="drop_subscription.html">drop_subscription →</a></div></nav>
 <h1><code>alter_subscription</code></h1>
 <h2>Synopsis</h2><pre>{
-  &quot;kind&quot;: &quot;alter_subscription&quot;,
-  &quot;name&quot;: &lt;required&gt;,
-  &quot;connection&quot;: &lt;required&gt;,
-  &quot;publications&quot;: &lt;optional&gt;,
-  &quot;enabled&quot;: &lt;optional&gt;,
-  &quot;connect&quot;: &lt;optional&gt;,
-  &quot;slot_name&quot;: &lt;optional&gt;,
-  &quot;refresh&quot;: &lt;optional&gt;
+  &quot;kind&quot;: &quot;alter_subscription&quot;
 }</pre>
 <h2>Parameters</h2><dl class="params">
-<dt>name<span class="tag req">required</span></dt>
-<dd>&nbsp;</dd>
-<dt>connection<span class="tag req">required</span></dt>
-<dd>A subscription&#x27;s connection string is stored in pg_subscription in the clear, and pg_laswell stores every statement it runs verbatim in the ledger — so a password here would be in the signed spec, in git and in laswell.step.sql. Put the credential in the server&#x27;s ~/.pgpass or a connection service file and name the service here. It is refused rather than redacted because a redacted ledger entry would no longer be what ran.</dd>
-<dt>publications<span class="tag opt">optional</span></dt>
-<dd>&nbsp;</dd>
-<dt>enabled<span class="tag opt">optional</span></dt>
-<dd>&nbsp;</dd>
-<dt>connect<span class="tag opt">optional</span></dt>
-<dd>&nbsp;</dd>
-<dt>slot_name<span class="tag opt">optional</span></dt>
-<dd>&nbsp;</dd>
-<dt>refresh<span class="tag opt">optional</span></dt>
-<dd>&nbsp;</dd>
 </dl>
 <div class="note">Any key not listed here is <strong>refused</strong>, not ignored: a key this binary skips and a newer one honours would be a silent difference between what was reviewed and what ran.</div>
 <h2>Examples</h2>

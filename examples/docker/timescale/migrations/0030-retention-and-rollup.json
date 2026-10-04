@@ -1,0 +1,36 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0030-retention-and-rollup",
+  "description": "Hourly averages kept, raw readings dropped after 90 days.",
+  "rationale": "The dashboards read hours after the first week; the raw rows are kept for a quarter for audits, and not longer.",
+  "target": {
+    "epoch": "timescale-license"
+  },
+  "depends_on": [
+    "0020-columnstore"
+  ],
+  "intents": [
+    {
+      "kind": "timescaledb_create_continuous_aggregate",
+      "schema": "public",
+      "name": "readings_hourly",
+      "query": "SELECT time_bucket('1 hour', ts) AS bucket, device_id, avg(value) AS avg_value, count(*) AS readings FROM public.readings GROUP BY 1, 2",
+      "comment": "Hourly average per device."
+    },
+    {
+      "kind": "timescaledb_add_continuous_aggregate_policy",
+      "schema": "public",
+      "name": "readings_hourly",
+      "start_offset": "3 days",
+      "end_offset": "1 hour",
+      "schedule_interval": "1 hour"
+    },
+    {
+      "kind": "timescaledb_add_retention_policy",
+      "schema": "public",
+      "table": "readings",
+      "drop_after": "90 days",
+      "acknowledge_data_loss": true
+    }
+  ]
+}

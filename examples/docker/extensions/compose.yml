@@ -1,0 +1,37 @@
+# PostgreSQL with pg_cron and pgvector, twice, because pg_cron is deployed two
+# ways and a module that supports both has to be measured on both:
+#
+#   cron_central  cron.database_name = postgres -- the usual layout: the
+#                 extension lives in the maintenance database and jobs for an
+#                 application database are scheduled with schedule_in_database.
+#   cron_local    cron.database_name = docs -- the extension lives in the
+#                 application database itself, next to the ledger.
+#
+# pgvector is per database and has no such split; both containers carry it.
+#
+#   docker compose -f examples/docker/extensions/compose.yml up -d --build
+#   docker compose -f examples/docker/extensions/compose.yml down -v
+x-ext: &ext
+  build: .
+  image: pg_laswell/extensions:18
+  environment:
+    POSTGRES_PASSWORD: laswell
+    POSTGRES_DB: app
+  healthcheck:
+    test: ['CMD-SHELL', 'pg_isready -U postgres -d app']
+    interval: 3s
+    timeout: 3s
+    retries: 30
+
+services:
+  cron_central:
+    <<: *ext
+    container_name: laswell_cron_central
+    ports: ['55450:5432']
+    command: [postgres, -c, shared_preload_libraries=pg_cron, -c, cron.database_name=postgres]
+
+  cron_local:
+    <<: *ext
+    container_name: laswell_cron_local
+    ports: ['55451:5432']
+    command: [postgres, -c, shared_preload_libraries=pg_cron, -c, cron.database_name=docs]

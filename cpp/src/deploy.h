@@ -581,6 +581,7 @@ class Deployment {
       for (const auto& c : plan.value("conflicts", json::array())) {
         out << "      " << c.get<std::string>() << "\n";
       }
+      report_advisories(out, plan);
       return DeployResult::kRefused;
     }
     out << "  " << id << ": " << plan.value("steps", json::array()).size()
@@ -588,7 +589,17 @@ class Deployment {
     for (const auto& w : plan.value("warnings", json::array())) {
       out << "      warning: " << w.get<std::string>() << "\n";
     }
+    report_advisories(out, plan);
     return DeployResult::kOk;
+  }
+
+  // Advisories: shown, and outside planDigest (Plan::advisories) -- facts that
+  // move on their own, such as a scheduled job edited by hand since it was
+  // applied. Absent from a plan that has none.
+  static void report_advisories(std::ostream& out, const json& plan) {
+    for (const auto& a : plan.value("advisories", json::array())) {
+      out << "      note: " << a.get<std::string>() << "\n";
+    }
   }
 
   // A json value as one line of text, whatever shape it arrived in.
@@ -622,6 +633,25 @@ class Deployment {
     // diagnosed and pretending otherwise encourages reading the wrong thing.
     if (st.contains("error")) {
       out << "      " << as_text(st["error"]) << "\n";
+    }
+    // What a module found left behind after the failure (executor.h,
+    // left_behind): on Citus, prepared transactions still on the nodes. This
+    // IS printed here, gids and all, because it is not in laswell.step and it
+    // is what someone has to act on next.
+    if (st.contains("error") && st["error"].is_object()) {
+      const auto& e = st["error"];
+      // Copies, not references into temporaries: value() returns by value.
+      const json left = e.value("left_behind", json::object());
+      const json hints = e.value("left_behind_hint", json::object());
+      const json unread = e.value("left_behind_unread", json::object());
+      for (const auto& [module, found] : left.items()) {
+        out << "      left behind (" << module << "): " << found.dump() << "\n";
+        if (hints.contains(module)) out << "      " << as_text(hints[module]) << "\n";
+      }
+      for (const auto& [module, why] : unread.items()) {
+        out << "      what " << module << " may have left behind could not be read: "
+            << as_text(why) << "\n";
+      }
     }
     for (const auto& s : st.value("steps", json::array())) {
       if (s.value("state", "") == "failed") {

@@ -710,6 +710,49 @@ else
 fi
 # Whatever happened above, leave the cluster able to place shards on worker2.
 q "SELECT citus_set_node_property('worker2', 5432, 'shouldhaveshards', true)" >/dev/null
+# AFTER A FAILED JOB: what is left prepared on the cluster is in its error. A
+# job that fails at apply and not in the dry run: a UNIQUE index built
+# concurrently over duplicates, which the dry run cannot rehearse. The prepared
+# transaction is made by hand on the coordinator, on a table of its own, so the
+# reading has something to find whatever the failed statement left.
+left_repo=$(mktemp -d)
+q "CREATE TABLE ct.dup (id int); INSERT INTO ct.dup VALUES (1), (1)" >/dev/null
+q "BEGIN; CREATE TABLE ct.left_probe (); PREPARE TRANSACTION 'laswell_test_left_behind'" >/dev/null
+cat > "$left_repo/9997-ct-left.json" <<'JSON'
+{"laswell_spec_version":1,"id":"9997-ct-left",
+ "description":"A unique index that cannot be built: the job fails at apply.",
+ "intents":[{"kind":"create_index","schema":"ct","table":"dup","name":"dup_id_key",
+             "columns":["id"],"unique":true,"comment":"Cannot be built."}]}
+JSON
+lbytes=$("$MCP" --call getSpecDigest --args "{\"spec\":$(cat "$left_repo/9997-ct-left.json")}" \
+         "$CITUS_URL" 2>/dev/null | python3 -c 'import json,sys;print(json.load(sys.stdin)["canonicalBytes"],end="")')
+printf '%s' "$lbytes" > "$left_repo/.bytes"
+lsig=$(openssl pkeyutl -sign -inkey "$key_dir/k.pem" -rawin -in "$left_repo/.bytes" 2>/dev/null | base64 -w0)
+python3 - "$left_repo/9997-ct-left.json" "$kid" "$lsig" <<'PY'
+import json, sys
+p, kid, sig = sys.argv[1], sys.argv[2], sys.argv[3]
+d = json.load(open(p))
+d["signatures"] = [{"key_id": kid, "algorithm": "ed25519", "signature": sig}]
+json.dump(d, open(p, "w"), indent=2)
+PY
+rm -f "$left_repo/.bytes"
+# Every repository that built this database, as above.
+out=$("$BIN" --repo "$left_repo" --repo "$topo_repo" --repo "$drain_repo" "${base_repos[@]}" "$CITUS_URL" 2>&1); rc=$?
+if [ "$rc" -ne 0 ] && echo "$out" | grep -q "left behind (citus)" \
+   && echo "$out" | grep -q "laswell_test_left_behind"; then
+  ok "a failed job reports the prepared transaction left on the cluster"
+else
+  bad "the failed job should name laswell_test_left_behind (rc=$rc)" "$out"
+fi
+in_ledger=$(q "SELECT j.error->'left_behind'->'citus'->'coordinator'->0->>'gid'
+                 FROM laswell.job j JOIN laswell.migration m USING (migration_id)
+                WHERE m.spec_id = '9997-ct-left' ORDER BY j.job_id DESC LIMIT 1")
+[ "$in_ledger" = "laswell_test_left_behind" ] && ok "and the ledger keeps it with the job" \
+  || bad "laswell.job.error should hold left_behind" "$in_ledger"
+q "ROLLBACK PREPARED 'laswell_test_left_behind'" >/dev/null
+q "DROP INDEX CONCURRENTLY IF EXISTS ct.dup_id_key" >/dev/null
+rm -rf "$left_repo"
+
 rm -rf "$drain_repo" "$topo_repo"
 for id in 9992-ct-drain 9993-ct-allow 9994-ct-rebalance; do
   cleanup_sql="
@@ -720,6 +763,14 @@ DELETE FROM laswell.job WHERE migration_id IN (
   SELECT migration_id FROM laswell.migration WHERE spec_id = '$id');
 DELETE FROM laswell.migration WHERE spec_id = '$id';$cleanup_sql"
 done
+
+cleanup_sql="$cleanup_sql
+DELETE FROM laswell.step WHERE job_id IN (
+  SELECT job_id FROM laswell.job WHERE migration_id IN (
+    SELECT migration_id FROM laswell.migration WHERE spec_id = '9997-ct-left'));
+DELETE FROM laswell.job WHERE migration_id IN (
+  SELECT migration_id FROM laswell.migration WHERE spec_id = '9997-ct-left');
+DELETE FROM laswell.migration WHERE spec_id = '9997-ct-left';"
 
 rm -rf "$walk_repo"
 cleanup_sql="$cleanup_sql

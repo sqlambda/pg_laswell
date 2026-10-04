@@ -83,6 +83,7 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
   &quot;unique&quot;: &lt;optional&gt;,
   &quot;method&quot;: &lt;optional&gt;,
   &quot;where&quot;: &lt;optional&gt;,
+  &quot;with&quot;: &lt;optional&gt;,
   &quot;on_equivalent_index&quot;: &quot;rename&quot; | &quot;adopt&quot; | &quot;refuse&quot;
 }</pre>
 <h2>Parameters</h2><dl class="params">
@@ -104,6 +105,8 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
 <dd>&nbsp;</dd>
 <dt>where<span class="tag opt">optional</span></dt>
 <dd>&nbsp;</dd>
+<dt>with<span class="tag opt">optional</span></dt>
+<dd>Each key is a storage parameter of the index&#x27;s method and each value a number, a boolean or a short word: {&quot;fillfactor&quot;: 70}, {&quot;m&quot;: 16, &quot;ef_construction&quot;: 64}.</dd>
 <dt>on_equivalent_index<span class="tag opt">optional</span></dt>
 <dd>One of <code>rename</code>, <code>adopt</code>, <code>refuse</code>. rename (the default) renames the existing index to the declared name; adopt accepts it where it is and changes nothing; refuse treats it as a conflict.</dd>
 </dl>

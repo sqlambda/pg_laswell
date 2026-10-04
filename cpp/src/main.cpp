@@ -10,8 +10,8 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
-#include <iterator>
 #include <optional>
+#include <sstream>
 #include <string>
 
 #include "config.h"
@@ -24,14 +24,18 @@ namespace {
 // Reads an --args value: literal JSON, @file, or @- for stdin.
 std::string read_args(const std::string& spec) {
   if (spec.empty() || spec[0] != '@') return spec;
+  // Through rdbuf() rather than istreambuf_iterator: GCC 14, optimizing, reads
+  // a possible null dereference into the iterator's inlined streambuf access
+  // (-Wnull-dereference), and this says the same thing without it.
+  std::ostringstream all;
   if (spec == "@-") {
-    return std::string(std::istreambuf_iterator<char>(std::cin),
-                       std::istreambuf_iterator<char>());
+    all << std::cin.rdbuf();
+    return all.str();
   }
   std::ifstream in(spec.substr(1));
   if (!in) throw std::runtime_error("cannot read " + spec.substr(1));
-  return std::string(std::istreambuf_iterator<char>(in),
-                     std::istreambuf_iterator<char>());
+  all << in.rdbuf();
+  return all.str();
 }
 
 std::string default_config_path() {

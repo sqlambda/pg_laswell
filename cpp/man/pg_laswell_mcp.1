@@ -1,4 +1,4 @@
-.Dd September 25, 2026
+.Dd September 28, 2026
 .Dt PG_LASWELL_MCP 1
 .Os
 .Sh NAME
@@ -153,6 +153,25 @@ must reproduce.
 That is how
 .Qq what ran is what you were shown
 becomes checkable rather than promised.
+.Pp
+Beside its
+.Va warnings
+a plan may carry
+.Va advisories ,
+rendered as
+.Ql note:
+lines: facts a module reads that move on their own \(em a table's row count,
+which autovacuum rewrites; a scheduled job's last run; a job edited by hand since
+a specification declared it.
+They are left out of
+.Va planDigest ,
+like the
+.Va budget ,
+because two plans a minute apart would otherwise disagree about a migration
+that had not changed, and they never change a statement.
+A plan with none has no
+.Va advisories
+key.
 .Pp
 By default it also performs a
 .Sx DRY RUN .
@@ -648,10 +667,66 @@ see
 .El
 .\" END CORE KIND LIST
 .Pp
-An intent that creates an object must carry a
+An intent that creates an object documents it with
 .Va comment ,
 which becomes its
-.Ic COMMENT ON .
+.Ic COMMENT ON
+in the same transaction.
+It is required when the object is a table, column, index, view, materialized
+view, sequence, schema, type or function, and optional when it is a constraint,
+trigger, policy, rule, extension, publication or subscription \(em optional
+there because requiring it would refuse repositories written before it
+existed.
+The comment is appended to the step that leaves the object in place: for a
+foreign key or check that is the
+.Ic VALIDATE
+after the
+.Ic NOT VALID
+add, for a unique constraint the
+.Ic ADD CONSTRAINT ... USING INDEX
+after the concurrent build.
+An object that already exists is reported satisfied without comparing its
+comment;
+.Cm set_comment
+changes one, and names the lock it takes, which is not nothing: a comment on a
+table, column, index, view or sequence takes
+.Li ShareUpdateExclusiveLock
+on it, which reads and writes pass and VACUUM and other DDL on it wait for.
+.Pp
+.Cm create_table
+with
+.Va partition_of
+.Pq Qq schema.table
+creates a partition of that parent:
+.Ic CREATE TABLE ... PARTITION OF ,
+with the parent's columns and keys rather than a restated copy of them, and
+exactly one bound \(em
+.Va from
+and
+.Va to ,
+.Va values ,
+.Va modulus
+and
+.Va remainder ,
+or
+.Va default .
+It takes
+.Li AccessExclusiveLock
+on the parent, and on its DEFAULT partition if it has one, so reads and writes
+on the parent wait until the step commits (measured: a SELECT on the parent
+waited); on a busy parent the lighter route is
+.Cm create_table
+without it and then
+.Cm attach_partition ,
+which takes
+.Li ShareUpdateExclusiveLock
+on the parent.
+Beside a DEFAULT partition every row of the default is read to prove none
+belongs to the new bound, and the plan states how many there are.
+Refused before it runs: a parent that is not partitioned, a bound of the wrong
+kind for the parent, a DEFAULT for a hash-partitioned parent or a second
+DEFAULT, and a table of that name that exists and is not already its partition.
+An overlapping bound is found by the dry run, which executes the statement.
 .Pp
 .Cm add_column
 must state
@@ -792,6 +867,40 @@ or
 .Cm refuse .
 A constraint-backed index is never renamed, because renaming it renames the
 constraint too.
+.Pp
+.Va with
+sets the index's storage parameters, emitted as
+.Ic WITH ( ... )
+between
+.Va include
+and
+.Va where :
+.Bd -literal -offset indent
+"with": {"fillfactor": 70}
+"with": {"m": 16, "ef_construction": 64}
+.Ed
+.Pp
+Each value is a number, a boolean, or a short word of letters, digits,
+.Ql _
+and
+.Ql \&. ;
+which names a method accepts is the method's to say, and PostgreSQL refuses an
+unknown one
+.Pq Qq unrecognized parameter .
+The parameters are part of what makes two indexes the same: they are read back
+from
+.Va pg_class.reloptions ,
+with
+.Ql off
+and
+.Ql false
+treated alike, and an index matching in everything but its parameters is
+built as a second index, with a warning naming both, rather than adopted.
+An index already present under the declared name with other parameters is
+satisfied, and the plan warns: changing them is a rebuild, which a later
+specification asks for by dropping and creating it.
+.Xr pg_laswell_pgvector 7
+checks the parameters of an HNSW or IVFFlat index against pgvector's bounds.
 .Pp
 .Cm drop_index
 decides on contention rather than size: a drop is fast whatever else is true,
@@ -1609,12 +1718,16 @@ none of its assumptions.
 .Pp
 Modules are chosen when the binary is configured:
 .Bd -literal -offset indent
-cmake -S cpp -B build -DPGLASWELL_MODULES=citus
+cmake -S cpp -B build -DPGLASWELL_MODULES="citus;pg_cron;pgvector;timescaledb"
 .Ed
 .Pp
 The released package is built with every module, so
-.Xr pg_laswell_citus 7
-is installed beside this page.
+.Xr pg_laswell_citus 7 ,
+.Xr pg_laswell_pg_cron 7 ,
+.Xr pg_laswell_pgvector 7
+and
+.Xr pg_laswell_timescaledb 7
+are installed beside this page.
 A module's kinds are refused where its extension is absent, and a server without
 the extension plans exactly as a build without the module would.
 .Pp
@@ -1623,8 +1736,8 @@ names the set a binary was built with, and says nothing when it was built with
 none:
 .Bd -literal -offset indent
 $ pg_laswell_mcp --version
-0.1.2
-modules: citus
+0.1.3
+modules: citus,pg_cron,pgvector,timescaledb
 .Ed
 .Pp
 This matters because two binaries with the same version string accept different
@@ -1686,6 +1799,19 @@ kind name.
 Citus: distributed tables, reference tables and distributed functions, plus
 refusals for a distributed topology.
 .Xr pg_laswell_citus 7
+.It Cm pg_cron
+pg_cron: scheduled jobs as intents, in the application database or in the one
+pg_cron keeps its jobs in.
+.Xr pg_laswell_pg_cron 7
+.It Cm pgvector
+pgvector: no kinds of its own; refusals for the HNSW and IVFFlat indexes
+pgvector would reject, said before a concurrent build starts.
+.Xr pg_laswell_pgvector 7
+.It Cm timescaledb
+TimescaleDB: hypertables, and in the Timescale License edition the columnstore,
+policies and continuous aggregates; and how core builds and drops an index on a
+hypertable, which it cannot do concurrently.
+.Xr pg_laswell_timescaledb 7
 .El
 .Sh PREREQUISITES
 Some migrations need something done that this program cannot do, often on a
@@ -1750,6 +1876,29 @@ lives in
 or
 .Pa ~/.pgpass ,
 and the prerequisite says what must be there and how to check it.
+.Pp
+.Em Whose
+.Pa ~/.pgpass
+is the part that is easy to get wrong.
+The subscription's connection is made by the subscriber's PostgreSQL server
+process, not by
+.Nm
+and not by the machine it runs on: the file that is read is the one in the home
+directory of the operating-system user that server runs as \(em usually
+.Li postgres
+\(em on the subscriber's host, or the service file there.
+A
+.Pa ~/.pgpass
+beside the deployment does nothing for it.
+.Pp
+This refusal is the kind a lab that rebuilds constantly might experience as
+friction and be tempted to relax.
+The pgshard lab met it 83 times in October 2026 and it cost nothing, because
+the subscriber's
+.Li postgres
+user already carried a wildcard entry,
+.Ql *:*:*:postgres:<password> .
+The right answer is that file, not a password in the specification.
 .Sh CAPACITY
 The migrations run inside PostgreSQL, not on the machine
 .Nm
@@ -2121,7 +2270,10 @@ pg_laswell_mcp --call planMigration --args @spec-args.json \e
 .Xr pg_laswell 1 ,
 .Xr pg_licht_mcp 1 ,
 .Xr psql 1 ,
-.Xr pg_laswell_citus 7
+.Xr pg_laswell_citus 7 ,
+.Xr pg_laswell_pg_cron 7 ,
+.Xr pg_laswell_pgvector 7 ,
+.Xr pg_laswell_timescaledb 7
 .Sh STANDARDS
 Model Context Protocol, revisions 2024-11-05 through 2025-11-25, over stdio
 using JSON-RPC 2.0.

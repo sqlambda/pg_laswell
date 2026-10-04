@@ -181,6 +181,9 @@
     <a href="pg_laswell.1.html">pg_laswell(1)</a>
     <a href="pg_laswell_mcp.1.html">pg_laswell_mcp(1)</a>
     <a href="pg_laswell_citus.7.html">Citus</a>
+    <a href="pg_laswell_pg_cron.7.html">pg_cron</a>
+    <a href="pg_laswell_pgvector.7.html">pgvector</a>
+    <a href="pg_laswell_timescaledb.7.html">TimescaleDB</a>
     <a href="https://github.com/sqlambda/pg_laswell">GitHub</a>
   </div>
 </nav>
@@ -980,6 +983,23 @@ flowchart LR
       <h3><a href="pg_laswell_citus.7.html">pg_laswell_citus(7)</a></h3>
       <p>The Citus module: every kind, every refusal and the measurement behind
       it, and how a distributed table is written to without naming the vendor.</p>
+    </div>
+    <div class="feature">
+      <h3><a href="pg_laswell_pg_cron.7.html">pg_laswell_pg_cron(7)</a></h3>
+      <p>Scheduled jobs as signed intents, whether pg_cron lives in the
+      application database or in the one it keeps its jobs in -- the
+      configuration says which, not the specification.</p>
+    </div>
+    <div class="feature">
+      <h3><a href="pg_laswell_pgvector.7.html">pg_laswell_pgvector(7)</a></h3>
+      <p>HNSW and IVFFlat indexes through the ordinary create_index, and every
+      index pgvector would refuse, refused before a concurrent build starts.</p>
+    </div>
+    <div class="feature">
+      <h3><a href="pg_laswell_timescaledb.7.html">pg_laswell_timescaledb(7)</a></h3>
+      <p>Hypertables, the columnstore, policies and continuous aggregates, the
+      edition read rather than assumed -- and indexes on a hypertable built one
+      chunk at a time, because it cannot be done concurrently.</p>
     </div>
   </div>
 </section>

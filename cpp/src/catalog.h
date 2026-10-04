@@ -115,6 +115,11 @@ SELECT COALESCE(
                    'definition', pg_get_indexdef(i.indexrelid),
                    'method', am.amname,
                    'predicate', COALESCE(pg_get_expr(i.indpred, i.indrelid), ''),
+                   -- Storage parameters as "name=value", exactly as written at
+                   -- creation (pg_class.reloptions). Part of what makes two
+                   -- indexes the same: an HNSW index with m = 16 is not the one
+                   -- a spec asking for m = 32 describes.
+                   'options', COALESCE(TO_JSONB(ic.reloptions), '[]'::jsonb),
                    -- Column names in index order. An expression column has
                    -- attnum 0 and cannot be named, so has_expressions marks the
                    -- index as one this tool must not reason about: comparing a
@@ -362,6 +367,14 @@ SELECT COALESCE(
                              JOIN pg_namespace pn ON pn.oid = pc.relnamespace
                             WHERE pi.inhparent = t.oid
                               AND PG_GET_EXPR(pc.relpartbound, pc.oid) = 'DEFAULT'),
+     -- And how much it holds, because that is what the scan costs: creating a
+     -- partition beside a DEFAULT reads every row of the default, under
+     -- AccessExclusiveLock on it -- measured, 47 ms for 1M rows.
+     'default_partition_rows', (SELECT pc.reltuples::bigint
+                             FROM pg_inherits pi
+                             JOIN pg_class pc ON pc.oid = pi.inhrelid
+                            WHERE pi.inhparent = t.oid
+                              AND PG_GET_EXPR(pc.relpartbound, pc.oid) = 'DEFAULT'),
      -- A partition left half-detached by an interrupted DETACH CONCURRENTLY.
      -- It is still in pg_inherits, still reports relispartition, and only this
      -- flag says the cluster is mid-operation and needs FINALIZE.
@@ -553,6 +566,10 @@ SELECT JSONB_BUILD_OBJECT(
   -- with units and does not cast to a number.
   'maintenance_work_mem_kb', (SELECT setting::bigint FROM pg_settings
                                WHERE name = 'maintenance_work_mem'),
+  -- In bytes, whatever unit it was set in. The one memory figure every server
+  -- is tuned by, and the basis of the limit an index build's memory is raised
+  -- to when no ceiling is configured (planner_base.h).
+  'shared_buffers_bytes', pg_size_bytes(current_setting('shared_buffers')),
   'is_in_recovery', pg_is_in_recovery(),
   'now', now()
 )
@@ -644,14 +661,69 @@ class Catalog {
   // A planner that cannot tell "not installed" from "installed and reporting
   // nothing" refuses the wrong things in both directions, which is why this
   // costs a probe query per module rather than a COALESCE.
+  //
+  // absent_sql is what a module reads where its extension is NOT installed, or
+  // nullptr for nothing (the key then stays absent). It exists because an
+  // extension can be loaded on a server without being installed in the
+  // database at hand: pg_cron lives in ONE database per cluster, and in every
+  // other database the module still has to say which one that is -- and its
+  // observation query cannot be used there, because a statement naming
+  // cron.job does not even parse where the cron schema does not exist. A NULL
+  // result leaves the key absent, as for an extension the server lacks.
+  //
+  // reads_applied_steps asks for one more reading: the module's OWN steps that
+  // this database's ledger records as applied, newest first, under
+  // "applied_steps" in its slot. It is how a module can tell an object it
+  // created from the same object edited by hand since -- pg_cron's jobs live
+  // in a table anyone with the role can change, and nothing else records what
+  // a specification declared. Bounded (kAppliedStepsLimit), read only when the
+  // ledger exists and this role may read it, and only for a module whose
+  // reading is present, so a database without a ledger plans as before.
+  static constexpr int kAppliedStepsLimit = 500;
+  void observe_applied_steps(pqxx::work& txn, json& slot, const std::string& module) {
+    // Looked up through the catalogs and tested by OID, because every
+    // name-based form RAISES for a role without USAGE on the schema rather
+    // than answering no. Measured on 18.6, as such a role: to_regclass(
+    // 'laswell.job') and has_table_privilege('laswell.job', ...) both fail
+    // "permission denied for schema laswell". This runs on every plan a
+    // pg_cron server sees, so that role's every plan failed until it read
+    // pg_class instead. No row means no ledger; false means not readable.
+    const auto readable = txn.exec(
+        "SELECT COALESCE((SELECT has_schema_privilege(n.oid, 'USAGE')"
+        "                    AND has_table_privilege(c.oid, 'SELECT')"
+        "                   FROM pg_class c"
+        "                   JOIN pg_namespace n ON n.oid = c.relnamespace"
+        "                  WHERE n.nspname = 'laswell' AND c.relname = 'job'), false)");
+    if (readable.empty() || !readable[0][0].as<bool>()) return;
+    const auto r = txn.exec(
+        "SELECT COALESCE(JSONB_AGG(s.step ORDER BY s.finished_at DESC, s.n DESC), "
+        "'[]'::jsonb) FROM ("
+        "  SELECT st AS step, j.finished_at, e.n"
+        "    FROM laswell.job j"
+        "   CROSS JOIN LATERAL JSONB_ARRAY_ELEMENTS(j.plan->'steps')"
+        "         WITH ORDINALITY AS e(st, n)"
+        "   WHERE j.state = 'succeeded' AND starts_with(st->>'kind', $1)"
+        "   ORDER BY j.finished_at DESC, e.n DESC LIMIT $2) s",
+        pqxx::params{module + "_", kAppliedStepsLimit});
+    if (!r.empty() && !r[0][0].is_null()) {
+      slot["applied_steps"] = json::parse(r[0][0].as<std::string>());
+    }
+  }
+
   void observe_extensions(pqxx::work& txn, Observations& obs) {
-#define PGLASWELL_OBSERVE(module_name, present_sql, observation_sql)         \
+#define PGLASWELL_OBSERVE(module_name, present_sql, observation_sql, absent_sql, \
+                          reads_applied_steps)                                 \
     do {                                                                      \
       const auto probe = txn.exec(present_sql);                               \
-      if (probe.empty() || !probe[0][0].as<bool>()) break;                    \
-      const auto r = txn.exec(observation_sql);                               \
+      const bool present = !probe.empty() && probe[0][0].as<bool>();          \
+      const char* const sql = present ? (observation_sql) : (absent_sql);     \
+      if (sql == nullptr) break;                                              \
+      const auto r = txn.exec(sql);                                           \
       if (!r.empty() && !r[0][0].is_null()) {                                 \
         obs.extensions[module_name] = json::parse(r[0][0].as<std::string>()); \
+        if (reads_applied_steps) {                                            \
+          observe_applied_steps(txn, obs.extensions[module_name], module_name); \
+        }                                                                     \
       }                                                                       \
     } while (false);
 #include "modules/enabled_observers.h"

@@ -25,10 +25,13 @@ inline std::string citus_reading(const json& citus) {
 
 inline const json& citus_table(const json& citus, const std::string& qualified) {
   static const json kEmpty = json::object();
-  const auto tables = citus.find("tables");
-  if (tables == citus.end()) return kEmpty;
-  const auto it = tables->find(qualified);
-  return it == tables->end() ? kEmpty : *it;
+  // By reference rather than through the iterator's operator->: GCC 14,
+  // optimizing, reads a possible null dereference into the latter
+  // (-Wnull-dereference).
+  if (!citus.is_object() || !citus.contains("tables")) return kEmpty;
+  const json& tables = citus["tables"];
+  if (!tables.is_object() || !tables.contains(qualified)) return kEmpty;
+  return tables[qualified];
 }
 
 // Is Citus here at all. Returns false, having refused and named the
@@ -134,8 +137,8 @@ inline int citus_shard_holders(const json& citus) {
   return n;
 }
 
-// THE EMPTY-CLUSTER TRAP, which CITUS.md calls the highest-value refusal for a
-// lab. Measured on a database with nothing in pg_dist_node:
+// THE EMPTY-CLUSTER TRAP: the highest-value refusal for a lab, where clusters
+// are built from nothing. Measured on a database with nothing in pg_dist_node:
 // create_distributed_table, create_reference_table and
 // citus_add_local_table_to_metadata all SUCCEED -- each registers the
 // coordinator as "localhost" taking shards, and a distributed table's 32 shards

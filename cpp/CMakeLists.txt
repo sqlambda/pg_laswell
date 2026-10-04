@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(pg_laswell_mcp VERSION 0.1.2 LANGUAGES CXX)
+project(pg_laswell_mcp VERSION 0.1.3 LANGUAGES CXX)
 
 # Standard bin/ and share/man/ layout, so `cmake --install` produces a tree that
 # can be dropped onto a prefix as-is: the release tarballs are staged this way,
@@ -59,11 +59,20 @@ find_package(OpenSSL REQUIRED)
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/SafetyFlags.cmake)
 
+# Threads by name, not by luck. The executor runs a worker thread per job and
+# an observer thread, and on Linux that linked without saying so only because
+# glibc 2.34 folded libpthread into libc. FreeBSD keeps it separate: built
+# there, every binary failed to link on pthread_create. Threads::Threads is
+# CMake's portable spelling, and on glibc it costs nothing.
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
+
 set(PGLASWELL_LIBS
     nlohmann_json::nlohmann_json
     PkgConfig::PQXX
     PkgConfig::LIBPQ
     OpenSSL::Crypto
+    Threads::Threads
 )
 
 # Two binaries, one core. pg_laswell_mcp is for AUTHORING a migration -- an
@@ -77,9 +86,9 @@ set(PGLASWELL_LIBS
 # within touching distance of the "recognized but unsupported" state spec.h
 # opens by forbidding. See src/modules/README.md.
 #
-#   cmake -S cpp -B cpp/build -DPGLASWELL_MODULES=citus
+#   cmake -S cpp -B cpp/build -DPGLASWELL_MODULES="citus;pg_cron;pgvector;timescaledb"
 # --------------------------------------------------------------------------
-set(PGLASWELL_MODULES "" CACHE STRING "Vendor modules to compile in, e.g. citus")
+set(PGLASWELL_MODULES "" CACHE STRING "Vendor modules to compile in, e.g. citus;pg_cron;pgvector;timescaledb")
 set(_mod_names "")
 
 set(_gen_dir ${CMAKE_CURRENT_BINARY_DIR}/generated/modules)
@@ -97,6 +106,12 @@ set(_topo_inc  "// Generated from PGLASWELL_MODULES. Do not edit.\n")
 set(_guard_inc "// Generated from PGLASWELL_MODULES. Do not edit.\n")
 set(_guard_head "// Generated from PGLASWELL_MODULES. Do not edit.\n")
 set(_confine_inc  "// Generated from PGLASWELL_MODULES. Do not edit.\n")
+set(_index_inc  "// Generated from PGLASWELL_MODULES. Do not edit.\n")
+set(_index_head "// Generated from PGLASWELL_MODULES. Do not edit.\n")
+set(_constraint_inc  "// Generated from PGLASWELL_MODULES. Do not edit.\n")
+set(_constraint_head "// Generated from PGLASWELL_MODULES. Do not edit.\n")
+set(_afterfail_inc  "// Generated from PGLASWELL_MODULES. Do not edit.\n")
+set(_afterfail_head "// Generated from PGLASWELL_MODULES. Do not edit.\n")
 set(_confine_head "// Generated from PGLASWELL_MODULES. Do not edit.\n")
 set(_ptest_inc "// Generated from PGLASWELL_MODULES. Do not edit.\n")
 set(_body_inc  "// Generated from PGLASWELL_MODULES. Do not edit.\n")
@@ -110,7 +125,7 @@ foreach(_mod IN LISTS PGLASWELL_MODULES)
     string(APPEND _kinds_inc "#include \"modules/${_mod}/kinds.inc\"\n")
     string(APPEND _heads_inc "#include \"modules/${_mod}/module.h\"\n")
     string(APPEND _plan_inc "#include \"modules/${_mod}/plan.h\"\n")
-    string(APPEND _obs_inc  "PGLASWELL_OBSERVE(\"${_mod}\", k${_mod}PresentSql, k${_mod}ObservationSql)\n")
+    string(APPEND _obs_inc  "PGLASWELL_OBSERVE(\"${_mod}\", k${_mod}PresentSql, k${_mod}ObservationSql, k${_mod}AbsentSql, k${_mod}ReadsAppliedSteps)\n")
     string(APPEND _obs_head "#include \"modules/${_mod}/observe.h\"\n")
     # keys.inc is optional: a module whose kinds plan against relations only,
     # and add no conflict edge, does not need one.
@@ -158,6 +173,32 @@ foreach(_mod IN LISTS PGLASWELL_MODULES)
         string(APPEND _confine_inc
             "PGLASWELL_CONFINEMENT(\"${_mod}\", ${_mod}_required_confinement)\n")
     endif()
+    # index.h is optional: a module whose vendor changes how an index may be
+    # built or dropped on some tables answers that one question for core --
+    # can it be concurrent, what builds one part at a time, how big is the
+    # data really -- and core decides and emits every statement.
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/modules/${_mod}/index.h)
+        string(APPEND _index_head "#include \"modules/${_mod}/index.h\"\n")
+        string(APPEND _index_inc
+            "PGLASWELL_INDEX_TRAITS(\"${_mod}\", ${_mod}_index_traits)\n")
+    endif()
+    # constraint.h is optional: a module whose vendor refuses VALIDATE
+    # CONSTRAINT on some tables says so, and core validates in the statement
+    # that adds the constraint instead of in a second step that would fail.
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/modules/${_mod}/constraint.h)
+        string(APPEND _constraint_head "#include \"modules/${_mod}/constraint.h\"\n")
+        string(APPEND _constraint_inc
+            "PGLASWELL_CONSTRAINT_TRAITS(\"${_mod}\", ${_mod}_constraint_traits)\n")
+    endif()
+    # after_failure.h is optional: a module whose vendor can leave something
+    # behind when a job fails (Citus: a prepared transaction on a worker) gives
+    # the executor a read-only query to run then, and core adds what it returns
+    # to the job's error.
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/modules/${_mod}/after_failure.h)
+        string(APPEND _afterfail_head "#include \"modules/${_mod}/after_failure.h\"\n")
+        string(APPEND _afterfail_inc
+            "PGLASWELL_AFTER_FAILURE(\"${_mod}\", k${_mod}AfterFailureAppliesSql, k${_mod}AfterFailureSql, k${_mod}AfterFailureHint)\n")
+    endif()
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/modules/${_mod}/guard.h)
         string(APPEND _guard_head "#include \"modules/${_mod}/guard.h\"\n")
         string(APPEND _guard_inc "PGLASWELL_PLAN_GUARD(${_mod}_plan_refusals)\n")
@@ -185,6 +226,18 @@ file(WRITE ${_gen_dir}/enabled_confinement_headers.h.tmp "${_confine_head}")
 configure_file(${_gen_dir}/enabled_confinement_headers.h.tmp ${_gen_dir}/enabled_confinement_headers.h COPYONLY)
 file(WRITE ${_gen_dir}/enabled_confinements.h.tmp "${_confine_inc}")
 configure_file(${_gen_dir}/enabled_confinements.h.tmp ${_gen_dir}/enabled_confinements.h COPYONLY)
+file(WRITE ${_gen_dir}/enabled_index_headers.h.tmp "${_index_head}")
+configure_file(${_gen_dir}/enabled_index_headers.h.tmp ${_gen_dir}/enabled_index_headers.h COPYONLY)
+file(WRITE ${_gen_dir}/enabled_index_traits.h.tmp "${_index_inc}")
+configure_file(${_gen_dir}/enabled_index_traits.h.tmp ${_gen_dir}/enabled_index_traits.h COPYONLY)
+file(WRITE ${_gen_dir}/enabled_constraint_headers.h.tmp "${_constraint_head}")
+configure_file(${_gen_dir}/enabled_constraint_headers.h.tmp ${_gen_dir}/enabled_constraint_headers.h COPYONLY)
+file(WRITE ${_gen_dir}/enabled_constraint_traits.h.tmp "${_constraint_inc}")
+configure_file(${_gen_dir}/enabled_constraint_traits.h.tmp ${_gen_dir}/enabled_constraint_traits.h COPYONLY)
+file(WRITE ${_gen_dir}/enabled_after_failure_headers.h.tmp "${_afterfail_head}")
+configure_file(${_gen_dir}/enabled_after_failure_headers.h.tmp ${_gen_dir}/enabled_after_failure_headers.h COPYONLY)
+file(WRITE ${_gen_dir}/enabled_after_failures.h.tmp "${_afterfail_inc}")
+configure_file(${_gen_dir}/enabled_after_failures.h.tmp ${_gen_dir}/enabled_after_failures.h COPYONLY)
 file(WRITE ${_gen_dir}/enabled_guard_headers.h.tmp "${_guard_head}")
 configure_file(${_gen_dir}/enabled_guard_headers.h.tmp ${_gen_dir}/enabled_guard_headers.h COPYONLY)
 file(WRITE ${_gen_dir}/enabled_guards.h.tmp "${_guard_inc}")
@@ -220,8 +273,16 @@ foreach(_t pg_laswell pg_laswell_mcp)
     target_include_directories(${_t} PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR}/generated)
 endforeach()
-pglaswell_harden(pg_laswell_mcp)
-pglaswell_apply_sanitizers(pg_laswell_mcp)
+# BOTH binaries. Until 2026-10-03 only pg_laswell_mcp was hardened: the
+# deployment binary -- the one that applies migrations -- compiled without the
+# warning flags, without -Werror and without sanitizer instrumentation, so the
+# sanitizer jobs never exercised deploy_main.cpp at all. Found applying the
+# shared build standard, which asks what reached the binary, not what was
+# requested for one of them.
+foreach(_t pg_laswell pg_laswell_mcp)
+    pglaswell_harden(${_t})
+    pglaswell_apply_sanitizers(${_t})
+endforeach()
 
 install(TARGETS pg_laswell pg_laswell_mcp RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 # The man page is checked in rather than generated: the release containers carry
@@ -310,9 +371,35 @@ if(BUILD_TESTING)
     # emits. That gap cost a defect -- a correct decision whose statement the
     # dry run could not verify -- so the seam gets a test against a real
     # cluster. It SKIPs loudly without one rather than passing quietly.
+    # The binary hardening from SafetyFlags.cmake, checked on the artifacts
+    # rather than trusted from the flags. Only for an optimised build without a
+    # sanitizer (FORTIFY is off otherwise), and only where there is an ELF to
+    # read: not on macOS.
+    find_program(READELF_EXECUTABLE readelf)
+    if(READELF_EXECUTABLE AND NOT APPLE AND PGLASWELL_SANITIZER STREQUAL "NONE"
+       AND CMAKE_BUILD_TYPE MATCHES "^(Release|RelWithDebInfo|MinSizeRel)$")
+        add_test(NAME hardening_check
+                 COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/hardening-check.sh
+                         $<TARGET_FILE:pg_laswell> $<TARGET_FILE:pg_laswell_mcp>)
+    endif()
+
     if(PGLASWELL_MODULES)
         add_test(NAME citus_tests
                  COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/citus-tests.sh
+                         $<TARGET_FILE:pg_laswell> $<TARGET_FILE:pg_laswell_mcp>)
+        # The same for pg_cron and pgvector, against the two servers of
+        # examples/docker/extensions: every refusal is checked to pre-empt an
+        # error the server really raises, so a release of either extension
+        # that lifts a limit fails here instead of being refused forever.
+        add_test(NAME extensions_tests
+                 COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/extensions-tests.sh
+                         $<TARGET_FILE:pg_laswell> $<TARGET_FILE:pg_laswell_mcp>)
+        # TimescaleDB, against both editions and the oldest supported line
+        # (examples/docker/timescale). Same rule: each refusal is checked to
+        # pre-empt an error the server really raises, and each index SQL the
+        # planner emits for a hypertable is run by hand.
+        add_test(NAME timescaledb_tests
+                 COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/timescaledb-tests.sh
                          $<TARGET_FILE:pg_laswell> $<TARGET_FILE:pg_laswell_mcp>)
     endif()
 

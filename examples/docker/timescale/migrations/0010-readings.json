@@ -1,0 +1,55 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0010-readings",
+  "description": "Sensor readings, as a hypertable partitioned by day.",
+  "rationale": "One chunk a day keeps a day's inserts and its indexes in memory; the device index serves the per-device dashboards.",
+  "intents": [
+    {
+      "kind": "create_table",
+      "schema": "public",
+      "table": "readings",
+      "comment": "One row per sensor reading.",
+      "columns": [
+        {
+          "name": "ts",
+          "type": "timestamptz",
+          "nullable": false,
+          "comment": "When the reading was taken."
+        },
+        {
+          "name": "device_id",
+          "type": "integer",
+          "nullable": false,
+          "comment": "The sensor."
+        },
+        {
+          "name": "value",
+          "type": "double precision",
+          "nullable": false,
+          "comment": "What it read."
+        }
+      ]
+    },
+    {
+      "kind": "timescaledb_create_hypertable",
+      "schema": "public",
+      "table": "readings",
+      "time_column": "ts",
+      "chunk_time_interval": "1 day"
+    },
+    {
+      "kind": "create_index",
+      "schema": "public",
+      "table": "readings",
+      "name": "readings_device_ts_idx",
+      "columns": [
+        "device_id",
+        {
+          "name": "ts",
+          "direction": "desc"
+        }
+      ],
+      "comment": "A device's latest readings first."
+    }
+  ]
+}

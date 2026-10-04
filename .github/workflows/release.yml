@@ -8,6 +8,20 @@ on:
       tag:
         description: 'tag to build (must already exist)'
         required: true
+  # Validating THIS workflow without publishing: a pull request that changes
+  # the release workflow, or a script it runs, builds and verifies every
+  # package and stops there. Without it a release job is first exercised by a
+  # tag -- which is how the FreeBSD job's missing pkg-config path was found
+  # only after it had been pushed. Path-filtered, because nine packages on
+  # every pull request would be minutes spent re-proving what did not change.
+  # Nothing is published and the site is not deployed: both are gated below.
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - '.github/scripts/**'
+      - '.github/actions/**'
+      - 'cpp/CMakeLists.txt'
+      - 'cpp/cmake/**'
 
 permissions:
   contents: write
@@ -48,12 +62,12 @@ jobs:
         include:
           # Tarballs for distributions with no package here. "Portable" only
           # within limits worth stating: each is built on the runner's own
-          # glibc (ubuntu-latest, currently 24.04) and glibc is
+          # glibc (ubuntu-24.04, pinned) and glibc is
           # backward-compatible, not forward -- so a tarball runs on that
           # release and newer, and will not run on an older one. The deb and
           # rpm below exist because a tarball can declare no dependency at all;
           # anyone on an older glibc should build from source.
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             artifact: pg_laswell-linux-x86_64
             distro: ubuntu
             extension: tar.gz
@@ -61,7 +75,7 @@ jobs:
             artifact: pg_laswell-linux-arm64
             distro: ubuntu
             extension: tar.gz
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             container: debian:trixie
             artifact: pg_laswell-linux-x86_64-debian13
             distro: debian
@@ -71,7 +85,7 @@ jobs:
             artifact: pg_laswell-linux-arm64-debian13
             distro: debian
             extension: deb
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             container: rockylinux:9
             artifact: pg_laswell-linux-x86_64-rocky9
             distro: rocky
@@ -90,7 +104,7 @@ jobs:
             extension: tar.gz
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
@@ -130,6 +144,14 @@ jobs:
           dnf install -y epel-release dnf-plugins-core
           dnf config-manager --set-enabled crb
           dnf install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-9-$(uname -m)/pgdg-redhat-repo-latest.noarch.rpm
+          # PGDG's repo file points at a directory per MINOR release,
+          # rhel-$releasever_major.$releasever_minor, and PGDG prunes old ones:
+          # the rockylinux:9 image reports 9.3, and rhel-9.3-* (like 9.4 and
+          # 9.5) now answers 404, which failed both Rocky builds of
+          # v0.1.3-alpha1 with "All mirrors were tried". The major-version
+          # directory, rhel-9-*, is the one PGDG keeps, so point there.
+          sed -i 's#rhel-$releasever_major\.$releasever_minor-#rhel-$releasever_major-#g' \
+            /etc/yum.repos.d/pgdg-redhat-all.repo
           dnf module disable -y postgresql
           # Rocky 9's default gcc-c++ is GCC 11, which cannot build this at all
           # (C++23) and lacks the complete <format> that libpqxx 8.x needs.
@@ -182,6 +204,7 @@ jobs:
       # and the two could never be string-equal. The suffix is what marks the
       # GitHub release as a pre-release, in the publish job below.
       - name: The tag must match the project version
+        if: github.event_name != 'pull_request'
         run: |
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
           # Shape checked before it is taken apart. Without this a typo like
@@ -210,8 +233,8 @@ jobs:
       # actually conflict (see cpp/src/modules/README.md).
       - name: Build
         run: |
-          cmake -S cpp -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
-                -DPGLASWELL_MODULES=citus
+          cmake -S cpp -B build -DPGLASWELL_WERROR=ON -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
+                "-DPGLASWELL_MODULES=citus;pg_cron;pgvector;timescaledb"
           # BOTH binaries. The install rules name both, so a tree with only one
           # built either fails packaging or -- worse -- produces a package that
           # installs and has nothing to deploy with, which nobody would discover
@@ -223,6 +246,14 @@ jobs:
       # silent fall back to the platform's shared copy would produce a package
       # that installs and then cannot start. Assert it where it is actually
       # visible: the linker's own record.
+      # The hardening SafetyFlags.cmake asks for, read back from the ELF: full
+      # RELRO, a non-executable stack, stack canaries, fortified calls, PIE.
+      # After strip, because that is the binary that ships. Not on macOS:
+      # Mach-O is not ELF, and ld64 takes none of the -z flags.
+      - name: Both binaries carry the hardening that was asked for
+        if: matrix.distro != 'macos'
+        run: bash cpp/test/hardening-check.sh build/pg_laswell build/pg_laswell_mcp
+
       - name: libpqxx must be linked statically
         run: |
           # Both binaries link it, so both are checked: they are separate link
@@ -278,6 +309,26 @@ jobs:
           rpm -qp --requires ./*.rpm | grep -vE 'rpmlib|GLIBC|CXXABI|GLIBCXX|GCC_'
           mv pg-laswell-*.rpm ../${{ matrix.artifact }}.rpm
 
+      # An artifact's version is the project's declared version, read back from
+      # the package rather than trusted: the tag is checked against
+      # CMakeLists.txt above, and this closes the other half -- that what CPack
+      # wrote inside the package is that same number. A tarball carries none.
+      - name: The package's own version is the project's
+        if: matrix.extension != 'tar.gz'
+        run: |
+          WANT=$(grep -oE 'project\(pg_laswell_mcp VERSION [0-9.]+' cpp/CMakeLists.txt | grep -oE '[0-9.]+$')
+          case "${{ matrix.extension }}" in
+            deb) GOT=$(dpkg-deb -f ${{ matrix.artifact }}.deb Version) ;;
+            rpm) GOT=$(rpm -qp --queryformat '%{VERSION}' ${{ matrix.artifact }}.rpm) ;;
+          esac
+          echo "package version: $GOT   project version: $WANT"
+          # A packaging revision may follow the version (0.1.3-1); nothing
+          # may precede or replace it.
+          case "$GOT" in
+            "$WANT"|"$WANT"-*) ;;
+            *) echo "::error::the package says $GOT and the project says $WANT"; exit 1 ;;
+          esac
+
       # The listing is captured ONCE and then grepped, rather than piped into
       # `grep -q` three times. `grep -q` exits at the first match and closes the
       # pipe, which kills dpkg-deb's tar subprocess with SIGPIPE -- so a passing
@@ -305,7 +356,8 @@ jobs:
           esac
           for want in bin/pg_laswell bin/pg_laswell_mcp \
                       man1/pg_laswell.1 man1/pg_laswell_mcp.1 \
-                      man7/pg_laswell_citus.7 \
+                      man7/pg_laswell_citus.7 man7/pg_laswell_pg_cron.7 \
+                      man7/pg_laswell_pgvector.7 man7/pg_laswell_timescaledb.7 \
                       share/pg_laswell/bootstrap.sql; do
             printf '%s\n' "$LIST" | grep -q "$want" || {
               echo "::error::$want is missing from the package"; exit 1; }
@@ -344,8 +396,8 @@ jobs:
           "$BIN" --version
           # The modules the package promises. A release built without them
           # would install, answer, and refuse every citus_* specification.
-          "$BIN" --version | grep -qx 'modules: citus' || {
-            echo "::error::the installed binary does not carry the citus module"; exit 1; }
+          "$BIN" --version | grep -qx 'modules: citus,pg_cron,pgvector,timescaledb' || {
+            echo "::error::the installed binary does not carry every module"; exit 1; }
           OUT=$("$BIN" --call getSpecDigest --args "$SPEC")
           printf '%s\n' "$OUT" | grep -q '"digest"' || {
             echo "::error::the installed binary did not answer: $OUT"; exit 1; }
@@ -361,10 +413,44 @@ jobs:
             echo "::error::pg_laswell with no --repo exited $rc, expected 3"; exit 1; }
           echo "both binaries unpacked from the release artifact, and answered"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}.${{ matrix.extension }}
+          if-no-files-found: error
+
+  # FreeBSD packages, built in a VM on a Linux runner by the same script the
+  # freebsd job in tests.yml runs on every pull request: built, checked for a
+  # static libpqxx, packaged with cpack -G FREEBSD, installed with pkg add and
+  # run. One per supported FreeBSD major, because a package records the ABI it
+  # was built for (FreeBSD:14:amd64, FreeBSD:15:amd64) and pkg refuses another.
+  freebsd:
+    name: ${{ matrix.artifact }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - release: "14.5"
+            artifact: pg_laswell-freebsd14-amd64
+          - release: "15.1"
+            artifact: pg_laswell-freebsd15-amd64
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - name: Build, package and install on FreeBSD ${{ matrix.release }}
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: ${{ matrix.release }}
+          envs: 'PQXX_VERSION PQXX_SHA256'
+          usesh: true
+          run: sh .github/scripts/freebsd-build.sh ${{ matrix.artifact }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.pkg
           if-no-files-found: error
 
   # The published site: the landing page, the generated reference, and both man
@@ -373,10 +459,10 @@ jobs:
   # the deploy below is gated on a tag.
   site:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
       - name: Install mandoc
@@ -410,7 +496,7 @@ jobs:
           # one is a build failure rather than an empty box on a live site.
           python3 tools/check-mermaid.py site/index.html
           ls -la _site
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: _site
 
@@ -418,7 +504,7 @@ jobs:
     name: Publish the site
     needs: [site, publish]
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       pages: write
@@ -428,17 +514,19 @@ jobs:
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
       - id: deploy
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
 
   publish:
-    needs: build
-    runs-on: ubuntu-latest
+    needs: [build, freebsd]
+    # Never on a pull request: that run exists to prove the packages build.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
@@ -465,7 +553,7 @@ jobs:
       # failure does not cancel the others, which means a partial release is
       # exactly what would otherwise get published -- silently, and looking
       # complete.
-      - name: All seven artifacts must be present
+      - name: All nine artifacts must be present
         run: |
           missing=0
           for f in pg_laswell-linux-x86_64.tar.gz \
@@ -474,7 +562,9 @@ jobs:
                    pg_laswell-linux-arm64-debian13.deb \
                    pg_laswell-linux-x86_64-rocky9.rpm \
                    pg_laswell-linux-arm64-rocky9.rpm \
-                   pg_laswell-macos-arm64.tar.gz; do
+                   pg_laswell-macos-arm64.tar.gz \
+                   pg_laswell-freebsd14-amd64.pkg \
+                   pg_laswell-freebsd15-amd64.pkg; do
             [ -f "dist/$f" ] || { echo "::error::missing artifact $f"; missing=1; }
           done
           ls -l dist

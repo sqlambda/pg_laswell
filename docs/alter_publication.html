@@ -73,30 +73,9 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
 <nav class="crumb"><div class="l"><a href="index.html">Intent kinds</a><span>Replication</span></div><div class="r"><a href="create_publication.html">← create_publication</a><a href="drop_publication.html">drop_publication →</a></div></nav>
 <h1><code>alter_publication</code></h1>
 <h2>Synopsis</h2><pre>{
-  &quot;kind&quot;: &quot;alter_publication&quot;,
-  &quot;name&quot;: &lt;required&gt;,
-  &quot;tables&quot;: &lt;optional&gt;,
-  &quot;all_tables&quot;: &lt;optional&gt;,
-  &quot;operations&quot;: &lt;optional&gt;,
-  &quot;add_tables&quot;: &lt;optional&gt;,
-  &quot;drop_tables&quot;: &lt;optional&gt;,
-  &quot;publish_via_partition_root&quot;: &lt;optional&gt;
+  &quot;kind&quot;: &quot;alter_publication&quot;
 }</pre>
 <h2>Parameters</h2><dl class="params">
-<dt>name<span class="tag req">required</span></dt>
-<dd>&nbsp;</dd>
-<dt>tables<span class="tag opt">optional</span></dt>
-<dd>&nbsp;</dd>
-<dt>all_tables<span class="tag opt">optional</span></dt>
-<dd>&nbsp;</dd>
-<dt>operations<span class="tag opt">optional</span></dt>
-<dd>Lower case, one of insert, update, delete, truncate.</dd>
-<dt>add_tables<span class="tag opt">optional</span></dt>
-<dd>&nbsp;</dd>
-<dt>drop_tables<span class="tag opt">optional</span></dt>
-<dd>&nbsp;</dd>
-<dt>publish_via_partition_root<span class="tag opt">optional</span></dt>
-<dd>true publishes a change as the PARTITIONED table&#x27;s own row, so a subscriber may be an ordinary table; false — the PostgreSQL default — publishes the leaf partition, and the subscriber must have a partition of the same name.</dd>
 </dl>
 <div class="note">Any key not listed here is <strong>refused</strong>, not ignored: a key this binary skips and a newer one honours would be a silent difference between what was reviewed and what ran.</div>
 <h2>Examples</h2>

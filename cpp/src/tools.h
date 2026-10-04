@@ -106,7 +106,18 @@ inline json spec_error_payload(const SpecError& e) {
 // backends' identities still sees their ungranted locks, so pacing works while
 // the reported waiter is anonymous. That is `degraded`, not `denied`, and
 // saying so is the whole point of the tool.
-inline const char* kCheckPrivilegesSql = R"SQL(
+// The ledger part is asked by OID (session.h): by name, every one of these
+// raised "permission denied for schema laswell" for a role without USAGE on the
+// schema -- so the tool meant to say "this role cannot use the ledger" failed
+// instead of saying it. A table privilege without the schema's USAGE is not
+// one the role can use, so both are required for true -- except for
+// canWriteTrustedKey, which reports the table privilege alone: it feeds the
+// "can grant itself trust" warning, and one GRANT USAGE would complete it.
+inline std::string check_privileges_sql() {
+  const auto tk = laswell_relation_oid_sql("trusted_key");
+  const auto job = laswell_relation_oid_sql("job");
+  const std::string usage = kLaswellSchemaUsableSql;
+  return R"SQL(
 SELECT JSONB_BUILD_OBJECT(
   'role', current_user,
   'isSuperuser', (SELECT usesuper FROM pg_user WHERE usename = current_user),
@@ -114,21 +125,23 @@ SELECT JSONB_BUILD_OBJECT(
      'pg_monitor',        pg_has_role(current_user, 'pg_monitor', 'MEMBER'),
      'pg_read_all_stats', pg_has_role(current_user, 'pg_read_all_stats', 'MEMBER')),
   'ledger', JSONB_BUILD_OBJECT(
-     'schemaPresent', to_regclass('laswell.trusted_key') IS NOT NULL,
-     'canReadTrustedKey', CASE WHEN to_regclass('laswell.trusted_key') IS NULL
-        THEN NULL ELSE has_table_privilege('laswell.trusted_key', 'SELECT') END,
-     'canWriteTrustedKey', CASE WHEN to_regclass('laswell.trusted_key') IS NULL
-        THEN NULL ELSE has_table_privilege('laswell.trusted_key', 'INSERT') END,
-     'canWriteJob', CASE WHEN to_regclass('laswell.job') IS NULL
-        THEN NULL ELSE has_table_privilege('laswell.job', 'INSERT') END),
+     'schemaPresent', )SQL" + tk + R"SQL( IS NOT NULL,
+     'schemaUsable', )SQL" + usage + R"SQL(,
+     'canReadTrustedKey', CASE WHEN )SQL" + tk + R"SQL( IS NULL THEN NULL
+        ELSE )SQL" + usage + R"SQL( AND has_table_privilege()SQL" + tk + R"SQL(, 'SELECT') END,
+     'canWriteTrustedKey', CASE WHEN )SQL" + tk + R"SQL( IS NULL THEN NULL
+        ELSE has_table_privilege()SQL" + tk + R"SQL(, 'INSERT') END,
+     'canWriteJob', CASE WHEN )SQL" + job + R"SQL( IS NULL THEN NULL
+        ELSE )SQL" + usage + R"SQL( AND has_table_privilege()SQL" + job + R"SQL(, 'INSERT') END),
   'isStandby', pg_is_in_recovery()
 )
 )SQL";
+}
 
 inline json check_privileges(ToolContext& ctx, const json& args) {
   const auto& cfg = ctx.connection(args);
   ReadSession s(cfg, std::nullopt, ctx.cache, 2000);
-  const auto r = s.txn().exec(kCheckPrivilegesSql);
+  const auto r = s.txn().exec(check_privileges_sql());
   json out = json::parse(r[0][0].as<std::string>());
   out["serverVersion"] = s.server_version();
 
@@ -141,6 +154,15 @@ inline json check_privileges(ToolContext& ctx, const json& args) {
         "counted -- pg_locks and pg_blocking_pids() are visible to any role -- "
         "so pacing works, but a waiter will be reported anonymously. Do not "
         "read that as 'nobody is waiting'.");
+  }
+  if (out["ledger"].value("schemaPresent", false) &&
+      !out["ledger"].value("schemaUsable", false)) {
+    notes.push_back(
+        "denied: the ledger is installed, but this role has no USAGE on the "
+        "laswell schema, so it can neither read what was applied nor record a "
+        "migration. bootstrap.sql grants the ledger to the role named in "
+        "laswell_role; re-run it with -v laswell_role=" +
+        out.value("role", std::string("<this role>")) + ", or apply as that role.");
   }
   if (out["ledger"].value("schemaPresent", false) &&
       out["ledger"].value("canWriteTrustedKey", false)) {
@@ -331,12 +353,74 @@ struct RehearsalInputs {
   // A step whose statements change the schema through a SELECT, and so must be
   // EXECUTED to be rehearsed. See Catalog::verify_statement.
   std::vector<bool> execute;
+  // Checks a step asks to have made in ANOTHER database of the same server
+  // (detail.rehearse_elsewhere): {step, database, sql[]}. A pg_cron job
+  // scheduled from the maintenance database runs somewhere else, and whether
+  // its command can work is only answerable there.
+  std::vector<json> elsewhere;
 };
+// One step's check in another database: connect there as the same role, run
+// the statements in a transaction, roll it back. A statement the server
+// refuses is a problem of that step; so is not being able to get there, said
+// as what it is rather than left to look like a clean check.
+inline void rehearse_elsewhere(const ConnConfig& cfg, const json& e, Catalog::DryRun& dry) {
+  const auto database = e.value("database", "");
+  const int step = e.value("step", -1);
+  ConnConfig there = cfg;
+  there.conninfo = with_dbname(cfg.conninfo, database);
+  there.dbname = database;
+  std::string current;
+  try {
+    WriteSession session(there);
+    session.begin("pg_laswell/dry-run elsewhere (rolled back)");
+    for (const auto& q : e.value("sql", json::array())) {
+      current = q.get<std::string>();
+      session.txn().exec(current);
+    }
+    session.rollback();
+  } catch (const pqxx::sql_error& err) {
+    dry.problems.push_back(Catalog::Problem{step, std::string(err.sqlstate()),
+                                            Catalog::server_message(err.what()),
+                                            "in database " + database + ": " + current});
+  } catch (const std::exception& err) {
+    dry.problems.push_back(Catalog::Problem{
+        step, "", std::string("could not check in database ") + database + ": " + err.what(),
+        current});
+  }
+}
+
 inline RehearsalInputs rehearsal_inputs(const Plan& plan) {
   RehearsalInputs r;
   for (const auto& step : plan.steps) {
     if (step.action != Action::kApply) continue;
-    r.steps.emplace_back(step.ordinal, step.sql);
+    // Rehearsed with the maintenance_work_mem it will run with, exactly as the
+    // executor sets it on a transactional step -- a dry run that runs a step
+    // with other settings than the real one is not rehearsing it.
+    const int mwm = step.detail.value("maintenance_work_mem_mb", 0);
+    if (mwm > 0 && step.txn_class != TxnClass::kForbidden &&
+        !step.detail.contains("copy_rows")) {
+      std::vector<std::string> sql = {"SET LOCAL maintenance_work_mem = '" +
+                                      std::to_string(mwm) + "MB';"};
+      sql.insert(sql.end(), step.sql.begin(), step.sql.end());
+      sql.push_back("SET LOCAL maintenance_work_mem TO DEFAULT;");
+      r.steps.emplace_back(step.ordinal, sql);
+    } else {
+      r.steps.emplace_back(step.ordinal, step.sql);
+    }
+    // Statements a step wants run in the REHEARSAL only, after its own, inside
+    // the same rolled-back transaction: a check that must see what the step
+    // and the ones before it made, and that has no business in the real run or
+    // in the ledger's record of it. Only for a step that is rehearsed at all.
+    if (step.txn_class != TxnClass::kForbidden && step.detail.contains("rehearse_only")) {
+      for (const auto& q : step.detail["rehearse_only"]) {
+        r.steps.back().second.push_back(q.get<std::string>());
+      }
+    }
+    if (step.detail.contains("rehearse_elsewhere")) {
+      json e = step.detail["rehearse_elsewhere"];
+      e["step"] = step.ordinal;
+      r.elsewhere.push_back(std::move(e));
+    }
     r.forbidden.push_back(step.txn_class == TxnClass::kForbidden);
     r.copy_payloads.push_back(step.detail.contains("copy_rows") ? step.detail : json());
     r.execute.push_back(step.detail.value("rehearse_by", "") == "execution");
@@ -381,8 +465,16 @@ inline json plan_migration_tool(ToolContext& ctx, const json& args) {
   // be tried before it is trusted.
   if (plan.ok && args.value("dryRun", true)) {
     const auto inputs = detail::rehearsal_inputs(plan);
-    const auto dry = cat.dry_run(inputs.steps, inputs.forbidden, obs.server_version,
-                                 inputs.copy_payloads, inputs.execute);
+    auto dry = cat.dry_run(inputs.steps, inputs.forbidden, obs.server_version,
+                           inputs.copy_payloads, inputs.execute);
+    // Checks in another database of the same server, each in its own
+    // transaction there, rolled back. That database is read as it is NOW: this
+    // dry run's own changes are in a transaction it cannot see.
+    if (dry.ran) {
+      for (const auto& e : inputs.elsewhere) {
+        detail::rehearse_elsewhere(cfg, e, dry);
+      }
+    }
     json d{{"ran", dry.ran},
            {"unverifiedSteps", dry.unverified_steps},
            {"note",
@@ -560,6 +652,17 @@ class ChainRehearsal {
       const auto result = Catalog::rehearse_steps(
           txn, inputs.steps, inputs.forbidden, link.server_version,
           inputs.copy_payloads, dry, link.skipped_any, inputs.execute);
+      // A check in ANOTHER database is not made in a chain: what it would look
+      // for there may be something an earlier specification of this very chain
+      // creates, inside a transaction of its own that is not committed. Listed
+      // as unverified rather than failed on a database it cannot see.
+      for (const auto& e : inputs.elsewhere) {
+        const int ordinal = e.value("step", -1);
+        if (std::find(dry.unverified_steps.begin(), dry.unverified_steps.end(), ordinal) ==
+            dry.unverified_steps.end()) {
+          dry.unverified_steps.push_back(ordinal);
+        }
+      }
 
       json r{{"unverifiedSteps", dry.unverified_steps}};
       if (!dry.weak_verification.empty()) r["weakVerification"] = dry.weak_verification;

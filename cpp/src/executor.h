@@ -315,6 +315,10 @@ inline BatchOutcome run_grouped_batch(pqxx::work& txn,
   return out;
 }
 
+// What a vendor module can read after a job fails, at namespace scope so the
+// class below can name it. Empty when no module has one.
+#include "modules/enabled_after_failure_headers.h"
+
 class Executor {
  public:
   Executor(ConnConfig cfg, std::shared_ptr<Job> job, Ledger* ledger,
@@ -481,6 +485,17 @@ class Executor {
   void run_in_transaction(WriteSession& w, int ordinal, const json& step) {
     const auto started = detail::steady_ms();
     long long rows = 0;
+    // maintenance_work_mem, when the planner decided this step uses it. The
+    // planner has always marked plain index builds and VALIDATE steps with it,
+    // and only the non-transactional path applied it -- so a step inside a
+    // transaction ran with the server's setting while the plan said
+    // otherwise (found 2026-10-02, adding pgvector's raise). SET LOCAL works
+    // here, unlike on a nontransaction; and it is put back after the step,
+    // because the steps after it share the transaction and do not use it.
+    const int mwm = step.value("detail", json::object()).value("maintenance_work_mem_mb", 0);
+    if (mwm > 0) {
+      w.txn().exec("SET LOCAL maintenance_work_mem = '" + std::to_string(mwm) + "MB'");
+    }
     for (const auto& raw : step.value("sql", json::array())) {
       const auto stmt = detail::strip_semicolon(raw.get<std::string>());
       if (stmt.empty()) continue;
@@ -507,6 +522,7 @@ class Executor {
         throw;
       }
     }
+    if (mwm > 0) w.txn().exec("SET LOCAL maintenance_work_mem TO DEFAULT");
     record_step(ordinal, step, "succeeded", rows,
                 json{{"elapsedMs", detail::steady_ms() - started}});
   }
@@ -1184,13 +1200,39 @@ class Executor {
     job_->state = JobState::kCancelled;
   }
 
-  void fail(const json& error) {
+  // What the failure may have left behind, asked of every enabled module that
+  // has something to ask (Citus: prepared transactions on the workers), on a
+  // connection of its own -- the job's may be the thing that broke. Read-only,
+  // bounded by the statement timeout, and never allowed to turn one failure
+  // into two: if the reading itself fails, the error says so and nothing more.
+  json left_behind(json error) const {
+#define PGLASWELL_AFTER_FAILURE(module_name, applies_sql, reading_sql, hint_text)    \
+    try {                                                                              \
+      ReadSession s(cfg_, kAfterFailureTimeoutMs);                                     \
+      const auto a = s.txn().exec(applies_sql);                                        \
+      if (!a.empty() && a[0][0].as<bool>()) {                                          \
+        const auto r = s.txn().exec(reading_sql);                                      \
+        if (!r.empty() && !r[0][0].is_null()) {                                        \
+          error["left_behind"][module_name] = json::parse(r[0][0].as<std::string>()); \
+          error["left_behind_hint"][module_name] = hint_text;                          \
+        }                                                                              \
+      }                                                                                \
+    } catch (const std::exception& e) {                                                \
+      error["left_behind_unread"][module_name] = e.what();                             \
+    }
+#include "modules/enabled_after_failures.h"
+#undef PGLASWELL_AFTER_FAILURE
+    return error;
+  }
+
+  void fail(const json& raw) {
     // The state this job is ending in, decided before it is published: an
     // abort for contention keeps its own state rather than being overwritten
     // with a generic failure.
     const auto ending = job_->state.load() == JobState::kAbortedContention
                             ? JobState::kAbortedContention
                             : JobState::kFailed;
+    const json error = left_behind(raw);
     {
       std::lock_guard<std::mutex> lock(job_->m);
       job_->error = error;
@@ -1200,6 +1242,8 @@ class Executor {
     }
     job_->state = ending;
   }
+
+  static constexpr int kAfterFailureTimeoutMs = 5000;
 
   ConnConfig cfg_;
   std::shared_ptr<Job> job_;

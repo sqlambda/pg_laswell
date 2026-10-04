@@ -43,12 +43,15 @@ required, and a build naming the module fails at configure time without them.
 | `module.h` | yes | Includes the parse surface (`parse.h`, `observer.h`); `spec.h` pulls it in. |
 | `parse.h` | yes | `parse_<kind>()` per kind, using `reject_unknown_keys` like core does |
 | `plan.h` | yes | `plan_<kind>()` per kind. **Must be pure** -- no pqxx, no clock, no connection |
-| `observe.h` | yes | `k<name>PresentSql` and `k<name>ObservationSql`: one query, gathered into `Observations::extensions["<name>"]` |
+| `observe.h` | yes | `k<name>PresentSql`, `k<name>ObservationSql` and `k<name>AbsentSql`: one query, gathered into `Observations::extensions["<name>"]`; the absent one (usually `nullptr`) is what to read where the extension is not installed |
 | `../../man/pg_laswell_<name>.7` | yes | The module's own page: its kinds are absent from a stock build, so the core page cannot list them |
 | `keys.inc` | no | Object keys and conflict edges for kinds that plan against something other than a table |
 | `project.h` + `project.inc` | no | What a step leaves for later steps in the same plan -- written into the module's OWN slot only |
-| `guard.h` | no | `<name>_plan_refusals(spec, obs, refuse)`: refusals true of the whole topology |
+| `guard.h` | no | `<name>_plan_refusals(spec, obs, budget, refuse, advise)`: refusals true of the whole topology, and advisories |
 | `confine.h` | no | `<name>_required_confinement(obs, table)`: the one reading core's paced walks consult |
+| `index.h` | no | `<name>_index_traits(obs, table, intent) -> IndexTraits`: how an index may be built and dropped on this table -- concurrently or not, by a per-part option, and the data's real size |
+| `constraint.h` | no | `<name>_constraint_traits(obs, table) -> ConstraintTraits`: whether a constraint on this table can be validated in a step of its own, the vendor's refusal in its words, and the data's real size |
+| `after_failure.h` | no | `k<name>AfterFailureAppliesSql`, `k<name>AfterFailureSql`, `k<name>AfterFailureHint`: a read-only query the executor runs when a job fails, on its own connection, whose result is added to the job's error as `left_behind` (Citus: prepared transactions on the nodes) |
 | `observer.h` | no | Where contention is visible when it is not in `pg_locks` (Citus: on the workers) |
 | `tests.inc` | no, in practice yes | Deferred-case reasons and one representative body per kind, for core's coverage tests |
 | `tests_planner.inc` | no, in practice yes | The module's planner tests, compiled into the test binary only when it is enabled |
@@ -88,6 +91,22 @@ keeps the design safe rather than merely tidy.
   core's `backfill` and `delete_rows` then walk it one value at a time, which is
   what makes their `FOR UPDATE` single-shard. The module contributes a column
   name. Every statement is core's.
+- **informing, again** -- the second question, asked through `index.h`
+  (2026-10-02, for TimescaleDB): *how may an index be built and dropped on this
+  table?* The answer is facts: whether CONCURRENTLY works there, the name of a
+  storage parameter that builds one part at a time and whether it takes UNIQUE,
+  and the data's real size when the relation's own relpages does not hold it.
+  Core decides from them -- plain, per-part or, for UNIQUE, plain with a warning
+  -- and emits every statement; the module contributes a parameter NAME, which
+  core validates as a (namespaced) identifier before it reaches SQL, the way
+  `confine.h` contributes a column name. The step records `index_build_by`.
+- **informing, a third time** -- asked through `constraint.h` (2026-10-03, for
+  TimescaleDB): *can a constraint on this table be validated in a step of its
+  own?* Where VALIDATE CONSTRAINT is refused, `NOT VALID` then `VALIDATE` would
+  commit the first step and fail on the second, so core validates in the
+  statement that adds the constraint and says what that lock costs. The answer
+  holds no SQL at all: a boolean, the vendor's message, a size and a scope for
+  the lock text. The step records `validated_in_one_step_by`.
 
 **Forbidden: a module may not emit or rewrite SQL for a CORE kind, and may not
 shape a plan for a table it has no reading about.**
@@ -158,14 +177,23 @@ weaker than "I tried to break it":
 | `TOPOLOGY` merge | counts only ever raised | compliant |
 | `OBSERVE` | writes only `extensions[<module>]` | compliant |
 | `CONFINEMENT` | a function `(const Observations&, table) -> column`; it cannot reach the plan or name another table | compliant by construction |
+| `INDEX_TRAITS` | a function `(const Observations&, table) -> IndexTraits`, a struct of facts; the one string in it that reaches SQL is validated by core as a (namespaced) identifier, and anything else throws | compliant by construction |
+| `CONSTRAINT_TRAITS` | a function `(const Observations&, table) -> ConstraintTraits`, a struct of facts; none of it reaches SQL -- the strings go into the step's lock and reason text only | compliant by construction |
 
 Every close is the same move, and it is the only one worth making: **pass a hook
 what it may touch, and nothing else.** A block that expands inside someone
 else's scope inherits every name in it, and then compliance is discipline. A
 function inherits its parameters, and then compliance is the signature.
 
-**The plan guard** is a function taking `(spec, obs, refuse)`. `plan` is not
-passed, so a guard can say no and say why, and nothing else.
+**The plan guard** is a function taking `(spec, obs, budget, refuse, advise)`.
+`plan` is not passed, so a guard can say no and say why, or add an ADVISORY,
+and nothing else. An advisory (added 2026-10-01, for pgvector and pg_cron) is a
+sentence shown beside the warnings and erased from `planDigest`, like the
+budget: it exists for facts that move on their own -- a table's reltuples, a
+job's last run, a job edited by hand -- which must not make planMigration and
+startMigration disagree. Both callbacks append a string; neither can reach a
+step. `budget` is passed read-only so a guard can say what
+`maintenance_work_mem` core will give a step, which core decides there.
 
 **The projection hook** calls a function taking `(in, qualified, step, json& mine)`,
 where `mine` is the module's own subtree of `Observations::extensions`. The
@@ -240,6 +268,11 @@ it. Say the vendor is called `acme`.
    empty one. A reading must never raise on a healthy but unusual server: the
    Citus rebalance plan is wrapped in a `CASE` because the function raises when
    no node may hold shards, and an error there would fail every plan.
+   `k<name>AbsentSql` is what to read when the probe says the extension is not
+   installed here; `nullptr` leaves the key absent. pg_cron is the one that
+   needs it: the extension lives in one database per cluster, every other
+   database must still be able to say which one, and the observation query
+   names `cron.job`, which does not parse where the `cron` schema is missing.
 
 5. **Plan** in `acme/plan.h`, as a pure function. Each kind decides three things
    from the reading: is it already done (`kSatisfied` -- re-running a
@@ -247,6 +280,12 @@ it. Say the vendor is called `acme`.
    do what is already done), is it refused (`kConflict`, with the vendor's own
    error quoted and what to do instead), or what exactly runs (`kApply`).
    Then classify it honestly:
+   - `detail["rehearse_only"]`, a list of statements the dry run runs after
+     the step's own, in the same rolled-back transaction, and the real run
+     never does -- a check, not a change. pg_cron uses it to have PostgreSQL
+     analyse a job's command without running it. `detail["rehearse_elsewhere"]`
+     (`{database, sql}`) is the same check made in another database of the
+     same server, over a second connection, for a job that runs elsewhere.
    - `TxnClass::kRequired` plus `detail["rehearse_by"] = "execution"` when the
      call is a `SELECT` that changes the catalog and rolls back cleanly --
      measured, not assumed. The dry run then executes it and rolls it back.
@@ -277,7 +316,7 @@ it. Say the vendor is called `acme`.
 
 The released package, `pg-laswell`, carries every module:
 
-    cmake -S cpp -B build -DPGLASWELL_MODULES=citus
+    cmake -S cpp -B build -DPGLASWELL_MODULES="citus;pg_cron;pgvector;timescaledb"
 
 A module is safe to carry on servers without its extension. Its kinds are
 prefixed with its vendor's name, its reading is absent when the extension is

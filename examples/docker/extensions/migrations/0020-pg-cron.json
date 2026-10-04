@@ -1,0 +1,11 @@
+{
+  "laswell_spec_version": 1,
+  "id": "0020-pg-cron",
+  "description": "pg_cron, in the database it keeps its jobs in.",
+  "rationale": "Which database that is, is the server's setting (cron.database_name), so this targets the connection named cron and the configuration says where that is.",
+  "target": { "connection": "cron" },
+  "intents": [
+    { "kind": "create_extension", "name": "pg_cron",
+      "comment": "pg_cron: jobs on a schedule, run by the server." }
+  ]
+}

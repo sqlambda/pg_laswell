@@ -80,7 +80,8 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
   &quot;command&quot;: &lt;optional&gt;,
   &quot;roles&quot;: &lt;optional&gt;,
   &quot;using&quot;: &lt;optional&gt;,
-  &quot;check&quot;: &lt;optional&gt;
+  &quot;check&quot;: &lt;optional&gt;,
+  &quot;comment&quot;: &lt;optional&gt;
 }</pre>
 <h2>Parameters</h2><dl class="params">
 <dt>schema<span class="tag req">required</span></dt>
@@ -97,18 +98,21 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
 <dd>A policy with neither restricts nothing and grants nothing; it is almost certainly not what was meant.</dd>
 <dt>check<span class="tag opt">optional</span></dt>
 <dd>&nbsp;</dd>
+<dt>comment<span class="tag opt">optional</span></dt>
+<dd>It becomes the object&#x27;s COMMENT ON, in the same transaction that creates it. Omit the key to leave the object uncommented.</dd>
 </dl>
 <div class="note">Any key not listed here is <strong>refused</strong>, not ignored: a key this binary skips and a newer one honours would be a silent difference between what was reviewed and what ran.</div>
 <h2>Examples</h2>
 <p>From the conformance suite, which plans this intent and <em>applies</em> it to a real PostgreSQL on every test run:</p>
 <pre>{
  &quot;kind&quot;: &quot;create_policy&quot;,
+ &quot;comment&quot;: &quot;documented by create_policy&quot;,
  &quot;schema&quot;: &quot;cf&quot;,
  &quot;table&quot;: &quot;t&quot;,
  &quot;name&quot;: &quot;p_all&quot;,
  &quot;using&quot;: &quot;true&quot;
 }</pre>
-<p>Afterwards, <code>SELECT count(*)::text FROM pg_policy WHERE polname=&#x27;p_all&#x27;</code> returns <code>1</code>.</p>
+<p>Afterwards, <code>SELECT count(*)::text || &#x27;:&#x27; || COALESCE(max(obj_description(oid, &#x27;pg_policy&#x27;)), &#x27;none&#x27;) FROM pg_policy WHERE polname=&#x27;p_all&#x27;</code> returns <code>1:documented by create_policy</code>.</p>
 <h2>See also</h2><p><a href="set_row_security.html"><code>set_row_security</code></a>, <a href="drop_policy.html"><code>drop_policy</code></a>, <a href="alter_policy.html"><code>alter_policy</code></a></p>
 <footer>Generated from <code>cpp/src/spec.h</code> and <code>cpp/src/conformance.inc</code> by <code>tools/gen-manual.py</code>. The manual page <code>pg_laswell_mcp(1)</code> remains the authoritative reference for everything that is not a per-kind option.</footer>
 </div></body></html>

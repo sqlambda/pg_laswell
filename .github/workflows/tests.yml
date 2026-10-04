@@ -12,6 +12,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# Runners are pinned to ubuntu-24.04, not ubuntu-latest: the label moves to
+# Ubuntu 26 on 2026-10-19, and a test matrix should change image when someone
+# decides to, in a commit that says so -- not in the middle of a release.
 env:
   DEBIAN_FRONTEND: noninteractive
   # Pinned, and built from source by .github/actions/libpqxx rather than taken
@@ -36,7 +39,7 @@ jobs:
   # beyond libpq.
   build:
     name: build-${{ matrix.config }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     strategy:
       fail-fast: false
@@ -67,7 +70,7 @@ jobs:
           - config: address-undefined
             compiler: g++
             sanitizer: ADDRESS_UNDEFINED
-            modules: citus
+            modules: citus;pg_cron;pgvector;timescaledb
             tools: false
           # THREAD is a gate for this project rather than belt-and-braces: a
           # worker thread per job plus one process-wide observer against a
@@ -75,11 +78,11 @@ jobs:
           - config: thread
             compiler: g++
             sanitizer: THREAD
-            modules: citus
+            modules: citus;pg_cron;pgvector;timescaledb
             tools: false
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install dependencies
         run: |
           sudo apt-get update -o DPkg::Lock::Timeout=300
@@ -91,10 +94,11 @@ jobs:
         with:
           version: ${{ env.PQXX_VERSION }}
           sha256: ${{ env.PQXX_SHA256 }}
+          compiler: ${{ matrix.compiler }}
 
       - name: Configure
         run: |
-          cmake -S cpp -B build -G Ninja \
+          cmake -S cpp -B build -DPGLASWELL_WERROR=ON -G Ninja \
             -DCMAKE_CXX_COMPILER=${{ matrix.compiler }} \
             -DPGLASWELL_SANITIZER=${{ matrix.sanitizer }} \
             "-DPGLASWELL_MODULES=${{ matrix.modules }}"
@@ -113,13 +117,13 @@ jobs:
         if: matrix.tools
         run: ctest --test-dir build -R 'manpage_lint|no_dangling_items|plans' --output-on-failure
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: test-binary-${{ matrix.config }}
           path: build/pg_laswell_mcp_test
           retention-days: 1
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: matrix.tools
         with:
           name: tools-plain
@@ -134,7 +138,7 @@ jobs:
   test:
     name: ${{ matrix.config }} / PostgreSQL ${{ matrix.pg }}
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -164,12 +168,12 @@ jobs:
       # The suite shells out to psql to install the ledger, and reads
       # sql/bootstrap.sql through a path baked in at compile time, so the source
       # tree has to be present even though nothing here is compiled.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install runtime dependencies
         run: |
           sudo apt-get update -o DPkg::Lock::Timeout=300
           sudo apt-get install -y --no-install-recommends libpq5 postgresql-client
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: test-binary-${{ matrix.config }}
           path: build
@@ -186,7 +190,7 @@ jobs:
   sanitizers:
     name: ${{ matrix.config }}
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -202,12 +206,12 @@ jobs:
           --health-timeout 5s --health-retries 10
         ports: ['5432:5432']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install runtime dependencies
         run: |
           sudo apt-get update -o DPkg::Lock::Timeout=300
           sudo apt-get install -y --no-install-recommends libpq5 postgresql-client
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: test-binary-${{ matrix.config }}
           path: build
@@ -226,7 +230,7 @@ jobs:
   # EVP handle lifetimes are the one place with manual C resource management.
   valgrind:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 40
     # Sharded because it ran serially for 12 minutes while every other job had
     # been finished for ten of them, and it is embarrassingly parallel: four
@@ -250,12 +254,12 @@ jobs:
           --health-timeout 5s --health-retries 10
         ports: ['5432:5432']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install runtime dependencies
         run: |
           sudo apt-get update -o DPkg::Lock::Timeout=300
           sudo apt-get install -y --no-install-recommends libpq5 valgrind postgresql-client
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: test-binary-plain-gcc
           path: build
@@ -293,7 +297,7 @@ jobs:
   # code is the whole point of it. Runs once: it does not vary by server major.
   call_mode:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     services:
       postgres:
@@ -305,12 +309,12 @@ jobs:
           --health-timeout 5s --health-retries 10
         ports: ['5432:5432']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install runtime dependencies
         run: |
           sudo apt-get update -o DPkg::Lock::Timeout=300
           sudo apt-get install -y --no-install-recommends libpq5 postgresql-client
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: tools-plain
           path: build
@@ -326,10 +330,10 @@ jobs:
   # service container.
   replication:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install runtime dependencies
         run: |
           sudo apt-get update -o DPkg::Lock::Timeout=300
@@ -344,7 +348,7 @@ jobs:
   # that the refusal HAPPENS -- not that the incompatibility is absent.
   pooled:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     services:
       postgres:
@@ -356,12 +360,12 @@ jobs:
           --health-timeout 5s --health-retries 10
         ports: ['5432:5432']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install runtime dependencies
         run: |
           sudo apt-get update -o DPkg::Lock::Timeout=300
           sudo apt-get install -y --no-install-recommends libpq5 pgbouncer postgresql-client
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: tools-plain
           path: build
@@ -373,10 +377,10 @@ jobs:
   # Independent of the fan-out: a package is built from a Release tree with
   # testing off, which is a different configuration from any of the four above.
   packages:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install dependencies
         run: |
           sudo apt-get update -o DPkg::Lock::Timeout=300
@@ -390,12 +394,17 @@ jobs:
           sha256: ${{ env.PQXX_SHA256 }}
       - name: Build packages
         run: |
-          cmake -S cpp -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+          cmake -S cpp -B build -DPGLASWELL_WERROR=ON -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
           # BOTH binaries: the install rules name both, so cpack fails on a tree
           # where only one was built -- and a package missing the deployment
           # binary would not be noticed until somebody tried to deploy with it.
           cmake --build build --target pg_laswell pg_laswell_mcp
           cd build && cpack -G DEB && cpack -G RPM && cpack -G TGZ
+      # What reached the binaries, read from the ELF, on the same Release
+      # configuration the release builds -- the test jobs build without a
+      # build type, where _FORTIFY_SOURCE does not apply.
+      - name: Both binaries carry the hardening that was asked for
+        run: bash cpp/test/hardening-check.sh build/pg_laswell build/pg_laswell_mcp
       - name: The package must carry both binaries, both manuals and bootstrap.sql
         shell: bash
         run: |
@@ -457,7 +466,7 @@ jobs:
           set +e; pg_laswell >/dev/null 2>&1; rc=$?; set -e
           [ "$rc" -eq 3 ] || {
             echo "::error::pg_laswell with no --repo exited $rc, expected 3"; exit 1; }
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: packages
           path: |
@@ -493,7 +502,7 @@ jobs:
   twin_clusters:
     name: twin clusters
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     services:
       postgres:
@@ -514,12 +523,12 @@ jobs:
           --health-timeout 5s --health-retries 10
         ports: ['5433:5432']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install runtime dependencies
         run: |
           sudo apt-get update -o DPkg::Lock::Timeout=300
           sudo apt-get install -y --no-install-recommends libpq5 postgresql-client
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: test-binary-plain-gcc
           path: build
@@ -544,7 +553,7 @@ jobs:
   # fetch-depth: 0 because the script reads that script out of git.
   ledger_upgrade:
     name: ledger upgrade
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     services:
       postgres:
@@ -556,7 +565,7 @@ jobs:
           --health-timeout 5s --health-retries 10
         ports: ['5432:5432']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Install runtime dependencies
@@ -590,10 +599,10 @@ jobs:
   examples:
     name: examples
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install runtime dependencies
         run: |
           sudo apt-get update -o DPkg::Lock::Timeout=300
@@ -603,7 +612,7 @@ jobs:
       # pg_laswell, and that split is the thing the tool exists to keep. The
       # test artifact carries pg_laswell_mcp_test and neither of them, which is
       # how this job first failed on `chmod: cannot access build/pg_laswell`.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: tools-plain
           path: build
@@ -662,10 +671,10 @@ jobs:
   #     reporting every function "already distributed" while routing nothing.
   citus:
     name: citus
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install dependencies
         run: |
           sudo apt-get update -o DPkg::Lock::Timeout=300
@@ -678,12 +687,12 @@ jobs:
           version: ${{ env.PQXX_VERSION }}
           sha256: ${{ env.PQXX_SHA256 }}
       - name: Configure with the citus module
-        run: cmake -S cpp -B build -G Ninja -DPGLASWELL_MODULES=citus
+        run: cmake -S cpp -B build -DPGLASWELL_WERROR=ON -G Ninja "-DPGLASWELL_MODULES=citus;pg_cron;pgvector;timescaledb"
       - name: Build everything
         run: cmake --build build
       - name: The binary says which modules it carries
         run: |
-          ./build/pg_laswell_mcp --version | tee /dev/stderr | grep -q '^modules: citus$'
+          ./build/pg_laswell_mcp --version | tee /dev/stderr | grep -q '^modules: citus,pg_cron,pgvector,timescaledb$'
       - name: The suite that needs no database, with the module in it
         run: ./build/pg_laswell_mcp_test
       - name: Manuals, source checks and plan transcripts, with the module in it
@@ -726,6 +735,211 @@ jobs:
         if: always()
         run: docker compose -f examples/docker/citus/compose.yml down -v
 
+  # pg_cron and pgvector, against PostgreSQL with both extensions: two servers,
+  # because pg_cron is kept two ways -- in a maintenance database, jobs for the
+  # application scheduled from there, or in the application database itself --
+  # and the module supports both. The modules' refusals are unit-tested in the
+  # citus job's build already; this proves what only a server can:
+  #
+  #   - every refusal pre-empts an error the server REALLY raises. The refused
+  #     statement is run by hand as well and must fail with the message the
+  #     refusal quotes, so an extension release that lifts a limit fails here;
+  #   - what is not refused is accepted -- the dry run executes it;
+  #   - the example applies one set of signed specifications to both layouts,
+  #     and the reading that runs for every plan does not break a role that
+  #     cannot read cron.database_name (measured: it needs pg_read_all_settings).
+  extensions:
+    name: extensions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -o DPkg::Lock::Timeout=300
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build libpq-dev nlohmann-json3-dev \
+            libgtest-dev libssl-dev mandoc postgresql-client openssl
+      - name: Build libpqxx from source, not from apt
+        uses: ./.github/actions/libpqxx
+        with:
+          version: ${{ env.PQXX_VERSION }}
+          sha256: ${{ env.PQXX_SHA256 }}
+      - name: Configure with every module
+        run: cmake -S cpp -B build -DPGLASWELL_WERROR=ON -G Ninja "-DPGLASWELL_MODULES=citus;pg_cron;pgvector;timescaledb"
+      - name: Build the binaries
+        run: cmake --build build --target pg_laswell pg_laswell_mcp
+      - name: Start PostgreSQL with pg_cron and pgvector
+        run: |
+          docker compose -f examples/docker/extensions/compose.yml up -d --build
+          for i in $(seq 1 90); do
+            ok=0
+            for c in laswell_cron_central laswell_cron_local; do
+              docker exec "$c" pg_isready -U postgres -d app -q 2>/dev/null && ok=$((ok+1))
+            done
+            [ "$ok" = 2 ] && break
+            sleep 2
+          done
+          [ "$ok" = 2 ] || { echo "::error::the extension servers did not come up"; exit 1; }
+      - name: The extensions example, both layouts
+        env:
+          PG_LASWELL: ${{ github.workspace }}/build/pg_laswell
+          PG_LASWELL_MCP: ${{ github.workspace }}/build/pg_laswell_mcp
+          PGPASSWORD: laswell
+        run: |
+          ./examples/docker/extensions/run.sh | tee example.log
+          grep -q 'repository : 0 pending' example.log \
+            || { echo "::error::the second run had something to do"; exit 1; }
+          # The ledger-backed advisory: a job edited by hand, noticed on a plan
+          # for something else entirely.
+          grep -q 'changed by hand since' example.log \
+            || { echo "::error::the hand-edited job was not noticed"; exit 1; }
+      - name: The modules against the servers
+        env:
+          EXT_CENTRAL_URL: postgresql://postgres:laswell@127.0.0.1:55450
+          EXT_LOCAL_URL: postgresql://postgres:laswell@127.0.0.1:55451
+        run: |
+          ./cpp/test/extensions-tests.sh build/pg_laswell build/pg_laswell_mcp | tee ext.log
+          grep -q ', 0 failed' ext.log || exit 1
+          ! grep -q '^SKIP' ext.log || { echo "::error::the live tests skipped"; exit 1; }
+      - name: Stop the servers
+        if: always()
+        run: docker compose -f examples/docker/extensions/compose.yml down -v
+
+  # TimescaleDB, against both editions and the oldest supported line: the
+  # Timescale License build, the Apache build (-oss, what PGDG and Debian
+  # package), and 2.28.3 on PostgreSQL 15. Proves what only a server can:
+  #
+  #   - every refusal pre-empts an error the server really raises, the refused
+  #     statement run by hand and required to fail with the quoted message;
+  #   - the index SQL the planner emits for a hypertable -- one chunk at a time,
+  #     never CONCURRENTLY -- is taken out of the plan and run, because a
+  #     per-chunk build cannot run in the dry run's transaction;
+  #   - the example applies one repository to both editions, the Timescale
+  #     License specs held on the Apache server by their epoch.
+  timescaledb:
+    name: timescaledb
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -o DPkg::Lock::Timeout=300
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build libpq-dev nlohmann-json3-dev \
+            libgtest-dev libssl-dev mandoc postgresql-client openssl
+      - name: Build libpqxx from source, not from apt
+        uses: ./.github/actions/libpqxx
+        with:
+          version: ${{ env.PQXX_VERSION }}
+          sha256: ${{ env.PQXX_SHA256 }}
+      - name: Configure with every module
+        run: cmake -S cpp -B build -DPGLASWELL_WERROR=ON -G Ninja "-DPGLASWELL_MODULES=citus;pg_cron;pgvector;timescaledb"
+      - name: Build the binaries
+        run: cmake --build build --target pg_laswell pg_laswell_mcp
+      - name: Start TimescaleDB, both editions and the oldest line
+        run: |
+          docker compose -f examples/docker/timescale/compose.yml up -d
+          for i in $(seq 1 90); do
+            ok=0
+            for c in laswell_ts_tsl laswell_ts_apache laswell_ts_oldest; do
+              docker exec "$c" pg_isready -U postgres -d app -q 2>/dev/null && ok=$((ok+1))
+            done
+            [ "$ok" = 3 ] && break
+            sleep 2
+          done
+          [ "$ok" = 3 ] || { echo "::error::the TimescaleDB servers did not come up"; exit 1; }
+      - name: The TimescaleDB example, both editions
+        env:
+          PG_LASWELL: ${{ github.workspace }}/build/pg_laswell
+          PG_LASWELL_MCP: ${{ github.workspace }}/build/pg_laswell_mcp
+          PGPASSWORD: laswell
+        run: |
+          ./examples/docker/timescale/run.sh | tee example.log
+          grep -q 'held_for_epoch' example.log \
+            || { echo "::error::the Apache server should hold the Timescale License specs"; exit 1; }
+          grep -q 'timescaledb.transaction_per_chunk' example.log \
+            || { echo "::error::the large hypertable's index was not planned per chunk"; exit 1; }
+          [ "$(grep -c 'repository : 0 pending' example.log)" = 2 ] \
+            || { echo "::error::the second run had something to do"; exit 1; }
+      - name: The module against the servers
+        env:
+          TS_TSL_URL: postgresql://postgres:laswell@127.0.0.1:55470
+          TS_APACHE_URL: postgresql://postgres:laswell@127.0.0.1:55471
+          TS_OLDEST_URL: postgresql://postgres:laswell@127.0.0.1:55472
+        run: |
+          ./cpp/test/timescaledb-tests.sh build/pg_laswell build/pg_laswell_mcp | tee ts.log
+          grep -q ', 0 failed' ts.log || exit 1
+          ! grep -q '^SKIP' ts.log || { echo "::error::the live tests skipped"; exit 1; }
+      - name: Stop the servers
+        if: always()
+        run: docker compose -f examples/docker/timescale/compose.yml down -v
+
+  # FreeBSD 15, in a VM on a Linux runner (GitHub has no FreeBSD runners):
+  # built with every module, the suite that needs no database run, then
+  # PACKAGED, installed with pkg add, and both binaries run -- the same script
+  # release.yml uses, so the package is proven on every pull request rather
+  # than first on a tag. The pgshard lab ran FreeBSD guests 92 times without
+  # once exercising this build, because there was no package to install.
+  freebsd:
+    name: freebsd
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build, test, package and install on FreeBSD 15
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "15.1"
+          envs: 'PQXX_VERSION PQXX_SHA256'
+          usesh: true
+          run: sh .github/scripts/freebsd-build.sh pg_laswell-freebsd15-amd64 tests
+
+  # macOS, built with every module and the suite that needs no database.
+  #
+  # The first macOS compile in this project's life happened on a release tag,
+  # and failed: libc++ deprecates char_traits<T> for non-character T, so a
+  # bytea read as std::basic_string<std::byte> stopped -Werror at the first
+  # instantiation (fixed with pqxx::bytes). Nothing in this workflow would have
+  # caught it, because every job here is Linux and libstdc++. This one is, and
+  # it builds what release.yml's macOS target builds -- Apple clang, libc++,
+  # Homebrew's libpq and OpenSSL 3 -- before a tag is pushed rather than after.
+  # No database: the database jobs above already cover the server side.
+  macos:
+    name: macos
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      # The same dependencies, and for the same reasons, as release.yml's macOS
+      # step: Apple ships LibreSSL headers, which are not a drop-in for
+      # Ed25519 EVP_DigestVerify, so OpenSSL 3 is named explicitly.
+      - name: Install dependencies
+        run: |
+          brew install cmake ninja libpq nlohmann-json pkg-config openssl@3 googletest mandoc
+          echo "PKG_CONFIG_PATH=$(brew --prefix libpq)/lib/pkgconfig:/usr/local/lib/pkgconfig" >> $GITHUB_ENV
+          echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> $GITHUB_ENV
+      - name: Build libpqxx from source
+        run: |
+          sh .github/scripts/build-libpqxx.sh \
+            "${PQXX_VERSION}" "${PQXX_SHA256}" "" \
+            -DCMAKE_PREFIX_PATH="$(brew --prefix libpq)"
+      - name: Configure with every module
+        run: |
+          cmake -S cpp -B build -DPGLASWELL_WERROR=ON -G Ninja \
+            "-DPGLASWELL_MODULES=citus;pg_cron;pgvector;timescaledb" \
+            -DCMAKE_PREFIX_PATH="$(brew --prefix libpq);$(brew --prefix googletest)"
+      - name: Build everything
+        run: cmake --build build
+      - name: The binary says which modules it carries
+        run: |
+          ./build/pg_laswell_mcp --version | tee /dev/stderr | grep -q '^modules: citus,pg_cron,pgvector,timescaledb$'
+      - name: The suite that needs no database
+        run: ./build/pg_laswell_mcp_test
+      - name: Manuals and source checks
+        run: ctest --test-dir build -R 'manpage_lint|manpage_kinds|no_dangling_items|plans' --output-on-failure
+
   ci-ok:
     name: ci-ok
     if: always()
@@ -741,8 +955,12 @@ jobs:
       - ledger_upgrade
       - examples
       - citus
+      - extensions
+      - timescaledb
+      - freebsd
+      - macos
       - packages
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Every job must have succeeded
