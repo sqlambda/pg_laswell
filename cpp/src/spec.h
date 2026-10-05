@@ -557,7 +557,7 @@ inline void parse_add_column(Intent& in) {
   // "fill": the value for a NOT NULL column that has no default, as one SQL
   // expression over the row's own columns. It selects the recipe that adds the
   // column nullable, fills new rows by trigger and old ones by a paced
-  // backfill, and only then sets NOT NULL (planner.h, plan_add_column_filled).
+  // backfill, and only then sets NOT NULL (planner.h, plan_add_columns_filled).
   //
   // The hints below are also the reference page's text for each key
   // (tools/manual_extract.py takes the first one that names it), so each is

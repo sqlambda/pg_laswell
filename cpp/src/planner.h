@@ -188,6 +188,57 @@ inline void plan_partitioned_index(const Intent& in, const json& t, Plan& plan,
 inline void plan_set_not_null(const Intent& in, const Observations& obs,
                               Plan& plan, std::vector<Step>& out);
 
+// A step the dry run must NOT execute, because executing it there is the harm
+// the recipe exists to avoid.
+//
+// The dry run applies every transactional step in ONE rolled-back transaction.
+// A split recipe -- ADD ... NOT VALID, then VALIDATE in a transaction of its
+// own -- is split so the exclusive lock of the first is not held across the
+// scan of the second; in one transaction it is, on the live table, before every
+// apply. Measured in the field on a 3 GB table under load: three seconds with
+// no insert at all, every one of them before the job started.
+//
+// So the scan is not rehearsed. `leaves_gap` says whether a later step may
+// fail in the dry run only because this one did not run (a SET NOT NULL that
+// did not happen, a partition that was not attached): the dry run then reports
+// such a failure as unverified rather than as a defect, as it does after a
+// CREATE INDEX CONCURRENTLY. A VALIDATE leaves no gap -- nothing a later
+// statement can see changes when it is skipped.
+//
+// What is lost, and said in the plan: a row that violates the constraint is
+// found by the job, at this step, with the NOT VALID constraint already
+// committed -- not before anything ran. The re-plan resumes from there.
+inline void do_not_rehearse(Step& step, const std::string& why, bool leaves_gap) {
+  step.detail["not_rehearsed"] = why;
+  step.detail["not_rehearsed_leaves_gap"] = leaves_gap;
+}
+
+namespace detail {
+inline constexpr const char* kScanNotRehearsed =
+    "the scan: the dry run runs in one transaction, where the lock of the step "
+    "before would be held across it. A violating row is found when the job "
+    "reaches this step";
+inline constexpr const char* kNeedsTheScan =
+    "it is cheap only because the scan before it proved the rows; in the dry "
+    "run that scan did not run, so this would scan under its exclusive lock";
+
+// A constraint by name, as the table's reading has it: absent, there and NOT
+// VALID (an earlier attempt added it and failed at its VALIDATE), or valid.
+enum class ConstraintState { kAbsent, kNotValid, kValid };
+inline ConstraintState constraint_state(const json& table, const std::string& name) {
+  const auto cs = table.find("constraints");
+  if (cs == table.end() || !cs->is_object() || !cs->contains(name)) {
+    return ConstraintState::kAbsent;
+  }
+  return (*cs)[name].value("validated", true) ? ConstraintState::kValid
+                                              : ConstraintState::kNotValid;
+}
+}  // namespace detail
+
+// Defined further down, with the dispatcher over the enabled modules.
+inline ConstraintTraits constraint_traits(const Observations& obs, const std::string& qualified,
+                                          std::string& decided_by);
+
 // --- add_column with "fill": a NOT NULL column that has no default ---------
 //
 // ADD COLUMN ... NOT NULL without a default fails on the first existing row.
@@ -216,21 +267,32 @@ inline void plan_set_not_null(const Intent& in, const Observations& obs,
 // Every part is resumable from the catalog alone -- the column, the trigger,
 // rows still null, the temporary check -- so a job that fails partway is
 // continued by applying the same specification again.
-inline void plan_add_column_filled(const Intent& in, const Observations& obs,
-                                   const ExecutorConfig& cfg, Plan& plan,
-                                   std::vector<Step>& out) {
+// SEVERAL such columns on one table, written as consecutive intents, are
+// planned as ONE recipe (filled_column_group, below): one trigger, one walk
+// that sets them all, one validation scan. Planned one after the other they
+// would rewrite every row once per column. Measured on 18.6, 6 million rows:
+// one CHECK (a IS NOT NULL AND b IS NOT NULL), validated once, is enough for
+// PostgreSQL to skip the scan for both columns -- "existing constraints on
+// column ... are sufficient to prove that it does not contain nulls" -- and
+// both SET NOT NULL ran in one statement in 4 ms, against 344 ms for a bare one.
+inline void plan_add_columns_filled(const std::vector<const Intent*>& group,
+                                    const Observations& obs, const ExecutorConfig& cfg,
+                                    Plan& plan, std::vector<Step>& out) {
+  const Intent& in = *group.front();
   const auto qualified = in.qualified_table();
   const auto sql_rel = detail::quote_qualified(qualified);
   const auto& t = obs.table(qualified);
-  const auto column = in.body.value("column", "");
-  const auto type = in.body.value("type", "");
-  const auto fill = in.body.value("fill", "");
   const bool drop_after = in.body.value("after", "") == "drop_trigger";
-  // One name for the trigger and its function, in the table's schema.
-  const auto filler = in.table() + "_" + column + "_laswell_fill";
+  // One name for the trigger and its function, in the table's schema: the
+  // first column's, so a single column is named exactly as it always was.
+  const auto filler = in.table() + "_" + in.body.value("column", "") + "_laswell_fill";
   const auto sql_filler = detail::quote_identifier(in.schema()) + "." +
                           detail::quote_identifier(filler);
-  const auto sql_col = detail::quote_identifier(column);
+  const auto rel_alias = detail::quote_identifier(in.table());
+
+  std::vector<std::string> names;
+  for (const auto* g : group) names.push_back(g->body.value("column", ""));
+  const std::string all_names = detail::join(names, ", ");
 
   const auto verdict = [&](Action a, const std::string& why, bool conflict = false) {
     Step s;
@@ -243,12 +305,20 @@ inline void plan_add_column_filled(const Intent& in, const Observations& obs,
 
   if (!t.value("exists", false)) {
     verdict(Action::kConflict,
-            qualified + " does not exist, so " + column + " cannot be added to it", true);
+            qualified + " does not exist, so " + all_names + " cannot be added to it", true);
     return;
   }
   const json columns = t.value("columns", json::object());
-  const bool present = columns.contains(column);
-  if (present) {
+  // What is left to do for each column, read from the catalog.
+  std::vector<const Intent*> missing, pending;  // not there; there or not, still nullable
+  for (const auto* g : group) {
+    const auto column = g->body.value("column", "");
+    const auto type = g->body.value("type", "");
+    if (!columns.contains(column)) {
+      missing.push_back(g);
+      pending.push_back(g);
+      continue;
+    }
     const auto existing_type = columns[column].value("type", "");
     if (existing_type != type && !type.empty()) {
       verdict(Action::kConflict,
@@ -256,6 +326,7 @@ inline void plan_add_column_filled(const Intent& in, const Observations& obs,
                   ", spec declares " + type, true);
       return;
     }
+    if (!columns[column].value("not_null", false)) pending.push_back(g);
   }
   const json triggers = t.value("triggers", json::object());
   const bool has_trigger = triggers.contains(filler);
@@ -274,13 +345,17 @@ inline void plan_add_column_filled(const Intent& in, const Observations& obs,
   };
 
   // Already NOT NULL: the recipe finished, or all of it but its last step.
-  if (present && columns[column].value("not_null", false)) {
+  if (pending.empty()) {
     if (drop_after && has_trigger) {
-      drop_filler("the column is NOT NULL and the trigger that filled it is still "
-                  "there: an earlier attempt stopped before dropping it");
-    } else {
+      drop_filler(all_names + (group.size() == 1 ? " is" : " are") +
+                  " NOT NULL and the trigger that filled " +
+                  (group.size() == 1 ? "it" : "them") +
+                  " is still there: an earlier attempt stopped before dropping it");
+    } else if (group.size() == 1) {
       verdict(Action::kSatisfied, "column already present as " +
-                                      columns[column].value("type", "") + " NOT NULL");
+                                      columns[names[0]].value("type", "") + " NOT NULL");
+    } else {
+      verdict(Action::kSatisfied, "columns " + all_names + " already present, NOT NULL");
     }
     return;
   }
@@ -297,58 +372,89 @@ inline void plan_add_column_filled(const Intent& in, const Observations& obs,
     if (key.empty()) {
       verdict(Action::kConflict,
               qualified + " has no single-column primary key to walk while filling " +
-                  column + ". Name a unique column in \"key\".", true);
+                  all_names + ". Name a unique column in \"key\".", true);
       return;
     }
   }
 
-  // Step 1. The column and the trigger commit together, so there is no moment
-  // at which the column exists and a new row can arrive without a value.
-  if (!present || !has_trigger) {
+  // Step 1. The columns and the trigger commit together, so there is no moment
+  // at which a column exists and a new row can arrive without a value.
+  if (!missing.empty() || !has_trigger) {
     Step s;
     s.kind = in.kind_name;
     s.txn_class = TxnClass::kRequired;
     s.own_transaction = true;
-    if (!present) {
-      s.sql.push_back("ALTER TABLE " + sql_rel + " ADD COLUMN " + sql_col + " " + type + ";");
-      s.sql.push_back("COMMENT ON COLUMN " + sql_rel + "." + sql_col + " IS " +
-                      detail::quote_literal(in.body.value("comment", "")) + ";");
+    for (const auto* g : missing) {
+      const auto c = detail::quote_identifier(g->body.value("column", ""));
+      s.sql.push_back("ALTER TABLE " + sql_rel + " ADD COLUMN " + c + " " +
+                      g->body.value("type", "") + ";");
+      s.sql.push_back("COMMENT ON COLUMN " + sql_rel + "." + c + " IS " +
+                      detail::quote_literal(g->body.value("comment", "")) + ";");
     }
+    std::string every_fill;
+    for (const auto* g : group) every_fill += g->body.value("fill", "");
     std::string tag = "laswell_fill";
-    while (fill.find("$" + tag + "$") != std::string::npos) tag += "_";
-    s.sql.push_back(
-        "CREATE OR REPLACE FUNCTION " + sql_filler + "() RETURNS trigger LANGUAGE plpgsql AS $" +
-        tag + "$\nBEGIN\n  IF NEW." + sql_col + " IS NULL THEN\n    SELECT (" + fill +
-        ") INTO NEW." + sql_col + " FROM (SELECT NEW.*) AS " +
-        detail::quote_identifier(in.table()) + ";\n  END IF;\n  RETURN NEW;\nEND\n$" + tag +
-        "$;");
-    s.sql.push_back("CREATE TRIGGER " + detail::quote_identifier(filler) +
-                    " BEFORE INSERT OR UPDATE ON " + sql_rel +
-                    " FOR EACH ROW EXECUTE FUNCTION " + sql_filler + "();");
-    s.lock = present ? "ShareRowExclusiveLock on " + qualified + " -- blocks writes, not reads"
-                     : "AccessExclusiveLock on " + qualified +
-                           ", briefly: a nullable column with no default is catalog-only";
-    s.why = present
-        ? "the column is there, nullable, without the trigger that fills it: an "
-          "earlier attempt was interrupted, or the column was added by hand. The "
-          "trigger first, so no row arrives without a value while the rest runs"
-        : "step 1: the column is added nullable -- catalog-only, no rewrite -- "
-          "and, in the same transaction, a trigger that fills it for every row "
-          "inserted or updated from this commit on. NOT NULL comes last, when "
-          "every row has a value";
+    while (every_fill.find("$" + tag + "$") != std::string::npos) tag += "_";
+    std::string body;
+    for (const auto* g : group) {
+      const auto c = detail::quote_identifier(g->body.value("column", ""));
+      body += "  IF NEW." + c + " IS NULL THEN\n    SELECT (" + g->body.value("fill", "") +
+              ") INTO NEW." + c + " FROM (SELECT NEW.*) AS " + rel_alias + ";\n  END IF;\n";
+    }
+    s.sql.push_back("CREATE OR REPLACE FUNCTION " + sql_filler +
+                    "() RETURNS trigger LANGUAGE plpgsql AS $" + tag + "$\nBEGIN\n" + body +
+                    "  RETURN NEW;\nEND\n$" + tag + "$;");
+    if (!has_trigger) {
+      s.sql.push_back("CREATE TRIGGER " + detail::quote_identifier(filler) +
+                      " BEFORE INSERT OR UPDATE ON " + sql_rel +
+                      " FOR EACH ROW EXECUTE FUNCTION " + sql_filler + "();");
+    }
+    const bool plural = group.size() > 1;
+    s.lock = missing.empty()
+                 ? "ShareRowExclusiveLock on " + qualified + " -- blocks writes, not reads"
+                 : "AccessExclusiveLock on " + qualified +
+                       ", briefly: a nullable column with no default is catalog-only";
+    s.why = missing.empty()
+        ? std::string(plural ? "the columns are" : "the column is") +
+              " there, nullable, without the trigger that fills " + (plural ? "them" : "it") +
+              ": an earlier attempt was interrupted, or " + (plural ? "they were" : "the column was") +
+              " added by hand. The trigger first, so no row arrives without a value while "
+              "the rest runs"
+        : std::string("step 1: ") +
+              (plural ? std::to_string(group.size()) + " columns are added nullable"
+                      : "the column is added nullable") +
+              " -- catalog-only, no rewrite -- and, in the same transaction, " +
+              (plural ? "ONE trigger that fills them" : "a trigger that fills it") +
+              " for every row inserted or updated from this commit on. NOT NULL comes "
+              "last, when every row has a value";
     s.detail["trigger"] = filler;
+    s.detail["columns"] = names;
     s.detail["expected"] = "metadata only, no table rewrite";
     out.push_back(std::move(s));
   }
 
-  // What the steps above leave, for the two recipes composed below: they are
-  // planned against the column as it will be, not as it is.
+  // What the steps above leave, for the recipes composed below: they are
+  // planned against the columns as they will be, not as they are.
   Observations after = obs;
-  after.tables[qualified]["columns"][column] = json{{"type", type}, {"not_null", false}};
+  for (const auto* g : missing) {
+    after.tables[qualified]["columns"][g->body.value("column", "")] =
+        json{{"type", g->body.value("type", "")}, {"not_null", false}};
+  }
   after.tables[qualified]["triggers"][filler] = json::object();
 
-  // Step 2. The rows that were already there. Its predicate makes it
-  // resumable: a second run walks only what is still null.
+  // Step 2. The rows that were already there, in ONE walk whatever the number
+  // of columns. Its predicate makes it resumable: a second run walks only the
+  // rows in which something is still null.
+  json set = json::object();
+  std::vector<std::string> still_null, not_null_terms, set_not_null_terms;
+  for (const auto* g : pending) {
+    const auto column = g->body.value("column", "");
+    const auto c = detail::quote_identifier(column);
+    set[column] = "(" + g->body.value("fill", "") + ")";
+    still_null.push_back(rel_alias + "." + c + " IS NULL");
+    not_null_terms.push_back(c + " IS NOT NULL");
+    set_not_null_terms.push_back("ALTER COLUMN " + c + " SET NOT NULL");
+  }
   Intent bf;
   bf.kind = IntentKind::kBackfill;
   bf.kind_name = "backfill";
@@ -356,8 +462,8 @@ inline void plan_add_column_filled(const Intent& in, const Observations& obs,
   bf.body = json{{"schema", in.schema()},
                  {"table", in.table()},
                  {"key", key},
-                 {"set", json{{column, "(" + fill + ")"}}},
-                 {"where", detail::quote_identifier(in.table()) + "." + sql_col + " IS NULL"}};
+                 {"set", set},
+                 {"where", detail::join(still_null, " OR ")}};
   const auto before = out.size();
   plan_backfill(bf, after, cfg, plan, out);
   for (std::size_t i = before; i < out.size(); ++i) {
@@ -366,31 +472,96 @@ inline void plan_add_column_filled(const Intent& in, const Observations& obs,
 
   // Step 3. NOT NULL, by the recipe whose scan runs under a lock the
   // application works through.
-  Intent nn;
-  nn.kind = IntentKind::kSetNotNull;
-  nn.kind_name = "set_not_null";
-  nn.ordinal = in.ordinal;
-  nn.body = json{{"schema", in.schema()}, {"table", in.table()}, {"column", column}};
-  plan_set_not_null(nn, after, plan, out);
+  std::string traits_by;
+  const auto traits = constraint_traits(after, qualified, traits_by);
+  const bool one_scan = pending.size() > 1 &&
+                        !(traits.answered && !traits.separate_validation);
+  if (!one_scan) {
+    // One column -- or a table whose vendor allows no separate VALIDATE, where
+    // each column goes through the recipe that knows what to do about that.
+    for (const auto* g : pending) {
+      Intent nn;
+      nn.kind = IntentKind::kSetNotNull;
+      nn.kind_name = "set_not_null";
+      nn.ordinal = in.ordinal;
+      nn.body = json{{"schema", in.schema()}, {"table", in.table()},
+                     {"column", g->body.value("column", "")}};
+      plan_set_not_null(nn, after, plan, out);
+    }
+  } else {
+    // Several columns, ONE scan: a single check over all of them proves each
+    // (measured, above), so they are set NOT NULL in one statement after it.
+    const auto check = in.table() + "_" + in.body.value("column", "") + "_laswell_nn";
+    const auto sql_check = detail::quote_identifier(check);
+    const auto have = detail::constraint_state(t, check);
+    const auto make = [&](const std::string& sql, const std::string& lock,
+                          const std::string& why) {
+      Step s;
+      s.kind = "set_not_null";
+      s.txn_class = TxnClass::kRequired;
+      s.own_transaction = true;
+      s.sql.push_back(sql);
+      s.lock = lock;
+      s.why = why;
+      s.detail["columns"] = names;
+      s.detail["qualified"] = qualified;
+      out.push_back(std::move(s));
+    };
+    if (have == detail::ConstraintState::kAbsent) {
+      make("ALTER TABLE " + sql_rel + " ADD CONSTRAINT " + sql_check + " CHECK (" +
+               detail::join(not_null_terms, " AND ") + ") NOT VALID;",
+           "AccessExclusiveLock, briefly: reads and writes wait while it is "
+           "requested and held; NOT VALID means no scan",
+           "one check over all " + std::to_string(pending.size()) + " columns, NOT VALID: "
+           "no scan, so the exclusive lock is held for the catalog change only");
+    }
+    if (have != detail::ConstraintState::kValid) {
+      make("ALTER TABLE " + sql_rel + " VALIDATE CONSTRAINT " + sql_check + ";",
+           "ShareUpdateExclusiveLock -- does NOT block reads or writes",
+           "the ONE scan for all " + std::to_string(pending.size()) + " columns, under a "
+           "lock that lets the application keep working. Its own transaction, or the "
+           "lock of the step before would be held across it");
+      do_not_rehearse(out.back(), detail::kScanNotRehearsed, /*leaves_gap=*/false);
+    }
+    make("ALTER TABLE " + sql_rel + " " + detail::join(set_not_null_terms, ", ") + ";",
+         "AccessExclusiveLock, but no scan",
+         "still an exclusive lock, but PostgreSQL skips the scan for every column: "
+         "the validated check proves each has no nulls (measured: both of two "
+         "columns in one statement, 4 ms on 6 million rows, against 344 ms for one "
+         "bare SET NOT NULL)");
+    if (have != detail::ConstraintState::kValid) {
+      do_not_rehearse(out.back(), detail::kNeedsTheScan, /*leaves_gap=*/true);
+    }
+    make("ALTER TABLE " + sql_rel + " DROP CONSTRAINT " + sql_check + ";",
+         "AccessExclusiveLock, briefly",
+         "the check is redundant once the columns are NOT NULL, and a redundant "
+         "constraint costs time on every insert");
+  }
 
+  std::vector<std::string> sources;
+  for (const auto* g : group) {
+    sources.push_back(g->body.value("column", "") + " from (" + g->body.value("fill", "") + ")");
+  }
   plan.warnings.push_back(
-      qualified + "." + column + " is filled from (" + fill + "), by trigger " + filler +
+      qualified + ": " + detail::join(sources, ", ") + " -- filled by trigger " + filler +
       " for rows written from step 1 on and by a backfill for the rest. A row for "
-      "which that expression is NULL stays null, and the VALIDATE before SET NOT "
-      "NULL then fails on it: the job stops there with the column nullable and the "
+      "which an expression is NULL stays null, and the VALIDATE before SET NOT NULL "
+      "then fails on it: the job stops there with the column nullable and the "
       "trigger in place, and the same specification resumes once the row is "
       "repaired. The dry run does not look for such a row.");
   plan.warnings.push_back(
       "trigger " + filler + " and its function are created by this plan in schema " +
-      in.schema() + ", and run as the role writing the row: names inside the "
+      in.schema() + ", and run as the role writing the row: names inside an "
       "expression resolve through that role's search_path, so qualify what it "
       "calls. The row's own columns are written bare or as " + in.table() + ".<column>.");
 
   // Step 4.
   if (drop_after) {
-    drop_filler("last step: the column is NOT NULL and the application writes it "
-                "itself (\"after\": \"drop_trigger\"), so the trigger and its function "
-                "go. An insert that does not supply the column fails from here on");
+    drop_filler("last step: NOT NULL is set and the application writes " +
+                std::string(group.size() == 1 ? "the column" : "the columns") +
+                " itself (\"after\": \"drop_trigger\"), so the trigger and its function "
+                "go. An insert that does not supply " +
+                (group.size() == 1 ? "it" : "them") + " fails from here on");
   } else {
     plan.warnings.push_back(
         "trigger " + filler + " STAYS (\"after\": \"keep_trigger\"): it runs on "
@@ -399,11 +570,57 @@ inline void plan_add_column_filled(const Intent& in, const Observations& obs,
   }
 }
 
+// Which consecutive add_column intents with "fill" are planned as one recipe:
+// same table, same "after", same "key". Returns, for the intent at `first`,
+// the intents planned with it (itself first).
+//
+// Not merged, and so planned one after the other, where one column's
+// expression names another column of the group: the trigger fills in order,
+// so the second expression would see the first column filled, while one
+// UPDATE evaluates every expression against the row as it was. One after the
+// other is the only reading under which the trigger and the backfill agree.
+inline std::vector<const Intent*> filled_column_group(const Spec& spec, std::size_t first) {
+  std::vector<const Intent*> group;
+  const Intent& lead = spec.intents[first];
+  if (lead.kind != IntentKind::kAddColumn || !lead.body.contains("fill")) return group;
+  group.push_back(&lead);
+  const auto names_word = [](const std::string& text, const std::string& word) {
+    std::size_t at = 0;
+    const auto ident = [](char ch) {
+      return std::isalnum(static_cast<unsigned char>(ch)) != 0 || ch == '_';
+    };
+    while ((at = text.find(word, at)) != std::string::npos) {
+      const bool left = at == 0 || !ident(text[at - 1]);
+      const bool right = at + word.size() >= text.size() || !ident(text[at + word.size()]);
+      if (left && right) return true;
+      ++at;
+    }
+    return false;
+  };
+  for (std::size_t i = first + 1; i < spec.intents.size(); ++i) {
+    const Intent& next = spec.intents[i];
+    if (next.kind != IntentKind::kAddColumn || !next.body.contains("fill")) break;
+    if (next.qualified_table() != lead.qualified_table()) break;
+    if (next.body.value("after", "") != lead.body.value("after", "")) break;
+    if (next.body.value("key", "") != lead.body.value("key", "")) break;
+    bool entangled = false;
+    for (const auto* g : group) {
+      if (names_word(next.body.value("fill", ""), g->body.value("column", "")) ||
+          names_word(g->body.value("fill", ""), next.body.value("column", ""))) {
+        entangled = true;
+      }
+    }
+    if (entangled) break;
+    group.push_back(&next);
+  }
+  return group;
+}
+
 inline void plan_add_column(const Intent& in, const Observations& obs,
                             const ExecutorConfig& cfg, Plan& plan,
                             std::vector<Step>& out) {
   if (in.body.contains("fill")) {
-    plan_add_column_filled(in, obs, cfg, plan, out);
+    plan_add_columns_filled({&in}, obs, cfg, plan, out);
     return;
   }
   Step step;
@@ -944,53 +1161,6 @@ inline ConstraintTraits constraint_traits(const Observations& obs, const std::st
   decided_by.clear();
   return {};
 }
-
-// A step the dry run must NOT execute, because executing it there is the harm
-// the recipe exists to avoid.
-//
-// The dry run applies every transactional step in ONE rolled-back transaction.
-// A split recipe -- ADD ... NOT VALID, then VALIDATE in a transaction of its
-// own -- is split so the exclusive lock of the first is not held across the
-// scan of the second; in one transaction it is, on the live table, before every
-// apply. Measured in the field on a 3 GB table under load: three seconds with
-// no insert at all, every one of them before the job started.
-//
-// So the scan is not rehearsed. `leaves_gap` says whether a later step may
-// fail in the dry run only because this one did not run (a SET NOT NULL that
-// did not happen, a partition that was not attached): the dry run then reports
-// such a failure as unverified rather than as a defect, as it does after a
-// CREATE INDEX CONCURRENTLY. A VALIDATE leaves no gap -- nothing a later
-// statement can see changes when it is skipped.
-//
-// What is lost, and said in the plan: a row that violates the constraint is
-// found by the job, at this step, with the NOT VALID constraint already
-// committed -- not before anything ran. The re-plan resumes from there.
-inline void do_not_rehearse(Step& step, const std::string& why, bool leaves_gap) {
-  step.detail["not_rehearsed"] = why;
-  step.detail["not_rehearsed_leaves_gap"] = leaves_gap;
-}
-
-namespace detail {
-inline constexpr const char* kScanNotRehearsed =
-    "the scan: the dry run runs in one transaction, where the lock of the step "
-    "before would be held across it. A violating row is found when the job "
-    "reaches this step";
-inline constexpr const char* kNeedsTheScan =
-    "it is cheap only because the scan before it proved the rows; in the dry "
-    "run that scan did not run, so this would scan under its exclusive lock";
-
-// A constraint by name, as the table's reading has it: absent, there and NOT
-// VALID (an earlier attempt added it and failed at its VALIDATE), or valid.
-enum class ConstraintState { kAbsent, kNotValid, kValid };
-inline ConstraintState constraint_state(const json& table, const std::string& name) {
-  const auto cs = table.find("constraints");
-  if (cs == table.end() || !cs->is_object() || !cs->contains(name)) {
-    return ConstraintState::kAbsent;
-  }
-  return (*cs)[name].value("validated", true) ? ConstraintState::kValid
-                                              : ConstraintState::kNotValid;
-}
-}  // namespace detail
 
 // Where VALIDATE CONSTRAINT is not available, the statement that adds the
 // constraint validates it too, and its lock is held for the scan. This fills
@@ -6335,6 +6505,9 @@ inline Plan plan_migration(const Spec& spec, const Observations& obs,
     }
   }
 
+  // An add_column planned as part of an earlier one's recipe: its ordinal, and
+  // the ordinal of the intent that leads the group.
+  std::map<std::size_t, std::size_t> planned_with;
   for (const auto& in : spec.intents) {
     // An intent may need more than one step, and more importantly more than
     // one TRANSACTION. The safe way to add a foreign key is ADD ... NOT VALID
@@ -6350,7 +6523,44 @@ inline Plan plan_migration(const Spec& spec, const Observations& obs,
       case IntentKind::enum_id: plan_fn(in, projected, cfg, plan, emitted); break;
 #include "modules/enabled_kinds.inc"
 #undef PGLASWELL_KIND
-      case IntentKind::kAddColumn:   plan_add_column(in, projected, cfg, plan, emitted); break;
+      case IntentKind::kAddColumn: {
+        // Consecutive NOT NULL columns with "fill" on one table are ONE
+        // recipe (filled_column_group): planned at the first of them, and the
+        // others say so instead of walking the table again.
+        const auto led = planned_with.find(in.ordinal);
+        if (led != planned_with.end()) {
+          Step s;
+          s.kind = in.kind_name;
+          s.action = Action::kSatisfied;
+          s.why = "planned together with intent " + std::to_string(led->second) +
+                  ": " + in.body.value("column", "") + " is added, filled and set NOT "
+                  "NULL by that intent's steps -- one trigger, one backfill and one "
+                  "validation scan for all of them";
+          emitted.push_back(std::move(s));
+          break;
+        }
+        const auto together = filled_column_group(spec, in.ordinal);
+        if (together.size() < 2) {
+          plan_add_column(in, projected, cfg, plan, emitted);
+          break;
+        }
+        plan_add_columns_filled(together, projected, cfg, plan, emitted);
+        bool applies = false;
+        for (const auto& s : emitted) applies = applies || s.action == Action::kApply;
+        for (std::size_t g = 1; g < together.size(); ++g) {
+          planned_with[together[g]->ordinal] = in.ordinal;
+          // Later intents plan against every column of the together, not only
+          // the first, which is all the projection below would give them.
+          if (applies) {
+            json col = json::object();
+            col["type"] = together[g]->body.value("type", "");
+            col["not_null"] = true;
+            projected.tables[in.qualified_table()]["columns"]
+                            [together[g]->body.value("column", "")] = std::move(col);
+          }
+        }
+        break;
+      }
       case IntentKind::kCreateIndex: plan_create_index(in, projected, cfg, plan, emitted); break;
       case IntentKind::kBackfill:    plan_backfill(in, projected, cfg, plan, emitted); break;
       case IntentKind::kDropIndex:   plan_drop_index(in, projected, plan, emitted); break;

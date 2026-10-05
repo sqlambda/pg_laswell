@@ -855,6 +855,29 @@ still null, the temporary check \(em and does only what is left.
 The dry run does not look for such a row; see
 .Sx DRY RUN .
 .Pp
+Several such columns on one table are written as consecutive
+.Cm add_column
+intents, and planned as one recipe: one trigger that fills them all, one
+backfill that sets them all, and one validation scan.
+Planned one after the other they would rewrite every row once per column.
+The scan is shared because one check over all the columns is enough
+(measured on 18.6, 6 million rows: after
+.Ql CHECK (a IS NOT NULL AND b IS NOT NULL)
+is validated once, PostgreSQL skips the scan for each column, and both
+.Ic SET NOT NULL
+ran in one statement in 4 ms against 344 ms for a bare one).
+The trigger is named after the first column, and each later intent's step says
+which intent it was planned with.
+Intents are merged only when they are consecutive, on the same table, with the
+same
+.Va after
+and
+.Va key ,
+and when no expression names another column of the group \(em the trigger
+fills in order and one
+.Ic UPDATE
+does not, so those are planned in order instead.
+.Pp
 Not covered: a value that needs a join is written as a scalar subquery inside
 the expression; and where a vendor does not allow row triggers on the table
 \(em a Citus distributed table \(em the dry run reports the refusal of

@@ -32,6 +32,15 @@ evaluates it as `SELECT (fill) INTO NEW.col FROM (SELECT NEW.*) AS table` -- so
 they cannot disagree. `after` has no default: whether the application writes the
 column itself is known only to the author.
 
+Several such columns on one table, written as consecutive intents, are planned
+as one recipe: one trigger, one backfill that sets them all, one validation
+scan. One after the other they would rewrite every row once per column.
+Measured on 6 million rows: one check over all the columns, validated once, is
+enough for PostgreSQL to skip the scan for each, and both `SET NOT NULL` ran in
+one statement in 4 ms against 344 ms for a bare one. They are not merged where
+one expression names another column of the group, since the trigger fills in
+order and a single `UPDATE` does not.
+
 Every part resumes from the catalog. A row the expression cannot fill stops the
 job at the validation scan with the column nullable and the trigger in place,
 and the same specification finishes once the row is repaired; the live test

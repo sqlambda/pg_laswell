@@ -2136,6 +2136,108 @@ TEST(Planner, AFilledColumnResumesFromWhereverAnAttemptStopped) {
   EXPECT_FALSE(plan_of().ok);
 }
 
+// Consecutive filled columns on one table are ONE recipe: one trigger, one
+// walk that sets them all, one validation scan. Planned one after the other
+// every row would be rewritten once per column.
+TEST(Planner, ConsecutiveFilledColumnsOnOneTableShareOneTriggerOneWalkAndOneScan) {
+  const auto obs = observations(2LL << 30, 8000000);
+  auto second = filled_column();
+  second["column"] = "region_len";
+  second["type"] = "integer";
+  second["fill"] = "length(fulfilment_region)";
+  second["comment"] = "Its length.";
+  const auto plan = pglaswell::plan_migration(
+      spec_with(json::array({filled_column(), second})), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+
+  int triggers = 0, walks = 0, scans = 0, adds = 0;
+  for (const auto& s : plan.steps) {
+    const auto sql = all_sql(s);
+    if (sql.find("CREATE TRIGGER") != std::string::npos) ++triggers;
+    if (s.kind == "backfill") ++walks;
+    if (sql.find("VALIDATE CONSTRAINT") != std::string::npos) ++scans;
+    for (const auto& q : s.sql) if (q.find("ADD COLUMN") != std::string::npos) ++adds;
+  }
+  EXPECT_EQ(adds, 2) << plan.render();
+  EXPECT_EQ(triggers, 1) << plan.render();
+  EXPECT_EQ(walks, 1) << plan.render();
+  EXPECT_EQ(scans, 1) << plan.render();
+
+  // The one function fills both, each from its own expression.
+  const auto first = all_sql(plan.steps[0]);
+  EXPECT_NE(first.find("SELECT (upper(fulfilment_region)) INTO NEW.\"region_code\""),
+            std::string::npos) << first;
+  EXPECT_NE(first.find("SELECT (length(fulfilment_region)) INTO NEW.\"region_len\""),
+            std::string::npos) << first;
+  // The one walk sets both, over rows in which EITHER is still null.
+  const auto bf = all_sql(plan.steps[1]);
+  EXPECT_NE(bf.find("\"region_code\" = (upper(fulfilment_region))"), std::string::npos) << bf;
+  EXPECT_NE(bf.find("\"region_len\" = (length(fulfilment_region))"), std::string::npos) << bf;
+  EXPECT_NE(bf.find("\"orders\".\"region_code\" IS NULL OR \"orders\".\"region_len\" IS NULL"),
+            std::string::npos) << bf;
+  // One check proves both (measured: PostgreSQL then skips the scan for each),
+  // and one statement sets both.
+  std::string rest;
+  for (std::size_t i = 2; i < plan.steps.size(); ++i) rest += all_sql(plan.steps[i]) + "\n";
+  EXPECT_NE(rest.find("CHECK (\"region_code\" IS NOT NULL AND \"region_len\" IS NOT NULL) NOT VALID"),
+            std::string::npos) << rest;
+  EXPECT_NE(rest.find("ALTER COLUMN \"region_code\" SET NOT NULL, ALTER COLUMN \"region_len\" SET NOT NULL;"),
+            std::string::npos) << rest;
+  // The second intent says where its work went, and walks nothing.
+  const auto& said = plan.steps.back();
+  EXPECT_EQ(said.action, pglaswell::Action::kSatisfied);
+  EXPECT_NE(said.why.find("planned together with intent 0"), std::string::npos) << said.why;
+
+  // A later intent sees BOTH columns.
+  auto with_index = json::array({filled_column(), second,
+      json{{"kind", "create_index"}, {"schema", "shop"}, {"table", "orders"},
+           {"name", "orders_region_len_idx"}, {"columns", json::array({"region_len"})},
+           {"comment", "By length."}}});
+  EXPECT_TRUE(pglaswell::plan_migration(spec_with(with_index), obs, {}).ok);
+
+  // Resumed after the first step: nothing is added again, one walk remains.
+  auto resumed = obs;
+  resumed.tables["shop.orders"]["columns"]["region_code"] = json{{"type", "text"}, {"not_null", false}};
+  resumed.tables["shop.orders"]["columns"]["region_len"] = json{{"type", "integer"}, {"not_null", false}};
+  resumed.tables["shop.orders"]["triggers"]["orders_region_code_laswell_fill"] = json::object();
+  const auto again = pglaswell::plan_migration(
+      spec_with(json::array({filled_column(), second})), resumed, {});
+  ASSERT_TRUE(again.ok) << again.render();
+  EXPECT_EQ(again.steps[0].kind, "backfill") << again.render();
+}
+
+// What is NOT merged, and so planned one after the other as before.
+TEST(Planner, FilledColumnsAreNotMergedWhereOneRecipeWouldNotMeanTheSame) {
+  const auto obs = observations(2LL << 30, 8000000);
+  const auto walks = [&](const json& intents) {
+    const auto p = pglaswell::plan_migration(spec_with(intents), obs, {});
+    EXPECT_TRUE(p.ok) << p.render();
+    int n = 0;
+    for (const auto& s : p.steps) if (s.kind == "backfill") ++n;
+    return n;
+  };
+  auto second = filled_column();
+  second["column"] = "region_len";
+  second["type"] = "integer";
+  second["fill"] = "length(fulfilment_region)";
+  ASSERT_EQ(walks(json::array({filled_column(), second})), 1);
+
+  // One expression names the other column: the trigger would fill in order
+  // and one UPDATE would not, so they are planned in order instead.
+  auto entangled = second;
+  entangled["fill"] = "length(region_code)";
+  EXPECT_EQ(walks(json::array({filled_column(), entangled})), 2);
+  // A different "after": two triggers with two fates.
+  auto kept = second;
+  kept["after"] = "keep_trigger";
+  EXPECT_EQ(walks(json::array({filled_column(), kept})), 2);
+  // Not consecutive: the planner does not reorder intents.
+  EXPECT_EQ(walks(json::array({filled_column(),
+                               json{{"kind", "create_schema"}, {"schema", "other"},
+                                    {"comment", "Between."}},
+                               second})), 2);
+}
+
 TEST(Spec, FillIsOnlyForANotNullColumnWithoutADefaultAndMustSayWhatFollows) {
   const auto refused = [](json in, const char* needle) {
     try {
@@ -4224,6 +4326,40 @@ TEST_F(ToolTest, AFilledNotNullColumnIsAppliedEndToEndAndResumesAfterANull) {
     w.commit();
   }
   EXPECT_EQ(one("SELECT warehouse_tag FROM shop.orders ORDER BY id DESC LIMIT 1"), "W4");
+
+  // Two columns in consecutive intents: one job, and the server agrees that
+  // one check was enough for both.
+  json pair = minimal_spec();
+  pair["id"] = "0005-orders-two-codes";
+  pair["description"] = "Two more codes, in one pass.";
+  pair["intents"] = json::array(
+      {json{{"kind", "add_column"}, {"schema", "shop"}, {"table", "orders"},
+            {"column", "code_a"}, {"type", "text"}, {"nullable", false},
+            {"fill", "'A' || orders.warehouse_id"}, {"after", "drop_trigger"},
+            {"comment", "A."}},
+       json{{"kind", "add_column"}, {"schema", "shop"}, {"table", "orders"},
+            {"column", "code_b"}, {"type", "bigint"}, {"nullable", false},
+            {"fill", "warehouse_id * 10"}, {"after", "drop_trigger"},
+            {"comment", "B."}}});
+  {
+    const auto parsed = pglaswell::parse_spec(pair);
+    pair["signatures"] = json::array({{{"key_id", test_key().key_id},
+                                       {"algorithm", "ed25519"},
+                                       {"signature", base64(sign(parsed.canonical_bytes))}}});
+  }
+  started = payload(call("startMigration", json{{"spec", pair}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, started["jobId"], [](const json& s) {
+    return s.value("state", "") == "succeeded";
+  })) << status_of(started["jobId"]).dump(2);
+  EXPECT_EQ(one("SELECT count(*) FROM pg_attribute WHERE attrelid = 'shop.orders'::regclass"
+                " AND attname IN ('code_a', 'code_b') AND attnotnull"), "2");
+  EXPECT_EQ(one("SELECT count(*) FROM shop.orders WHERE code_a <> 'A' || warehouse_id"
+                " OR code_b <> warehouse_id * 10"), "0");
+  EXPECT_EQ(one("SELECT count(*) FROM pg_trigger WHERE tgname LIKE '%laswell_fill'"
+                " AND tgrelid = 'shop.orders'::regclass"), "1")
+      << "only the kept trigger of the earlier specification should remain";
+  EXPECT_EQ(one("SELECT count(*) FROM pg_constraint WHERE conname LIKE '%laswell_nn'"), "0");
 }
 
 TEST_F(ToolTest, AFailedStepFailsTheJobAndTheLedgerSaysWhich) {
