@@ -314,6 +314,9 @@ SELECT COALESCE(
      -- the planner beats failing at execution.
      'constraints', COALESCE((SELECT JSONB_OBJECT_AGG(k.conname, JSONB_BUILD_OBJECT(
                        'type', k.contype::text,
+                       -- A NOT VALID constraint left by an attempt that failed
+                       -- at its VALIDATE is resumed there, not added again.
+                       'validated', k.convalidated,
                        'has_index', k.conindid <> 0,
                        'index', CASE WHEN k.conindid <> 0
                                      THEN k.conindid::regclass::text END,

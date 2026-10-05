@@ -1,5 +1,56 @@
 # Changes
 
+## Unreleased
+
+Two defects from a field report: a 10-million-row table under 1,000 inserts a
+second, where `set_not_null` stopped every insert for three seconds before its
+job had started.
+
+### The dry run no longer runs the scan of a split recipe
+
+`set_not_null`, `add_check_constraint`, `add_foreign_key`, `attach_partition`
+and a domain's check add a constraint `NOT VALID` and validate it in a
+transaction of its own, so the lock of the first step is not held across the
+scan of the second. The dry run applies every step in one rolled-back
+transaction, so it held that lock across exactly that scan -- on the live
+table, before every apply. The job honoured the recipe; the rehearsal in front
+of it undid it.
+
+The planner now marks those steps and the dry run leaves them out:
+`VALIDATE CONSTRAINT`, and the `SET NOT NULL` of `set_not_null`, which is cheap
+only once the scan has proved the rows. They are listed in `unverifiedSteps`,
+and a new `unverifiedWhy` gives the reason for each. `--dry-run=chain`, which is
+for an empty database or a restored copy, still runs them.
+
+What this gives up, and what makes it acceptable: a violating row is found by
+the job at its `VALIDATE`, with the `NOT VALID` constraint already committed,
+instead of before anything ran. So the same specification applied again now
+resumes there -- a constraint that exists and is not valid is validated, not
+added a second time, and one that is valid is satisfied. Before, the second
+attempt failed on the constraint's own name.
+
+### The rehearsal's time is recorded
+
+The dry run takes real locks before any job exists, and `laswell.job.started_at`
+is after it, so three seconds of stall left no trace in the ledger. Its duration
+is now in the result (`dryRun.durationMs`), which is the plan the job stores,
+and `pg_laswell` prints it when the job starts, with the steps it did not run.
+
+### Three locks the plan named wrongly
+
+Read from `pg_locks` on PostgreSQL 18.6:
+
+- Adding a `CHECK` constraint takes `AccessExclusiveLock`, `NOT VALID` or not.
+  The plan said `ShareRowExclusiveLock` for `set_not_null`, `add_check_constraint`
+  and `attach_partition`, under which a reader would not wait. It does.
+- A `NOT VALID` foreign key takes `ShareRowExclusiveLock` on the referenced
+  table as well as the referencing one. The plan said `RowShareLock` there,
+  which is what the `VALIDATE` takes.
+
+The steps now also say that the lock must be granted before it is brief: behind
+a long transaction or an autovacuum it waits, and every session queues behind
+it until `lock_timeout`.
+
 ## 0.1.3
 
 Two gaps reported from pgshard while writing specifications for an audit

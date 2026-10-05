@@ -3891,6 +3891,94 @@ TEST_F(ToolTest, AStatementCeilingHoldsAcrossConcurrentJobs) {
                 .as<int>(), 0);
 }
 
+// The dry run does not run the scan of a split recipe (see the planner test of
+// the same subject), and this is what that costs and what makes the cost
+// acceptable, against a real server: a null the rehearsal no longer looks for
+// is found by the JOB at its VALIDATE, the NOT VALID check stays committed, and
+// the next plan resumes at the scan instead of failing on the check's name.
+TEST_F(ToolTest, TheDryRunLeavesTheScanToTheJobAndAFailedScanIsResumed) {
+  make_shop(cfg());
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/null-row");
+    w.txn().exec("INSERT INTO shop.orders(warehouse_id) VALUES (NULL)");
+    w.commit();
+  }
+  const auto signed_nn = [&] {
+    json doc = minimal_spec();
+    doc["id"] = "0002-orders-warehouse-not-null";
+    doc["description"] = "Every order has a warehouse.";
+    doc["intents"] = json::array({json{{"kind", "set_not_null"}, {"schema", "shop"},
+                                       {"table", "orders"}, {"column", "warehouse_id"}}});
+    const auto parsed = pglaswell::parse_spec(doc);
+    doc["signatures"] = json::array({{{"key_id", test_key().key_id},
+                                      {"algorithm", "ed25519"},
+                                      {"signature", base64(sign(parsed.canonical_bytes))}}});
+    return doc;
+  }();
+
+  const auto plan = payload(call("planMigration", json{{"spec", signed_nn}}));
+  ASSERT_TRUE(plan.value("ok", false)) << plan.dump(2);
+  const auto& dry = plan["dryRun"];
+  ASSERT_TRUE(dry.value("ran", false)) << dry.dump(2);
+  // Nothing found: the row is there, and the rehearsal did not scan for it.
+  EXPECT_FALSE(dry.contains("problems")) << dry.dump(2);
+  ASSERT_EQ(plan["steps"].size(), 4u);
+  EXPECT_EQ(dry["unverifiedSteps"], json::array({1, 2})) << dry.dump(2);
+  EXPECT_NE(dry["unverifiedWhy"].value("1", "").find("the scan"), std::string::npos);
+  EXPECT_NE(dry["unverifiedWhy"].value("2", "").find("exclusive lock"), std::string::npos);
+  EXPECT_TRUE(dry.contains("durationMs")) << "the time spent before any job exists";
+  {
+    pglaswell::ReadSession r(cfg());
+    EXPECT_EQ(r.txn().exec("SELECT count(*) FROM pg_constraint WHERE conname ="
+                           " 'orders_warehouse_id_laswell_nn'")[0][0].as<int>(), 0)
+        << "the dry run committed something";
+  }
+
+  // The job finds the null, at step 1, and stops with the check in place.
+  auto started = payload(call("startMigration", json{{"spec", signed_nn}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, started["jobId"], [](const json& s) {
+    return s.value("state", "") == "failed";
+  })) << status_of(started["jobId"]).dump(2);
+  {
+    pglaswell::ReadSession r(cfg());
+    const auto c = r.txn().exec("SELECT convalidated FROM pg_constraint WHERE conname ="
+                                " 'orders_warehouse_id_laswell_nn'");
+    ASSERT_EQ(c.size(), 1u) << "the NOT VALID check should have been committed by step 0";
+    EXPECT_FALSE(c[0][0].as<bool>());
+    // The plan the ledger keeps for the job carries the rehearsal's duration.
+    const auto kept = r.txn().exec(
+        "SELECT plan->'dryRun'->>'durationMs' FROM laswell.job WHERE job_id = $1::uuid",
+        pqxx::params{started["jobId"].get<std::string>()});
+    ASSERT_EQ(kept.size(), 1u);
+    EXPECT_FALSE(kept[0][0].is_null()) << "the rehearsal left no trace with the job";
+  }
+
+  // Repaired, the same specification resumes at the scan and finishes.
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/repair");
+    w.txn().exec("UPDATE shop.orders SET warehouse_id = 1 WHERE warehouse_id IS NULL");
+    w.commit();
+  }
+  const auto again = payload(call("planMigration", json{{"spec", signed_nn}}));
+  ASSERT_TRUE(again.value("ok", false)) << again.dump(2);
+  ASSERT_EQ(again["steps"].size(), 3u) << again.dump(2);
+  EXPECT_NE(again["steps"][0]["sql"][0].get<std::string>().find("VALIDATE CONSTRAINT"),
+            std::string::npos);
+  started = payload(call("startMigration", json{{"spec", signed_nn}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, started["jobId"], [](const json& s) {
+    return s.value("state", "") == "succeeded";
+  })) << status_of(started["jobId"]).dump(2);
+  pglaswell::ReadSession r(cfg());
+  EXPECT_TRUE(r.txn().exec("SELECT attnotnull FROM pg_attribute WHERE attrelid ="
+                           " 'shop.orders'::regclass AND attname = 'warehouse_id'")[0][0].as<bool>());
+  EXPECT_EQ(r.txn().exec("SELECT count(*) FROM pg_constraint WHERE conname ="
+                         " 'orders_warehouse_id_laswell_nn'")[0][0].as<int>(), 0);
+}
+
 TEST_F(ToolTest, AFailedStepFailsTheJobAndTheLedgerSaysWhich) {
   make_shop(cfg());
   // A backfill expression that parses and plans but fails at runtime: a cast
@@ -8518,7 +8606,156 @@ TEST(Planner, AddForeignKeySplitsIntoNotValidThenValidate) {
   // The lock people are surprised by: a statement naming one table locks two.
   EXPECT_NE(s[0]->lock.find("shop.warehouse"), std::string::npos) << s[0]->lock;
   EXPECT_NE(s[0]->why.find("names one table and locks two"), std::string::npos);
-  EXPECT_NE(s[1]->lock.find("does NOT block reads or writes"), std::string::npos);
+  EXPECT_NE(s[1]->lock.find("neither blocks reads or writes"), std::string::npos) << s[1]->lock;
+  // Measured on 18.6 with pg_locks: the NOT VALID add takes
+  // ShareRowExclusiveLock on BOTH tables. RowShareLock on the referenced one is
+  // what the VALIDATE takes, and the plan used to name it for the add.
+  EXPECT_NE(s[0]->lock.find("ShareRowExclusiveLock on shop.orders and on shop.warehouse"),
+            std::string::npos) << s[0]->lock;
+  EXPECT_EQ(s[0]->lock.find("RowShareLock on"), std::string::npos) << s[0]->lock;
+  EXPECT_NE(s[1]->lock.find("RowShareLock on shop.warehouse"), std::string::npos) << s[1]->lock;
+}
+
+// THE DRY RUN MUST NOT RUN THE SCAN OF A SPLIT RECIPE. It applies every step in
+// one rolled-back transaction, so the lock of the NOT VALID add would be held
+// across the VALIDATE -- on the live table, before every apply. Found in the
+// field: three seconds without one insert on a 3 GB table, all of them before
+// the job began. The planner marks the steps; the rehearsal leaves them out and
+// says why.
+TEST(Planner, TheScanOfASplitRecipeIsMarkedNotToBeRehearsed) {
+  auto obs = observations(2LL << 30, 8000000);
+  const auto nn = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "set_not_null"}, {"schema", "shop"},
+                                {"table", "orders"}, {"column", "fulfilment_region"}}})),
+      obs, {});
+  ASSERT_TRUE(nn.ok) << nn.render();
+  const auto s = steps_of(nn, "set_not_null");
+  ASSERT_EQ(s.size(), 4u);
+  // Measured on 18.6: a CHECK is added under AccessExclusiveLock, NOT VALID or
+  // not. The plan said ShareRowExclusiveLock, under which readers would not wait.
+  EXPECT_NE(s[0]->lock.find("AccessExclusiveLock"), std::string::npos) << s[0]->lock;
+  EXPECT_EQ(s[0]->lock.find("ShareRowExclusiveLock"), std::string::npos) << s[0]->lock;
+  EXPECT_NE(s[0]->lock.find("reads and writes wait"), std::string::npos) << s[0]->lock;
+  EXPECT_FALSE(s[0]->detail.contains("not_rehearsed")) << "the catalog change IS rehearsed";
+  // The VALIDATE: not run, and nothing later can see that it was not.
+  ASSERT_TRUE(s[1]->detail.contains("not_rehearsed"));
+  EXPECT_FALSE(s[1]->detail.value("not_rehearsed_leaves_gap", true));
+  // SET NOT NULL: cheap only after the scan, so it would scan under its
+  // exclusive lock in the dry run -- and a later step may need the column so.
+  ASSERT_TRUE(s[2]->detail.contains("not_rehearsed"));
+  EXPECT_TRUE(s[2]->detail.value("not_rehearsed_leaves_gap", false));
+  EXPECT_FALSE(s[3]->detail.contains("not_rehearsed")) << "the drop is a catalog change";
+
+  for (const json& in : {json{{"kind", "add_check_constraint"}, {"schema", "shop"},
+                              {"table", "orders"}, {"name", "orders_ck"},
+                              {"expression", "warehouse_id > 0"}},
+                         json{{"kind", "add_foreign_key"}, {"schema", "shop"},
+                              {"table", "orders"}, {"name", "orders_wh_fk"},
+                              {"columns", json::array({"warehouse_id"})},
+                              {"references_schema", "shop"},
+                              {"references_table", "warehouse"},
+                              {"references_columns", json::array({"id"})}}}) {
+    const auto p = pglaswell::plan_migration(spec_of(json::array({in})), obs, {});
+    ASSERT_TRUE(p.ok) << p.render();
+    const auto t = steps_of(p, in.value("kind", "").c_str());
+    ASSERT_EQ(t.size(), 2u);
+    EXPECT_FALSE(t[0]->detail.contains("not_rehearsed"));
+    ASSERT_TRUE(t[1]->detail.contains("not_rehearsed")) << in.dump();
+    EXPECT_FALSE(t[1]->detail.value("not_rehearsed_leaves_gap", true));
+  }
+  const auto ck = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "add_check_constraint"}, {"schema", "shop"},
+                                {"table", "orders"}, {"name", "orders_ck"},
+                                {"expression", "warehouse_id > 0"}}})),
+      obs, {});
+  EXPECT_NE(steps_of(ck, "add_check_constraint")[0]->lock.find("AccessExclusiveLock"),
+            std::string::npos);
+}
+
+// What the rehearsal is handed: the marked steps as nothing to run. One that
+// leaves a gap is treated as a step that cannot run in a transaction is; one
+// that leaves none is listed as not run. The chain rehearsal -- for an empty
+// database or a restored copy -- runs them all, because finding the violating
+// row is what it is for.
+TEST(Planner, TheRehearsalIsHandedNothingToRunForAMarkedStep) {
+  auto obs = observations(2LL << 30, 8000000);
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "set_not_null"}, {"schema", "shop"},
+                                {"table", "orders"}, {"column", "fulfilment_region"}}})),
+      obs, {});
+  ASSERT_TRUE(plan.ok);
+  const auto in = pglaswell::detail::rehearsal_inputs(plan);
+  ASSERT_EQ(in.steps.size(), 4u);
+  EXPECT_FALSE(in.steps[0].second.empty());
+  EXPECT_TRUE(in.steps[1].second.empty()) << "the VALIDATE must not reach the server";
+  EXPECT_TRUE(in.steps[2].second.empty()) << "nor the SET NOT NULL that leans on it";
+  EXPECT_FALSE(in.steps[3].second.empty());
+  EXPECT_EQ(in.forbidden, (std::vector<bool>{false, false, true, false}));
+  EXPECT_EQ(in.not_run, std::vector<int>{in.steps[1].first});
+
+  pglaswell::Catalog::DryRun dry;
+  dry.unverified_steps.push_back(in.steps[2].first);  // as the loop records a skip
+  pglaswell::detail::note_not_run(in, dry);
+  EXPECT_EQ(dry.unverified_steps, (std::vector<int>{in.steps[1].first, in.steps[2].first}));
+  const auto why = pglaswell::detail::unverified_reasons(plan, dry.unverified_steps);
+  EXPECT_NE(why[std::to_string(in.steps[1].first)].get<std::string>().find("the scan"),
+            std::string::npos);
+  EXPECT_NE(why[std::to_string(in.steps[2].first)].get<std::string>().find("exclusive lock"),
+            std::string::npos);
+
+  const auto chain = pglaswell::detail::rehearsal_inputs(plan, /*run_scans=*/true);
+  for (const auto& st : chain.steps) EXPECT_FALSE(st.second.empty());
+  EXPECT_TRUE(chain.not_run.empty());
+}
+
+// With the scan out of the rehearsal, a violating row is found by the JOB, at
+// the VALIDATE, with the NOT VALID constraint already committed. The next plan
+// must resume there: adding the constraint again would fail on its own name.
+TEST(Planner, AConstraintLeftNotValidByAFailedAttemptIsResumedAtItsScan) {
+  auto obs = observations(2LL << 30, 8000000);
+  auto& cs = obs.tables["shop.orders"]["constraints"];
+
+  // set_not_null: the temporary check is there, not yet valid.
+  cs["orders_fulfilment_region_laswell_nn"] = json{{"type", "c"}, {"validated", false}};
+  const json nn = {{"kind", "set_not_null"}, {"schema", "shop"}, {"table", "orders"},
+                   {"column", "fulfilment_region"}};
+  auto p = pglaswell::plan_migration(spec_of(json::array({nn})), obs, {});
+  ASSERT_TRUE(p.ok) << p.render();
+  auto s = steps_of(p, "set_not_null");
+  ASSERT_EQ(s.size(), 3u) << p.render();
+  EXPECT_NE(all_sql(*s[0]).find("VALIDATE CONSTRAINT"), std::string::npos);
+  EXPECT_EQ(all_sql(*s[0]).find("NOT VALID"), std::string::npos);
+  // ... and valid: the scan is done, so SET NOT NULL is cheap and IS rehearsed.
+  cs["orders_fulfilment_region_laswell_nn"]["validated"] = true;
+  p = pglaswell::plan_migration(spec_of(json::array({nn})), obs, {});
+  s = steps_of(p, "set_not_null");
+  ASSERT_EQ(s.size(), 2u) << p.render();
+  EXPECT_NE(all_sql(*s[0]).find("SET NOT NULL"), std::string::npos);
+  EXPECT_FALSE(s[0]->detail.contains("not_rehearsed"));
+
+  // add_check_constraint and add_foreign_key the same way.
+  const json ck = {{"kind", "add_check_constraint"}, {"schema", "shop"}, {"table", "orders"},
+                   {"name", "orders_ck"}, {"expression", "warehouse_id > 0"}};
+  const json fk = {{"kind", "add_foreign_key"}, {"schema", "shop"}, {"table", "orders"},
+                   {"name", "orders_wh_fk"}, {"columns", json::array({"warehouse_id"})},
+                   {"references_schema", "shop"}, {"references_table", "warehouse"},
+                   {"references_columns", json::array({"id"})}};
+  for (const json& in : {ck, fk}) {
+    const auto name = in.value("name", "");
+    const auto kind = in.value("kind", "");
+    cs[name] = json{{"type", kind == "add_check_constraint" ? "c" : "f"}, {"validated", false}};
+    auto q = pglaswell::plan_migration(spec_of(json::array({in})), obs, {});
+    ASSERT_TRUE(q.ok) << q.render();
+    auto t = steps_of(q, kind.c_str());
+    ASSERT_EQ(t.size(), 1u) << q.render();
+    EXPECT_NE(all_sql(*t[0]).find("VALIDATE CONSTRAINT"), std::string::npos);
+    EXPECT_NE(t[0]->why.find("an earlier attempt added it"), std::string::npos) << t[0]->why;
+    cs[name]["validated"] = true;
+    q = pglaswell::plan_migration(spec_of(json::array({in})), obs, {});
+    t = steps_of(q, kind.c_str());
+    ASSERT_EQ(t.size(), 1u);
+    EXPECT_EQ(t[0]->action, pglaswell::Action::kSatisfied) << q.render();
+  }
 }
 
 TEST(Planner, AnUnindexedForeignKeyColumnWarns) {

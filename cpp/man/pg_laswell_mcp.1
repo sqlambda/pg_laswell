@@ -298,16 +298,55 @@ Almost all PostgreSQL DDL is transactional, which is what makes this possible,
 and nothing weaker works: a backfill referencing a column that step 0 adds does
 not parse until step 0 has run, and that is the ordinary case.
 .Pp
-Three costs, all bounded and all reported:
+Four costs, all bounded and all reported:
 .Bl -bullet -compact
 .It
-It takes the real locks, briefly, and rolls them back.
+It takes the real locks, on the live schema, and holds each until the rollback
+at the end.
 .Va lock_timeout
-bounds the attempt, so planning can never queue behind anything.
+bounds each request, and
+.Va durationMs
+in the result says how long the whole of it took.
+That time is before any job exists \(em
+.Li laswell.job.started_at
+is after it \(em so it is kept in the plan the job stores and printed by
+.Xr pg_laswell 1
+when the job starts.
 .It
 .Ic CREATE INDEX CONCURRENTLY
 cannot run inside a transaction block, so it is listed as unverified rather
 than silently passed.
+.It
+The scan of a split recipe is not run.
+.Cm set_not_null ,
+.Cm add_check_constraint ,
+.Cm add_foreign_key ,
+.Cm attach_partition
+and a domain's check add a constraint
+.Ic NOT VALID
+and validate it in a transaction of its own, so that the lock of the first is
+not held across the scan of the second.
+One transaction would hold it across exactly that: measured in the field on a
+3 GB table under load, three seconds without a single insert, all of them
+before the job began.
+So
+.Ic VALIDATE CONSTRAINT
+is listed as unverified, and so is the
+.Ic SET NOT NULL
+of
+.Cm set_not_null ,
+which is cheap only once the scan has proved the rows;
+.Va unverifiedWhy
+gives the reason for each.
+What this gives up: a row that violates the constraint is found by the job, at
+its
+.Ic VALIDATE ,
+with the
+.Ic NOT VALID
+constraint already committed \(em not before anything ran.
+Applying the specification again resumes at the scan: a constraint that is
+there and not valid is validated, not added a second time.
+The chain rehearsal below runs the scans, since it is not for a live database.
 .It
 Queries are planned with
 .Ic EXPLAIN Pq Cm GENERIC_PLAN ,
@@ -921,7 +960,9 @@ which takes
 and scans the whole table.
 It emits four steps in four separate transactions: a
 .Ic NOT VALID
-check, a
+check
+.Pq Va AccessExclusiveLock , No held for the catalog change only ,
+a
 .Ic VALIDATE
 that does the scanning under
 .Va ShareUpdateExclusiveLock
@@ -955,14 +996,19 @@ Note what the first step locks: adding a foreign key takes
 .Va ShareRowExclusiveLock
 on the child
 .Em and
-.Va RowShareLock
-on the parent, so a statement naming one table locks two, and the table nobody
-mentioned is often the busier one.
+on the parent (measured; writes to both wait, reads do not), so a statement
+naming one table locks two, and the table nobody mentioned is often the busier
+one.
 It warns when no index leads with the referencing column, because without one
 every parent update or delete scans the child.
 .Pp
 .Cm add_check_constraint
 takes the same two-step shape as a foreign key, for the same measured reason.
+Its first step is not the same lock, though: adding a check takes
+.Va AccessExclusiveLock ,
+.Ic NOT VALID
+or not, so reads wait too, while it is requested and while it is held.
+Only a foreign key gets the weaker lock.
 .Pp
 .Cm create_index
 on a

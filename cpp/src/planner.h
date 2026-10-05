@@ -726,6 +726,53 @@ inline ConstraintTraits constraint_traits(const Observations& obs, const std::st
   return {};
 }
 
+// A step the dry run must NOT execute, because executing it there is the harm
+// the recipe exists to avoid.
+//
+// The dry run applies every transactional step in ONE rolled-back transaction.
+// A split recipe -- ADD ... NOT VALID, then VALIDATE in a transaction of its
+// own -- is split so the exclusive lock of the first is not held across the
+// scan of the second; in one transaction it is, on the live table, before every
+// apply. Measured in the field on a 3 GB table under load: three seconds with
+// no insert at all, every one of them before the job started.
+//
+// So the scan is not rehearsed. `leaves_gap` says whether a later step may
+// fail in the dry run only because this one did not run (a SET NOT NULL that
+// did not happen, a partition that was not attached): the dry run then reports
+// such a failure as unverified rather than as a defect, as it does after a
+// CREATE INDEX CONCURRENTLY. A VALIDATE leaves no gap -- nothing a later
+// statement can see changes when it is skipped.
+//
+// What is lost, and said in the plan: a row that violates the constraint is
+// found by the job, at this step, with the NOT VALID constraint already
+// committed -- not before anything ran. The re-plan resumes from there.
+inline void do_not_rehearse(Step& step, const std::string& why, bool leaves_gap) {
+  step.detail["not_rehearsed"] = why;
+  step.detail["not_rehearsed_leaves_gap"] = leaves_gap;
+}
+
+namespace detail {
+inline constexpr const char* kScanNotRehearsed =
+    "the scan: the dry run runs in one transaction, where the lock of the step "
+    "before would be held across it. A violating row is found when the job "
+    "reaches this step";
+inline constexpr const char* kNeedsTheScan =
+    "it is cheap only because the scan before it proved the rows; in the dry "
+    "run that scan did not run, so this would scan under its exclusive lock";
+
+// A constraint by name, as the table's reading has it: absent, there and NOT
+// VALID (an earlier attempt added it and failed at its VALIDATE), or valid.
+enum class ConstraintState { kAbsent, kNotValid, kValid };
+inline ConstraintState constraint_state(const json& table, const std::string& name) {
+  const auto cs = table.find("constraints");
+  if (cs == table.end() || !cs->is_object() || !cs->contains(name)) {
+    return ConstraintState::kAbsent;
+  }
+  return (*cs)[name].value("validated", true) ? ConstraintState::kValid
+                                              : ConstraintState::kNotValid;
+}
+}  // namespace detail
+
 // Where VALIDATE CONSTRAINT is not available, the statement that adds the
 // constraint validates it too, and its lock is held for the scan. This fills
 // in what every such step says: who decided, over how much data, and the
@@ -1536,17 +1583,38 @@ inline void plan_add_check_constraint(const Intent& in, const Observations& obs,
     return;
   }
 
+  // An earlier attempt may have committed the NOT VALID add and failed at its
+  // VALIDATE -- on a violating row, which the dry run no longer looks for. The
+  // constraint is then there, and adding it again would fail on its name.
+  const auto have = detail::constraint_state(t, name);
+  if (have == detail::ConstraintState::kValid) {
+    Step s;
+    s.kind = in.kind_name;
+    s.action = Action::kSatisfied;
+    s.why = "constraint " + name + " already exists on " + qualified + " and is valid";
+    out.push_back(std::move(s));
+    return;
+  }
+
   Step add;
   add.kind = in.kind_name;
   add.txn_class = TxnClass::kRequired;
   add.own_transaction = true;
-  add.lock = "ShareRowExclusiveLock, briefly; NOT VALID means no scan";
+  // Measured on 18.6: ADD CONSTRAINT ... CHECK takes AccessExclusiveLock,
+  // NOT VALID or not. Only a foreign key gets the weaker ShareRowExclusiveLock.
+  // This said ShareRowExclusiveLock until a field report sampled pg_locks under
+  // load and found readers queued behind it.
+  add.lock = "AccessExclusiveLock, briefly: reads and writes wait while it is "
+             "requested and held; NOT VALID means no scan";
   add.sql.push_back("ALTER TABLE " + sql_rel + " ADD CONSTRAINT " + detail::quote_identifier(name) +
                     " CHECK (" + expression + ") NOT VALID;");
-  add.why = "step 1 of 2: NOT VALID costs no scan, so the strong lock is held "
-            "for the catalog change only";
+  add.why = "step 1 of 2: NOT VALID costs no scan, so the exclusive lock is held "
+            "for the catalog change only. It still has to be GRANTED: behind a "
+            "long transaction or an autovacuum on the table it waits, and every "
+            "reader and writer queues behind it until lock_timeout";
   add.detail["constraint"] = name;
-  out.push_back(std::move(add));
+  const bool resuming = have == detail::ConstraintState::kNotValid;
+  if (!resuming) out.push_back(std::move(add));
 
   Step validate;
   validate.kind = in.kind_name;
@@ -1554,9 +1622,14 @@ inline void plan_add_check_constraint(const Intent& in, const Observations& obs,
   validate.own_transaction = true;
   validate.lock = "ShareUpdateExclusiveLock -- does NOT block reads or writes";
   validate.sql.push_back("ALTER TABLE " + sql_rel + " VALIDATE CONSTRAINT " + detail::quote_identifier(name) + ";");
-  validate.why = "step 2 of 2: the scan, under a lock the application can work "
-                 "through. Its own transaction, or step 1's lock would span it";
+  validate.why = resuming
+      ? "the constraint is already there, NOT VALID: an earlier attempt added it "
+        "and did not finish validating. This resumes at the scan, under a lock "
+        "the application can work through"
+      : "step 2 of 2: the scan, under a lock the application can work "
+        "through. Its own transaction, or step 1's lock would span it";
   validate.detail["constraint"] = name;
+  do_not_rehearse(validate, detail::kScanNotRehearsed, /*leaves_gap=*/false);
   out.push_back(std::move(validate));
 }
 
@@ -3011,6 +3084,7 @@ inline void plan_alter_misc(const Intent& in, const Observations& obs,
              "step 2 of 2: the scan happens here, in its own transaction, so "
              "step 1's lock is not held across it",
              /*own=*/true);
+        do_not_rehearse(out.back(), detail::kScanNotRehearsed, /*leaves_gap=*/false);
         plan.warnings.push_back(
             "validating a domain constraint reads every column of type " +
             qualified_obj +
@@ -4670,20 +4744,32 @@ inline void plan_attach_partition(const Intent& in, const Observations& obs,
         "deliberate: a CHECK over part of the key would not prove what ATTACH "
         "needs, and the scan would happen anyway without anyone being told.");
   } else if (!check_expr.empty()) {
-    emit(TxnClass::kRequired,
-         "ALTER TABLE " + child + " ADD CONSTRAINT " + detail::quote_identifier(check_name) + " CHECK (" +
-             check_expr + ") NOT VALID;",
-         "ShareRowExclusiveLock on " + child + ", briefly; NOT VALID means no scan",
-         "step 1 of 4: the CHECK is what lets ATTACH skip its scan, and adding "
-         "it NOT VALID costs nothing",
-         /*own=*/true);
-    emit(TxnClass::kRequired,
-         "ALTER TABLE " + child + " VALIDATE CONSTRAINT " + detail::quote_identifier(check_name) + ";",
-         "ShareUpdateExclusiveLock on " + child + " -- does NOT block reads or writes",
-         "step 2 of 4: the scan happens here instead, under a lock the "
-         "application survives. Measured: ATTACH without this took 98ms on 2M "
-         "rows against 0.9ms with it",
-         /*own=*/true);
+    // Resumed where an earlier attempt stopped: the bound check may be there
+    // already, valid or not.
+    const auto have = detail::constraint_state(c, check_name);
+    if (have == detail::ConstraintState::kAbsent) {
+      emit(TxnClass::kRequired,
+           "ALTER TABLE " + child + " ADD CONSTRAINT " + detail::quote_identifier(check_name) + " CHECK (" +
+               check_expr + ") NOT VALID;",
+           "AccessExclusiveLock on " + child + ", briefly; NOT VALID means no scan",
+           "step 1 of 4: the CHECK is what lets ATTACH skip its scan, and adding "
+           "it NOT VALID costs nothing",
+           /*own=*/true);
+    }
+    if (have != detail::ConstraintState::kValid) {
+      emit(TxnClass::kRequired,
+           "ALTER TABLE " + child + " VALIDATE CONSTRAINT " + detail::quote_identifier(check_name) + ";",
+           "ShareUpdateExclusiveLock on " + child + " -- does NOT block reads or writes",
+           "step 2 of 4: the scan happens here instead, under a lock the "
+           "application survives. Measured: ATTACH without this took 98ms on 2M "
+           "rows against 0.9ms with it",
+           /*own=*/true);
+      // The ATTACH after it IS rehearsed, because it is what finds an
+      // overlapping bound: in the dry run it scans the candidate under the
+      // candidate's own lock, which the parent's readers and writers do not
+      // wait on.
+      do_not_rehearse(out.back(), detail::kScanNotRehearsed, /*leaves_gap=*/false);
+    }
   }
 
   emit(TxnClass::kRequired,
@@ -5610,7 +5696,8 @@ inline void plan_drop_index(const Intent& in, const Observations& obs, Plan& pla
 // The safe form uses a CHECK constraint to do the scanning under a weaker lock:
 //
 //   1. ADD CONSTRAINT ... CHECK (col IS NOT NULL) NOT VALID
-//      ShareRowExclusiveLock, no scan, brief.
+//      AccessExclusiveLock (measured on 18.6; only a foreign key gets the
+//      weaker ShareRowExclusiveLock), no scan, brief.
 //   2. VALIDATE CONSTRAINT
 //      ShareUpdateExclusiveLock -- does NOT block reads or writes -- and this
 //      is where the scan happens.
@@ -5620,7 +5707,7 @@ inline void plan_drop_index(const Intent& in, const Observations& obs, Plan& pla
 //   4. DROP the CHECK, which is now redundant and costs time on every insert.
 //
 // Each of the first three MUST be in its own transaction. If 1 and 2 shared
-// one, the ShareRowExclusiveLock from 1 would be held across 2's scan and the
+// one, the AccessExclusiveLock from 1 would be held across 2's scan and the
 // recipe would buy nothing at all.
 inline void plan_set_not_null(const Intent& in, const Observations& obs, Plan& plan,
                               std::vector<Step>& out) {
@@ -5700,22 +5787,35 @@ inline void plan_set_not_null(const Intent& in, const Observations& obs, Plan& p
     return;
   }
 
-  make(TxnClass::kRequired,
-       "ALTER TABLE " + sql_rel + " ADD CONSTRAINT " +
-           detail::quote_identifier(check) + " CHECK (" +
-           detail::quote_identifier(column) + " IS NOT NULL) NOT VALID;",
-       "ShareRowExclusiveLock, briefly; NOT VALID means no scan",
-       "step 1 of 4: a NOT VALID check costs no scan, so the strong lock is "
-       "held only for the catalog change",
-       /*own=*/true);
+  // Resumed where an earlier attempt stopped. Its check may be there already:
+  // NOT VALID when the VALIDATE failed on a null -- which the dry run no
+  // longer looks for -- or valid when it stopped after that.
+  const auto have = detail::constraint_state(t, check);
 
-  make(TxnClass::kRequired,
-       "ALTER TABLE " + sql_rel + " VALIDATE CONSTRAINT " + detail::quote_identifier(check) + ";",
-       "ShareUpdateExclusiveLock -- does NOT block reads or writes",
-       "step 2 of 4: this is where the scan happens, and it happens under a "
-       "lock that lets the application keep working. It must be its own "
-       "transaction, or step 1's stronger lock would be held across it",
-       /*own=*/true);
+  if (have == detail::ConstraintState::kAbsent) {
+    make(TxnClass::kRequired,
+         "ALTER TABLE " + sql_rel + " ADD CONSTRAINT " +
+             detail::quote_identifier(check) + " CHECK (" +
+             detail::quote_identifier(column) + " IS NOT NULL) NOT VALID;",
+         "AccessExclusiveLock, briefly: reads and writes wait while it is "
+         "requested and held; NOT VALID means no scan",
+         "step 1 of 4: a NOT VALID check costs no scan, so the exclusive lock is "
+         "held only for the catalog change. It still has to be GRANTED: behind a "
+         "long transaction or an autovacuum on the table it waits, and every "
+         "reader and writer queues behind it until lock_timeout",
+         /*own=*/true);
+  }
+
+  if (have != detail::ConstraintState::kValid) {
+    make(TxnClass::kRequired,
+         "ALTER TABLE " + sql_rel + " VALIDATE CONSTRAINT " + detail::quote_identifier(check) + ";",
+         "ShareUpdateExclusiveLock -- does NOT block reads or writes",
+         "step 2 of 4: this is where the scan happens, and it happens under a "
+         "lock that lets the application keep working. It must be its own "
+         "transaction, or step 1's stronger lock would be held across it",
+         /*own=*/true);
+    do_not_rehearse(out.back(), detail::kScanNotRehearsed, /*leaves_gap=*/false);
+  }
 
   make(TxnClass::kRequired,
        "ALTER TABLE " + sql_rel + " ALTER COLUMN " + detail::quote_identifier(column) + " SET NOT NULL;",
@@ -5724,6 +5824,11 @@ inline void plan_set_not_null(const Intent& in, const Observations& obs, Plan& p
        "because the validated CHECK already proves the column has no nulls "
        "(measured: 24ms on 5000 rows)",
        /*own=*/true);
+  // Unless the check is valid ALREADY, the dry run has not validated it, and
+  // SET NOT NULL there would scan the table under AccessExclusiveLock.
+  if (have != detail::ConstraintState::kValid) {
+    do_not_rehearse(out.back(), detail::kNeedsTheScan, /*leaves_gap=*/true);
+  }
 
   if (!in.body.value("keep_check", false)) {
     make(TxnClass::kRequired,
@@ -5738,9 +5843,11 @@ inline void plan_set_not_null(const Intent& in, const Observations& obs, Plan& p
 
 // --- add_foreign_key -------------------------------------------------------
 //
-// Measured: adding a foreign key in one statement takes ShareRowExclusiveLock
-// on the child and RowShareLock on the parent, and HOLDS THEM FOR THE WHOLE
-// SCAN -- so writes to both tables are blocked for its duration. The two-step
+// Measured on 18.6: adding a foreign key takes ShareRowExclusiveLock on the
+// child AND on the parent -- NOT VALID or not -- and a validating add HOLDS
+// THEM FOR THE WHOLE SCAN, so writes to both tables are blocked for its
+// duration. (This said RowShareLock on the parent until pg_locks was read for
+// the NOT VALID form; RowShareLock is what VALIDATE takes there.) The two-step
 // form takes the same strong lock for a catalog change only, then does the scan
 // under ShareUpdateExclusiveLock, which does not block writes.
 //
@@ -5817,12 +5924,23 @@ inline void plan_add_foreign_key(const Intent& in, const Observations& obs,
     return;
   }
 
+  // As for a check: an earlier attempt may have left it NOT VALID.
+  const auto have = detail::constraint_state(t, name);
+  if (have == detail::ConstraintState::kValid) {
+    Step s;
+    s.kind = in.kind_name;
+    s.action = Action::kSatisfied;
+    s.why = "constraint " + name + " already exists on " + qualified + " and is valid";
+    out.push_back(std::move(s));
+    return;
+  }
+
   Step add;
   add.kind = in.kind_name;
   add.txn_class = TxnClass::kRequired;
   add.own_transaction = true;
-  add.lock = "ShareRowExclusiveLock on " + qualified + " and RowShareLock on " +
-             parent + "; NOT VALID means no scan";
+  add.lock = "ShareRowExclusiveLock on " + qualified + " and on " + parent +
+             ", briefly: writes to both wait, reads do not; NOT VALID means no scan";
   add.sql.push_back("ALTER TABLE " + sql_rel + " ADD CONSTRAINT " + detail::quote_identifier(name) + " " +
                     clause + " NOT VALID;");
   add.why =
@@ -5833,21 +5951,26 @@ inline void plan_add_foreign_key(const Intent& in, const Observations& obs,
       " may be the busier one";
   add.detail["constraint"] = name;
   add.detail["references"] = parent;
-  out.push_back(std::move(add));
+  const bool resuming = have == detail::ConstraintState::kNotValid;
+  if (!resuming) out.push_back(std::move(add));
 
   Step validate;
   validate.kind = in.kind_name;
   validate.txn_class = TxnClass::kRequired;
   validate.own_transaction = true;
-  validate.lock = "ShareUpdateExclusiveLock on " + qualified +
-                  " -- does NOT block reads or writes";
+  validate.lock = "ShareUpdateExclusiveLock on " + qualified + " and RowShareLock on " +
+                  parent + " -- neither blocks reads or writes";
   validate.sql.push_back("ALTER TABLE " + sql_rel + " VALIDATE CONSTRAINT " + detail::quote_identifier(name) + ";");
-  validate.why =
-      "step 2 of 2: the scan, under a lock that lets the application keep "
-      "working. It must be its own transaction, or step 1's "
-      "ShareRowExclusiveLock would be held across it and the two-step form "
-      "would buy nothing";
+  validate.why = resuming
+      ? "the constraint is already there, NOT VALID: an earlier attempt added it "
+        "and did not finish validating. This resumes at the scan, under a lock "
+        "that lets the application keep working"
+      : "step 2 of 2: the scan, under a lock that lets the application keep "
+        "working. It must be its own transaction, or step 1's "
+        "ShareRowExclusiveLock would be held across it and the two-step form "
+        "would buy nothing";
   validate.detail["constraint"] = name;
+  do_not_rehearse(validate, detail::kScanNotRehearsed, /*leaves_gap=*/false);
   out.push_back(std::move(validate));
 }
 

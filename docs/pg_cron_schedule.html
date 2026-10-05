@@ -81,6 +81,7 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
   &quot;database&quot;: &lt;optional&gt;,
   &quot;username&quot;: &lt;optional&gt;,
   &quot;active&quot;: &lt;optional&gt;,
+  &quot;validate_command&quot;: &lt;optional&gt;,
   &quot;comment&quot;: &lt;optional&gt;
 }</pre>
 <h2>Parameters</h2><dl class="params">
@@ -96,6 +97,8 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
 <dd>&nbsp;</dd>
 <dt>active<span class="tag opt">optional</span></dt>
 <dd>false schedules the job without running it until it is scheduled again with active true.</dd>
+<dt>validate_command<span class="tag opt">optional</span></dt>
+<dd>true (the default) has the dry run check the command&#x27;s syntax and that the tables, functions and procedures it names exist; false schedules it unchecked.</dd>
 <dt>comment<span class="tag opt">optional</span></dt>
 <dd>&nbsp;</dd>
 </dl>
