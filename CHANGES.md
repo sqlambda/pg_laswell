@@ -2,9 +2,40 @@
 
 ## Unreleased
 
-Two defects from a field report: a 10-million-row table under 1,000 inserts a
+Two defects from a field report -- a 10-million-row table under 1,000 inserts a
 second, where `set_not_null` stopped every insert for three seconds before its
-job had started.
+job had started -- and the recipe that report was writing by hand.
+
+### A NOT NULL column without a default, as one intent
+
+`ADD COLUMN ... NOT NULL` without a default fails on the first existing row, so
+`add_column` refused it and told the author to add the column nullable,
+backfill it and set NOT NULL later. Written as separate intents, nothing covers
+the rows inserted while the backfill runs unless the author also thinks of a
+trigger.
+
+`add_column` now takes `fill`, one SQL expression over the row's own columns,
+and `after`, which says what becomes of the trigger:
+
+```json
+{"kind": "add_column", "schema": "public", "table": "messages",
+ "column": "customer_id", "type": "bigint", "nullable": false,
+ "fill": "(payload->>'customer')::bigint", "after": "drop_trigger",
+ "comment": "The customer the message was sent to."}
+```
+
+The plan is the whole recipe: the column nullable and, in the same transaction,
+a trigger that fills it on insert and update; a paced backfill of the rows
+already there; the `set_not_null` recipe; and the trigger dropped or kept. One
+expression serves the trigger and the backfill -- measured, the trigger
+evaluates it as `SELECT (fill) INTO NEW.col FROM (SELECT NEW.*) AS table` -- so
+they cannot disagree. `after` has no default: whether the application writes the
+column itself is known only to the author.
+
+Every part resumes from the catalog. A row the expression cannot fill stops the
+job at the validation scan with the column nullable and the trigger in place,
+and the same specification finishes once the row is repaired; the live test
+does exactly that.
 
 ### The dry run no longer runs the scan of a split recipe
 

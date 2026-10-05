@@ -188,8 +188,224 @@ inline void plan_partitioned_index(const Intent& in, const json& t, Plan& plan,
 inline void plan_set_not_null(const Intent& in, const Observations& obs,
                               Plan& plan, std::vector<Step>& out);
 
-inline void plan_add_column(const Intent& in, const Observations& obs, Plan& plan,
+// --- add_column with "fill": a NOT NULL column that has no default ---------
+//
+// ADD COLUMN ... NOT NULL without a default fails on the first existing row.
+// The way through is known and has four parts, and an author asked to write
+// them as four intents gets the one that matters wrong: nothing covers the
+// rows inserted while the backfill runs. So it is one intent, and the plan is
+// the whole recipe:
+//
+//   1. ADD COLUMN, nullable -- catalog-only -- and, in the SAME transaction, a
+//      BEFORE INSERT OR UPDATE trigger that fills the column when it is null.
+//      From this commit on no new row lacks a value, and an old row the
+//      application touches gets one.
+//   2. A paced backfill of the rows that were already there.
+//   3. The set_not_null recipe: its scan finds every row filled.
+//   4. The trigger dropped, or kept, as the specification says.
+//
+// ONE expression serves the trigger and the backfill, so they cannot disagree.
+// Measured on 18.6: inside the trigger it is evaluated as
+//     SELECT (<fill>) INTO NEW.col FROM (SELECT NEW.*) AS "<table>";
+// which gives the row's columns the names they have in
+//     UPDATE <table> SET col = (<fill>) ...
+// bare or qualified by the table's own name. New rows were filled, an old row
+// touched by an UPDATE was filled, and a value the application supplied was
+// kept. CREATE TRIGGER took ShareRowExclusiveLock.
+//
+// Every part is resumable from the catalog alone -- the column, the trigger,
+// rows still null, the temporary check -- so a job that fails partway is
+// continued by applying the same specification again.
+inline void plan_add_column_filled(const Intent& in, const Observations& obs,
+                                   const ExecutorConfig& cfg, Plan& plan,
+                                   std::vector<Step>& out) {
+  const auto qualified = in.qualified_table();
+  const auto sql_rel = detail::quote_qualified(qualified);
+  const auto& t = obs.table(qualified);
+  const auto column = in.body.value("column", "");
+  const auto type = in.body.value("type", "");
+  const auto fill = in.body.value("fill", "");
+  const bool drop_after = in.body.value("after", "") == "drop_trigger";
+  // One name for the trigger and its function, in the table's schema.
+  const auto filler = in.table() + "_" + column + "_laswell_fill";
+  const auto sql_filler = detail::quote_identifier(in.schema()) + "." +
+                          detail::quote_identifier(filler);
+  const auto sql_col = detail::quote_identifier(column);
+
+  const auto verdict = [&](Action a, const std::string& why, bool conflict = false) {
+    Step s;
+    s.kind = in.kind_name;
+    s.action = a;
+    s.why = why;
+    if (conflict) plan.conflicts.push_back(why);
+    out.push_back(std::move(s));
+  };
+
+  if (!t.value("exists", false)) {
+    verdict(Action::kConflict,
+            qualified + " does not exist, so " + column + " cannot be added to it", true);
+    return;
+  }
+  const json columns = t.value("columns", json::object());
+  const bool present = columns.contains(column);
+  if (present) {
+    const auto existing_type = columns[column].value("type", "");
+    if (existing_type != type && !type.empty()) {
+      verdict(Action::kConflict,
+              qualified + "." + column + " exists as " + existing_type +
+                  ", spec declares " + type, true);
+      return;
+    }
+  }
+  const json triggers = t.value("triggers", json::object());
+  const bool has_trigger = triggers.contains(filler);
+
+  const auto drop_filler = [&](const std::string& why) {
+    Step s;
+    s.kind = in.kind_name;
+    s.txn_class = TxnClass::kRequired;
+    s.own_transaction = true;
+    s.lock = "AccessExclusiveLock on " + qualified + ", briefly";
+    s.sql.push_back("DROP TRIGGER " + detail::quote_identifier(filler) + " ON " + sql_rel + ";");
+    s.sql.push_back("DROP FUNCTION " + sql_filler + "();");
+    s.why = why;
+    s.detail["trigger"] = filler;
+    out.push_back(std::move(s));
+  };
+
+  // Already NOT NULL: the recipe finished, or all of it but its last step.
+  if (present && columns[column].value("not_null", false)) {
+    if (drop_after && has_trigger) {
+      drop_filler("the column is NOT NULL and the trigger that filled it is still "
+                  "there: an earlier attempt stopped before dropping it");
+    } else {
+      verdict(Action::kSatisfied, "column already present as " +
+                                      columns[column].value("type", "") + " NOT NULL");
+    }
+    return;
+  }
+
+  // The walk needs a unique key. The primary key, unless the spec names one.
+  std::string key = in.body.value("key", "");
+  if (key.empty()) {
+    const json indexes = t.value("indexes", json::object());
+    for (const auto& [name, ix] : indexes.items()) {
+      (void)name;
+      const json cols = ix.value("columns", json::array());
+      if (ix.value("is_primary", false) && cols.size() == 1) key = cols[0].get<std::string>();
+    }
+    if (key.empty()) {
+      verdict(Action::kConflict,
+              qualified + " has no single-column primary key to walk while filling " +
+                  column + ". Name a unique column in \"key\".", true);
+      return;
+    }
+  }
+
+  // Step 1. The column and the trigger commit together, so there is no moment
+  // at which the column exists and a new row can arrive without a value.
+  if (!present || !has_trigger) {
+    Step s;
+    s.kind = in.kind_name;
+    s.txn_class = TxnClass::kRequired;
+    s.own_transaction = true;
+    if (!present) {
+      s.sql.push_back("ALTER TABLE " + sql_rel + " ADD COLUMN " + sql_col + " " + type + ";");
+      s.sql.push_back("COMMENT ON COLUMN " + sql_rel + "." + sql_col + " IS " +
+                      detail::quote_literal(in.body.value("comment", "")) + ";");
+    }
+    std::string tag = "laswell_fill";
+    while (fill.find("$" + tag + "$") != std::string::npos) tag += "_";
+    s.sql.push_back(
+        "CREATE OR REPLACE FUNCTION " + sql_filler + "() RETURNS trigger LANGUAGE plpgsql AS $" +
+        tag + "$\nBEGIN\n  IF NEW." + sql_col + " IS NULL THEN\n    SELECT (" + fill +
+        ") INTO NEW." + sql_col + " FROM (SELECT NEW.*) AS " +
+        detail::quote_identifier(in.table()) + ";\n  END IF;\n  RETURN NEW;\nEND\n$" + tag +
+        "$;");
+    s.sql.push_back("CREATE TRIGGER " + detail::quote_identifier(filler) +
+                    " BEFORE INSERT OR UPDATE ON " + sql_rel +
+                    " FOR EACH ROW EXECUTE FUNCTION " + sql_filler + "();");
+    s.lock = present ? "ShareRowExclusiveLock on " + qualified + " -- blocks writes, not reads"
+                     : "AccessExclusiveLock on " + qualified +
+                           ", briefly: a nullable column with no default is catalog-only";
+    s.why = present
+        ? "the column is there, nullable, without the trigger that fills it: an "
+          "earlier attempt was interrupted, or the column was added by hand. The "
+          "trigger first, so no row arrives without a value while the rest runs"
+        : "step 1: the column is added nullable -- catalog-only, no rewrite -- "
+          "and, in the same transaction, a trigger that fills it for every row "
+          "inserted or updated from this commit on. NOT NULL comes last, when "
+          "every row has a value";
+    s.detail["trigger"] = filler;
+    s.detail["expected"] = "metadata only, no table rewrite";
+    out.push_back(std::move(s));
+  }
+
+  // What the steps above leave, for the two recipes composed below: they are
+  // planned against the column as it will be, not as it is.
+  Observations after = obs;
+  after.tables[qualified]["columns"][column] = json{{"type", type}, {"not_null", false}};
+  after.tables[qualified]["triggers"][filler] = json::object();
+
+  // Step 2. The rows that were already there. Its predicate makes it
+  // resumable: a second run walks only what is still null.
+  Intent bf;
+  bf.kind = IntentKind::kBackfill;
+  bf.kind_name = "backfill";
+  bf.ordinal = in.ordinal;
+  bf.body = json{{"schema", in.schema()},
+                 {"table", in.table()},
+                 {"key", key},
+                 {"set", json{{column, "(" + fill + ")"}}},
+                 {"where", detail::quote_identifier(in.table()) + "." + sql_col + " IS NULL"}};
+  const auto before = out.size();
+  plan_backfill(bf, after, cfg, plan, out);
+  for (std::size_t i = before; i < out.size(); ++i) {
+    if (out[i].action == Action::kConflict) return;  // said by the backfill itself
+  }
+
+  // Step 3. NOT NULL, by the recipe whose scan runs under a lock the
+  // application works through.
+  Intent nn;
+  nn.kind = IntentKind::kSetNotNull;
+  nn.kind_name = "set_not_null";
+  nn.ordinal = in.ordinal;
+  nn.body = json{{"schema", in.schema()}, {"table", in.table()}, {"column", column}};
+  plan_set_not_null(nn, after, plan, out);
+
+  plan.warnings.push_back(
+      qualified + "." + column + " is filled from (" + fill + "), by trigger " + filler +
+      " for rows written from step 1 on and by a backfill for the rest. A row for "
+      "which that expression is NULL stays null, and the VALIDATE before SET NOT "
+      "NULL then fails on it: the job stops there with the column nullable and the "
+      "trigger in place, and the same specification resumes once the row is "
+      "repaired. The dry run does not look for such a row.");
+  plan.warnings.push_back(
+      "trigger " + filler + " and its function are created by this plan in schema " +
+      in.schema() + ", and run as the role writing the row: names inside the "
+      "expression resolve through that role's search_path, so qualify what it "
+      "calls. The row's own columns are written bare or as " + in.table() + ".<column>.");
+
+  // Step 4.
+  if (drop_after) {
+    drop_filler("last step: the column is NOT NULL and the application writes it "
+                "itself (\"after\": \"drop_trigger\"), so the trigger and its function "
+                "go. An insert that does not supply the column fails from here on");
+  } else {
+    plan.warnings.push_back(
+        "trigger " + filler + " STAYS (\"after\": \"keep_trigger\"): it runs on "
+        "every insert and update of " + qualified + " until a later specification "
+        "drops it with drop_trigger and drop_function.");
+  }
+}
+
+inline void plan_add_column(const Intent& in, const Observations& obs,
+                            const ExecutorConfig& cfg, Plan& plan,
                             std::vector<Step>& out) {
+  if (in.body.contains("fill")) {
+    plan_add_column_filled(in, obs, cfg, plan, out);
+    return;
+  }
   Step step;
   step.kind = in.kind_name;
   struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
@@ -281,8 +497,11 @@ inline void plan_add_column(const Intent& in, const Observations& obs, Plan& pla
     plan.conflicts.push_back(
         qualified + "." + column +
         " is declared NOT NULL with no default; on a non-empty table that "
-        "fails outright. Add the column nullable, backfill it, then set NOT "
-        "NULL in a later spec.");
+        "fails outright. Give the value as \"fill\" -- one expression over the "
+        "row's own columns, with \"after\" saying what becomes of the trigger -- "
+        "and the plan adds the column nullable, fills new rows by trigger and "
+        "existing ones by a paced backfill, and sets NOT NULL last. Or give a "
+        "\"default\", which is catalog-only.");
     return;
   }
 
@@ -6131,7 +6350,7 @@ inline Plan plan_migration(const Spec& spec, const Observations& obs,
       case IntentKind::enum_id: plan_fn(in, projected, cfg, plan, emitted); break;
 #include "modules/enabled_kinds.inc"
 #undef PGLASWELL_KIND
-      case IntentKind::kAddColumn:   plan_add_column(in, projected, plan, emitted); break;
+      case IntentKind::kAddColumn:   plan_add_column(in, projected, cfg, plan, emitted); break;
       case IntentKind::kCreateIndex: plan_create_index(in, projected, cfg, plan, emitted); break;
       case IntentKind::kBackfill:    plan_backfill(in, projected, cfg, plan, emitted); break;
       case IntentKind::kDropIndex:   plan_drop_index(in, projected, plan, emitted); break;

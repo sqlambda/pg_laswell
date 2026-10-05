@@ -80,7 +80,10 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
   &quot;type&quot;: &lt;required&gt;,
   &quot;comment&quot;: &lt;required&gt;,
   &quot;nullable&quot;: &lt;optional&gt;,
-  &quot;default&quot;: &lt;optional&gt;
+  &quot;default&quot;: &lt;optional&gt;,
+  &quot;fill&quot;: &lt;optional&gt;,
+  &quot;key&quot;: &lt;optional&gt;,
+  &quot;after&quot;: &quot;drop_trigger&quot; | &quot;keep_trigger&quot;
 }</pre>
 <h2>Parameters</h2><dl class="params">
 <dt>schema<span class="tag req">required</span></dt>
@@ -97,6 +100,12 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
 <dd>There is no default. NOT NULL on an existing table is a different risk class from a nullable add, and which one you meant must be written down rather than inferred.</dd>
 <dt>default<span class="tag opt">optional</span></dt>
 <dd>&nbsp;</dd>
+<dt>fill<span class="tag opt">optional</span></dt>
+<dd>The value for a NOT NULL column that has no default: one SQL expression over the row&#x27;s own columns, for example (payload-&gt;&gt;&#x27;customer&#x27;)::bigint. The plan adds the column nullable with a trigger that fills it on insert and update, backfills the existing rows from the same expression, and sets NOT NULL last. Requires nullable false, no default, and &quot;after&quot;.</dd>
+<dt>key<span class="tag opt">optional</span></dt>
+<dd>With fill, optional: the unique column the backfill walks. It defaults to the table&#x27;s single-column primary key.</dd>
+<dt>after<span class="tag opt">optional</span></dt>
+<dd>One of <code>drop_trigger</code>, <code>keep_trigger</code>. With fill, required: what becomes of the trigger that fills the column once it is NOT NULL. drop_trigger if the application writes the column itself by then — its inserts fail otherwise. keep_trigger if it does not: the trigger then stays on every insert and update until a later specification drops it.</dd>
 </dl>
 <div class="note">Any key not listed here is <strong>refused</strong>, not ignored: a key this binary skips and a newer one honours would be a silent difference between what was reviewed and what ran.</div>
 <h2>Examples</h2>

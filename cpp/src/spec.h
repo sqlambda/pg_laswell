@@ -539,7 +539,7 @@ inline void parse_add_column(Intent& in) {
   detail::reject_unknown_keys(
       in.body,
       {"kind", "schema", "table", "column", "type", "nullable", "default",
-       "comment"},
+       "comment", "fill", "key", "after"},
       at);
   detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
   detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
@@ -553,6 +553,85 @@ inline void parse_add_column(Intent& in) {
                  "meant must be written down rather than inferred.");
   }
   (void)detail::require_string(in.body, "comment", at);
+
+  // "fill": the value for a NOT NULL column that has no default, as one SQL
+  // expression over the row's own columns. It selects the recipe that adds the
+  // column nullable, fills new rows by trigger and old ones by a paced
+  // backfill, and only then sets NOT NULL (planner.h, plan_add_column_filled).
+  //
+  // The hints below are also the reference page's text for each key
+  // (tools/manual_extract.py takes the first one that names it), so each is
+  // written to describe the key and not only the mistake.
+  if (in.body.contains("fill")) {
+    if (!in.body["fill"].is_string() || in.body["fill"].get<std::string>().empty()) {
+      detail::fail(at + ".fill must be a non-empty SQL expression",
+                   "The value for a NOT NULL column that has no default: one "
+                   "SQL expression over the row's own columns, for example "
+                   "(payload->>'customer')::bigint. The plan adds the column "
+                   "nullable with a trigger that fills it on insert and update, "
+                   "backfills the existing rows from the same expression, and "
+                   "sets NOT NULL last. Requires nullable false, no default, "
+                   "and \"after\".");
+    }
+    if (in.body["nullable"].get<bool>()) {
+      detail::fail(at + ".fill is for a column declared with nullable false",
+                   "A nullable column needs no recipe: add it, and use a "
+                   "backfill intent if existing rows should carry a value.");
+    }
+    if (in.body.contains("default") && !in.body["default"].is_null()) {
+      detail::fail(at + ".fill cannot be combined with a default",
+                   "A NOT NULL column with a default is added in one "
+                   "catalog-only statement and needs no fill. Keep one of the two.");
+    }
+  }
+  // No default for what happens to the trigger afterwards, for the reason
+  // "nullable" has none: whether the application writes the column itself is
+  // known to the author and to nobody else, and guessing wrong either breaks
+  // its inserts or leaves a trigger on every write for good.
+  if (in.body.contains("fill") || in.body.contains("after")) {
+    if (!in.body.contains("fill")) {
+      detail::fail(at + ".after is only meaningful together with a fill expression",
+                   "With fill, required: what becomes of the trigger that fills "
+                   "the column once it is NOT NULL. drop_trigger if the "
+                   "application writes the column itself by then -- its inserts "
+                   "fail otherwise. keep_trigger if it does not: the trigger then "
+                   "stays on every insert and update until a later specification "
+                   "drops it.");
+    }
+    if (!in.body.contains("after") || !in.body["after"].is_string() ||
+        (in.body["after"] != "drop_trigger" && in.body["after"] != "keep_trigger")) {
+      detail::fail(at + ".after must be \"drop_trigger\" or \"keep_trigger\"",
+                   "Say what becomes of the trigger that fills the column once "
+                   "it is NOT NULL. There is no default: whether the application "
+                   "writes the column itself is known only to the author.");
+    }
+  }
+  if (in.body.contains("key")) {
+    if (!in.body.contains("fill")) {
+      detail::fail(at + ".key is only meaningful together with a fill expression",
+                   "With fill, optional: the unique column the backfill walks. "
+                   "It defaults to the table's single-column primary key.");
+    }
+    if (!in.body["key"].is_string()) {
+      detail::fail(at + ".key must be a column name", "A string naming one column.");
+    }
+    detail::require_identifier(in.body["key"].get<std::string>(), "key", in.ordinal);
+  }
+  if (!in.body.contains("fill")) return;
+  // The trigger, its function and the temporary check are named from the
+  // table and the column. PostgreSQL truncates an identifier at 63 bytes
+  // without saying so, and a truncated name is then not found under the name
+  // the plan uses.
+  const auto generated = in.body.value("table", "") + "_" + in.body.value("column", "") +
+                         "_laswell_fill";
+  if (generated.size() > 63) {
+    detail::fail(at + ": the generated name \"" + generated + "\" is " +
+                     std::to_string(generated.size()) + " bytes",
+                 "PostgreSQL truncates identifiers at 63 bytes. Write this "
+                 "column's recipe as separate intents (add_column nullable, "
+                 "create_function, create_trigger, backfill, set_not_null), "
+                 "where every name is yours to choose.");
+  }
 }
 
 inline void parse_backfill(Intent& in) {

@@ -775,6 +775,92 @@ There is no default, because
 .Ic NOT NULL
 on an existing table is a different risk class from a nullable add.
 .Pp
+A
+.Ic NOT NULL
+column with a
+.Va default
+that is not volatile is one catalog-only statement.
+Without a default,
+.Ic ADD COLUMN ... NOT NULL
+fails on the first existing row, and the column is refused unless the
+specification says where its value comes from:
+.Bd -literal -offset indent
+{"kind": "add_column", "schema": "public", "table": "messages",
+ "column": "customer_id", "type": "bigint", "nullable": false,
+ "fill": "(payload->>'customer')::bigint",
+ "after": "drop_trigger",
+ "comment": "The customer the message was sent to."}
+.Ed
+.Pp
+.Va fill
+is one SQL expression over the row's own columns, written bare or as
+.Ql table.column .
+The plan is then the whole recipe, in this order:
+.Bl -enum -compact
+.It
+The column, nullable \(em catalog-only \(em and in the same transaction a
+.Ic BEFORE INSERT OR UPDATE
+trigger that sets it from the expression when it is null.
+From that commit on no new row lacks a value, and an existing row the
+application updates gets one.
+.Va AccessExclusiveLock ,
+briefly.
+.It
+A paced
+.Cm backfill
+of the rows already there, walking
+.Va key ,
+which defaults to the table's single-column primary key.
+.It
+The
+.Cm set_not_null
+recipe, whose scan runs under a lock the application works through.
+.It
+What
+.Va after
+says:
+.Ql drop_trigger
+drops the trigger and its function;
+.Ql keep_trigger
+leaves them.
+.El
+.Pp
+The same expression is used by the trigger and by the backfill, so the two
+cannot disagree: inside the trigger it is evaluated as
+.Ql SELECT (fill) INTO NEW.column FROM (SELECT NEW.*) AS table
+(measured on 18.6).
+The trigger and its function are named
+.Ql <table>_<column>_laswell_fill
+and created in the table's schema.
+They run as the role writing the row, so names inside the expression resolve
+through that role's
+.Va search_path ;
+qualify what it calls.
+.Pp
+.Va after
+has no default, for the reason
+.Va nullable
+has none.
+Whether the application writes the column itself is known only to the author:
+dropping the trigger when it does not makes its next insert fail, and keeping
+it when it does leaves a trigger on every write for nothing.
+.Pp
+A row for which the expression is NULL stays null, and the
+.Ic VALIDATE
+of step 3 fails on it.
+The job stops there with the column nullable and the trigger in place, so the
+application is unaffected, and applying the same specification again resumes:
+each part reads what is already there \(em the column, the trigger, the rows
+still null, the temporary check \(em and does only what is left.
+The dry run does not look for such a row; see
+.Sx DRY RUN .
+.Pp
+Not covered: a value that needs a join is written as a scalar subquery inside
+the expression; and where a vendor does not allow row triggers on the table
+\(em a Citus distributed table \(em the dry run reports the refusal of
+.Ic CREATE TRIGGER
+before anything runs.
+.Pp
 .Cm backfill
 takes a single-column
 .Va key

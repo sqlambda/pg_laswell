@@ -2003,7 +2003,7 @@ TEST(Planner, AddColumnIsPlannedWhenTheColumnIsAbsent) {
   EXPECT_EQ(s->txn_class, pglaswell::TxnClass::kRequired);
 }
 
-TEST(Planner, NotNullWithNoDefaultIsRefusedWithTheThreeStepAlternative) {
+TEST(Planner, NotNullWithNoDefaultAndNoFillIsRefusedNamingFill) {
   auto obs = observations(1024, 10);
   obs.tables["shop.orders"]["columns"].erase("fulfilment_region");
   const auto spec = spec_with(json::array({json::parse(R"({
@@ -2011,8 +2011,162 @@ TEST(Planner, NotNullWithNoDefaultIsRefusedWithTheThreeStepAlternative) {
       "type":"text","nullable":false,"comment":"c"})")}));
   const auto plan = pglaswell::plan_migration(spec, obs, {});
   EXPECT_FALSE(plan.ok);
-  EXPECT_NE(plan.conflicts[0].find("backfill it, then set NOT NULL"), std::string::npos)
+  EXPECT_NE(plan.conflicts[0].find("Give the value as \"fill\""), std::string::npos)
       << plan.conflicts[0];
+}
+
+namespace {
+json filled_column(const char* after = "drop_trigger") {
+  return json{{"kind", "add_column"}, {"schema", "shop"}, {"table", "orders"},
+              {"column", "region_code"}, {"type", "text"}, {"nullable", false},
+              {"fill", "upper(fulfilment_region)"}, {"after", after},
+              {"comment", "The region, as a code."}};
+}
+}  // namespace
+
+// A NOT NULL column with no default, as ONE intent: the column nullable and a
+// trigger that fills it in the same transaction, a paced backfill of the rows
+// already there, the NOT NULL recipe, and the trigger dropped or kept.
+TEST(Planner, ANotNullColumnWithAFillIsTheWholeRecipe) {
+  const auto obs = observations(2LL << 30, 8000000);
+  const auto plan = pglaswell::plan_migration(spec_with(json::array({filled_column()})), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  std::vector<std::string> kinds;
+  for (const auto& s : plan.steps) kinds.push_back(s.kind);
+  ASSERT_EQ(kinds, (std::vector<std::string>{"add_column", "backfill", "set_not_null",
+                                             "set_not_null", "set_not_null", "set_not_null",
+                                             "add_column"}))
+      << plan.render();
+
+  // Step 1: column and trigger commit TOGETHER, so no new row arrives without
+  // a value. The column is nullable here; NOT NULL comes last.
+  const auto& first = plan.steps[0];
+  ASSERT_EQ(first.sql.size(), 4u) << plan.render();
+  EXPECT_EQ(first.sql[0], "ALTER TABLE \"shop\".\"orders\" ADD COLUMN \"region_code\" text;");
+  EXPECT_NE(first.sql[1].find("COMMENT ON COLUMN"), std::string::npos);
+  // ONE expression, evaluated over the new row under the table's own name.
+  EXPECT_NE(first.sql[2].find("IF NEW.\"region_code\" IS NULL THEN"), std::string::npos);
+  EXPECT_NE(first.sql[2].find("SELECT (upper(fulfilment_region)) INTO NEW.\"region_code\" "
+                              "FROM (SELECT NEW.*) AS \"orders\";"),
+            std::string::npos) << first.sql[2];
+  EXPECT_EQ(first.sql[3],
+            "CREATE TRIGGER \"orders_region_code_laswell_fill\" BEFORE INSERT OR UPDATE ON "
+            "\"shop\".\"orders\" FOR EACH ROW EXECUTE FUNCTION "
+            "\"shop\".\"orders_region_code_laswell_fill\"();");
+  EXPECT_TRUE(first.own_transaction);
+
+  // Step 2: the same expression, over the rows still null -- so it resumes.
+  const auto bf = all_sql(plan.steps[1]);
+  EXPECT_NE(bf.find("SET \"region_code\" = (upper(fulfilment_region))"), std::string::npos) << bf;
+  EXPECT_NE(bf.find("\"orders\".\"region_code\" IS NULL"), std::string::npos) << bf;
+  EXPECT_GT(plan.steps[1].txn_group, first.txn_group) << "the trigger must be committed first";
+
+  // Step 3: the NOT NULL recipe, its scan left out of the rehearsal.
+  EXPECT_NE(all_sql(plan.steps[3]).find("VALIDATE CONSTRAINT"), std::string::npos);
+  EXPECT_TRUE(plan.steps[3].detail.contains("not_rehearsed"));
+  EXPECT_NE(all_sql(plan.steps[4]).find("SET NOT NULL"), std::string::npos);
+
+  // Step 4: the trigger and its function go, last.
+  const auto& last = plan.steps.back();
+  EXPECT_EQ(last.sql.at(0), "DROP TRIGGER \"orders_region_code_laswell_fill\" ON \"shop\".\"orders\";");
+  EXPECT_EQ(last.sql.at(1), "DROP FUNCTION \"shop\".\"orders_region_code_laswell_fill\"();");
+
+  bool says_null = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("stays null") != std::string::npos) says_null = true;
+  }
+  EXPECT_TRUE(says_null) << "a row the expression cannot fill must be said: " << plan.render();
+
+  // keep_trigger: no drop, and the plan says the trigger stays.
+  const auto kept = pglaswell::plan_migration(
+      spec_with(json::array({filled_column("keep_trigger")})), obs, {});
+  ASSERT_TRUE(kept.ok) << kept.render();
+  EXPECT_EQ(kept.steps.size(), plan.steps.size() - 1);
+  EXPECT_EQ(all_sql(kept.steps.back()).find("DROP TRIGGER"), std::string::npos);
+  bool says_stays = false;
+  for (const auto& w : kept.warnings) {
+    if (w.find("STAYS") != std::string::npos) says_stays = true;
+  }
+  EXPECT_TRUE(says_stays);
+
+  // A later intent in the same specification sees the column, NOT NULL.
+  const auto then = pglaswell::plan_migration(
+      spec_with(json::array(
+          {filled_column(),
+           json{{"kind", "create_index"}, {"schema", "shop"}, {"table", "orders"},
+                {"name", "orders_region_code_idx"}, {"columns", json::array({"region_code"})},
+                {"comment", "By code."}}})),
+      obs, {});
+  EXPECT_TRUE(then.ok) << then.render();
+}
+
+// Every part is resumable from the catalog alone.
+TEST(Planner, AFilledColumnResumesFromWhereverAnAttemptStopped) {
+  auto obs = observations(2LL << 30, 8000000);
+  auto& tbl = obs.tables["shop.orders"];
+  const auto plan_of = [&](const char* after = "drop_trigger") {
+    return pglaswell::plan_migration(spec_with(json::array({filled_column(after)})), obs, {});
+  };
+  // The column is there, nullable, with its trigger: nothing is added again.
+  tbl["columns"]["region_code"] = json{{"type", "text"}, {"not_null", false}};
+  tbl["triggers"]["orders_region_code_laswell_fill"] = json::object();
+  auto p = plan_of();
+  ASSERT_TRUE(p.ok) << p.render();
+  EXPECT_EQ(p.steps[0].kind, "backfill") << p.render();
+  // The column without the trigger (added by hand, or the trigger dropped):
+  // the trigger first, and no ADD COLUMN.
+  tbl["triggers"].erase("orders_region_code_laswell_fill");
+  p = plan_of();
+  ASSERT_TRUE(p.ok) << p.render();
+  EXPECT_EQ(all_sql(p.steps[0]).find("ADD COLUMN"), std::string::npos);
+  EXPECT_NE(all_sql(p.steps[0]).find("CREATE TRIGGER"), std::string::npos);
+  // NOT NULL already, trigger still there: only the last step is left.
+  tbl["columns"]["region_code"]["not_null"] = true;
+  tbl["triggers"]["orders_region_code_laswell_fill"] = json::object();
+  p = plan_of();
+  ASSERT_TRUE(p.ok) << p.render();
+  ASSERT_EQ(p.steps.size(), 1u) << p.render();
+  EXPECT_NE(all_sql(p.steps[0]).find("DROP TRIGGER"), std::string::npos);
+  // ... and where the trigger is to be kept, or is gone: satisfied.
+  EXPECT_EQ(plan_of("keep_trigger").steps[0].action, pglaswell::Action::kSatisfied);
+  tbl["triggers"].erase("orders_region_code_laswell_fill");
+  EXPECT_EQ(plan_of().steps[0].action, pglaswell::Action::kSatisfied);
+  // Another type under that name is a conflict, as for any add_column.
+  tbl["columns"]["region_code"] = json{{"type", "integer"}, {"not_null", false}};
+  EXPECT_FALSE(plan_of().ok);
+}
+
+TEST(Spec, FillIsOnlyForANotNullColumnWithoutADefaultAndMustSayWhatFollows) {
+  const auto refused = [](json in, const char* needle) {
+    try {
+      pglaswell::parse_spec(json{{"laswell_spec_version", 1}, {"id", "s"},
+                                 {"description", "d"}, {"intents", json::array({in})}});
+    } catch (const pglaswell::SpecError& e) {
+      return std::string(e.what()).find(needle) != std::string::npos;
+    }
+    return false;
+  };
+  auto in = filled_column();
+  in.erase("after");
+  EXPECT_TRUE(refused(in, "after must be \"drop_trigger\" or \"keep_trigger\""));
+  in = filled_column("later");
+  EXPECT_TRUE(refused(in, "after must be"));
+  in = filled_column();
+  in["nullable"] = true;
+  EXPECT_TRUE(refused(in, "nullable false"));
+  in = filled_column();
+  in["default"] = "'x'";
+  EXPECT_TRUE(refused(in, "cannot be combined with a default"));
+  in = filled_column();
+  in.erase("fill");
+  EXPECT_TRUE(refused(in, ".after is only meaningful together with a fill"));
+  in.erase("after");
+  in["key"] = "id";
+  EXPECT_TRUE(refused(in, ".key is only meaningful together with a fill"));
+  // PostgreSQL truncates at 63 bytes; a truncated trigger name is never found.
+  in = filled_column();
+  in["column"] = std::string(50, 'c');
+  EXPECT_TRUE(refused(in, "is 70 bytes"));
 }
 
 TEST(Planner, BackfillWithoutAUniqueKeyIsRefusedNamingTheIndexNeeded) {
@@ -3977,6 +4131,99 @@ TEST_F(ToolTest, TheDryRunLeavesTheScanToTheJobAndAFailedScanIsResumed) {
                            " 'shop.orders'::regclass AND attname = 'warehouse_id'")[0][0].as<bool>());
   EXPECT_EQ(r.txn().exec("SELECT count(*) FROM pg_constraint WHERE conname ="
                          " 'orders_warehouse_id_laswell_nn'")[0][0].as<int>(), 0);
+}
+
+// add_column with "fill", against a real server and through a real job: the
+// whole recipe runs, a row the expression cannot fill stops it at the scan
+// with the trigger still protecting new rows, and the same specification
+// finishes once the row is repaired.
+TEST_F(ToolTest, AFilledNotNullColumnIsAppliedEndToEndAndResumesAfterANull) {
+  make_shop(cfg());
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/unfillable");
+    // One row the expression yields NULL for.
+    w.txn().exec("INSERT INTO shop.orders(warehouse_id) VALUES (NULL)");
+    w.commit();
+  }
+  const auto signed_fill = [&](const char* id, const char* column, const char* after) {
+    json doc = minimal_spec();
+    doc["id"] = id;
+    doc["description"] = "A code for the warehouse, on every order.";
+    doc["intents"] = json::array(
+        {json{{"kind", "add_column"}, {"schema", "shop"}, {"table", "orders"},
+              {"column", column}, {"type", "text"}, {"nullable", false},
+              {"fill", "'W' || orders.warehouse_id"}, {"after", after},
+              {"comment", "The warehouse, as a code."}}});
+    const auto parsed = pglaswell::parse_spec(doc);
+    doc["signatures"] = json::array({{{"key_id", test_key().key_id},
+                                      {"algorithm", "ed25519"},
+                                      {"signature", base64(sign(parsed.canonical_bytes))}}});
+    return doc;
+  };
+  const auto one = [&](const std::string& sql) {
+    pglaswell::ReadSession r(cfg());
+    return r.txn().exec(sql)[0][0].as<std::string>();
+  };
+  const auto spec = signed_fill("0003-orders-warehouse-code", "warehouse_code", "drop_trigger");
+
+  const auto plan = payload(call("planMigration", json{{"spec", spec}}));
+  ASSERT_TRUE(plan.value("ok", false)) << plan.dump(2);
+  EXPECT_FALSE(plan["dryRun"].contains("problems")) << plan["dryRun"].dump(2);
+
+  // First attempt: stops at the scan, on the row that could not be filled.
+  auto started = payload(call("startMigration", json{{"spec", spec}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, started["jobId"], [](const json& s) {
+    return s.value("state", "") == "failed";
+  })) << status_of(started["jobId"]).dump(2);
+  EXPECT_EQ(one("SELECT count(*) FROM shop.orders WHERE warehouse_code IS NULL"), "1")
+      << "every row but the unfillable one should have been backfilled";
+  EXPECT_EQ(one("SELECT count(*) FROM pg_trigger WHERE tgname = 'orders_warehouse_code_laswell_fill'"), "1")
+      << "the trigger must still be there: the column is not safe without it yet";
+  EXPECT_EQ(one("SELECT attnotnull FROM pg_attribute WHERE attrelid = 'shop.orders'::regclass"
+                " AND attname = 'warehouse_code'"), "f");
+  // While it is stopped, the application keeps writing and gets its value.
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/app-writes");
+    w.txn().exec("INSERT INTO shop.orders(warehouse_id) VALUES (3)");
+    w.txn().exec("UPDATE shop.orders SET warehouse_id = 2 WHERE warehouse_id IS NULL");
+    w.commit();
+  }
+  EXPECT_EQ(one("SELECT count(*) FROM shop.orders WHERE warehouse_code IS NULL"), "0")
+      << "the trigger fills a new row, and an old row when the application touches it";
+
+  // Second attempt: nothing is added twice, and it finishes.
+  const auto again = payload(call("planMigration", json{{"spec", spec}}));
+  ASSERT_TRUE(again.value("ok", false)) << again.dump(2);
+  EXPECT_EQ(again["steps"][0].value("kind", ""), "backfill") << again.dump(2);
+  started = payload(call("startMigration", json{{"spec", spec}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, started["jobId"], [](const json& s) {
+    return s.value("state", "") == "succeeded";
+  })) << status_of(started["jobId"]).dump(2);
+  EXPECT_EQ(one("SELECT attnotnull FROM pg_attribute WHERE attrelid = 'shop.orders'::regclass"
+                " AND attname = 'warehouse_code'"), "t");
+  EXPECT_EQ(one("SELECT count(*) FROM shop.orders WHERE warehouse_code <> 'W' || warehouse_id"), "0");
+  EXPECT_EQ(one("SELECT count(*) FROM pg_trigger WHERE tgname = 'orders_warehouse_code_laswell_fill'"), "0");
+  EXPECT_EQ(one("SELECT count(*) FROM pg_proc WHERE proname = 'orders_warehouse_code_laswell_fill'"), "0");
+  EXPECT_EQ(one("SELECT count(*) FROM pg_constraint WHERE conname = 'orders_warehouse_code_laswell_nn'"), "0");
+
+  // keep_trigger: the application never learns the column, and still inserts.
+  const auto kept = signed_fill("0004-orders-warehouse-tag", "warehouse_tag", "keep_trigger");
+  started = payload(call("startMigration", json{{"spec", kept}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, started["jobId"], [](const json& s) {
+    return s.value("state", "") == "succeeded";
+  })) << status_of(started["jobId"]).dump(2);
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/app-still-writes");
+    w.txn().exec("INSERT INTO shop.orders(warehouse_id, warehouse_code) VALUES (4, 'W4')");
+    w.commit();
+  }
+  EXPECT_EQ(one("SELECT warehouse_tag FROM shop.orders ORDER BY id DESC LIMIT 1"), "W4");
 }
 
 TEST_F(ToolTest, AFailedStepFailsTheJobAndTheLedgerSaysWhich) {
