@@ -267,6 +267,71 @@ inline ConstraintTraits constraint_traits(const Observations& obs, const std::st
 // Every part is resumable from the catalog alone -- the column, the trigger,
 // rows still null, the temporary check -- so a job that fails partway is
 // continued by applying the same specification again.
+// "fill" as the planner uses it: the sources of one column's value, in the
+// order they are tried. A plain expression over the row has no `from`.
+//
+// A LIST of sources means: the first that gives a value. Measured on 18.6:
+// COALESCE over scalar subqueries stops at the first that is not null -- of
+// 100 000 rows the second table was probed for the 50 000 the first had no
+// value for -- so the trigger evaluates one COALESCE. The backfill does not
+// probe row by row: it makes one JOINED pass per source, each over the rows
+// still null, which PostgreSQL plans as a join per batch (measured, one
+// source: 17.5 ms a batch of 5 000 against 30 ms for the subquery form).
+//
+// "Found" means a value: a row that is there with a NULL falls through to the
+// next source, since NULL can never be the answer for a NOT NULL column.
+namespace detail {
+struct FillSource {
+  std::string from, on, value;
+  bool joined() const { return !from.empty(); }
+  bool operator==(const FillSource&) const = default;
+};
+inline std::vector<FillSource> fill_sources(const json& body) {
+  std::vector<FillSource> out;
+  const auto it = body.find("fill");
+  if (it == body.end()) return out;
+  if (it->is_string()) {
+    out.push_back(FillSource{"", "", it->get<std::string>()});
+    return out;
+  }
+  for (const auto& src : *it) {
+    if (src.is_string()) {
+      out.push_back(FillSource{"", "", src.get<std::string>()});
+    } else {
+      out.push_back(FillSource{src.value("from", ""), src.value("on", ""),
+                               src.value("value", "")});
+    }
+  }
+  return out;
+}
+// Every piece of text a fill carries, for the checks made on the text itself.
+inline std::string fill_text(const json& body) {
+  std::string all;
+  for (const auto& src : fill_sources(body)) all += src.from + " " + src.on + " " + src.value + " ";
+  return all;
+}
+// One expression for the whole list, as the trigger evaluates it over the row.
+inline std::string fill_expression(const std::vector<FillSource>& sources) {
+  const auto one = [](const FillSource& src) {
+    return src.joined() ? "(SELECT (" + src.value + ") FROM " + src.from + " WHERE " + src.on + ")"
+                        : src.value;
+  };
+  if (sources.size() == 1 && !sources[0].joined()) return sources[0].value;
+  std::vector<std::string> parts;
+  for (const auto& src : sources) parts.push_back(one(src));
+  return sources.size() == 1 ? parts[0] : "COALESCE(" + join(parts, ", ") + ")";
+}
+// In words, for the plan.
+inline std::string fill_described(const std::vector<FillSource>& sources) {
+  std::vector<std::string> parts;
+  for (const auto& src : sources) {
+    parts.push_back(src.joined() ? "(" + src.value + ") from " + src.from + " on " + src.on
+                                 : "(" + src.value + ")");
+  }
+  return join(parts, ", then ");
+}
+}  // namespace detail
+
 // SEVERAL such columns on one table, written as consecutive intents, are
 // planned as ONE recipe (filled_column_group, below): one trigger, one walk
 // that sets them all, one validation scan. Planned one after the other they
@@ -392,13 +457,14 @@ inline void plan_add_columns_filled(const std::vector<const Intent*>& group,
                       detail::quote_literal(g->body.value("comment", "")) + ";");
     }
     std::string every_fill;
-    for (const auto* g : group) every_fill += g->body.value("fill", "");
+    for (const auto* g : group) every_fill += detail::fill_text(g->body);
     std::string tag = "laswell_fill";
     while (every_fill.find("$" + tag + "$") != std::string::npos) tag += "_";
     std::string body;
     for (const auto* g : group) {
       const auto c = detail::quote_identifier(g->body.value("column", ""));
-      body += "  IF NEW." + c + " IS NULL THEN\n    SELECT (" + g->body.value("fill", "") +
+      body += "  IF NEW." + c + " IS NULL THEN\n    SELECT (" +
+              detail::fill_expression(detail::fill_sources(g->body)) +
               ") INTO NEW." + c + " FROM (SELECT NEW.*) AS " + rel_alias + ";\n  END IF;\n";
     }
     s.sql.push_back("CREATE OR REPLACE FUNCTION " + sql_filler +
@@ -442,32 +508,79 @@ inline void plan_add_columns_filled(const std::vector<const Intent*>& group,
   }
   after.tables[qualified]["triggers"][filler] = json::object();
 
-  // Step 2. The rows that were already there, in ONE walk whatever the number
-  // of columns. Its predicate makes it resumable: a second run walks only the
-  // rows in which something is still null.
-  json set = json::object();
-  std::vector<std::string> still_null, not_null_terms, set_not_null_terms;
+  // Step 2. The rows that were already there. Every pass is resumable: its
+  // predicate selects only rows in which something is still null.
+  //
+  // Columns filled from ONE expression each share ONE walk, whatever their
+  // number. A list of sources is a pass per source, in order, each a join over
+  // the rows still null -- and columns whose source at the same position is
+  // the same table found the same way share that pass too.
+  std::vector<std::string> not_null_terms, set_not_null_terms;
+  std::size_t rounds = 0;
+  bool simple = pending.size() == 1;  // one column, one plain expression: as it always was
   for (const auto* g : pending) {
-    const auto column = g->body.value("column", "");
-    const auto c = detail::quote_identifier(column);
-    set[column] = "(" + g->body.value("fill", "") + ")";
-    still_null.push_back(rel_alias + "." + c + " IS NULL");
+    const auto c = detail::quote_identifier(g->body.value("column", ""));
     not_null_terms.push_back(c + " IS NOT NULL");
     set_not_null_terms.push_back("ALTER COLUMN " + c + " SET NOT NULL");
+    const auto sources = detail::fill_sources(g->body);
+    rounds = std::max(rounds, sources.size());
+    if (sources.size() != 1 || sources[0].joined()) simple = false;
   }
-  Intent bf;
-  bf.kind = IntentKind::kBackfill;
-  bf.kind_name = "backfill";
-  bf.ordinal = in.ordinal;
-  bf.body = json{{"schema", in.schema()},
-                 {"table", in.table()},
-                 {"key", key},
-                 {"set", set},
-                 {"where", detail::join(still_null, " OR ")}};
-  const auto before = out.size();
-  plan_backfill(bf, after, cfg, plan, out);
-  for (std::size_t i = before; i < out.size(); ++i) {
-    if (out[i].action == Action::kConflict) return;  // said by the backfill itself
+  for (std::size_t round = 0; round < rounds; ++round) {
+    // The passes of this round, in the order their first column was written.
+    std::vector<std::pair<detail::FillSource, std::vector<const Intent*>>> passes;
+    for (const auto* g : pending) {
+      const auto sources = detail::fill_sources(g->body);
+      if (round >= sources.size()) continue;
+      detail::FillSource where{sources[round].from, sources[round].on, ""};
+      auto it = std::find_if(passes.begin(), passes.end(),
+                             [&](const auto& p) { return p.first == where; });
+      if (it == passes.end()) {
+        passes.emplace_back(where, std::vector<const Intent*>{});
+        it = passes.end() - 1;
+      }
+      it->second.push_back(g);
+    }
+    for (const auto& [where, cols] : passes) {
+      json set = json::object();
+      std::vector<std::string> terms, what;
+      for (const auto* g : cols) {
+        const auto column = g->body.value("column", "");
+        const auto c = rel_alias + "." + detail::quote_identifier(column);
+        const auto value = detail::fill_sources(g->body)[round].value;
+        // Never over a value already there: one the application wrote, or an
+        // earlier source gave. Only the single-expression, single-column walk
+        // needs no such care, since its predicate is that column being null.
+        set[column] = simple ? "(" + value + ")" : "COALESCE(" + c + ", (" + value + "))";
+        terms.push_back(where.joined() ? "(" + c + " IS NULL AND (" + value + ") IS NOT NULL)"
+                                       : c + " IS NULL");
+        what.push_back(column);
+      }
+      Intent bf;
+      bf.kind = IntentKind::kBackfill;
+      bf.kind_name = "backfill";
+      bf.ordinal = in.ordinal;
+      bf.body = json{{"schema", in.schema()}, {"table", in.table()}, {"key", key}, {"set", set}};
+      if (where.joined()) {
+        bf.body["from"] = where.from;
+        bf.body["where"] = "(" + where.on + ") AND (" + detail::join(terms, " OR ") + ")";
+      } else {
+        bf.body["where"] = detail::join(terms, " OR ");
+      }
+      const auto before = out.size();
+      plan_backfill(bf, after, cfg, plan, out);
+      for (std::size_t i = before; i < out.size(); ++i) {
+        if (out[i].action == Action::kConflict) return;  // said by the backfill itself
+        if (rounds > 1 || where.joined()) {
+          out[i].detail["fill_source"] = round + 1;
+          out[i].why = "source " + std::to_string(round + 1) + " of " + std::to_string(rounds) +
+                       " for " + detail::join(what, ", ") +
+                       (where.joined() ? ": joined to " + where.from + " on " + where.on
+                                       : ": an expression over the row") +
+                       ", over the rows still null. " + out[i].why;
+        }
+      }
+    }
   }
 
   // Step 3. NOT NULL, by the recipe whose scan runs under a lock the
@@ -539,13 +652,25 @@ inline void plan_add_columns_filled(const std::vector<const Intent*>& group,
   }
 
   std::vector<std::string> sources;
+  bool any_joined = false;
   for (const auto* g : group) {
-    sources.push_back(g->body.value("column", "") + " from (" + g->body.value("fill", "") + ")");
+    const auto list = detail::fill_sources(g->body);
+    for (const auto& src : list) any_joined = any_joined || src.joined();
+    sources.push_back(g->body.value("column", "") + " from " + detail::fill_described(list));
+  }
+  if (any_joined) {
+    plan.warnings.push_back(
+        "a source's \"on\" must match at most one row of its table. The trigger "
+        "takes the value by a subquery and FAILS the write when two rows match "
+        "(\"more than one row returned by a subquery\"); the backfill joins, "
+        "and takes one of them without saying which. A unique key on what "
+        "\"on\" compares is what makes the two agree. The value is copied when "
+        "the row is written: a later change in the other table does not follow.");
   }
   plan.warnings.push_back(
-      qualified + ": " + detail::join(sources, ", ") + " -- filled by trigger " + filler +
+      qualified + ": " + detail::join(sources, "; ") + " -- filled by trigger " + filler +
       " for rows written from step 1 on and by a backfill for the rest. A row for "
-      "which an expression is NULL stays null, and the VALIDATE before SET NOT NULL "
+      "which no source gives a value stays null, and the VALIDATE before SET NOT NULL "
       "then fails on it: the job stops there with the column nullable and the "
       "trigger in place, and the same specification resumes once the row is "
       "repaired. The dry run does not look for such a row.");
@@ -584,6 +709,11 @@ inline std::vector<const Intent*> filled_column_group(const Spec& spec, std::siz
   const Intent& lead = spec.intents[first];
   if (lead.kind != IntentKind::kAddColumn || !lead.body.contains("fill")) return group;
   group.push_back(&lead);
+  // A column with a default has no trigger and no NOT NULL recipe to share.
+  const auto defaulted = [](const Intent& i) {
+    return i.body.contains("default") && !i.body["default"].is_null();
+  };
+  if (defaulted(lead)) return group;
   const auto names_word = [](const std::string& text, const std::string& word) {
     std::size_t at = 0;
     const auto ident = [](char ch) {
@@ -600,13 +730,14 @@ inline std::vector<const Intent*> filled_column_group(const Spec& spec, std::siz
   for (std::size_t i = first + 1; i < spec.intents.size(); ++i) {
     const Intent& next = spec.intents[i];
     if (next.kind != IntentKind::kAddColumn || !next.body.contains("fill")) break;
+    if (defaulted(next)) break;
     if (next.qualified_table() != lead.qualified_table()) break;
     if (next.body.value("after", "") != lead.body.value("after", "")) break;
     if (next.body.value("key", "") != lead.body.value("key", "")) break;
     bool entangled = false;
     for (const auto* g : group) {
-      if (names_word(next.body.value("fill", ""), g->body.value("column", "")) ||
-          names_word(g->body.value("fill", ""), next.body.value("column", ""))) {
+      if (names_word(detail::fill_text(next.body), g->body.value("column", "")) ||
+          names_word(detail::fill_text(g->body), next.body.value("column", ""))) {
         entangled = true;
       }
     }
@@ -616,13 +747,120 @@ inline std::vector<const Intent*> filled_column_group(const Spec& spec, std::siz
   return group;
 }
 
+// --- add_column with "default" AND "fill" ------------------------------------
+//
+// Where most rows keep one value, the column is added NOT NULL with that value
+// as its default: catalog-only (measured, a non-volatile default), and every
+// existing row reads it without being rewritten. What is left is to write the
+// rows whose value DIFFERS -- and only those, so the walk reads the table once
+// and writes, logs and leaves dead rows for the exceptions alone.
+//
+// There is nothing after it: no check, no validation scan, no SET NOT NULL.
+// The one exclusive lock is the ADD COLUMN, taken BEFORE the walk, so it never
+// lands behind the autovacuum a backfill provokes.
+//
+// No trigger (decided with the form): a row written after the column exists
+// gets the default unless the application supplies a value. So the walk
+// touches a row only while it still HOLDS the default -- a value the
+// application wrote is never overwritten -- and a row no source has a value
+// for keeps the default.
+inline void plan_defaulted_fill(const Intent& in, const Observations& obs,
+                                const ExecutorConfig& cfg, Plan& plan,
+                                std::vector<Step>& out) {
+  const auto qualified = in.qualified_table();
+  const auto& t = obs.table(qualified);
+  const auto column = in.body.value("column", "");
+  const auto dflt = "(" + in.body.value("default", "") + ")";
+  const auto c = detail::quote_identifier(in.table()) + "." + detail::quote_identifier(column);
+  const auto sources = detail::fill_sources(in.body);
+
+  std::string key = in.body.value("key", "");
+  if (key.empty()) {
+    const json indexes = t.value("indexes", json::object());
+    for (const auto& [name, ix] : indexes.items()) {
+      (void)name;
+      const json cols = ix.value("columns", json::array());
+      if (ix.value("is_primary", false) && cols.size() == 1) key = cols[0].get<std::string>();
+    }
+    if (key.empty()) {
+      Step s;
+      s.kind = in.kind_name;
+      s.action = Action::kConflict;
+      s.why = qualified + " has no single-column primary key to walk while filling " +
+              column + ". Name a unique column in \"key\".";
+      plan.conflicts.push_back(s.why);
+      out.push_back(std::move(s));
+      return;
+    }
+  }
+
+  Intent bf;
+  bf.kind = IntentKind::kBackfill;
+  bf.kind_name = "backfill";
+  bf.ordinal = in.ordinal;
+  bf.body = json{{"schema", in.schema()}, {"table", in.table()}, {"key", key}};
+  // One joined source is a join. Several are one pass with the same COALESCE
+  // a trigger would use: with a default in the column, "still to do" cannot
+  // be told apart from "an earlier source gave the default's own value", so
+  // the sources cannot be walked one after the other as they are without one.
+  const bool join = sources.size() == 1 && sources[0].joined();
+  const std::string value = join ? sources[0].value : detail::fill_expression(sources);
+  bf.body["set"] = json{{column, "(" + value + ")"}};
+  const std::string differs = c + " IS NOT DISTINCT FROM " + dflt + " AND (" + value +
+                              ") IS NOT NULL AND (" + value + ") IS DISTINCT FROM " + dflt;
+  if (join) {
+    bf.body["from"] = sources[0].from;
+    bf.body["where"] = "(" + sources[0].on + ") AND " + differs;
+  } else {
+    bf.body["where"] = differs;
+  }
+  const auto before = out.size();
+  plan_backfill(bf, obs, cfg, plan, out);
+  for (std::size_t i = before; i < out.size(); ++i) {
+    if (out[i].action == Action::kConflict) return;
+    out[i].why = "only the rows whose value differs from the default " + dflt +
+                 " are written: " + column + " from " + detail::fill_described(sources) +
+                 ". " + out[i].why;
+  }
+  plan.warnings.push_back(
+      qualified + "." + column + " is NOT NULL with default " + dflt + " from its first "
+      "step, and no trigger is created. A row written from then on gets the default "
+      "unless the application supplies a value; the backfill writes a row only while "
+      "it still holds the default, so a value the application wrote is kept -- and a "
+      "row it deliberately set to the default is indistinguishable from one it never "
+      "set, and is given the computed value. A row no source has a value for keeps "
+      "the default.");
+}
+
+inline void plan_add_column_plain(const Intent& in, const Observations& obs, Plan& plan,
+                                  std::vector<Step>& out);
+
 inline void plan_add_column(const Intent& in, const Observations& obs,
                             const ExecutorConfig& cfg, Plan& plan,
                             std::vector<Step>& out) {
-  if (in.body.contains("fill")) {
+  const bool has_fill = in.body.contains("fill");
+  const bool has_default = in.body.contains("default") && !in.body["default"].is_null();
+  if (has_fill && !has_default) {
     plan_add_columns_filled({&in}, obs, cfg, plan, out);
     return;
   }
+  const auto before = out.size();
+  plan_add_column_plain(in, obs, plan, out);
+  if (!has_fill) return;
+  // With a default AND a fill: the column as any defaulted column is added --
+  // or found already there, when an earlier attempt stopped during the walk --
+  // and then the walk, which is its own predicate and so simply runs again.
+  for (std::size_t i = before; i < out.size(); ++i) {
+    if (out[i].action == Action::kConflict) return;
+  }
+  Observations after = obs;
+  after.tables[in.qualified_table()]["columns"][in.body.value("column", "")] =
+      json{{"type", in.body.value("type", "")}, {"not_null", true}};
+  plan_defaulted_fill(in, after, cfg, plan, out);
+}
+
+inline void plan_add_column_plain(const Intent& in, const Observations& obs, Plan& plan,
+                                  std::vector<Step>& out) {
   Step step;
   step.kind = in.kind_name;
   struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};

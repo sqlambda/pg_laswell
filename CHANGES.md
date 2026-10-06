@@ -41,6 +41,22 @@ one statement in 4 ms against 344 ms for a bare one. They are not merged where
 one expression names another column of the group, since the trigger fills in
 order and a single `UPDATE` does not.
 
+`fill` may be a list of sources, the first that gives a value winning: an
+expression over the row, or `{"from", "on", "value"}` naming another table, how
+its row is found and what is taken from it. A row found with a NULL falls
+through to the next. The trigger evaluates the list as one `COALESCE`, which
+stops at the first value (measured: the second table was probed for half the
+rows, those the first had no value for). The backfill makes one joined pass per
+source over the rows still null -- 17.5 ms a batch of 5,000 against 30 ms for
+the per-row form, with one source -- and each pass is a step, so the ledger says
+how many rows each source filled.
+
+With a `default` as well, the recipe is shorter: the column is added NOT NULL
+with its default, catalog-only, and the backfill writes only the rows whose
+value differs from it. No trigger, no check, no validation scan, and the one
+exclusive lock comes before the walk. A row is written only while it still
+holds the default, so a value the application wrote is kept.
+
 Every part resumes from the catalog. A row the expression cannot fill stops the
 job at the validation scan with the column nullable and the trigger in place,
 and the same specification finishes once the row is repaired; the live test

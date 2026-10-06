@@ -878,8 +878,84 @@ fills in order and one
 .Ic UPDATE
 does not, so those are planned in order instead.
 .Pp
-Not covered: a value that needs a join is written as a scalar subquery inside
-the expression; and where a vendor does not allow row triggers on the table
+.Va fill
+may be a list of sources, tried in order; the first that gives a value wins:
+.Bd -literal -offset indent
+"fill": [
+  {"from": "public.crm AS c", "on": "c.msg_id = messages.id",
+   "value": "c.customer"},
+  {"from": "public.legacy AS l", "on": "l.msg_id = messages.id",
+   "value": "l.customer"},
+  "(payload->>'customer')::bigint",
+  "0"
+]
+.Ed
+.Pp
+A source is an expression over the row, or another table:
+.Va from
+names it with an alias,
+.Va on
+says how its row is found from this table's row, and
+.Va value
+is what is taken from it.
+.Dq Found
+means a value: a row that is there with a NULL falls through to the next
+source, since NULL can never be the answer for a
+.Ic NOT NULL
+column.
+The trigger evaluates the list as one
+.Ic COALESCE
+over scalar subqueries, which stops at the first that is not null (measured:
+of 100 000 rows the second table was probed for the 50 000 the first had no
+value for).
+The backfill does not probe row by row: it makes one joined pass per source,
+in order, each over the rows still null, and the ledger's step for each pass
+says how many rows that source filled.
+Columns of one recipe whose source at the same position is the same table
+found the same way share that pass.
+.Pp
+.Va on
+must match at most one row.
+The trigger fails the write when two match
+.Pq Qq more than one row returned by a subquery ,
+while the join takes one of them without saying which, so a unique key on what
+.Va on
+compares is what makes the two agree; the plan says so.
+The value is copied when the row is written, and a later change in the other
+table does not follow.
+.Pp
+With a
+.Va default
+as well as a
+.Va fill ,
+the recipe is a different and shorter one, for a column most of whose rows keep
+one value.
+The column is added
+.Ic NOT NULL
+with its default, which is catalog-only: every existing row reads the default
+without being rewritten.
+The backfill then writes only the rows whose value differs from it, so the walk
+reads the table once and writes, logs and leaves dead rows for the exceptions
+alone.
+There is no check, no validation scan and no
+.Ic SET NOT NULL ,
+and the one exclusive lock is taken before the walk and not after it.
+No trigger is created and
+.Va after
+is not given: a row written from then on gets the default unless the
+application supplies a value.
+The walk touches a row only while it still holds the default, so a value the
+application wrote is kept; a row it deliberately set to the default cannot be
+told from one it never set, and is given the computed value.
+A row no source has a value for keeps the default.
+A list of sources is here one pass over the same
+.Ic COALESCE ,
+since with a default in the column
+.Dq still to do
+cannot be told from
+.Dq already given .
+.Pp
+Not covered: where a vendor does not allow row triggers on the table
 \(em a Citus distributed table \(em the dry run reports the refusal of
 .Ic CREATE TRIGGER
 before anything runs.

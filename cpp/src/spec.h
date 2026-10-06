@@ -563,32 +563,82 @@ inline void parse_add_column(Intent& in) {
   // (tools/manual_extract.py takes the first one that names it), so each is
   // written to describe the key and not only the mistake.
   if (in.body.contains("fill")) {
-    if (!in.body["fill"].is_string() || in.body["fill"].get<std::string>().empty()) {
-      detail::fail(at + ".fill must be a non-empty SQL expression",
+    const auto& fill = in.body["fill"];
+    const bool one = fill.is_string() && !fill.get<std::string>().empty();
+    if (!one && !(fill.is_array() && !fill.empty())) {
+      detail::fail(at + ".fill must be a non-empty SQL expression, or a list of sources",
                    "The value for a NOT NULL column that has no default: one "
                    "SQL expression over the row's own columns, for example "
-                   "(payload->>'customer')::bigint. The plan adds the column "
-                   "nullable with a trigger that fills it on insert and update, "
-                   "backfills the existing rows from the same expression, and "
-                   "sets NOT NULL last. Requires nullable false, no default, "
-                   "and \"after\".");
+                   "(payload->>'customer')::bigint -- or a list of sources "
+                   "tried in order, the first that gives a value winning. A "
+                   "source is such an expression, or {\"from\", \"on\", "
+                   "\"value\"} naming another table, how its row is found, and "
+                   "what is taken from it. The plan adds the column nullable "
+                   "with a trigger that fills it on insert and update, backfills "
+                   "the existing rows from the same sources, and sets NOT NULL "
+                   "last. Requires nullable false, no default, and \"after\".");
+    }
+    if (fill.is_array()) {
+      std::size_t n = 0;
+      for (const auto& src : fill) {
+        const std::string here = at + ".fill[" + std::to_string(n++) + "]";
+        if (src.is_string()) {
+          if (src.get<std::string>().empty()) {
+            detail::fail(here + " is an empty expression",
+                         "A source written as a string is one SQL expression "
+                         "over the row's own columns.");
+          }
+          continue;
+        }
+        if (!src.is_object()) {
+          detail::fail(here + " is neither an expression nor a source object",
+                       "Write a string, or {\"from\": \"schema.table AS s\", "
+                       "\"on\": \"s.id = <table>.some_id\", \"value\": \"s.column\"}.");
+        }
+        for (auto it = src.begin(); it != src.end(); ++it) {
+          if (it.key() != "from" && it.key() != "on" && it.key() != "value") {
+            detail::fail(here + " has an unknown key \"" + it.key() + "\"",
+                         "A source object has exactly \"from\", \"on\" and \"value\".");
+          }
+        }
+        for (const char* k : {"from", "on", "value"}) {
+          if (!src.contains(k) || !src[k].is_string() || src[k].get<std::string>().empty()) {
+            detail::fail(here + " needs a non-empty \"" + std::string(k) + "\"",
+                         "\"from\" is the other table, with an alias; \"on\" is "
+                         "how its row is found from this table's row, and must "
+                         "match at most one; \"value\" is the expression taken "
+                         "from it. A row with no match, or whose value is NULL, "
+                         "falls through to the next source.");
+          }
+        }
+      }
     }
     if (in.body["nullable"].get<bool>()) {
       detail::fail(at + ".fill is for a column declared with nullable false",
                    "A nullable column needs no recipe: add it, and use a "
                    "backfill intent if existing rows should carry a value.");
     }
-    if (in.body.contains("default") && !in.body["default"].is_null()) {
-      detail::fail(at + ".fill cannot be combined with a default",
-                   "A NOT NULL column with a default is added in one "
-                   "catalog-only statement and needs no fill. Keep one of the two.");
-    }
+  }
+  // "default" WITH "fill" is its own recipe: the column is added NOT NULL with
+  // its default -- catalog-only, every row reads the default at once -- and the
+  // backfill then writes only the rows whose value differs from it. There is
+  // no trigger in it, so nothing for "after" to decide.
+  const bool defaulted_fill = in.body.contains("fill") && in.body.contains("default") &&
+                              !in.body["default"].is_null();
+  if (defaulted_fill && in.body.contains("after")) {
+    detail::fail(at + ".after does not apply when the column has a default",
+                 "With a default and a fill, no trigger is created: the column "
+                 "is NOT NULL from the start, rows written from then on get the "
+                 "default unless the application supplies a value, and the "
+                 "backfill writes the existing rows whose value differs from "
+                 "the default. Remove \"after\", or remove the default to have "
+                 "new rows filled by trigger.");
   }
   // No default for what happens to the trigger afterwards, for the reason
   // "nullable" has none: whether the application writes the column itself is
   // known to the author and to nobody else, and guessing wrong either breaks
   // its inserts or leaves a trigger on every write for good.
-  if (in.body.contains("fill") || in.body.contains("after")) {
+  if (!defaulted_fill && (in.body.contains("fill") || in.body.contains("after"))) {
     if (!in.body.contains("fill")) {
       detail::fail(at + ".after is only meaningful together with a fill expression",
                    "With fill, required: what becomes of the trigger that fills "
