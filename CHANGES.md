@@ -57,10 +57,43 @@ value differs from it. No trigger, no check, no validation scan, and the one
 exclusive lock comes before the walk. A row is written only while it still
 holds the default, so a value the application wrote is kept.
 
+Consecutive columns with a default and a fill share one walk too: a row is
+selected when any still holds its default and has another value to take, and
+each column is written only where that is so for it. Found in the field as two
+walks, every row rewritten twice.
+
 Every part resumes from the catalog. A row the expression cannot fill stops the
 job at the validation scan with the column nullable and the trigger in place,
 and the same specification finishes once the row is repaired; the live test
 does exactly that.
+
+### Citus: a distributed table is sized by its shards
+
+From a probe of the same change on Citus 14: the coordinator's relation for a
+distributed table is a shell -- 8192 bytes and 0 rows beside whatever its
+shards hold -- and core decides how to build an index from the table's size.
+So every index on a distributed table was built plainly, 346 MB as "size 0 B <
+64 MiB ceiling", blocking writes on every shard for the length of the build and
+presenting that as the safe choice. A backfill said "0 rows estimated" for a
+million.
+
+The Citus module now reads what the shards hold and answers core's question
+about the index build, as TimescaleDB does for a hypertable. The sum is taken
+from each node's own catalog over `run_command_on_workers`, not from
+`citus_table_size`, which Citus refuses inside a transaction that has made
+multi-shard modifications -- every chained dry run after its first write. It
+matched `citus_table_size` to the byte. On the probe's table the plan now reads
+"size 346.0 MiB >= 64 MiB ceiling -> concurrent build" and "1000000 rows
+estimated".
+
+### Citus: the trigger recipe is refused, and says what works instead
+
+`add_column` with `fill` and no `default` creates a trigger, and Citus allows
+none on a distributed or reference table unless `citus.enable_unsafe_triggers`
+is on. The recipe failed in the dry run at `CREATE FUNCTION` with a Citus hint
+about a setting, and the manual said it would fail somewhere else. It is now
+refused at planning, quoting the measured errors, and names the form with a
+`default`, which needs no trigger and works there.
 
 ### An exclusive step no longer queues the application behind its request
 

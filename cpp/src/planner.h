@@ -748,11 +748,11 @@ inline std::vector<const Intent*> filled_column_group(const Spec& spec, std::siz
   const Intent& lead = spec.intents[first];
   if (lead.kind != IntentKind::kAddColumn || !lead.body.contains("fill")) return group;
   group.push_back(&lead);
-  // A column with a default has no trigger and no NOT NULL recipe to share.
+  // A column with a default has no trigger and no NOT NULL recipe to share,
+  // but it has a walk, and that is shared among columns of its own kind.
   const auto defaulted = [](const Intent& i) {
     return i.body.contains("default") && !i.body["default"].is_null();
   };
-  if (defaulted(lead)) return group;
   const auto names_word = [](const std::string& text, const std::string& word) {
     std::size_t at = 0;
     const auto ident = [](char ch) {
@@ -769,7 +769,7 @@ inline std::vector<const Intent*> filled_column_group(const Spec& spec, std::siz
   for (std::size_t i = first + 1; i < spec.intents.size(); ++i) {
     const Intent& next = spec.intents[i];
     if (next.kind != IntentKind::kAddColumn || !next.body.contains("fill")) break;
-    if (defaulted(next)) break;
+    if (defaulted(next) != defaulted(lead)) break;
     if (next.qualified_table() != lead.qualified_table()) break;
     if (next.body.value("after", "") != lead.body.value("after", "")) break;
     if (next.body.value("key", "") != lead.body.value("key", "")) break;
@@ -803,15 +803,17 @@ inline std::vector<const Intent*> filled_column_group(const Spec& spec, std::siz
 // touches a row only while it still HOLDS the default -- a value the
 // application wrote is never overwritten -- and a row no source has a value
 // for keeps the default.
-inline void plan_defaulted_fill(const Intent& in, const Observations& obs,
-                                const ExecutorConfig& cfg, Plan& plan,
-                                std::vector<Step>& out) {
+//
+// Several such columns on one table, written as consecutive intents, share ONE
+// walk: it selects a row when ANY of them still holds its default and has
+// another value to take, and writes each column only where that is so for it.
+inline void plan_defaulted_fill(const std::vector<const Intent*>& group,
+                                const Observations& obs, const ExecutorConfig& cfg,
+                                Plan& plan, std::vector<Step>& out) {
+  const Intent& in = *group.front();
   const auto qualified = in.qualified_table();
   const auto& t = obs.table(qualified);
-  const auto column = in.body.value("column", "");
-  const auto dflt = "(" + in.body.value("default", "") + ")";
-  const auto c = detail::quote_identifier(in.table()) + "." + detail::quote_identifier(column);
-  const auto sources = detail::fill_sources(in.body);
+  const auto rel = detail::quote_identifier(in.table());
 
   std::string key = in.body.value("key", "");
   if (key.empty()) {
@@ -826,45 +828,73 @@ inline void plan_defaulted_fill(const Intent& in, const Observations& obs,
       s.kind = in.kind_name;
       s.action = Action::kConflict;
       s.why = qualified + " has no single-column primary key to walk while filling " +
-              column + ". Name a unique column in \"key\".";
+              in.body.value("column", "") + ". Name a unique column in \"key\".";
       plan.conflicts.push_back(s.why);
       out.push_back(std::move(s));
       return;
     }
   }
 
+  // One joined source, the same for every column, is a join. Anything else is
+  // one pass over the expression a trigger would use -- a COALESCE over the
+  // sources: with a default in the column, "still to do" cannot be told apart
+  // from "an earlier source gave the default's own value", so the sources
+  // cannot be walked one after the other as they are without a default.
+  const auto first_sources = detail::fill_sources(in.body);
+  bool join = first_sources.size() == 1 && first_sources[0].joined();
+  for (const auto* g : group) {
+    const auto src = detail::fill_sources(g->body);
+    if (src.size() != 1 || !src[0].joined() || src[0].from != first_sources[0].from ||
+        src[0].on != first_sources[0].on) {
+      join = false;
+    }
+  }
+
+  json set = json::object();
+  std::vector<std::string> any, described;
+  for (const auto* g : group) {
+    const auto column = g->body.value("column", "");
+    const auto c = rel + "." + detail::quote_identifier(column);
+    const auto dflt = "(" + g->body.value("default", "") + ")";
+    const auto sources = detail::fill_sources(g->body);
+    const std::string value = join ? sources[0].value : detail::fill_expression(sources);
+    // "Still holds the default, and there is another value to take."
+    const std::string differs = c + " IS NOT DISTINCT FROM " + dflt + " AND (" + value +
+                                ") IS NOT NULL AND (" + value + ") IS DISTINCT FROM " + dflt;
+    // Alone, the walk's predicate IS that condition. Among several, a row is
+    // selected for any of them, so each column is written only where it holds
+    // for THAT column.
+    set[column] = group.size() == 1
+                      ? "(" + value + ")"
+                      : "CASE WHEN " + differs + " THEN (" + value + ") ELSE " + c + " END";
+    any.push_back(group.size() == 1 ? differs : "(" + differs + ")");
+    described.push_back(column + " (default " + dflt + ") from " +
+                        detail::fill_described(sources));
+  }
   Intent bf;
   bf.kind = IntentKind::kBackfill;
   bf.kind_name = "backfill";
   bf.ordinal = in.ordinal;
-  bf.body = json{{"schema", in.schema()}, {"table", in.table()}, {"key", key}};
-  // One joined source is a join. Several are one pass with the same COALESCE
-  // a trigger would use: with a default in the column, "still to do" cannot
-  // be told apart from "an earlier source gave the default's own value", so
-  // the sources cannot be walked one after the other as they are without one.
-  const bool join = sources.size() == 1 && sources[0].joined();
-  const std::string value = join ? sources[0].value : detail::fill_expression(sources);
-  bf.body["set"] = json{{column, "(" + value + ")"}};
-  const std::string differs = c + " IS NOT DISTINCT FROM " + dflt + " AND (" + value +
-                              ") IS NOT NULL AND (" + value + ") IS DISTINCT FROM " + dflt;
+  bf.body = json{{"schema", in.schema()}, {"table", in.table()}, {"key", key}, {"set", set}};
   if (join) {
-    bf.body["from"] = sources[0].from;
-    bf.body["where"] = "(" + sources[0].on + ") AND " + differs;
+    bf.body["from"] = first_sources[0].from;
+    bf.body["where"] = "(" + first_sources[0].on + ") AND " +
+                       (group.size() == 1 ? any[0] : "(" + detail::join(any, " OR ") + ")");
   } else {
-    bf.body["where"] = differs;
+    bf.body["where"] = detail::join(any, " OR ");
   }
   const auto before = out.size();
   plan_backfill(bf, obs, cfg, plan, out);
   for (std::size_t i = before; i < out.size(); ++i) {
     if (out[i].action == Action::kConflict) return;
-    out[i].why = "only the rows whose value differs from the default " + dflt +
-                 " are written: " + column + " from " + detail::fill_described(sources) +
-                 ". " + out[i].why;
+    out[i].why = "only the rows whose value differs from the default are written: " +
+                 detail::join(described, "; ") + ". " + out[i].why;
   }
   plan.warnings.push_back(
-      qualified + "." + column + " is NOT NULL with default " + dflt + " from its first "
+      qualified + ": " + detail::join(described, "; ") + " -- NOT NULL with " +
+      (group.size() == 1 ? "its default" : "their defaults") + " from the first "
       "step, and no trigger is created. A row written from then on gets the default "
-      "unless the application supplies a value; the backfill writes a row only while "
+      "unless the application supplies a value; the backfill writes a column only while "
       "it still holds the default, so a value the application wrote is kept -- and a "
       "row it deliberately set to the default is indistinguishable from one it never "
       "set, and is given the computed value. A row no source has a value for keeps "
@@ -873,6 +903,26 @@ inline void plan_defaulted_fill(const Intent& in, const Observations& obs,
 
 inline void plan_add_column_plain(const Intent& in, const Observations& obs, Plan& plan,
                                   std::vector<Step>& out);
+
+// Consecutive add_column intents with a default AND a fill, as one recipe:
+// every column added as any defaulted column is -- or found already there --
+// and then ONE walk.
+inline void plan_add_columns_defaulted(const std::vector<const Intent*>& group,
+                                       const Observations& obs, const ExecutorConfig& cfg,
+                                       Plan& plan, std::vector<Step>& out) {
+  const auto before = out.size();
+  Observations after = obs;
+  for (const auto* g : group) {
+    plan_add_column_plain(*g, obs, plan, out);
+    after.tables[g->qualified_table()]["columns"][g->body.value("column", "")] =
+        json{{"type", g->body.value("type", "")}, {"not_null", true}};
+  }
+  for (std::size_t i = before; i < out.size(); ++i) {
+    if (out[i].action == Action::kConflict) return;
+  }
+  plan_defaulted_fill(group, after, cfg, plan, out);
+}
+
 
 inline void plan_add_column(const Intent& in, const Observations& obs,
                             const ExecutorConfig& cfg, Plan& plan,
@@ -895,7 +945,7 @@ inline void plan_add_column(const Intent& in, const Observations& obs,
   Observations after = obs;
   after.tables[in.qualified_table()]["columns"][in.body.value("column", "")] =
       json{{"type", in.body.value("type", "")}, {"not_null", true}};
-  plan_defaulted_fill(in, after, cfg, plan, out);
+  plan_defaulted_fill({&in}, after, cfg, plan, out);
 }
 
 inline void plan_add_column_plain(const Intent& in, const Observations& obs, Plan& plan,
@@ -6815,9 +6865,8 @@ inline Plan plan_migration(const Spec& spec, const Observations& obs,
           s.kind = in.kind_name;
           s.action = Action::kSatisfied;
           s.why = "planned together with intent " + std::to_string(led->second) +
-                  ": " + in.body.value("column", "") + " is added, filled and set NOT "
-                  "NULL by that intent's steps -- one trigger, one backfill and one "
-                  "validation scan for all of them";
+                  ": " + in.body.value("column", "") + " is added and filled by that "
+                  "intent's steps, in one walk of the table for all of them";
           emitted.push_back(std::move(s));
           break;
         }
@@ -6826,7 +6875,12 @@ inline Plan plan_migration(const Spec& spec, const Observations& obs,
           plan_add_column(in, projected, cfg, plan, emitted);
           break;
         }
-        plan_add_columns_filled(together, projected, cfg, plan, emitted);
+        if (together.front()->body.contains("default") &&
+            !together.front()->body["default"].is_null()) {
+          plan_add_columns_defaulted(together, projected, cfg, plan, emitted);
+        } else {
+          plan_add_columns_filled(together, projected, cfg, plan, emitted);
+        }
         bool applies = false;
         for (const auto& s : emitted) applies = applies || s.action == Action::kApply;
         for (std::size_t g = 1; g < together.size(); ++g) {

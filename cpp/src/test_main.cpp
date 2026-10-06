@@ -2364,7 +2364,11 @@ TEST(Planner, ADefaultWithAFillWritesOnlyTheRowsThatDifferFromTheDefault) {
   EXPECT_NE(all_sql(listed.steps[1]).find("COALESCE((SELECT (w.region) FROM shop.warehouse AS w"),
             std::string::npos) << all_sql(listed.steps[1]);
 
-  // Two such columns are not merged: each has its own default and its own walk.
+  // Two such columns, consecutive, share ONE walk: a row is selected when
+  // either still holds its default and has another value to take, and each
+  // column is written only where that is so for IT. (Found in the field as
+  // two walks, every row rewritten twice.)
+  in["fill"] = "upper(fulfilment_region)";
   auto second = in;
   second["column"] = "region_len";
   second["type"] = "integer";
@@ -2373,8 +2377,34 @@ TEST(Planner, ADefaultWithAFillWritesOnlyTheRowsThatDifferFromTheDefault) {
   const auto two = pglaswell::plan_migration(spec_with(json::array({in, second})), obs, {});
   ASSERT_TRUE(two.ok) << two.render();
   walks = 0;
-  for (const auto& s : two.steps) if (s.kind == "backfill") ++walks;
-  EXPECT_EQ(walks, 2);
+  int adds = 0;
+  std::string walk;
+  for (const auto& s : two.steps) {
+    if (s.kind == "backfill") { ++walks; walk = all_sql(s); }
+    if (all_sql(s).find("ADD COLUMN") != std::string::npos) ++adds;
+  }
+  EXPECT_EQ(walks, 1) << two.render();
+  EXPECT_EQ(adds, 2) << two.render();
+  EXPECT_NE(walk.find("\"region_code\" = CASE WHEN \"orders\".\"region_code\" IS NOT DISTINCT FROM "
+                      "('none') AND (upper(fulfilment_region)) IS NOT NULL AND "
+                      "(upper(fulfilment_region)) IS DISTINCT FROM ('none') THEN "
+                      "(upper(fulfilment_region)) ELSE \"orders\".\"region_code\" END"),
+            std::string::npos) << walk;
+  EXPECT_NE(walk.find("\"region_len\" = CASE WHEN \"orders\".\"region_len\" IS NOT DISTINCT FROM (0)"),
+            std::string::npos) << walk;
+  EXPECT_NE(walk.find(") OR (\"orders\".\"region_len\" IS NOT DISTINCT FROM (0)"),
+            std::string::npos) << walk;
+  EXPECT_NE(two.steps.back().why.find("planned together with intent 0"), std::string::npos);
+  // A defaulted column and a trigger-filled one are different recipes.
+  auto triggered = filled_column();
+  triggered["column"] = "region_len";
+  triggered["type"] = "integer";
+  triggered["fill"] = "length(fulfilment_region)";
+  const auto mixed = pglaswell::plan_migration(spec_with(json::array({in, triggered})), obs, {});
+  ASSERT_TRUE(mixed.ok) << mixed.render();
+  walks = 0;
+  for (const auto& s : mixed.steps) if (s.kind == "backfill") ++walks;
+  EXPECT_EQ(walks, 2) << mixed.render();
 }
 
 // What is NOT merged, and so planned one after the other as before.
@@ -4644,6 +4674,40 @@ TEST_F(ToolTest, AFilledNotNullColumnIsAppliedEndToEndAndResumesAfterANull) {
                 " AND attname = 'priority'"), "t");
   EXPECT_EQ(updates() - before_updates, expected_high)
       << "the walk wrote rows whose value did not differ from the default";
+
+  // Two defaulted columns in consecutive intents: ONE walk, and a row that
+  // differs in only one of them has only that one written.
+  json pair2 = minimal_spec();
+  pair2["id"] = "0009-orders-two-flags";
+  pair2["description"] = "Two flags; most orders have neither.";
+  pair2["intents"] = json::array(
+      {json{{"kind", "add_column"}, {"schema", "shop"}, {"table", "orders"},
+            {"column", "flag_a"}, {"type", "integer"}, {"nullable", false}, {"default", "0"},
+            {"fill", "CASE WHEN orders.id % 40 = 0 THEN 1 ELSE 0 END"}, {"comment", "A."}},
+       json{{"kind", "add_column"}, {"schema", "shop"}, {"table", "orders"},
+            {"column", "flag_b"}, {"type", "integer"}, {"nullable", false}, {"default", "0"},
+            {"fill", "CASE WHEN orders.id % 60 = 0 THEN 2 ELSE 0 END"}, {"comment", "B."}}});
+  {
+    const auto parsed = pglaswell::parse_spec(pair2);
+    pair2["signatures"] = json::array({{{"key_id", test_key().key_id},
+                                        {"algorithm", "ed25519"},
+                                        {"signature", base64(sign(parsed.canonical_bytes))}}});
+  }
+  const auto touched = std::stoll(one("SELECT count(*) FROM shop.orders"
+                                      " WHERE id % 40 = 0 OR id % 60 = 0"));
+  ASSERT_GT(touched, 0);
+  const auto before_pair = updates();
+  started = payload(call("startMigration", json{{"spec", pair2}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, started["jobId"], [](const json& s) {
+    return s.value("state", "") == "succeeded";
+  })) << status_of(started["jobId"]).dump(2);
+  EXPECT_EQ(one("SELECT count(*) FROM shop.orders WHERE flag_a <> CASE WHEN id % 40 = 0 THEN 1"
+                " ELSE 0 END OR flag_b <> CASE WHEN id % 60 = 0 THEN 2 ELSE 0 END"), "0");
+  EXPECT_EQ(one("SELECT count(*) FROM laswell.step WHERE job_id = '" +
+                started["jobId"].get<std::string>() + "'::uuid AND kind = 'backfill'"), "1");
+  EXPECT_EQ(updates() - before_pair, touched)
+      << "one write per row that differs in either column, and none for the rest";
 }
 
 // An exclusive step behind a long APPLICATION transaction. It used to wait all

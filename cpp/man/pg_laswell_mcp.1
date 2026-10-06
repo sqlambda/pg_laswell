@@ -1007,10 +1007,17 @@ since with a default in the column
 cannot be told from
 .Dq already given .
 .Pp
-Not covered: where a vendor does not allow row triggers on the table
-\(em a Citus distributed table \(em the dry run reports the refusal of
-.Ic CREATE TRIGGER
-before anything runs.
+Several columns with a default and a fill, written as consecutive intents on
+one table, share one walk as well: a row is selected when any of them still
+holds its default and has another value to take, and each column is written
+only where that is so for it.
+.Pp
+Where a vendor allows no row trigger on the table, the recipe that needs one is
+refused at planning and the form with a
+.Va default
+is named instead; see
+.Xr pg_laswell_citus 7
+for a distributed or reference table.
 .Pp
 .Cm backfill
 takes a single-column
