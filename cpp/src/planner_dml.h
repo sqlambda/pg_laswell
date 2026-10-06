@@ -592,6 +592,12 @@ inline void warn_about_row_security(const json& t, const std::string& qualified,
 
 }  // namespace detail
 
+// index_traits: defined in planner.h, with the dispatcher over the enabled
+// modules. Declared here because a backfill asks it how many rows a table
+// really holds.
+inline IndexTraits index_traits(const Observations& obs, const std::string& qualified,
+                                const Intent& in, std::string& decided_by);
+
 // --- backfill --------------------------------------------------------------
 //
 // One expression applied to many rows. The oldest kind in this family and the
@@ -712,7 +718,14 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
     }
   }
 
-  const long long rows = t.value("reltuples", 0LL);
+  // The table's own estimate, unless a module knows the relation does not
+  // hold the rows: a Citus distributed table and a TimescaleDB hypertable both
+  // read 0 from the parent (measured), and "0 rows estimated" for a table of a
+  // million was what the plan said.
+  std::string rows_by;
+  const auto traits = index_traits(obs, qualified, in, rows_by);
+  const long long rows = traits.answered && traits.rows >= 0 ? traits.rows
+                                                              : t.value("reltuples", 0LL);
   const auto where = in.body.value("where", "");
   const auto from = in.body.value("from", "");
 

@@ -35,6 +35,36 @@ inline void citus_plan_refusals(const Spec& spec, const Observations& obs,
     return it->value("repmodel", "") == "t" ? "reference" : "local";
   };
 
+  // 0. THE TRIGGER RECIPE. add_column with "fill" and no default adds the
+  // column with a trigger that fills it. Measured on Citus 14.0:
+  //   - the recipe's first transaction alters the table and creates the
+  //     function, and Citus refuses the second after the first ("cannot run
+  //     function command because there was a parallel operation on a
+  //     distributed table in the transaction") -- which is what a field probe
+  //     met, as a dry-run failure carrying a hint about a setting;
+  //   - with the function created in a transaction of its own, CREATE TRIGGER
+  //     is refused: "triggers are not supported on distributed tables", and
+  //     "... on reference tables";
+  //   - it is accepted only with citus.enable_unsafe_triggers on, which is the
+  //     vendor's own word for it. pg_laswell does not turn that on.
+  // So the recipe is not available there, and this says so before anything is
+  // built, naming the form that is: with a "default" the column is NOT NULL at
+  // once and only a backfill follows, which needs no trigger (measured in the
+  // same probe: it works, one walk a tenant at a time).
+  for (const auto& in : spec.intents) {
+    if (in.kind != IntentKind::kAddColumn || !in.body.contains("fill")) continue;
+    if (in.body.contains("default") && !in.body["default"].is_null()) continue;
+    const auto q = in.qualified_table();
+    const auto kind = kind_of(q);
+    if (kind == "local") continue;
+    refuse("add_column on " + q + ": \"fill\" without a \"default\" fills new rows by a "
+           "trigger, and " + q + " is a " + kind + " table. Citus: \"triggers are not "
+           "supported on " + kind + " tables\" unless citus.enable_unsafe_triggers is on, "
+           "which pg_laswell will not turn on for you. Give " + in.body.value("column", "") +
+           " a \"default\" as well: the column is then NOT NULL from the start, no "
+           "trigger is created, and the backfill writes the rows whose value differs.");
+  }
+
   // 1. DDL PROPAGATION. DECIDED: a hard refusal, not a warning. Whether it
   // should refuse or warn was an open question; this is the decision, with
   // the reason.

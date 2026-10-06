@@ -815,6 +815,30 @@ holds its locks (measured: an INSERT waited on one indefinitely) and pins the
 node's xmin horizon, so VACUUM there reclaims nothing.
 Citus resolves its own within that interval, so one older than it is not being
 resolved; the refusal says how to find it.
+.It A column filled by a trigger
+.Cm add_column
+with
+.Va fill
+and no
+.Va default
+adds the column with a trigger that fills new rows, and is refused on a
+distributed or reference table.
+Measured on Citus 14.0: the recipe's first transaction alters the table and
+creates the function, which Citus refuses together
+.Pq Qq cannot run function command because there was a parallel operation on a distributed table in the transaction ;
+with the function created first,
+.Ic CREATE TRIGGER
+is refused
+.Pq Qq triggers are not supported on distributed tables ,
+and it is accepted only with
+.Va citus.enable_unsafe_triggers
+on, which pg_laswell does not turn on.
+The refusal names what works there: with a
+.Va default
+as well, the column is
+.Ic NOT NULL
+from the start, no trigger is created, and one backfill writes the rows whose
+value differs, a distribution value at a time.
 .It A walk whose key is the distribution column
 .Cm backfill
 and
@@ -901,6 +925,36 @@ Moving shards by logical replication when a worker is not at
 Rebalancing when fewer nodes may hold shards than the replication factor
 requires, where Citus cannot compute a plan at all.
 .El
+.Sh THE SIZE OF A DISTRIBUTED TABLE
+The coordinator's own relation for a distributed table is a shell.
+Measured on 14.0: 8192 bytes and 0 rows, beside 15 MB and 200 000 rows in its
+shards.
+Core decides how to build an index from the table's size, so it sized every
+index on a distributed table as tiny and built it plainly \(em in the field,
+346 MB as
+.Qq size 0 B < 64 MiB ceiling
+\(em which blocks writes on every shard for as long as it runs.
+.Pp
+The module reads what the shards hold and answers core's question with it, so
+an index is built concurrently above the ceiling
+.Pq Ic CREATE INDEX CONCURRENTLY No works on a distributed table, measured ,
+and a backfill states the shards' rows.
+The step records
+.Va index_build_by .
+.Pp
+The size is summed from each node's own catalog over
+.Fn run_command_on_workers ,
+not taken from
+.Fn citus_table_size :
+Citus refuses its size functions in a transaction that has made multi-shard
+modifications, which a chained dry run is after its first write, while
+.Fn run_command_on_workers
+answers there and reports a failure as a row.
+The sum matched
+.Fn citus_table_size
+to the byte.
+A node that does not answer contributes nothing; a table no node reported is
+decided as before.
 .Sh AFTER A FAILED JOB
 The refusal above speaks at the next plan, and only once a prepared transaction
 is old.

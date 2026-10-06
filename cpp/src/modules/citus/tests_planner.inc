@@ -1744,3 +1744,104 @@ TEST(CitusPlanner, ARebalanceWhosePlanCouldNotBeReadRunsRatherThanRefusing) {
   EXPECT_EQ(p.steps[0].txn_class, pglaswell::TxnClass::kForbidden);
   EXPECT_NE(p.steps[0].why.find("could not be read"), std::string::npos) << p.steps[0].why;
 }
+
+// The coordinator's relation is a shell: 0 pages, 0 rows, whatever the shards
+// hold. Core, reading it, built every index on a distributed table plainly --
+// in the field, 346 MB as "size 0 B < 64 MiB ceiling". The module now says
+// what the shards hold, and core decides by that.
+TEST(CitusPlanner, AnIndexOnADistributedTableIsSizedByItsShardsNotByTheShell) {
+  const json index = {{"kind", "create_index"}, {"schema", "public"}, {"table", "messages"},
+                      {"name", "messages_tenant_idx"}, {"columns", json::array({"tenant_id"})},
+                      {"comment", "By tenant."}};
+  auto shell = table_with_pk({"tenant_id", "message_id"}, 0);
+  shell["size_estimate"] = 0;
+  auto citus = citus_obs(json{{"public.messages", {{"partmethod", "h"},
+                                                   {"distribution_column", "tenant_id"},
+                                                   {"shard_count", 32}}}});
+  const auto plan_with = [&](const json& reading) {
+    return pglaswell::plan_migration(
+        pglaswell::parse_spec(citus_spec(index)),
+        citus_observations(reading, json{{"public.messages", shell}}), {});
+  };
+  // Without the reading: as before, the shell's zero.
+  const auto blind = plan_with(citus);
+  ASSERT_TRUE(blind.ok) << blind.render();
+  EXPECT_EQ(blind.steps[0].sql.at(0).find("CONCURRENTLY"), std::string::npos);
+
+  citus["sizes"] = json{{"public.messages", {{"size_bytes", 346LL << 20}, {"rows", 1000000}}}};
+  const auto seen = plan_with(citus);
+  ASSERT_TRUE(seen.ok) << seen.render();
+  EXPECT_NE(seen.steps[0].sql.at(0).find("CREATE INDEX CONCURRENTLY"), std::string::npos)
+      << seen.render();
+  EXPECT_NE(seen.steps[0].why.find("346.0 MiB >= 64 MiB ceiling"), std::string::npos)
+      << seen.steps[0].why;
+  EXPECT_EQ(seen.steps[0].detail.value("index_build_by", ""), "citus");
+
+  // Small by its shards: still plain, and the plan says the real size.
+  citus["sizes"]["public.messages"]["size_bytes"] = 15LL << 20;
+  const auto small = plan_with(citus);
+  EXPECT_EQ(small.steps[0].sql.at(0).find("CONCURRENTLY"), std::string::npos);
+  EXPECT_NE(small.steps[0].why.find("size 15.0 MiB"), std::string::npos) << small.steps[0].why;
+
+  // A backfill states the shards' rows, not the shell's zero.
+  const json walk = {{"kind", "backfill"}, {"schema", "public"}, {"table", "messages"},
+                     {"key", "message_id"}, {"set", json{{"balance", "0"}}},
+                     {"where", "balance IS NULL"}};
+  const auto bf = pglaswell::plan_migration(
+      pglaswell::parse_spec(citus_spec(walk)),
+      citus_observations(citus, json{{"public.messages", shell}}), {});
+  ASSERT_TRUE(bf.ok) << bf.render();
+  EXPECT_NE(bf.steps[0].why.find("1000000 rows estimated"), std::string::npos) << bf.steps[0].why;
+}
+
+// add_column with "fill" and no default needs a trigger, and Citus allows none
+// on a distributed or reference table (measured on 14.0, with the two errors
+// the guard quotes). Refused at planning, in the module's words, naming the
+// form that works there -- not left to fail in the dry run with a Citus hint
+// about a setting, which is what a field probe met.
+TEST(CitusPlanner, TheTriggerRecipeIsRefusedOnACitusTableAndTheDefaultFormIsNot) {
+  json fill = {{"kind", "add_column"}, {"schema", "public"}, {"table", "messages"},
+               {"column", "customer_id"}, {"type", "bigint"}, {"nullable", false},
+               {"fill", "(payload->>'customer')::bigint"}, {"after", "keep_trigger"},
+               {"key", "message_id"}, {"comment", "The customer."}};
+  auto shell = table_with_pk({"tenant_id", "message_id"}, 0);
+  const auto plan_on = [&](const json& entry, const json& intent) {
+    return pglaswell::plan_migration(
+        pglaswell::parse_spec(citus_spec(intent)),
+        citus_observations(citus_obs(json{{"public.messages", entry}}),
+                           json{{"public.messages", shell}}), {});
+  };
+  const json distributed = {{"partmethod", "h"}, {"distribution_column", "tenant_id"}};
+  const json reference = {{"partmethod", "n"}, {"repmodel", "t"}};
+
+  const auto refused = plan_on(distributed, fill);
+  ASSERT_FALSE(refused.ok);
+  ASSERT_FALSE(refused.conflicts.empty());
+  EXPECT_NE(refused.conflicts[0].find("triggers are not supported on distributed tables"),
+            std::string::npos) << refused.conflicts[0];
+  EXPECT_NE(refused.conflicts[0].find("Give customer_id a \"default\""), std::string::npos)
+      << refused.conflicts[0];
+  EXPECT_TRUE(refused.steps.empty() || pglaswell::detail::join(refused.steps[0].sql, " ").empty())
+      << "nothing is built for a refused recipe";
+  EXPECT_NE(plan_on(reference, fill).conflicts.at(0).find("on reference tables"),
+            std::string::npos);
+
+  // With a default there is no trigger, and it is planned: the column, then
+  // one walk confined to a tenant at a time.
+  fill.erase("after");
+  fill["default"] = "0";
+  const auto ok = plan_on(distributed, fill);
+  ASSERT_TRUE(ok.ok) << ok.render();
+  for (const auto& s : ok.steps) {
+    EXPECT_EQ(pglaswell::detail::join(s.sql, " ").find("TRIGGER"), std::string::npos);
+  }
+  // A plain local table in a Citus database is not Citus's to refuse.
+  fill.erase("default");
+  fill["after"] = "keep_trigger";
+  const auto local = pglaswell::plan_migration(
+      pglaswell::parse_spec(citus_spec(fill)),
+      citus_observations(citus_obs(), json{{"public.messages", shell}}), {});
+  for (const auto& c : local.conflicts) {
+    EXPECT_EQ(c.find("triggers are not supported"), std::string::npos) << c;
+  }
+}

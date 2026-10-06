@@ -242,6 +242,21 @@ DELETE FROM laswell.job WHERE migration_id IN (
 DELETE FROM laswell.migration WHERE spec_id = '9990-ct-ref';"
 # THE §6 REFUSALS, each a Citus error found beforehand. Every expectation below
 # was measured against Citus 13 before the refusal was written.
+# THE SIZE OF A DISTRIBUTED TABLE is its shards', not the coordinator's shell.
+# ct.dist has rows and was analysed; the shell reads 0 bytes of data and 0
+# rows, and a plan that says "size 0 B" or "0 rows estimated" is reading it.
+q "ANALYZE ct.dist" >/dev/null
+out=$("$MCP" --call planMigration --args "{\"spec\":{\"laswell_spec_version\":1,
+   \"id\":\"ct-size\",\"description\":\"an index on a distributed table\",
+   \"intents\":[{\"kind\":\"create_index\",\"schema\":\"ct\",\"table\":\"dist\",
+     \"name\":\"dist_v_idx\",\"columns\":[\"v\"],\"comment\":\"c\"}]},
+   \"skipTrustChecks\":true,\"dryRun\":false}" "$CITUS_URL" 2>&1)
+if echo "$out" | grep -q '"index_build_by":"citus"' && ! echo "$out" | grep -q 'size 0 B'; then
+  ok "an index on a distributed table is sized by its shards"
+else
+  bad "the plan should carry the shards' size, decided by citus" "$out"
+fi
+
 echo "citus: refusals before execution"
 q "CREATE TABLE ct.fa (tenant_id bigint NOT NULL, id bigint NOT NULL, other bigint,
                        PRIMARY KEY (tenant_id, id))" >/dev/null
