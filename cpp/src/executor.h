@@ -425,6 +425,21 @@ class Executor {
         continue;
       }
 
+      // A step that asks for an exclusive lock and stands alone in its
+      // transaction is run so that the application does not queue behind the
+      // request; see run_exclusive. Alone, because a retry rolls back, and
+      // only a step that opens its transaction has nothing of an earlier
+      // step's to lose.
+      if (!group_open &&
+          step.value("detail", json::object()).value("exclusive_retry", false)) {
+        if (!run_exclusive(worker, ordinal, step, group_slot)) {
+          cancelled();
+          return;
+        }
+        group_open = true;
+        continue;
+      }
+
       if (!group_open) {
         group_slot = operation_slot();
         worker.begin(app_name(ordinal));
@@ -482,7 +497,69 @@ class Executor {
     }
   }
 
-  void run_in_transaction(WriteSession& w, int ordinal, const json& step) {
+  // How long one attempt at an exclusive lock may wait, and how long the step
+  // goes on trying. The first bounds how long the application can queue behind
+  // a single request; the second is this step's patience, and since nothing
+  // queues while it sleeps between attempts it can be far longer than
+  // lock_timeout, which bounds a wait the application DOES queue behind.
+  static constexpr int kExclusiveTryMs = 200;
+  static constexpr int kExclusivePatienceFactor = 20;  // x lock_timeout_ms
+
+  // A step that needs an exclusive lock, in a transaction of its own.
+  //
+  // The plan put LOCK TABLE ... IN SHARE UPDATE EXCLUSIVE MODE first
+  // (planner.h, weaker_lock_first): that waits with the ordinary lock_timeout,
+  // behind an autovacuum or other DDL, and nothing the application does queues
+  // behind it. What follows asks for the exclusive lock with a SHORT timeout.
+  // If a long application transaction is in the way the attempt gives up after
+  // kExclusiveTryMs, the transaction is rolled back -- releasing the pending
+  // request the application was queued behind -- and it is tried again after a
+  // pause. So the application waits a fraction of a second at a time, where it
+  // used to wait all of lock_timeout and the step then failed anyway.
+  //
+  // Returns false when the job was cancelled between attempts. Leaves the
+  // transaction OPEN on success, as the caller's group.
+  bool run_exclusive(WriteSession& w, int ordinal, const json& step,
+                     OperationGate::Slot& slot) {
+    const auto began = detail::steady_ms();
+    const long long patience =
+        static_cast<long long>(cfg_.executor.lock_timeout_ms) * kExclusivePatienceFactor;
+    for (int attempt = 1;; ++attempt) {
+      slot = operation_slot();
+      w.begin(app_name(ordinal));
+      bool timed_out = false;
+      run_in_transaction(w, ordinal, step, &timed_out, attempt);
+      if (!timed_out) return true;
+      w.rollback();
+      slot = OperationGate::Slot();
+      if (job_->pacing.cancel_stop.load()) return false;
+      if (detail::steady_ms() - began >= patience) {
+        record_step(ordinal, step, "lock_not_acquired", 0,
+                    json{{"sqlstate", "55P03"},
+                         {"lockAttempts", attempt},
+                         {"note",
+                          "the exclusive lock was not available in " +
+                              std::to_string(attempt) + " attempts over " +
+                              std::to_string(detail::steady_ms() - began) +
+                              " ms; nothing was applied. Each attempt waited at most " +
+                              std::to_string(kExclusiveTryMs) +
+                              " ms, so the application was never queued for longer. "
+                              "Something holds a lock on the table for a long time -- "
+                              "pg_licht currentLocks names the holder."}});
+        throw std::runtime_error("step " + std::to_string(ordinal) +
+                                 " could not acquire its exclusive lock in " +
+                                 std::to_string(attempt) + " attempts");
+      }
+      std::this_thread::sleep_for(
+          std::chrono::milliseconds(std::min(100 * attempt, 1000)));
+    }
+  }
+
+  // `lock_timed_out`, when given, makes a lock timeout the CALLER's to handle:
+  // it is set, nothing is recorded, and the transaction is left aborted for
+  // the caller to roll back. `attempt` is recorded with the step.
+  void run_in_transaction(WriteSession& w, int ordinal, const json& step,
+                          bool* lock_timed_out = nullptr, int attempt = 1) {
     const auto started = detail::steady_ms();
     long long rows = 0;
     // maintenance_work_mem, when the planner decided this step uses it. The
@@ -496,16 +573,31 @@ class Executor {
     if (mwm > 0) {
       w.txn().exec("SET LOCAL maintenance_work_mem = '" + std::to_string(mwm) + "MB'");
     }
+    bool gated = false;
+    long long gates_taken = 0;
     for (const auto& raw : step.value("sql", json::array())) {
       const auto stmt = detail::strip_semicolon(raw.get<std::string>());
       if (stmt.empty()) continue;
       try {
         const auto r = w.txn().exec(stmt);
         rows += r.affected_rows();
+        // After the weaker lock, the exclusive one: a short wait per attempt.
+        if (lock_timed_out != nullptr && stmt.rfind("LOCK TABLE ", 0) == 0 &&
+            !gated) {
+          const auto more = step.value("detail", json::object()).value("weaker_lock_first", 1LL);
+          if (++gates_taken >= more) {
+            w.txn().exec("SET LOCAL lock_timeout = " + std::to_string(kExclusiveTryMs));
+            gated = true;
+          }
+        }
       } catch (const pqxx::sql_error& e) {
         // A lock timeout is a retryable OUTCOME, not a broken migration: "we
         // did not get the lock this second" and "this migration is wrong" are
         // different facts and must not share a state.
+        if (detail::is_lock_timeout(e) && lock_timed_out != nullptr) {
+          *lock_timed_out = true;
+          return;
+        }
         if (detail::is_lock_timeout(e)) {
           record_step(ordinal, step, "lock_not_acquired", 0,
                       json{{"sqlstate", "55P03"},
@@ -523,8 +615,9 @@ class Executor {
       }
     }
     if (mwm > 0) w.txn().exec("SET LOCAL maintenance_work_mem TO DEFAULT");
-    record_step(ordinal, step, "succeeded", rows,
-                json{{"elapsedMs", detail::steady_ms() - started}});
+    json result{{"elapsedMs", detail::steady_ms() - started}};
+    if (lock_timed_out != nullptr) result["lockAttempts"] = attempt;
+    record_step(ordinal, step, "succeeded", rows, result);
   }
 
   // COPY ... FROM STDIN.

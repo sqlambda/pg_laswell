@@ -260,8 +260,8 @@ TEST(TimescaledbPlanner, WithoutTheColumnstoreTheTwoStepRecipeIsUnchanged) {
   const auto plain = ts_plan(in, obs);
   EXPECT_EQ(hyper.digest(), plain.digest());
   ASSERT_EQ(hyper.steps.size(), 2u);
-  EXPECT_NE(hyper.steps[0].sql.at(0).find("NOT VALID;"), std::string::npos);
-  EXPECT_NE(hyper.steps[1].sql.at(0).find("VALIDATE CONSTRAINT"), std::string::npos);
+  EXPECT_NE(hyper.steps[0].sql.back().find("NOT VALID;"), std::string::npos);
+  EXPECT_NE(hyper.steps[1].sql.back().find("VALIDATE CONSTRAINT"), std::string::npos);
 }
 
 // A policy step records what it declared -- applied or already satisfied -- so

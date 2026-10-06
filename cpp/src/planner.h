@@ -208,6 +208,42 @@ inline void plan_set_not_null(const Intent& in, const Observations& obs,
 // What is lost, and said in the plan: a row that violates the constraint is
 // found by the job, at this step, with the NOT VALID constraint already
 // committed -- not before anything ran. The re-plan resumes from there.
+// A step that needs an exclusive lock on a busy table, taken so that the
+// application does not queue behind the REQUEST.
+//
+// A pending AccessExclusiveLock blocks every reader and writer that arrives
+// after it, for as long as it waits. Measured in the field and reproduced on a
+// 1.5 GB table with autovacuum running on it: ADD CONSTRAINT waited 1.05 s
+// (deadlock_timeout, after which PostgreSQL cancels the autovacuum), and an
+// insert that arrived meanwhile took 1 027 ms. With
+//     LOCK TABLE t IN SHARE UPDATE EXCLUSIVE MODE
+// first, in the same transaction, the step still waited 1.04 s -- but that
+// lock conflicts with autovacuum and NOT with inserts and updates, so the
+// worst insert was 30 ms, as before it. Once it is held autovacuum cannot
+// start again, and the exclusive lock is then granted almost at once.
+//
+// That is the autovacuum case. The other is a long APPLICATION transaction,
+// which the weaker lock passes straight through: there the exclusive statement
+// waits with the application queued. So the step is also marked for the
+// executor to run with a short lock timeout and retry (executor.h,
+// run_exclusive): the application then queues for a fraction of a second at a
+// time rather than for all of lock_timeout.
+//
+// The LOCK is written into the step, so the plan shows what will run.
+inline void weaker_lock_first(Step& step, const std::vector<std::string>& sql_rels) {
+  std::vector<std::string> sql;
+  for (const auto& rel : sql_rels) {
+    sql.push_back("LOCK TABLE " + rel + " IN SHARE UPDATE EXCLUSIVE MODE;");
+  }
+  sql.insert(sql.end(), step.sql.begin(), step.sql.end());
+  step.sql = std::move(sql);
+  step.detail["exclusive_retry"] = true;
+  step.detail["weaker_lock_first"] = static_cast<long long>(sql_rels.size());
+  step.why += ". SHARE UPDATE EXCLUSIVE is taken first: it waits out an autovacuum "
+              "without queueing reads or writes, and the exclusive lock after it is "
+              "asked for with a short timeout and retried";
+}
+
 inline void do_not_rehearse(Step& step, const std::string& why, bool leaves_gap) {
   step.detail["not_rehearsed"] = why;
   step.detail["not_rehearsed_leaves_gap"] = leaves_gap;
@@ -406,6 +442,7 @@ inline void plan_add_columns_filled(const std::vector<const Intent*>& group,
     s.sql.push_back("DROP FUNCTION " + sql_filler + "();");
     s.why = why;
     s.detail["trigger"] = filler;
+    weaker_lock_first(s, {sql_rel});
     out.push_back(std::move(s));
   };
 
@@ -496,6 +533,7 @@ inline void plan_add_columns_filled(const std::vector<const Intent*>& group,
     s.detail["trigger"] = filler;
     s.detail["columns"] = names;
     s.detail["expected"] = "metadata only, no table rewrite";
+    weaker_lock_first(s, {sql_rel});
     out.push_back(std::move(s));
   }
 
@@ -618,6 +656,7 @@ inline void plan_add_columns_filled(const std::vector<const Intent*>& group,
       s.why = why;
       s.detail["columns"] = names;
       s.detail["qualified"] = qualified;
+      if (sql.find("VALIDATE CONSTRAINT") == std::string::npos) weaker_lock_first(s, {sql_rel});
       out.push_back(std::move(s));
     };
     if (have == detail::ConstraintState::kAbsent) {
@@ -2240,6 +2279,7 @@ inline void plan_add_check_constraint(const Intent& in, const Observations& obs,
             "long transaction or an autovacuum on the table it waits, and every "
             "reader and writer queues behind it until lock_timeout";
   add.detail["constraint"] = name;
+  weaker_lock_first(add, {sql_rel});
   const bool resuming = have == detail::ConstraintState::kNotValid;
   if (!resuming) out.push_back(std::move(add));
 
@@ -6392,6 +6432,8 @@ inline void plan_set_not_null(const Intent& in, const Observations& obs, Plan& p
     s.sql.push_back(sql);
     s.detail["column"] = column;
     s.detail["qualified"] = qualified;
+    // Every step of this recipe but the VALIDATE asks for an exclusive lock.
+    if (sql.find("VALIDATE CONSTRAINT") == std::string::npos) weaker_lock_first(s, {sql_rel});
     out.push_back(std::move(s));
   };
 
@@ -6578,6 +6620,8 @@ inline void plan_add_foreign_key(const Intent& in, const Observations& obs,
       " may be the busier one";
   add.detail["constraint"] = name;
   add.detail["references"] = parent;
+  // ShareRowExclusiveLock conflicts with autovacuum too, and on BOTH tables.
+  weaker_lock_first(add, {sql_rel, detail::quote_qualified(parent)});
   const bool resuming = have == detail::ConstraintState::kNotValid;
   if (!resuming) out.push_back(std::move(add));
 

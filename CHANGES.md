@@ -2,8 +2,8 @@
 
 ## Unreleased
 
-Two defects from a field report -- a 10-million-row table under 1,000 inserts a
-second, where `set_not_null` stopped every insert for three seconds before its
+Three findings from a field report -- a 10-million-row table under 1,000 inserts
+a second, where `set_not_null` stopped every insert for three seconds before its
 job had started -- and the recipe that report was writing by hand.
 
 ### A NOT NULL column without a default, as one intent
@@ -61,6 +61,28 @@ Every part resumes from the catalog. A row the expression cannot fill stops the
 job at the validation scan with the column nullable and the trigger in place,
 and the same specification finishes once the row is repaired; the live test
 does exactly that.
+
+### An exclusive step no longer queues the application behind its request
+
+A third finding from the same report, still there once the rehearsal was fixed:
+straight after a backfill autovacuum is on the table, and the next exclusive
+step waited a second behind it with every session queued behind that request.
+
+Reproduced on a 1.5 GB table with autovacuum running: asking for the exclusive
+lock directly waited 1.05 s, and an insert arriving meanwhile took 1,027 ms.
+Taking `LOCK TABLE ... IN SHARE UPDATE EXCLUSIVE MODE` first, in the same
+transaction, waited the same second with the worst insert at 30 ms: that lock
+conflicts with autovacuum and not with inserts and updates, and once it is held
+the exclusive lock is granted almost at once. The exclusive steps of
+`set_not_null`, `add_check_constraint`, `add_foreign_key` and the `fill` recipe
+now begin with that statement, and the plan shows it.
+
+The other cause of the same stall is a long application transaction, which the
+weaker lock does not help with. There the exclusive statement runs with a 200 ms
+lock timeout; when it gives up the transaction is rolled back and tried again,
+for up to twenty times `lock_timeout_ms`. The application waits a fraction of a
+second at a time, where it used to wait all of `lock_timeout_ms` before the step
+failed anyway. A step records `lockAttempts`.
 
 ### The dry run no longer runs the scan of a split recipe
 

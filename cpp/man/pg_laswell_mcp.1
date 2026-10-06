@@ -395,6 +395,58 @@ Against production it would block the application for the length of the run,
 which is why it is a separate mode and not what
 .Fl -dry-run
 does.
+.Sh EXCLUSIVE LOCKS
+A pending
+.Va AccessExclusiveLock
+blocks every reader and writer that arrives after it, for as long as it waits,
+so what a brief exclusive step costs the application is not how long it holds
+its lock but how long it waits for it.
+Two things make it wait, and each is handled where it was measured.
+.Pp
+.Em \&An autovacuum on the table ,
+which is close to certain straight after a backfill.
+PostgreSQL cancels it once a session has waited
+.Va deadlock_timeout
+behind it.
+Measured on a 1.5 GB table: asking for the exclusive lock directly waited
+1.05 s and an insert arriving meanwhile took 1 027 ms; taking
+.Bd -literal -offset indent
+LOCK TABLE t IN SHARE UPDATE EXCLUSIVE MODE;
+.Ed
+.Pp
+first, in the same transaction, waited the same second while the worst insert
+stayed at 30 ms, because that lock conflicts with autovacuum and not with
+inserts and updates.
+Once it is held autovacuum cannot start again, and the exclusive lock is then
+granted almost at once.
+The steps of
+.Cm set_not_null ,
+.Cm add_check_constraint ,
+.Cm add_foreign_key
+(for both tables) and the
+.Va fill
+recipe that ask for an exclusive lock begin with that statement, and the plan
+shows it.
+.Pp
+.Em A long application transaction ,
+which the weaker lock passes straight through.
+There the exclusive statement itself is run with a lock timeout of 200 ms.
+When it gives up, the transaction is rolled back \(em releasing the request
+the application was queued behind \(em and it is tried again after a pause.
+The application waits a fraction of a second at a time where it used to wait
+all of
+.Va lock_timeout_ms ,
+after which the step failed anyway.
+The step goes on trying for twenty times
+.Va lock_timeout_ms
+(one minute by default), since nothing queues while it sleeps, and then ends
+as
+.Li lock_not_acquired
+with the number of attempts.
+A step that succeeds records
+.Va lockAttempts .
+This applies to a step that stands alone in its transaction, which those above
+do.
 .Sh PACING
 A backfill walks the table by keyset and commits on whichever comes first:
 .Bl -tag -width Ds -compact

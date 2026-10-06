@@ -2041,15 +2041,20 @@ TEST(Planner, ANotNullColumnWithAFillIsTheWholeRecipe) {
   // Step 1: column and trigger commit TOGETHER, so no new row arrives without
   // a value. The column is nullable here; NOT NULL comes last.
   const auto& first = plan.steps[0];
-  ASSERT_EQ(first.sql.size(), 4u) << plan.render();
-  EXPECT_EQ(first.sql[0], "ALTER TABLE \"shop\".\"orders\" ADD COLUMN \"region_code\" text;");
-  EXPECT_NE(first.sql[1].find("COMMENT ON COLUMN"), std::string::npos);
+  ASSERT_EQ(first.sql.size(), 5u) << plan.render();
+  // The weaker lock first: it waits out an autovacuum without queueing the
+  // application, which a pending exclusive request would (measured: an insert
+  // of 1 027 ms behind the request, 30 ms behind this).
+  EXPECT_EQ(first.sql[0], "LOCK TABLE \"shop\".\"orders\" IN SHARE UPDATE EXCLUSIVE MODE;");
+  EXPECT_TRUE(first.detail.value("exclusive_retry", false));
+  EXPECT_EQ(first.sql[1], "ALTER TABLE \"shop\".\"orders\" ADD COLUMN \"region_code\" text;");
+  EXPECT_NE(first.sql[2].find("COMMENT ON COLUMN"), std::string::npos);
   // ONE expression, evaluated over the new row under the table's own name.
-  EXPECT_NE(first.sql[2].find("IF NEW.\"region_code\" IS NULL THEN"), std::string::npos);
-  EXPECT_NE(first.sql[2].find("SELECT (upper(fulfilment_region)) INTO NEW.\"region_code\" "
+  EXPECT_NE(first.sql[3].find("IF NEW.\"region_code\" IS NULL THEN"), std::string::npos);
+  EXPECT_NE(first.sql[3].find("SELECT (upper(fulfilment_region)) INTO NEW.\"region_code\" "
                               "FROM (SELECT NEW.*) AS \"orders\";"),
-            std::string::npos) << first.sql[2];
-  EXPECT_EQ(first.sql[3],
+            std::string::npos) << first.sql[3];
+  EXPECT_EQ(first.sql[4],
             "CREATE TRIGGER \"orders_region_code_laswell_fill\" BEFORE INSERT OR UPDATE ON "
             "\"shop\".\"orders\" FOR EACH ROW EXECUTE FUNCTION "
             "\"shop\".\"orders_region_code_laswell_fill\"();");
@@ -2068,8 +2073,8 @@ TEST(Planner, ANotNullColumnWithAFillIsTheWholeRecipe) {
 
   // Step 4: the trigger and its function go, last.
   const auto& last = plan.steps.back();
-  EXPECT_EQ(last.sql.at(0), "DROP TRIGGER \"orders_region_code_laswell_fill\" ON \"shop\".\"orders\";");
-  EXPECT_EQ(last.sql.at(1), "DROP FUNCTION \"shop\".\"orders_region_code_laswell_fill\"();");
+  EXPECT_EQ(last.sql.at(1), "DROP TRIGGER \"orders_region_code_laswell_fill\" ON \"shop\".\"orders\";");
+  EXPECT_EQ(last.sql.at(2), "DROP FUNCTION \"shop\".\"orders_region_code_laswell_fill\"();");
 
   bool says_null = false;
   for (const auto& w : plan.warnings) {
@@ -4639,6 +4644,76 @@ TEST_F(ToolTest, AFilledNotNullColumnIsAppliedEndToEndAndResumesAfterANull) {
                 " AND attname = 'priority'"), "t");
   EXPECT_EQ(updates() - before_updates, expected_high)
       << "the walk wrote rows whose value did not differ from the default";
+}
+
+// An exclusive step behind a long APPLICATION transaction. It used to wait all
+// of lock_timeout with every other session queued behind its request, and then
+// fail the job. Now each attempt waits a fraction of a second, is rolled back,
+// and is tried again: the application gets through between attempts, and the
+// job finishes when the transaction in its way does.
+TEST_F(ToolTest, AnExclusiveStepBehindALongTransactionRetriesAndLetsTheApplicationThrough) {
+  make_shop(cfg());
+  json doc = minimal_spec();
+  doc["id"] = "0008-orders-warehouse-required";
+  doc["description"] = "Every order has a warehouse.";
+  doc["intents"] = json::array({json{{"kind", "set_not_null"}, {"schema", "shop"},
+                                     {"table", "orders"}, {"column", "warehouse_id"}}});
+  {
+    const auto parsed = pglaswell::parse_spec(doc);
+    doc["signatures"] = json::array({{{"key_id", test_key().key_id},
+                                      {"algorithm", "ed25519"},
+                                      {"signature", base64(sign(parsed.canonical_bytes))}}});
+  }
+  // The dry run first, on a quiet table; the job is started once the blocker
+  // is in place, without a second rehearsal that would itself wait on it.
+  ASSERT_TRUE(payload(call("planMigration", json{{"spec", doc}})).value("ok", false));
+
+  // An application transaction that has written a row and not finished.
+  // A bare connection, not a WriteSession: that sets
+  // idle_in_transaction_session_timeout, and the server would end this
+  // transaction for us long before the test is done with it.
+  pqxx::connection app_conn(cfg().conninfo);
+  pqxx::work app(app_conn);
+  app.exec("UPDATE shop.orders SET status = status WHERE id = 1");
+
+  const auto started = payload(call("startMigration", json{{"spec", doc}, {"dryRun", false}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  const auto job_id = started["jobId"].get<std::string>();
+
+  // Well past one attempt, and past what lock_timeout used to allow in total.
+  std::this_thread::sleep_for(std::chrono::milliseconds(cfg().executor.lock_timeout_ms + 500));
+  EXPECT_EQ(status_of(job_id).value("state", ""), "running")
+      << "the step should still be trying, not failed: " << status_of(job_id).dump(2);
+
+  // Meanwhile another session writes. Behind a pending exclusive request it
+  // would wait until that request gave up; between attempts it goes through.
+  long long worst_ms = 0;
+  for (int i = 0; i < 5; ++i) {
+    const auto t0 = std::chrono::steady_clock::now();
+    pglaswell::WriteSession other(cfg());
+    other.begin("pg_laswell/test/another-writer");
+    other.txn().exec("INSERT INTO shop.orders(warehouse_id) VALUES (2)");
+    other.commit();
+    worst_ms = std::max<long long>(
+        worst_ms, std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - t0).count());
+  }
+  EXPECT_LT(worst_ms, cfg().executor.lock_timeout_ms / 2)
+      << "an insert waited " << worst_ms << " ms behind the exclusive request";
+
+  app.commit();
+  ASSERT_TRUE(wait_for_status(*this, job_id, [](const json& st) {
+    return st.value("state", "") == "succeeded";
+  })) << status_of(job_id).dump(2);
+
+  pglaswell::ReadSession r(cfg());
+  const auto attempts = r.txn().exec(
+      "SELECT (detail->>'lockAttempts')::int FROM laswell.step"
+      " WHERE job_id = $1::uuid AND ordinal = 0", pqxx::params{job_id});
+  ASSERT_EQ(attempts.size(), 1u);
+  EXPECT_GT(attempts[0][0].as<int>(), 1) << "the first step should have needed more than one try";
+  EXPECT_TRUE(r.txn().exec("SELECT attnotnull FROM pg_attribute WHERE attrelid ="
+                           " 'shop.orders'::regclass AND attname = 'warehouse_id'")[0][0].as<bool>());
 }
 
 TEST_F(ToolTest, AFailedStepFailsTheJobAndTheLedgerSaysWhich) {
@@ -9332,6 +9407,41 @@ TEST(Planner, TheScanOfASplitRecipeIsMarkedNotToBeRehearsed) {
       obs, {});
   EXPECT_NE(steps_of(ck, "add_check_constraint")[0]->lock.find("AccessExclusiveLock"),
             std::string::npos);
+}
+
+// Which steps take the weaker lock first: every one that asks for an exclusive
+// lock on the table, and not the VALIDATE, which asks for the weaker one itself.
+TEST(Planner, StepsThatNeedAnExclusiveLockTakeTheWeakerOneFirst) {
+  auto obs = observations(2LL << 30, 8000000);
+  const auto gate = std::string("LOCK TABLE \"shop\".\"orders\" IN SHARE UPDATE EXCLUSIVE MODE;");
+  const auto nn = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "set_not_null"}, {"schema", "shop"},
+                                {"table", "orders"}, {"column", "fulfilment_region"}}})),
+      obs, {});
+  ASSERT_TRUE(nn.ok) << nn.render();
+  const auto s = steps_of(nn, "set_not_null");
+  ASSERT_EQ(s.size(), 4u);
+  for (const std::size_t i : {std::size_t{0}, std::size_t{2}, std::size_t{3}}) {
+    EXPECT_EQ(s[i]->sql.at(0), gate) << i;
+    EXPECT_TRUE(s[i]->detail.value("exclusive_retry", false)) << i;
+  }
+  EXPECT_EQ(all_sql(*s[1]).find("LOCK TABLE"), std::string::npos) << "the VALIDATE";
+  EXPECT_FALSE(s[1]->detail.contains("exclusive_retry"));
+
+  // A foreign key locks two tables, and autovacuum may be on either.
+  const auto fk = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "add_foreign_key"}, {"schema", "shop"},
+                                {"table", "orders"}, {"name", "orders_wh_fk"},
+                                {"columns", json::array({"warehouse_id"})},
+                                {"references_schema", "shop"},
+                                {"references_table", "warehouse"},
+                                {"references_columns", json::array({"id"})}}})),
+      obs, {});
+  ASSERT_TRUE(fk.ok) << fk.render();
+  const auto f = steps_of(fk, "add_foreign_key");
+  EXPECT_EQ(f[0]->sql.at(0), gate);
+  EXPECT_EQ(f[0]->sql.at(1), "LOCK TABLE \"shop\".\"warehouse\" IN SHARE UPDATE EXCLUSIVE MODE;");
+  EXPECT_EQ(f[0]->detail.value("weaker_lock_first", 0), 2);
 }
 
 // What the rehearsal is handed: the marked steps as nothing to run. One that
