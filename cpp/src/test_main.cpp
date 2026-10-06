@@ -1749,6 +1749,8 @@ inline long long drive_paced_step(const pglaswell::ConnConfig& cfg,
   const auto mode = step.detail.value("batch_mode", "");
   const bool two = mode == "two_statement" && step.sql.size() > 1;
   const bool grouped = mode == "grouped" && step.sql.size() > 2;
+  const bool composite = mode == "composite" && step.sql.size() > 1;
+  const auto key_columns = step.detail.value("key_columns", json::array()).size();
 
   std::string cursor = "0";
   long long considered = 0;
@@ -1765,6 +1767,10 @@ inline long long drive_paced_step(const pglaswell::ConnConfig& cfg,
       out = pglaswell::run_grouped_batch(b.txn(), strip(step.sql[0]),
                                          strip(step.sql[1]), strip(step.sql[2]),
                                          at, 1000, 1 << 20);
+    } else if (composite) {
+      out = pglaswell::run_composite_batch(b.txn(), strip(step.sql[0]),
+                                           strip(step.sql[1]), cursor, 1000, 1 << 20,
+                                           key_columns);
     } else {
       out = pglaswell::run_paced_batch(b.txn(), strip(step.sql[0]),
                                        two ? strip(step.sql[1]) : std::string(),
@@ -2480,11 +2486,15 @@ TEST(Planner, BackfillWithoutAUniqueKeyIsRefusedNamingTheIndexNeeded) {
   EXPECT_FALSE(plan.ok);
   bool names_the_fix = false;
   for (const auto& c : plan.conflicts) {
-    if (c.find("CREATE UNIQUE INDEX CONCURRENTLY") != std::string::npos) {
+    // What the walk needs, said without a recipe: it used to offer CREATE
+    // UNIQUE INDEX CONCURRENTLY ... (key), which a hypertable refuses twice
+    // over, and what index a table can have is its owner's to know.
+    if (c.find("needs a unique index that contains id") != std::string::npos &&
+        c.find("CONCURRENTLY") == std::string::npos) {
       names_the_fix = true;
     }
   }
-  EXPECT_TRUE(names_the_fix) << "the refusal must name the index to create";
+  EXPECT_TRUE(names_the_fix) << "the refusal must say what index the walk needs";
 }
 
 TEST(Planner, TheBackfillBatchUsesForUpdateWithoutSkipLocked) {
@@ -4780,6 +4790,63 @@ TEST_F(ToolTest, AnExclusiveStepBehindALongTransactionRetriesAndLetsTheApplicati
                            " 'shop.orders'::regclass AND attname = 'warehouse_id'")[0][0].as<bool>());
 }
 
+// THE COMPOSITE WALK. A key unique only together with other columns -- a tenant
+// column first, or a time column on a partitioned table -- is walked along the
+// whole unique index, a full batch at a time, whatever the size of a "group".
+// Found in the field on a hypertable keyed (time, id): the walk by group made
+// every timestamp a group of one row, 550 rows a second.
+TEST(Planner, AKeyUniqueOnlyWithOtherColumnsIsWalkedAlongTheWholeIndex) {
+  auto obs = observations(64 << 20, 1000000);
+  auto& t = obs.tables["shop.orders"];
+  t["columns"]["created_at"] = json{{"type", "timestamp with time zone"}, {"not_null", true}};
+  t["columns"]["id"] = json{{"type", "bigint"}, {"not_null", true}};
+  const auto with_key = [&](json cols) {
+    t["indexes"] = json{{"orders_pkey",
+                         {{"is_valid", true}, {"is_unique", true}, {"is_primary", true},
+                          {"leading_column", cols[0]}, {"columns", cols}, {"predicate", ""},
+                          {"has_expressions", false}}}};
+    json doc = minimal_spec();
+    doc["intents"] = json::array({json{{"kind", "backfill"}, {"schema", "shop"},
+                                       {"table", "orders"}, {"key", "id"},
+                                       {"set", {{"fulfilment_region", "'x'"}}},
+                                       {"where", "orders.fulfilment_region IS NULL"}}});
+    return pglaswell::plan_migration(pglaswell::parse_spec(doc), obs, {});
+  };
+
+  // (time, id): the key is second -- what the walk by group used to take.
+  auto plan = with_key(json::array({"created_at", "id"}));
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto* s = find_step(plan, "backfill");
+  ASSERT_NE(s, nullptr);
+  EXPECT_EQ(s->detail.value("batch_mode", ""), "composite") << plan.render();
+  EXPECT_EQ(s->detail["key_columns"], json::array({"created_at", "id"}));
+  ASSERT_EQ(s->sql.size(), 2u);
+  EXPECT_NE(s->sql[0].find("WHERE ((\"orders\".\"created_at\", \"orders\".\"id\") > ($1, $2) "
+                           "OR $1 IS NULL) AND (orders.fulfilment_region IS NULL)"),
+            std::string::npos) << s->sql[0];
+  EXPECT_NE(s->sql[0].find("ORDER BY \"orders\".\"created_at\", \"orders\".\"id\"\n LIMIT $3"),
+            std::string::npos) << s->sql[0];
+  EXPECT_NE(s->sql[0].find("FOR UPDATE OF \"orders\""), std::string::npos);
+  EXPECT_NE(s->sql[1].find("WHERE (\"orders\".\"created_at\", \"orders\".\"id\") IN (SELECT * FROM "
+                           "unnest($1::timestamp with time zone[], $2::bigint[]))"),
+            std::string::npos) << s->sql[1];
+  EXPECT_NE(s->why.find("keyset walk on (created_at, id) together"), std::string::npos) << s->why;
+
+  // (id, time): the key is FIRST, which the walk by group refused outright.
+  plan = with_key(json::array({"id", "created_at"}));
+  ASSERT_TRUE(plan.ok) << plan.render();
+  s = find_step(plan, "backfill");
+  EXPECT_EQ(s->detail["key_columns"], json::array({"id", "created_at"}));
+  EXPECT_NE(s->sql[0].find("(\"orders\".\"id\", \"orders\".\"created_at\") > ($1, $2)"),
+            std::string::npos) << s->sql[0];
+
+  // A NULLABLE column in the index: rows with a NULL there are passed over by
+  // a row comparison, so that index is not a key to walk.
+  t["columns"]["created_at"]["not_null"] = false;
+  plan = with_key(json::array({"id", "created_at"}));
+  EXPECT_FALSE(plan.ok) << plan.render();
+}
+
 // A grouped walk must not ask which group is next while it holds the row locks
 // of the batches before. Found in the field, under load on Citus: that
 // question ran inside the transaction, took up to 1.5 s, and updates to rows
@@ -4792,9 +4859,11 @@ TEST_F(ToolTest, AGroupedWalkCommitsAtTheEndOfAGroupBeforeLookingForTheNext) {
     w.begin("pg_laswell/test/tenants");
     w.txn().exec("DROP SCHEMA IF EXISTS shop CASCADE");
     w.txn().exec("CREATE SCHEMA shop");
-    // Unique only as (tenant_id, id): the walk is grouped by tenant.
-    w.txn().exec("CREATE TABLE shop.entries(tenant_id int NOT NULL, id bigint NOT NULL,"
-                 " flag boolean, PRIMARY KEY (tenant_id, id))");
+    // Unique only as (tenant_id, id), and tenant_id NULLABLE: the composite
+    // walk needs every key column NOT NULL, so this table is still walked by
+    // group -- which off Citus is now the only way to reach that walk.
+    w.txn().exec("CREATE TABLE shop.entries(tenant_id int, id bigint NOT NULL,"
+                 " flag boolean, UNIQUE (tenant_id, id))");
     w.txn().exec("INSERT INTO shop.entries SELECT t, g, NULL FROM generate_series(1, 6) t,"
                  " generate_series(1, 300) g");
     // Tenants 2 and 3 have nothing left: groups the walk must pass, which the
@@ -4842,6 +4911,77 @@ TEST_F(ToolTest, AGroupedWalkCommitsAtTheEndOfAGroupBeforeLookingForTheNext) {
   EXPECT_EQ(r.txn().exec("SELECT rows_done FROM laswell.backfill_cursor WHERE job_id = $1::uuid",
                          pqxx::params{started["jobId"].get<std::string>()})[0][0].as<int>(),
             1200) << "only the rows that had work are walked: " << st["backfill"].dump(2);
+}
+
+// The composite walk through a real job: a table keyed (stamp, id) with one row
+// per stamp -- the shape that made the walk by group a row at a time -- filled
+// in full batches, the pre-image captured by the whole key, and resumed after
+// a cancel from a cursor that is the last row's whole key.
+TEST_F(ToolTest, ACompositeWalkFillsATableKeyedByTimeAndIdInFullBatches) {
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/events");
+    w.txn().exec("DROP SCHEMA IF EXISTS shop CASCADE");
+    w.txn().exec("CREATE SCHEMA shop");
+    w.txn().exec("CREATE TABLE shop.events(stamp timestamptz NOT NULL, id bigint NOT NULL,"
+                 " payload jsonb NOT NULL, customer bigint, PRIMARY KEY (stamp, id))");
+    // Every stamp distinct: 5 000 groups of one row each.
+    w.txn().exec("INSERT INTO shop.events SELECT '2026-01-01'::timestamptz + g * interval"
+                 " '1 second', g, jsonb_build_object('customer', g * 7), NULL"
+                 " FROM generate_series(1, 5000) g");
+    w.commit();
+    w.exec_nontransactional("ANALYZE shop.events");
+  }
+  auto e = cfg().executor;
+  e.batch_rows = 500;
+  e.commit_interval_ms = 600000;  // unreachable: commits come from the row cap
+  e.batch_cap_rows = 1000;
+  set_executor(e);
+
+  json doc = minimal_spec();
+  doc["id"] = "0011-events-customer";
+  doc["description"] = "The customer, out of the payload.";
+  doc["intents"] = json::array(
+      {json{{"kind", "backfill"}, {"schema", "shop"}, {"table", "events"}, {"key", "id"},
+            {"set", json{{"customer", "(payload->>'customer')::bigint"}}},
+            {"where", "events.customer IS NULL"},
+            {"preserve", json{{"schema", "shop"}, {"table", "events_before"}}}}});
+  {
+    const auto parsed = pglaswell::parse_spec(doc);
+    doc["signatures"] = json::array({{{"key_id", test_key().key_id},
+                                      {"algorithm", "ed25519"},
+                                      {"signature", base64(sign(parsed.canonical_bytes))}}});
+  }
+  const auto plan = payload(call("planMigration", json{{"spec", doc}}));
+  ASSERT_TRUE(plan.value("ok", false)) << plan.dump(2);
+  EXPECT_FALSE(plan["dryRun"].contains("problems")) << plan["dryRun"].dump(2);
+
+  const auto started = payload(call("startMigration", json{{"spec", doc}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, started["jobId"], [](const json& s) {
+    return s.value("state", "") == "succeeded";
+  })) << status_of(started["jobId"]).dump(2);
+
+  pglaswell::ReadSession r(cfg());
+  EXPECT_EQ(r.txn().exec("SELECT count(*) FROM shop.events WHERE customer IS DISTINCT FROM"
+                         " id * 7")[0][0].as<int>(), 0);
+  // Full batches, not a row each: 5 000 rows at a cap of 1 000 a transaction is
+  // five commits and the final one. The walk by group made 5 000.
+  const auto cur = r.txn().exec(
+      "SELECT rows_done, commits, last_key FROM laswell.backfill_cursor WHERE job_id = $1::uuid",
+      pqxx::params{started["jobId"].get<std::string>()});
+  ASSERT_EQ(cur.size(), 1u);
+  EXPECT_EQ(cur[0][0].as<int>(), 5000);
+  EXPECT_LE(cur[0][1].as<int>(), 7) << "a commit per row is what this walk exists to avoid";
+  // The cursor is the last row's WHOLE key.
+  const auto last = json::parse(cur[0][2].as<std::string>());
+  ASSERT_TRUE(last.is_array());
+  EXPECT_EQ(last.size(), 2u) << last.dump();
+  EXPECT_EQ(last[1], "5000") << last.dump();
+  // The pre-image names each row by its whole key and holds what it had.
+  EXPECT_EQ(r.txn().exec("SELECT count(*) FROM shop.events_before b JOIN shop.events e"
+                         " ON e.stamp = b.stamp AND e.id = b.id WHERE b.customer IS NULL")
+                [0][0].as<int>(), 5000);
 }
 
 TEST_F(ToolTest, AFailedStepFailsTheJobAndTheLedgerSaysWhich) {

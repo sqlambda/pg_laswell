@@ -209,6 +209,93 @@ inline std::optional<std::string> maybe(const std::string& v) {
   return v;
 }
 
+// ONE BATCH of a composite walk: a keyset walk along ALL the key columns of a
+// unique index at once, in index order.
+//
+// For a table whose key is unique only together with other columns -- a
+// tenant column first, or a time column on a partitioned table -- when nothing
+// requires a batch to stay inside one value of anything. The walk by group
+// (run_grouped_batch) handles such a table one group at a time, and where the
+// leading column is nearly unique that is one ROW at a time: found in the
+// field on a hypertable keyed (time, id), 550 rows a second. Measured there for
+// this walk, 1 000 rows a batch along the whole key: 0.44 ms a batch whichever
+// column leads, and a million rows in 13 s.
+//
+// Two statements, as the plain walk has: select the next rows after the cursor
+// FOR UPDATE, then change exactly those. The cursor is the last row's key, all
+// columns of it, as a JSON array of strings; "" or "0" is "not started".
+inline BatchOutcome run_composite_batch(pqxx::work& txn,
+                                        const std::string& select_sql,
+                                        const std::string& apply_sql,
+                                        const std::string& cursor, int batch,
+                                        long long batch_bytes,
+                                        std::size_t columns) {
+  BatchOutcome out;
+  out.cursor = cursor;
+  std::vector<std::string> at;
+  if (!cursor.empty() && cursor != "0") {
+    json j;
+    try {
+      j = json::parse(cursor);
+    } catch (const std::exception&) {
+      j = json();
+    }
+    if (!j.is_array() || j.size() != columns) {
+      throw std::runtime_error("a composite walk could not read its own cursor: \"" +
+                               cursor + "\"");
+    }
+    for (const auto& v : j) at.push_back(v.get<std::string>());
+  }
+
+  pqxx::params where;
+  for (std::size_t c = 0; c < columns; ++c) {
+    if (at.empty()) {
+      where.append(std::optional<std::string>());  // NULL: before the first row
+    } else {
+      where.append(at[c]);
+    }
+  }
+  where.append(batch);
+  const auto sel = txn.exec(select_sql, where);
+
+  // One array per key column, element i of each being row i's value.
+  std::vector<std::string> literals(columns, "{");
+  std::vector<std::string> last;
+  long long bytes = 0;
+  std::size_t taken = 0;
+  for (const auto& row : sel) {
+    std::vector<std::string> values;
+    long long row_bytes = 0;
+    for (std::size_t c = 0; c < columns; ++c) {
+      values.push_back(row[static_cast<pqxx::row::size_type>(c)].as<std::string>());
+      row_bytes += static_cast<long long>(values.back().size());
+    }
+    // Between rows, never mid-row, and never zero rows: see run_paced_batch.
+    if (taken != 0 && bytes + row_bytes > batch_bytes) break;
+    bytes += row_bytes;
+    for (std::size_t c = 0; c < columns; ++c) {
+      if (taken != 0) literals[c] += ',';
+      literals[c] += '"';
+      for (const char ch : values[c]) {
+        if (ch == '"' || ch == '\\') literals[c] += '\\';
+        literals[c] += ch;
+      }
+      literals[c] += '"';
+    }
+    last = std::move(values);
+    ++taken;
+  }
+  if (taken == 0) return out;
+
+  pqxx::params keys;
+  for (auto& l : literals) keys.append(l + "}");
+  const auto r = txn.exec(apply_sql, keys);
+  out.cursor = json(last).dump();
+  out.considered = static_cast<long long>(r.size());
+  if (out.considered == 0) out.considered = static_cast<long long>(taken);
+  return out;
+}
+
 // ONE BATCH of a grouped walk, and the only implementation of it.
 //
 // A grouped walk iterates the values of one column and keyset-walks the key
@@ -813,8 +900,16 @@ class Executor {
     // the mode, it does not bring its own executor.
     const bool grouped =
         batch_mode == "grouped" && step["sql"].size() > 2;
+    // A composite walk: two statements, like the plain one, over all the key
+    // columns of a unique index together. See run_composite_batch.
+    const bool composite =
+        batch_mode == "composite" && step["sql"].size() > 1;
+    std::vector<std::string> composite_columns;
+    for (const auto& c : detail_json.value("key_columns", json::array())) {
+      composite_columns.push_back(c.get<std::string>());
+    }
     const auto apply_sql =
-        (two_statement || grouped)
+        (two_statement || grouped || composite)
             ? detail::strip_semicolon(
                   step["sql"][grouped ? 2 : 1].get<std::string>())
             : std::string();
@@ -829,6 +924,7 @@ class Executor {
     // Non-empty only for a grouped walk, whose cursor is a pair and whose
     // staleness check therefore has a different shape. See cursor_is_stale.
     resume_group_ = detail_json.value("group_column", "");
+    resume_columns_ = composite ? composite_columns : std::vector<std::string>{};
     std::string cursor = resume_cursor(ordinal);
     // Recorded so a resume is VISIBLE. Without it a retry that resumed and one
     // that silently started over were indistinguishable -- the predicate hides
@@ -923,7 +1019,20 @@ class Executor {
             outcome = run_grouped_batch(w.txn(), sql, confined_select_sql,
                                                apply_sql, at, batch,
                                                e.batch_bytes,
-                                               /*holds_locks=*/rows_this_txn > 0);
+                                               // Only once the transaction holds a
+                                               // batch's worth of rows. A group can be
+                                               // one row -- any key whose leading
+                                               // column is nearly unique -- and a
+                                               // commit at the end of each was a
+                                               // commit per row (found in the field,
+                                               // after this commit was introduced).
+                                               // Below that the next-group question,
+                                               // now an index probe, runs with those
+                                               // few rows locked.
+                                               /*holds_locks=*/rows_this_txn >= batch);
+          } else if (composite) {
+            outcome = run_composite_batch(w.txn(), sql, apply_sql, cursor, batch,
+                                          e.batch_bytes, composite_columns.size());
           } else {
             outcome = run_paced_batch(w.txn(), sql, apply_sql, cursor, batch,
                                       e.batch_bytes);
@@ -1151,10 +1260,32 @@ class Executor {
   std::string resume_key_;
   std::string resume_where_;
   std::string resume_group_;
+  std::vector<std::string> resume_columns_;  // a composite walk's key, in order
 
   bool cursor_is_stale(ReadSession& r, const std::string& from) {
     if (resume_qualified_.empty() || resume_where_.empty()) return false;
     try {
+      // A composite cursor is one row's whole key. "Everything at or below it
+      // is done" is the same question as for a single key, asked with a row
+      // comparison over the same columns the walk orders by.
+      if (!resume_columns_.empty()) {
+        if (from.empty() || from == "0") return false;  // nothing claimed yet
+        const json at = json::parse(from);
+        if (!at.is_array() || at.size() != resume_columns_.size()) return true;
+        std::vector<std::string> cols, marks;
+        pqxx::params values;
+        for (std::size_t c = 0; c < resume_columns_.size(); ++c) {
+          cols.push_back(detail::quote_identifier(resume_columns_[c]));
+          marks.push_back("$" + std::to_string(c + 1));
+          values.append(at[c].get<std::string>());
+        }
+        const auto res = r.txn().exec(
+            "SELECT EXISTS (SELECT 1 FROM " + resume_qualified_ + " WHERE (" +
+                detail::join(cols, ", ") + ") <= (" + detail::join(marks, ", ") +
+                ") AND (" + resume_where_ + "))",
+            values);
+        return !res.empty() && res[0][0].as<bool>();
+      }
       // A grouped cursor is a pair, so "everything at or below it is
       // done" means: every earlier distribution value, and within the current
       // one every key up to the recorded one. The check asks whether any row in

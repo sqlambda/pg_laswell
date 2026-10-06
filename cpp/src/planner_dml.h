@@ -380,6 +380,62 @@ inline bool unique_group_key_index(const json& t, const std::string& key,
   return false;
 }
 
+// The composite counterpart: a unique index that CONTAINS `key`, whatever else
+// it holds and wherever in it `key` sits. Its key columns together identify a
+// row, so a walk along all of them, in index order, neither skips nor repeats
+// one -- which a walk along `key` alone could.
+//
+// Held to the same standard: unique, valid, not partial, no expressions, a
+// reading that says which columns it covers. And every column NOT NULL: a
+// unique index admits any number of rows with a NULL in it, and a row
+// comparison passes over them. The primary key is preferred; among others the
+// narrowest, then by name, so the choice is the same on every reading.
+inline bool unique_index_containing(const json& t, const std::string& key,
+                                    std::vector<std::string>& columns,
+                                    std::string& index_name) {
+  const json indexes = t.value("indexes", json::object());
+  const json table_columns = t.value("columns", json::object());
+  bool found = false, found_primary = false;
+  for (auto it = indexes.begin(); it != indexes.end(); ++it) {
+    const auto& ix = it.value();
+    if (!ix.value("is_unique", false) || !ix.value("is_valid", false)) continue;
+    if (ix.value("has_expressions", false)) continue;
+    if (!ix.contains("columns") || !ix["columns"].is_array() ||
+        !ix.contains("predicate")) {
+      continue;
+    }
+    if (!ix.value("predicate", "").empty()) continue;
+    const auto& all = ix["columns"];
+    const auto key_count = static_cast<std::size_t>(
+        ix.value("key_column_count", static_cast<int>(all.size())));
+    if (key_count < 2 || all.size() < key_count) continue;
+    std::vector<std::string> cols;
+    bool usable = true, has_key = false;
+    for (std::size_t c = 0; c < key_count; ++c) {
+      if (!all[c].is_string()) { usable = false; break; }
+      const auto name = all[c].get<std::string>();
+      if (!table_columns.contains(name) ||
+          !table_columns[name].value("not_null", false)) {
+        usable = false;
+        break;
+      }
+      if (name == key) has_key = true;
+      cols.push_back(name);
+    }
+    if (!usable || !has_key) continue;
+    const bool primary = ix.value("is_primary", false);
+    const bool better = !found || (primary && !found_primary) ||
+                        (primary == found_primary && cols.size() < columns.size());
+    if (better) {
+      columns = cols;
+      index_name = it.key();
+      found = true;
+      found_primary = primary;
+    }
+  }
+  return found;
+}
+
 inline bool unique_key_index(const json& t, const std::string& key,
                              std::string& index_name,
                              std::string* reason = nullptr) {
@@ -669,9 +725,31 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
   const auto required_group = required_confinement(obs, qualified, confined_by);
   std::string supporting_index, unproven, group_column;
   bool grouped = false;
+  // The key is unique only together with other columns, and nothing requires a
+  // batch to stay inside one value of any of them: the walk follows the whole
+  // unique index (executor.h, run_composite_batch).
+  //
+  // REVIEW LATER IF THIS CAUSES TROUBLE (decided 2026-10-06): this is taken for
+  // EVERY such table, including a plain tenant table keyed (tenant_id, id) that
+  // was walked one tenant at a time until now and worked. The reason to switch
+  // them all is that the walk by group degenerates to a row per batch wherever
+  // the leading column is nearly unique -- (time, id) on a hypertable or a
+  // partitioned table, measured at 550 rows a second -- and the planner has no
+  // reading of how many values a column holds to tell the two cases apart. The
+  // alternative considered was to keep the walk by group where groups are
+  // large and decide by a distinct-value estimate, which can be stale. If a
+  // tenant table turns out to need the per-tenant walk (its commits at tenant
+  // boundaries, or batches that never span two tenants), that is where to look.
+  bool composite = false;
+  std::vector<std::string> composite_columns;
+  std::string composite_index;
   if (required_group.empty() &&
       detail::unique_key_index(t, key, supporting_index, &unproven)) {
     grouped = false;
+  } else if (required_group.empty() &&
+             detail::unique_index_containing(t, key, composite_columns, composite_index)) {
+    composite = true;
+    supporting_index = composite_index;
   } else if (!required_group.empty() && required_group == key) {
     // Confinement is an equality on the group column, so when that column IS
     // the key every group holds exactly one row: technically a walk, and one row
@@ -705,14 +783,19 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
             "), in that order, proves. Create it, or walk a key that such an "
             "index already covers.");
       } else {
+        // No recipe for the index is offered. It used to say CREATE UNIQUE
+        // INDEX CONCURRENTLY ... (key), which a hypertable refuses twice over
+        // -- found in the field -- and what index a table can have is its
+        // owner's to know.
         step.why = "no unique index proves " + key + " unique";
         plan.conflicts.push_back(
             qualified + " has no valid unique index on (" + key + ") alone" +
             (unproven.empty() ? "" : " (" + unproven + ")") +
-            ", nor on (<group>, " + key + ") with " + key + " second, so a "
-            "keyset walk could skip or repeat rows. Create one first: "
-            "CREATE UNIQUE INDEX CONCURRENTLY ... ON " + qualified + " (" + key +
-            ");");
+            ", nor one that contains " + key + " over NOT NULL columns only, so a "
+            "keyset walk could skip or repeat rows. The walk needs a unique index "
+            "that contains " + key + ": on it alone, or with other columns, which "
+            "it then follows together. Name as \"key\" a column of such an "
+            "index, or create one.");
       }
       return;
     }
@@ -795,7 +878,15 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
       changed.push_back(it.key());
     }
     detail::Preserved pv;
-    if (detail::plan_preserve(in, columns, sql_rel, key, changed, out, pv)) {
+    // For a composite walk the side table carries the WHOLE key, since that is
+    // what identifies the row a pre-image belongs to.
+    std::vector<std::string> saved = changed;
+    if (composite) {
+      saved.assign(composite_columns.begin() + 1, composite_columns.end());
+      saved.insert(saved.end(), changed.begin(), changed.end());
+    }
+    if (detail::plan_preserve(in, columns, sql_rel,
+                              composite ? composite_columns[0] : key, saved, out, pv)) {
       preserve_cte =
           "WITH " + detail::preserve_cte_by_keys(pv, sql_rel, rel, key, key_array) +
           "\n";
@@ -823,7 +914,67 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
       " WHERE " + rel + "." + k + " = " + key_array + " AND (" + where + ")\n"
       "RETURNING " + rel + "." + k + ";";
 
-  if (!grouped) {
+  if (composite) {
+    // Two statements, as the plain walk has, over the index's columns
+    // together. The row comparison is what an index on those columns serves in
+    // order without a sort (measured on a hypertable, either column leading:
+    // an index scan per chunk, 0.44 ms for 1 000 rows).
+    //
+    // `$1 IS NULL` means "before the first row", and comes AFTER the
+    // comparison for the reason given below for the walk by group.
+    std::vector<std::string> cols, marks, arrays;
+    for (std::size_t c = 0; c < composite_columns.size(); ++c) {
+      cols.push_back(rel + "." + detail::quote_identifier(composite_columns[c]));
+      marks.push_back("$" + std::to_string(c + 1));
+      arrays.push_back("$" + std::to_string(c + 1) + "::" +
+                       columns.value(composite_columns[c], json::object()).value("type", "text") +
+                       "[]");
+    }
+    const std::string tuple = "(" + detail::join(cols, ", ") + ")";
+    const std::string in_batch =
+        tuple + " IN (SELECT * FROM unnest(" + detail::join(arrays, ", ") + "))";
+    step.sql.push_back(
+        "SELECT " + detail::join(cols, ", ") + "\n"
+        "  FROM " + sql_rel + (from.empty() ? "" : ", " + from) + "\n"
+        " WHERE (" + tuple + " > (" + detail::join(marks, ", ") + ") OR $1 IS NULL) AND (" +
+            where + ")\n"
+        " ORDER BY " + detail::join(cols, ", ") + "\n"
+        " LIMIT $" + std::to_string(composite_columns.size() + 1) + "\n"
+        " FOR UPDATE OF " + rel + ";");
+    std::string composite_preserve;
+    if (step.detail.contains("preserve")) {
+      // The pre-image is identified by the whole key, so every key column is
+      // saved, and the capture selects the batch by all of them.
+      detail::Preserved pv;
+      std::vector<std::string> saved(composite_columns.begin() + 1, composite_columns.end());
+      for (auto it = in.body["set"].begin(); it != in.body["set"].end(); ++it) {
+        saved.push_back(it.key());
+      }
+      std::vector<Step> discard;  // the side table step was already emitted above
+      detail::plan_preserve(in, columns, sql_rel, composite_columns[0], saved, discard, pv);
+      std::vector<std::string> quoted, selected;
+      for (const auto& c : pv.cols) {
+        quoted.push_back(detail::quote_identifier(c));
+        selected.push_back(rel + "." + detail::quote_identifier(c));
+      }
+      composite_preserve =
+          "WITH preserved AS (\n"
+          "  INSERT INTO " + pv.sql_rel + " (" + detail::join(quoted, ", ") + ")\n"
+          "  SELECT " + detail::join(selected, ", ") + "\n"
+          "    FROM " + sql_rel + "\n"
+          "   WHERE " + in_batch + "\n"
+          ")\n";
+    }
+    step.sql.push_back(
+        composite_preserve +
+        "UPDATE " + sql_rel + "\n"
+        "   SET " + detail::join(assignments, ", ") + "\n" +
+        (from.empty() ? "" : "  FROM " + from + "\n") +
+        " WHERE " + in_batch + " AND (" + where + ")\n"
+        "RETURNING " + detail::join(cols, ", ") + ";");
+    step.detail["batch_mode"] = "composite";
+    step.detail["key_columns"] = composite_columns;
+  } else if (!grouped) {
     step.sql.push_back(select_sql);
     step.sql.push_back(apply_sql);
     // Which loop the executor runs. Named rather than inferred from the number
@@ -929,7 +1080,9 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
         "does not: a backfill can complete every row and still halve a total.";
   }
 
-  step.why = std::to_string(rows) + " rows estimated; keyset walk on " + key +
+  step.why = std::to_string(rows) + " rows estimated; keyset walk on " +
+             (composite ? "(" + detail::join(composite_columns, ", ") + ") together"
+                        : key) +
              (grouped ? " within each " + group_column : std::string()) +
              " via " + supporting_index + ", " + std::to_string(cfg.batch_rows) +
              " rows per batch, committing on a lock waiter or " +

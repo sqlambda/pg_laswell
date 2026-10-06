@@ -87,6 +87,32 @@ the unique index the walk already requires: measured at 0.017 ms, against
 left now costs one empty batch, taken with no lock held. The live test makes
 every other commit trigger unreachable and counts the commits that remain.
 
+### A key that is unique only with other columns is walked along the whole index
+
+An eighth finding, from a probe on a TimescaleDB hypertable, whose primary key
+must contain the time column. With the key as `(message_id, created_at)` a
+backfill was refused, with advice no hypertable can follow (a unique index on
+`message_id` alone, built concurrently). With it as `(created_at, message_id)`
+it was accepted as a walk by group in which every timestamp was a group of one
+row: 550 rows a second, about five hours for 10 million rows, with nothing in
+the plan to say so -- and, since the end-of-group commit above, a commit per
+row.
+
+A backfill now walks such a key as what it is. Where the unique index that
+contains `key` holds other columns too, and no module requires a batch to stay
+inside one value of any of them, the walk follows all the index's columns
+together in index order (`batch_mode: composite`), a full batch at a time
+whatever the size of a "group". Measured on a hypertable of a million rows in
+nine chunks: 0.44 ms for a batch of 1,000 whichever column leads, and the whole
+table in 13 s. Every column of the index must be NOT NULL. The cursor is the
+last row's whole key, and a pre-image is captured by it.
+
+This applies to every table that was walked by group without being required
+to, a plain tenant table keyed `(tenant_id, id)` included; the walk by group
+remains for a Citus distributed table, where it is required. The end-of-group
+commit now fires only once the transaction holds a batch of rows, and the
+refusal no longer suggests an index: it says what the walk needs.
+
 ### Citus: a distributed table is sized by its shards
 
 From a probe of the same change on Citus 14: the coordinator's relation for a

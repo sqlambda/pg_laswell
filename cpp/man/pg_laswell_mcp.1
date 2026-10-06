@@ -459,9 +459,8 @@ has elapsed
 .Va batch_cap_rows
 rows since the last commit, a backstop against pathological row widths
 .It Cm group_end
-in a walk that goes one group at a time \(em a table whose key is unique only
-within a tenant, or a Citus distributed table \(em the end of a group, when
-batches are uncommitted
+in a walk that goes one group at a time \(em a Citus distributed table
+\(em the end of a group, once the transaction holds at least a batch of rows
 .El
 .Pp
 The last is there because of what comes next.
@@ -476,6 +475,8 @@ of the unique index the walk already requires (measured: 0.017 ms, against
 359 ms for the earlier form to pass six finished groups of 200 000 rows).
 A group with nothing left to do therefore costs one empty batch, taken with no
 lock held.
+Below a batch of rows the walk does not commit at the end of a group: groups
+can be a row each, and a commit for every one of them was a commit per row.
 .Pp
 Two knobs that are easy to conflate and must not be.
 .Va batch_rows
@@ -1039,7 +1040,7 @@ for a distributed or reference table.
 .Cm backfill
 takes a single-column
 .Va key
-that must lead a unique index, a
+that a unique index must contain, a
 .Va set
 of column-to-expression mappings, an optional
 .Va from ,
@@ -1051,6 +1052,34 @@ predicate that must select zero rows when the backfill is complete.
 An unfiltered backfill is refused; write
 .Ql true
 to mean it.
+.Pp
+How the table is walked follows from the unique index that contains
+.Va key ,
+and the step records it as
+.Va batch_mode :
+.Bl -tag -width Ds -compact
+.It Cm two_statement
+the index is on
+.Va key
+alone: a keyset walk on it.
+.It Cm composite
+the index holds other columns too \(em a tenant column first, or the time
+column of a partitioned table or hypertable, in either order.
+The walk follows all its columns together, in index order, a full batch at a
+time; every one of them must be
+.Ic NOT NULL .
+.It Cm grouped
+a module requires each batch to stay inside one value of a column, as Citus
+does for a distributed table: one group at a time.
+.El
+.Pp
+The composite walk exists because going group by group is a row at a time
+wherever the leading column is nearly unique.
+Found on a hypertable keyed by time and id: 550 rows a second, with a commit
+for each.
+Measured there for the composite walk, 1 000 rows a batch: 0.44 ms a batch
+whichever column leads, and a million rows in 13 s.
+Its cursor is the last row's whole key.
 .Pp
 .Va assert_invariants
 is a list of named scalar queries, evaluated on the worker connection before
