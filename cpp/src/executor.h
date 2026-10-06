@@ -90,6 +90,10 @@ struct BatchOutcome {
   // success having merged nothing.
   long long considered = 0;
   std::string cursor;
+  // A grouped walk has reached the end of a group while this transaction still
+  // holds the row locks of earlier batches. Nothing was done; the caller
+  // commits and comes back, and the next group is looked for with no lock held.
+  bool commit_first = false;
 };
 
 // WHERE a grouped walk has got to: which value of the group column, and how far
@@ -231,7 +235,8 @@ inline BatchOutcome run_grouped_batch(pqxx::work& txn,
                                              const std::string& select_sql,
                                              const std::string& apply_sql,
                                              const GroupCursor& from, int batch,
-                                             long long batch_bytes) {
+                                             long long batch_bytes,
+                                             bool holds_locks = false) {
   BatchOutcome out;
   GroupCursor at = from;
   out.cursor = at.encode();
@@ -259,10 +264,24 @@ inline BatchOutcome run_grouped_batch(pqxx::work& txn,
     const auto sel = txn.exec(select_sql,
                                pqxx::params{at.group, maybe(at.key), batch});
     if (sel.empty()) {
-      // This group is done. Advance past it and look at the next one: `groups_sql`
-      // is keyset-walked on the group, so an empty key with a group set means
-      // "everything in this group is done", and the next iteration asks for the
-      // next group after it.
+      // This group is done. The question that comes next -- which group
+      // follows -- needs none of the row locks this transaction holds, and
+      // must not be asked while it holds any. Found in the field, under load
+      // on Citus: the question took 0.6 to 1.5 s on a shard, the batches before
+      // it stayed locked for all of that, and updates to rows the walk had just
+      // touched waited up to 1.8 s -- the walk's commit on a lock waiter can
+      // only happen once the statement in flight returns. So the caller
+      // commits first. (The question itself was made cheap as well; see where
+      // the planner writes it.)
+      if (holds_locks) {
+        out.cursor = at.encode();
+        out.commit_first = true;
+        return out;
+      }
+      // Advance past it and look at the next one: `groups_sql` is keyset-walked
+      // on the group, so an empty key with a group set means "everything in
+      // this group is done", and the next iteration asks for the next group
+      // after it.
       const auto g = txn.exec(groups_sql,
                                pqxx::params{maybe(at.group), 1});
       if (g.empty()) {
@@ -821,7 +840,8 @@ class Executor {
     long long rows_committed = 0; // survives a crash
     int commits = 0;
     std::map<std::string, int> reasons{
-        {"interval", 0}, {"lock_waiter", 0}, {"batch_cap", 0}, {"final", 0}};
+        {"interval", 0}, {"lock_waiter", 0}, {"batch_cap", 0}, {"final", 0},
+        {"group_end", 0}};
 
     // Invariants are evaluated BEFORE the first batch and again after the
     // last, on the worker connection. Both readings are stored, so a failure
@@ -877,6 +897,7 @@ class Executor {
                               ? std::max(1, e.batch_rows / 2)
                               : e.batch_rows;
         long long affected = 0;
+        bool outcome_commit_first = false;
         try {
           BatchOutcome outcome;
           if (grouped) {
@@ -901,13 +922,15 @@ class Executor {
             }
             outcome = run_grouped_batch(w.txn(), sql, confined_select_sql,
                                                apply_sql, at, batch,
-                                               e.batch_bytes);
+                                               e.batch_bytes,
+                                               /*holds_locks=*/rows_this_txn > 0);
           } else {
             outcome = run_paced_batch(w.txn(), sql, apply_sql, cursor, batch,
                                       e.batch_bytes);
           }
           affected = outcome.considered;
           cursor = outcome.cursor;
+          outcome_commit_first = outcome.commit_first;
           // A batch that only advanced past finished groups did no work and is
           // not the end of the walk. Treated as progress so the loop continues,
           // and not counted as rows.
@@ -941,6 +964,12 @@ class Executor {
         // throughout -- indistinguishable from a stuck job.
         publish_backfill(ordinal, rows_done, rows_committed, commits, cursor,
                          reasons, detail_json, "in_flight");
+        if (outcome_commit_first) {
+          // A group ended with batches uncommitted: commit them, then ask
+          // which group is next with nothing locked.
+          reason = CommitReason::kGroupEnd;
+          break;
+        }
         if (affected == 0 && !skipped_groups_only) {
           done = true;
           reason = CommitReason::kFinal;

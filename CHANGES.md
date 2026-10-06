@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-Three findings from a field report -- a 10-million-row table under 1,000 inserts
+Findings from a field report -- a 10-million-row table under 1,000 inserts
 a second, where `set_not_null` stopped every insert for three seconds before its
 job had started -- and the recipe that report was writing by hand.
 
@@ -66,6 +66,26 @@ Every part resumes from the catalog. A row the expression cannot fill stops the
 job at the validation scan with the column nullable and the trigger in place,
 and the same specification finishes once the row is repaired; the live test
 does exactly that.
+
+### A grouped walk no longer looks for the next group while holding row locks
+
+A seventh finding, from running the change under load on Citus. A walk that
+goes one group at a time -- a Citus distributed table, or any table whose key
+is unique only within a tenant -- asks, at the end of a group, which group
+comes next. It asked inside the transaction that still held the row locks of
+the batches before. On a shard of 5 million rows that question took 0.6 to
+1.5 s, and updates to rows the walk had just touched waited for it: single-row
+updates went from 1.5 ms to 11.9 ms mean and 313 ms worst, with waits of up to
+1.8 s seen on the workers. The walk commits when another session waits, but
+only once the statement in flight returns.
+
+Two changes. The walk now commits at the end of a group before it asks, as a
+commit reason of its own, `group_end`. And the question is the next value after
+this one and nothing more -- no predicate, no `DISTINCT` -- which is a probe of
+the unique index the walk already requires: measured at 0.017 ms, against
+359 ms for the earlier form to pass six finished groups. A group with nothing
+left now costs one empty batch, taken with no lock held. The live test makes
+every other commit trigger unreachable and counts the commits that remain.
 
 ### Citus: a distributed table is sized by its shards
 

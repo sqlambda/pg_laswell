@@ -4780,6 +4780,70 @@ TEST_F(ToolTest, AnExclusiveStepBehindALongTransactionRetriesAndLetsTheApplicati
                            " 'shop.orders'::regclass AND attname = 'warehouse_id'")[0][0].as<bool>());
 }
 
+// A grouped walk must not ask which group is next while it holds the row locks
+// of the batches before. Found in the field, under load on Citus: that
+// question ran inside the transaction, took up to 1.5 s, and updates to rows
+// the walk had just touched waited for it. So the walk commits at the end of a
+// group FIRST. Proved here by making every other commit trigger unreachable:
+// the commits that then happen mid-walk can only be those.
+TEST_F(ToolTest, AGroupedWalkCommitsAtTheEndOfAGroupBeforeLookingForTheNext) {
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/tenants");
+    w.txn().exec("DROP SCHEMA IF EXISTS shop CASCADE");
+    w.txn().exec("CREATE SCHEMA shop");
+    // Unique only as (tenant_id, id): the walk is grouped by tenant.
+    w.txn().exec("CREATE TABLE shop.entries(tenant_id int NOT NULL, id bigint NOT NULL,"
+                 " flag boolean, PRIMARY KEY (tenant_id, id))");
+    w.txn().exec("INSERT INTO shop.entries SELECT t, g, NULL FROM generate_series(1, 6) t,"
+                 " generate_series(1, 300) g");
+    // Tenants 2 and 3 have nothing left: groups the walk must pass, which the
+    // next-group question no longer filters out.
+    w.txn().exec("UPDATE shop.entries SET flag = true WHERE tenant_id IN (2, 3)");
+    w.commit();
+    w.exec_nontransactional("ANALYZE shop.entries");
+  }
+  auto e = cfg().executor;
+  e.batch_rows = 100;
+  e.commit_interval_ms = 600000;  // unreachable here
+  e.batch_cap_rows = 100000000;   // unreachable here
+  e.pause_waiters = 1000;
+  set_executor(e);
+
+  json doc = minimal_spec();
+  doc["id"] = "0010-entries-flag";
+  doc["description"] = "Flag every entry.";
+  doc["intents"] = json::array({json{{"kind", "backfill"}, {"schema", "shop"},
+                                     {"table", "entries"}, {"key", "id"},
+                                     {"set", json{{"flag", "true"}}},
+                                     {"where", "entries.flag IS NULL"}}});
+  {
+    const auto parsed = pglaswell::parse_spec(doc);
+    doc["signatures"] = json::array({{{"key_id", test_key().key_id},
+                                      {"algorithm", "ed25519"},
+                                      {"signature", base64(sign(parsed.canonical_bytes))}}});
+  }
+  const auto started = payload(call("startMigration", json{{"spec", doc}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, started["jobId"], [](const json& s) {
+    return s.value("state", "") == "succeeded";
+  })) << status_of(started["jobId"]).dump(2);
+
+  pglaswell::ReadSession r(cfg());
+  EXPECT_EQ(r.txn().exec("SELECT count(*) FROM shop.entries WHERE flag IS NOT TRUE")[0][0].as<int>(), 0);
+  const auto st = status_of(started["jobId"]);
+  ASSERT_TRUE(st.contains("backfill")) << st.dump(2);
+  const auto& reasons = st["backfill"]["commitReasons"];
+  // Four tenants had work (1, 4, 5, 6). Each ends with uncommitted batches,
+  // and each of those ends is a commit of its own before the next is sought.
+  EXPECT_GE(reasons.value("group_end", 0), 4) << st["backfill"].dump(2);
+  EXPECT_EQ(reasons.value("interval", 0) + reasons.value("batch_cap", 0), 0)
+      << "another trigger was reachable, so group_end proves nothing: " << reasons.dump();
+  EXPECT_EQ(r.txn().exec("SELECT rows_done FROM laswell.backfill_cursor WHERE job_id = $1::uuid",
+                         pqxx::params{started["jobId"].get<std::string>()})[0][0].as<int>(),
+            1200) << "only the rows that had work are walked: " << st["backfill"].dump(2);
+}
+
 TEST_F(ToolTest, AFailedStepFailsTheJobAndTheLedgerSaysWhich) {
   make_shop(cfg());
   // A backfill expression that parses and plans but fails at runtime: a cast
@@ -6449,6 +6513,13 @@ TEST(Planner, ABackfillWhoseKeyIsUniqueOnlyWithinAGroupWalksGroupByGroup) {
   const auto* s = find_step(plan, "backfill");
   ASSERT_NE(s, nullptr);
   EXPECT_EQ(s->detail.value("batch_mode", ""), "grouped") << plan.render();
+  // WHICH GROUP IS NEXT is the next value and nothing more: no predicate and
+  // no DISTINCT, so it is a probe of the index the walk already requires. With
+  // the predicate it read every row of a finished group to pass it (measured:
+  // 359 ms against 0.017 ms; on a Citus shard in the field, up to 1.5 s).
+  EXPECT_EQ(s->sql.at(0).find("DISTINCT"), std::string::npos) << s->sql.at(0);
+  EXPECT_EQ(s->sql.at(0).find(" AND ("), std::string::npos) << s->sql.at(0);
+  EXPECT_NE(s->sql.at(0).find("ORDER BY"), std::string::npos) << s->sql.at(0);
   EXPECT_EQ(s->detail.value("group_column", ""), "tenant_id");
   EXPECT_EQ(s->detail.value("supporting_index", ""), "ledger_pkey");
   // No module decided this -- and none may be credited with it.

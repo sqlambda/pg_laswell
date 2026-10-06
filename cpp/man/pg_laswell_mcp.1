@@ -458,7 +458,24 @@ has elapsed
 .It Cm batch_cap
 .Va batch_cap_rows
 rows since the last commit, a backstop against pathological row widths
+.It Cm group_end
+in a walk that goes one group at a time \(em a table whose key is unique only
+within a tenant, or a Citus distributed table \(em the end of a group, when
+batches are uncommitted
 .El
+.Pp
+The last is there because of what comes next.
+After a group, the walk asks which group follows, and that question must not
+run while the transaction holds the row locks of the batches before it: a
+commit on a lock waiter can only happen once the statement in flight returns.
+Found under load on a Citus cluster, where the question took 0.6 to 1.5 s on a
+shard and updates to rows the walk had just touched waited up to 1.8 s.
+So the walk commits first.
+The question itself is the next value after this one and nothing more, a probe
+of the unique index the walk already requires (measured: 0.017 ms, against
+359 ms for the earlier form to pass six finished groups of 200 000 rows).
+A group with nothing left to do therefore costs one empty batch, taken with no
+lock held.
 .Pp
 Two knobs that are easy to conflate and must not be.
 .Va batch_rows
