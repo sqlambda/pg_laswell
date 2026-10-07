@@ -659,8 +659,9 @@ inline void parse_add_column(Intent& in) {
   if (in.body.contains("key")) {
     if (!in.body.contains("fill")) {
       detail::fail(at + ".key is only meaningful together with a fill expression",
-                   "With fill, optional: the unique column the backfill walks. "
-                   "It defaults to the table's single-column primary key.");
+                   "With fill, optional: the column the backfill walks -- unique, or "
+                   "contained in a unique index over NOT NULL columns. It "
+                   "defaults to a column of the table's primary key.");
     }
     if (!in.body["key"].is_string()) {
       detail::fail(at + ".key must be a column name", "A string naming one column.");

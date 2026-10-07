@@ -103,7 +103,7 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
 <dt>fill<span class="tag opt">optional</span></dt>
 <dd>The value for a NOT NULL column that has no default: one SQL expression over the row&#x27;s own columns, for example (payload-&gt;&gt;&#x27;customer&#x27;)::bigint — or a list of sources tried in order, the first that gives a value winning. A source is such an expression, or {&quot;from&quot;, &quot;on&quot;, &quot;value&quot;} naming another table, how its row is found, and what is taken from it. The plan adds the column nullable with a trigger that fills it on insert and update, backfills the existing rows from the same sources, and sets NOT NULL last. Requires nullable false, no default, and &quot;after&quot;.</dd>
 <dt>key<span class="tag opt">optional</span></dt>
-<dd>With fill, optional: the unique column the backfill walks. It defaults to the table&#x27;s single-column primary key.</dd>
+<dd>With fill, optional: the column the backfill walks — unique, or contained in a unique index over NOT NULL columns. It defaults to a column of the table&#x27;s primary key.</dd>
 <dt>after<span class="tag opt">optional</span></dt>
 <dd>One of <code>drop_trigger</code>, <code>keep_trigger</code>. With a default and a fill, no trigger is created: the column is NOT NULL from the start, rows written from then on get the default unless the application supplies a value, and the backfill writes the existing rows whose value differs from the default. Remove &quot;after&quot;, or remove the default to have new rows filled by trigger.</dd>
 </dl>

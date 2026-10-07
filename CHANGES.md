@@ -240,6 +240,48 @@ The steps now also say that the lock must be granted before it is brief: behind
 a long transaction or an autovacuum it waits, and every session queues behind
 it until `lock_timeout`.
 
+### Plans that could not run
+
+- `detach_partition` chose `DETACH ... CONCURRENTLY` for a large or busy
+  partition without looking for a DEFAULT partition, and PostgreSQL refuses that
+  (measured: "cannot detach partitions concurrently when a default partition
+  exists") -- in the job, since the dry run executes nothing that cannot be
+  rolled back. Beside a DEFAULT partition the plain form is planned, and a
+  warning says that it blocks every partition.
+- `create_index` over an INVALID index of the same name, on a table small and
+  quiet enough for a plain build, put `DROP INDEX CONCURRENTLY` into the plain
+  build's transaction, where it cannot run. The invalid index is now dropped
+  plainly in that transaction: dropped and rebuilt together, the table is never
+  without it.
+- `add_column` with `fill` and no `key` refused a table whose primary key has
+  more than one column, although the backfill it hands to walks such a key
+  whole. The walk now defaults to a column of the primary key, whatever its
+  width.
+- `drop_index` on an index that backs a constraint said that dropping the
+  constraint "is not yet planned". `drop_constraint` plans it.
+
+### More locks the plan named wrongly
+
+Each read from `pg_locks` on 18.6, as the three above were.
+
+| Statement | The plan said | PostgreSQL takes |
+| --- | --- | --- |
+| `ALTER TABLE ... SET (fillfactor ...)` | AccessExclusiveLock | ShareUpdateExclusiveLock |
+| `ALTER TABLE ... CLUSTER ON`, `SET WITHOUT CLUSTER` | AccessExclusiveLock | ShareUpdateExclusiveLock |
+| `ALTER COLUMN ... SET STATISTICS` | AccessExclusiveLock | ShareUpdateExclusiveLock |
+| `ALTER SEQUENCE` | AccessExclusiveLock | ShareRowExclusiveLock on the sequence |
+| `ALTER INDEX ... ATTACH PARTITION` | AccessExclusiveLock on both indexes | that on the partition's index, ShareUpdateExclusiveLock on the parent's |
+| `DROP PUBLICATION` | ShareUpdateExclusiveLock on the published tables | no lock on them |
+| `ALTER DOMAIN ... VALIDATE CONSTRAINT`, `SET NOT NULL` | AccessExclusiveLock on the domain | ShareLock on every table with a column of the type, for the scan |
+| `ATTACH PARTITION` | nothing about a DEFAULT partition | AccessExclusiveLock on it, for its scan |
+| plain `DETACH PARTITION` | parent and partition | and the DEFAULT partition |
+| `DROP TABLE` of a partition | the table | and its parent and the parent's DEFAULT partition |
+| `DROP TABLE` with a foreign key | the table | and the table the key references |
+
+`SECURITY LABEL` was described as AccessShareLock; it goes the way of `COMMENT`,
+ShareUpdateExclusiveLock on a relation. That one is not measured: the lab has no
+label provider.
+
 ## 0.1.3
 
 Two gaps reported from pgshard while writing specifications for an audit

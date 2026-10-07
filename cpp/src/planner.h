@@ -376,6 +376,33 @@ inline std::string fill_described(const std::vector<FillSource>& sources) {
 // PostgreSQL to skip the scan for both columns -- "existing constraints on
 // column ... are sufficient to prove that it does not contain nulls" -- and
 // both SET NOT NULL ran in one statement in 4 ms, against 344 ms for a bare one.
+namespace detail {
+// The key a fill walks when the specification names none: a column of the
+// primary key. Alone when the key is one column; of a composite key, the first
+// column a module does not confine batches to (on a Citus table the walk goes
+// within the distribution column, not along it). The backfill then walks the
+// whole key in its order. INCLUDE columns are not key columns.
+inline std::string default_fill_key(const Observations& obs, const std::string& qualified) {
+  const auto& t = obs.table(qualified);
+  const json indexes = t.value("indexes", json::object());
+  std::string confined_by;
+  const std::string confined = required_confinement(obs, qualified, confined_by);
+  for (const auto& [name, ix] : indexes.items()) {
+    (void)name;
+    if (!ix.value("is_primary", false)) continue;
+    const json cols = ix.value("columns", json::array());
+    const auto keys = static_cast<std::size_t>(
+        ix.value("key_column_count", static_cast<int>(cols.size())));
+    for (std::size_t c = 0; c < keys && c < cols.size(); ++c) {
+      if (!cols[c].is_string()) continue;
+      if (keys > 1 && cols[c].get<std::string>() == confined) continue;
+      return cols[c].get<std::string>();
+    }
+  }
+  return {};
+}
+}  // namespace detail
+
 inline void plan_add_columns_filled(const std::vector<const Intent*>& group,
                                     const Observations& obs, const ExecutorConfig& cfg,
                                     Plan& plan, std::vector<Step>& out) {
@@ -465,16 +492,12 @@ inline void plan_add_columns_filled(const std::vector<const Intent*>& group,
   // The walk needs a unique key. The primary key, unless the spec names one.
   std::string key = in.body.value("key", "");
   if (key.empty()) {
-    const json indexes = t.value("indexes", json::object());
-    for (const auto& [name, ix] : indexes.items()) {
-      (void)name;
-      const json cols = ix.value("columns", json::array());
-      if (ix.value("is_primary", false) && cols.size() == 1) key = cols[0].get<std::string>();
-    }
+    key = detail::default_fill_key(obs, qualified);
     if (key.empty()) {
       verdict(Action::kConflict,
-              qualified + " has no single-column primary key to walk while filling " +
-                  all_names + ". Name a unique column in \"key\".", true);
+              qualified + " has no primary key to walk while filling " +
+                  all_names + ". Name in \"key\" a column that is unique, or "
+                  "that a unique index over NOT NULL columns contains.", true);
       return;
     }
   }
@@ -812,23 +835,18 @@ inline void plan_defaulted_fill(const std::vector<const Intent*>& group,
                                 Plan& plan, std::vector<Step>& out) {
   const Intent& in = *group.front();
   const auto qualified = in.qualified_table();
-  const auto& t = obs.table(qualified);
   const auto rel = detail::quote_identifier(in.table());
 
   std::string key = in.body.value("key", "");
   if (key.empty()) {
-    const json indexes = t.value("indexes", json::object());
-    for (const auto& [name, ix] : indexes.items()) {
-      (void)name;
-      const json cols = ix.value("columns", json::array());
-      if (ix.value("is_primary", false) && cols.size() == 1) key = cols[0].get<std::string>();
-    }
+    key = detail::default_fill_key(obs, qualified);
     if (key.empty()) {
       Step s;
       s.kind = in.kind_name;
       s.action = Action::kConflict;
-      s.why = qualified + " has no single-column primary key to walk while filling " +
-              in.body.value("column", "") + ". Name a unique column in \"key\".";
+      s.why = qualified + " has no primary key to walk while filling " +
+              in.body.value("column", "") + ". Name in \"key\" a column that is "
+              "unique, or that a unique index over NOT NULL columns contains.";
       plan.conflicts.push_back(s.why);
       out.push_back(std::move(s));
       return;
@@ -2128,7 +2146,11 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
     // Where a concurrent drop is not possible (a hypertable: measured, "DROP
     // INDEX CONCURRENTLY does not support dropping multiple objects"), the
     // invalid index goes with a plain DROP.
-    step.sql.push_back(std::string(traits.answered && !traits.concurrent
+    // And where the build itself is plain -- one transaction, on a small quiet
+    // table -- the drop joins it: DROP INDEX CONCURRENTLY cannot run inside a
+    // transaction block (measured), and dropped and rebuilt in one transaction
+    // the table is never without the index.
+    step.sql.push_back(std::string((traits.answered && !traits.concurrent) || plain
                                        ? "DROP INDEX "
                                        : "DROP INDEX CONCURRENTLY ") +
                        detail::quote_identifier(in.schema()) + "." +
@@ -2392,7 +2414,11 @@ inline void plan_partitioned_index(const Intent& in, const json& t, Plan& plan,
     Step s;
     s.kind = in.kind_name;
     s.txn_class = TxnClass::kOptional;
-    s.lock = "AccessExclusiveLock on the two indexes, briefly";
+    // Measured on 18.6: AccessExclusiveLock on the partition's index,
+    // ShareUpdateExclusiveLock on the parent index, AccessShareLock on both
+    // tables.
+    s.lock = "AccessExclusiveLock on the partition's index and "
+             "ShareUpdateExclusiveLock on the parent index, briefly";
     s.sql.push_back("ALTER INDEX " + detail::quote_identifier(in.schema()) + "." + detail::quote_identifier(name) +
                     " ATTACH PARTITION " + detail::quote_identifier(in.schema()) + "." + detail::quote_identifier(child_indexes[i]) + ";");
     s.why = "attach " + std::to_string(i + 1) + " of " +
@@ -2877,7 +2903,8 @@ inline void plan_replication(const Intent& in, const Observations& obs,
 
     case IntentKind::kDropPublication:
       step.sql.push_back("DROP PUBLICATION " + name + ";");
-      step.lock = "ShareUpdateExclusiveLock on the published tables";
+      // Measured on 18.6: dropping a publication locks none of its tables.
+      step.lock = "none on the published tables";
       step.why = "the publication stops sending at commit";
       plan.warnings.push_back(
           "any subscriber to this publication stops receiving changes and does "
@@ -3142,7 +3169,10 @@ inline void plan_final_kinds(const Intent& in, const Observations& obs,
           detail::quote_literal(in.body.value("provider", "")) + " ON " + ot +
           " " + target + " IS " +
           (removing ? "NULL" : detail::quote_literal(in.body.value("label", ""))) + ";");
-      step.lock = "AccessShareLock";
+      // The same path as COMMENT, which was measured (see set_comment). Not
+      // measured itself: the lab has no label provider loaded.
+      step.lock = "ShareUpdateExclusiveLock on a relation; none that blocks "
+                  "on other objects";
       step.why = "a security label is metadata this server stores and does not "
                  "interpret";
       plan.warnings.push_back(
@@ -3538,7 +3568,14 @@ inline void plan_physical(const Intent& in, const Observations& obs, Plan& plan,
       if (in.body.contains("compression")) {
         sql.push_back(head + "COMPRESSION " + in.body.value("compression", "") + ";");
       }
-      emit(std::move(sql), "AccessExclusiveLock on " + qualified + ", no rewrite",
+      // Measured on 18.6: SET STATISTICS takes ShareUpdateExclusiveLock, SET
+      // STORAGE AccessExclusiveLock.
+      const bool statistics_only =
+          !in.body.contains("storage") && !in.body.contains("compression");
+      emit(std::move(sql),
+           std::string(statistics_only ? "ShareUpdateExclusiveLock"
+                                       : "AccessExclusiveLock") +
+               " on " + qualified + ", no rewrite",
            "measured: all three are catalog-only");
       if (in.body.contains("storage") || in.body.contains("compression")) {
         plan.warnings.push_back(
@@ -3570,7 +3607,13 @@ inline void plan_physical(const Intent& in, const Observations& obs, Plan& plan,
         sql.push_back("ALTER TABLE " + sql_rel + " RESET (" +
                       detail::join(names, ", ") + ");");
       }
-      emit(std::move(sql), "AccessExclusiveLock on " + qualified + ", no rewrite",
+      // Measured on 18.6 for fillfactor and autovacuum_enabled. PostgreSQL
+      // takes the strongest lock any parameter named asks for, and a few ask
+      // for AccessExclusiveLock.
+      emit(std::move(sql),
+           "ShareUpdateExclusiveLock on " + qualified +
+               " for most parameters (PostgreSQL takes the strongest any named "
+               "parameter asks for), no rewrite",
            "measured: setting a storage parameter such as fillfactor is "
            "catalog-only; it changes how FUTURE writes lay out pages and "
            "reorganises nothing already there");
@@ -3682,7 +3725,8 @@ inline void plan_physical(const Intent& in, const Observations& obs, Plan& plan,
             (setting ? " CLUSTER ON " +
                            detail::quote_identifier(in.body.value("index", "")) + ";"
                      : " SET WITHOUT CLUSTER;")},
-           "AccessExclusiveLock on " + qualified + ", no rewrite",
+           // Measured on 18.6, both forms.
+           "ShareUpdateExclusiveLock on " + qualified + ", no rewrite",
            "this only RECORDS which index a future CLUSTER would use; it does "
            "not reorder anything now");
       if (setting) {
@@ -3837,7 +3881,8 @@ inline void plan_alter_misc(const Intent& in, const Observations& obs,
       }
       if (!alter.empty()) sql.push_back("ALTER SEQUENCE " + qualified_obj + alter + ";");
       emit(TxnClass::kRequired, std::move(sql),
-           "AccessExclusiveLock on the sequence only",
+           // Measured on 18.6 (INCREMENT BY).
+           "ShareRowExclusiveLock on the sequence",
            "altering a sequence touches no table", /*own=*/false);
       if (in.body.contains("restart")) {
         plan.warnings.push_back(
@@ -3939,7 +3984,8 @@ inline void plan_alter_misc(const Intent& in, const Observations& obs,
              {"ALTER DOMAIN " + qualified_obj + " ADD CONSTRAINT " +
               detail::quote_identifier(cname) + " CHECK (" +
               in.body.value("add_check", "") + ") NOT VALID;"},
-             "AccessExclusiveLock on the domain, briefly; NOT VALID means no scan",
+             // Measured on 18.6: no lock on any table using the domain.
+             "no lock on any table; NOT VALID means no scan",
              "step 1 of 2: measured on 18.6, adding the constraint NOT VALID "
              "took 0.5ms against 37ms for the same constraint validated -- and "
              "that 37ms was 1.5M values across two tables, growing with every "
@@ -3948,8 +3994,9 @@ inline void plan_alter_misc(const Intent& in, const Observations& obs,
         emit(TxnClass::kRequired,
              {"ALTER DOMAIN " + qualified_obj + " VALIDATE CONSTRAINT " +
               detail::quote_identifier(cname) + ";"},
-             "AccessExclusiveLock on the domain while every column of this type "
-             "is scanned",
+             // Measured on 18.6.
+             "ShareLock on every table with a column of this type while it is "
+             "scanned: reads continue, writes to those tables wait",
              "step 2 of 2: the scan happens here, in its own transaction, so "
              "step 1's lock is not held across it",
              /*own=*/true);
@@ -3977,7 +4024,11 @@ inline void plan_alter_misc(const Intent& in, const Observations& obs,
                       in.body.value("default", "") + ";");
       }
       emit(TxnClass::kRequired, std::move(sql),
-           "AccessExclusiveLock on the domain",
+           // Measured on 18.6 for SET NOT NULL.
+           in.body.value("not_null", false)
+               ? "ShareLock on every table with a column of this type while it "
+                 "is scanned: reads continue, writes to those tables wait"
+               : "none on the tables using the domain",
            "a domain change reaches every column of that type", /*own=*/false);
       if (in.body.value("not_null", false)) {
         plan.warnings.push_back(
@@ -5258,6 +5309,25 @@ inline void plan_drop_table(const Intent& in, const Observations& obs,
   step.txn_class = TxnClass::kRequired;
   step.sql.push_back("DROP TABLE " + sql_rel + ";");
   step.lock = "AccessExclusiveLock on " + qualified;
+  // Measured on 18.6: dropping a partition takes the same lock on its parent
+  // and on the parent's DEFAULT partition, and dropping a table with a foreign
+  // key takes it on the table the key references.
+  if (t.value("is_partition", false)) {
+    step.lock += ", on its parent table and on the parent's DEFAULT partition "
+                 "if there is one -- every query against every partition waits";
+  }
+  {
+    std::set<std::string> referenced;
+    const json constraints = t.value("constraints", json::object());
+    for (const auto& [cname, k] : constraints.items()) {
+      (void)cname;
+      const auto ref = k.value("references", json());
+      if (ref.is_string() && ref.get<std::string>() != qualified) {
+        referenced.insert(ref.get<std::string>());
+      }
+    }
+    for (const auto& r : referenced) step.lock += ", and on " + r + " (a foreign key references it)";
+  }
   step.why =
       "nothing depends on " + qualified +
       ", so the drop is a brief catalog change whatever the table's size";
@@ -5644,9 +5714,16 @@ inline void plan_attach_partition(const Intent& in, const Observations& obs,
   emit(TxnClass::kRequired,
        "ALTER TABLE " + sql_parent + " ATTACH PARTITION " + sql_child + " " +
            detail::bounds_as_for_values(in) + ";",
+       // Measured on 18.6: the DEFAULT partition is locked as the candidate is,
+       // for the scan that proves it holds no row of the new bounds.
        "ShareUpdateExclusiveLock on " + parent +
            " -- other partitions keep serving -- and AccessExclusiveLock on " +
-           child,
+           child +
+           (p.value("default_partition", json()).is_string()
+                ? " and on the DEFAULT partition " +
+                      p.value("default_partition", json()).get<std::string>() +
+                      ", whose readers and writers wait while it is scanned"
+                : ""),
        check_expr.empty()
            ? "step 3 of 4: attaching, with a full validation scan under the lock"
            : "step 3 of 4: attaching, now a catalog change because the "
@@ -5729,7 +5806,11 @@ inline void plan_detach_partition(const Intent& in, const Observations& obs,
 
   const long long size = obs.table(child).value("size_estimate", 0LL);
   const int waiters = p.value("lock_waiters", 0);
-  const bool concurrent_available = obs.server_version >= 140000;
+  // Measured on 18.6: "cannot detach partitions concurrently when a default
+  // partition exists". With a default, the plain form is the only one.
+  const auto detach_default = p.value("default_partition", json());
+  const bool has_default = detach_default.is_string();
+  const bool concurrent_available = obs.server_version >= 140000 && !has_default;
   const bool small_and_quiet = size < (64LL << 20) && waiters == 0;
 
   if (concurrent_available && !small_and_quiet) {
@@ -5760,19 +5841,37 @@ inline void plan_detach_partition(const Intent& in, const Observations& obs,
   step.txn_class = TxnClass::kRequired;
   step.own_transaction = true;
   step.sql.push_back("ALTER TABLE " + sql_parent + " DETACH PARTITION " + sql_child + ";");
-  step.lock = "AccessExclusiveLock on " + parent + " AND on " + child;
+  // Measured on 18.6: the DEFAULT partition is locked the same way.
+  step.lock = "AccessExclusiveLock on " + parent + " AND on " + child +
+              (has_default && detach_default.get<std::string>() != child
+                   ? " AND on the DEFAULT partition " + detach_default.get<std::string>()
+                   : "");
   step.why =
       concurrent_available
           ? "size " + detail::human_bytes(size) +
                 " < 64 MiB and nothing queued: a plain detach is a brief "
                 "catalog change, and CONCURRENTLY costs an extra transaction "
                 "and a recoverable-but-awkward intermediate state for nothing"
+          : has_default
+                ? parent + " has a DEFAULT partition, and PostgreSQL refuses "
+                           "DETACH ... CONCURRENTLY beside one, so the exclusive "
+                           "lock on the parent is unavoidable -- it blocks every "
+                           "query against every partition while it is held"
           : "PostgreSQL " + std::to_string(obs.server_version) +
                 " has no DETACH ... CONCURRENTLY (it arrived in 14), so the "
                 "exclusive lock on the parent is unavoidable -- it blocks "
                 "every query against every partition while it is held";
   step.detail["method"] = "plain";
-  if (!concurrent_available) {
+  if (has_default && obs.server_version >= 140000 && !small_and_quiet) {
+    plan.warnings.push_back(
+        "detaching " + child + " (" + detail::human_bytes(size) +
+        (waiters > 0 ? ", " + std::to_string(waiters) + " lock waiter(s)" : "") +
+        ") takes AccessExclusiveLock on " + parent +
+        " and blocks queries against EVERY partition: the DEFAULT partition " +
+        detach_default.get<std::string>() +
+        " rules out DETACH ... CONCURRENTLY. Schedule it for a quiet window.");
+  }
+  if (obs.server_version < 140000) {
     plan.warnings.push_back(
         "this server is older than PostgreSQL 14, so detaching " + child +
         " takes AccessExclusiveLock on " + parent +
@@ -6506,8 +6605,8 @@ inline void plan_drop_index(const Intent& in, const Observations& obs, Plan& pla
     plan.conflicts.push_back(
         "\"" + name + "\" on " + qualified +
         " backs a constraint. PostgreSQL refuses to drop such an index "
-        "directly; drop the constraint instead, which pg_laswell does not yet "
-        "plan.");
+        "directly; drop the constraint instead, with a drop_constraint "
+        "intent.");
     return;
   }
   if (ex.value("is_unique", false)) {

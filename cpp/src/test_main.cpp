@@ -1891,6 +1891,23 @@ TEST(Planner, AnInvalidIndexIsDroppedConcurrentlyBeforeRebuilding) {
   EXPECT_EQ(s->detail.value("recovering_invalid_index", false), true);
 }
 
+// The plain build is one transaction, and DROP INDEX CONCURRENTLY cannot run in
+// one (measured). On a small quiet table the invalid index is dropped plainly,
+// in the transaction that rebuilds it.
+TEST(Planner, AnInvalidIndexOnASmallQuietTableIsDroppedInTheTransactionThatRebuildsIt) {
+  auto obs = observations(1024, 10);
+  obs.tables["shop.orders"]["indexes"]["orders_open_by_region_idx"] =
+      json{{"is_valid", false}, {"is_unique", false},
+           {"definition", "CREATE INDEX ..."}, {"leading_column", "fulfilment_region"}};
+  const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(minimal_spec()), obs, {});
+  const auto* s = find_step(plan, "create_index");
+  ASSERT_NE(s, nullptr);
+  EXPECT_EQ(s->txn_class, pglaswell::TxnClass::kOptional) << plan.render();
+  ASSERT_GE(s->sql.size(), 2u) << all_sql(*s);
+  EXPECT_EQ(s->sql[0].rfind("DROP INDEX \"shop\".", 0), 0u) << s->sql[0];
+  EXPECT_EQ(all_sql(*s).find("CONCURRENTLY"), std::string::npos) << all_sql(*s);
+}
+
 TEST(Planner, AValidIndexOfTheSameNameIsSatisfiedNotRebuilt) {
   auto obs = observations(2LL << 30, 8100000);
   obs.tables["shop.orders"]["indexes"]["orders_open_by_region_idx"] =
@@ -4795,6 +4812,26 @@ TEST_F(ToolTest, AnExclusiveStepBehindALongTransactionRetriesAndLetsTheApplicati
 // whole unique index, a full batch at a time, whatever the size of a "group".
 // Found in the field on a hypertable keyed (time, id): the walk by group made
 // every timestamp a group of one row, 550 rows a second.
+// A table keyed (time, id) has no single-column primary key, and the fill
+// refused it -- while the walk it hands to takes such a key whole.
+TEST(Planner, AFillWithNoKeyWalksACompositePrimaryKey) {
+  auto obs = observations(2LL << 30, 8000000);
+  auto& t = obs.tables["shop.orders"];
+  t["columns"]["created_at"] = json{{"type", "timestamp with time zone"}, {"not_null", true}};
+  t["columns"]["id"] = json{{"type", "bigint"}, {"not_null", true}};
+  t["indexes"] = json{{"orders_pkey",
+                       {{"is_valid", true}, {"is_unique", true}, {"is_primary", true},
+                        {"leading_column", "created_at"},
+                        {"columns", json::array({"created_at", "id"})}, {"predicate", ""},
+                        {"has_expressions", false}}}};
+  const auto plan = pglaswell::plan_migration(spec_with(json::array({filled_column()})), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto* s = find_step(plan, "backfill");
+  ASSERT_NE(s, nullptr);
+  EXPECT_EQ(s->detail.value("batch_mode", ""), "composite") << plan.render();
+  EXPECT_EQ(s->detail["key_columns"], json::array({"created_at", "id"}));
+}
+
 TEST(Planner, AKeyUniqueOnlyWithOtherColumnsIsWalkedAlongTheWholeIndex) {
   auto obs = observations(64 << 20, 1000000);
   auto& t = obs.tables["shop.orders"];
@@ -7001,6 +7038,30 @@ TEST(Planner, DetachingALargePartitionUsesConcurrentlyOutsideATransaction) {
   }
   EXPECT_TRUE(warned) << "the recoverable-but-awkward state must be stated: "
                       << plan.render();
+}
+
+// Measured on 18.6: "cannot detach partitions concurrently when a default
+// partition exists". Planned CONCURRENTLY it failed in the job, outside any
+// transaction, where the dry run never went.
+TEST(Planner, BesideADefaultPartitionTheDetachIsPlainAndSaysWhatItBlocks) {
+  auto obs = obs_partitioned(/*with_default=*/true);
+  obs.server_version = 180006;
+  const auto plan = pglaswell::plan_migration(detach_spec(), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto* step = steps_of(plan, "detach_partition")[0];
+  EXPECT_EQ(all_sql(*step).find("CONCURRENTLY"), std::string::npos) << all_sql(*step);
+  EXPECT_EQ(step->txn_class, pglaswell::TxnClass::kRequired);
+  EXPECT_EQ(step->detail.value("method", ""), "plain");
+  EXPECT_NE(step->lock.find("the DEFAULT partition shop.events_def"), std::string::npos)
+      << step->lock;
+  EXPECT_NE(step->why.find("refuses DETACH ... CONCURRENTLY beside one"), std::string::npos)
+      << step->why;
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("EVERY partition") != std::string::npos &&
+        w.find("shop.events_def") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned) << plan.render();
 }
 
 TEST(Planner, ASmallQuietPartitionIsDetachedPlainly) {
