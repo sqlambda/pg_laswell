@@ -370,6 +370,35 @@ SELECT COALESCE(
                                JOIN pg_class pc ON pc.oid = pi.inhrelid
                                JOIN pg_namespace pn ON pn.oid = pc.relnamespace
                               WHERE pi.inhparent = t.oid), '[]'::jsonb),
+     -- Each direct partition, with what a per-partition recipe has to know
+     -- before it builds on one: whether it is itself partitioned (no
+     -- CREATE INDEX CONCURRENTLY there either), and its indexes -- valid or
+     -- not, which constraint each backs, and whether it is already attached to
+     -- an index of the parent. That is what lets an interrupted recipe resume
+     -- at the partition it stopped on.
+     'partition_parts', COALESCE((
+        SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
+                 'relation', pn.nspname || '.' || pc.relname,
+                 'partitioned', pc.relkind = 'p',
+                 'indexes', COALESCE((
+                    SELECT JSONB_OBJECT_AGG(ic.relname, JSONB_BUILD_OBJECT(
+                             'valid', ix.indisvalid,
+                             'unique', ix.indisunique,
+                             'constraint', (SELECT k.conname FROM pg_constraint k
+                                             WHERE k.conindid = ix.indexrelid
+                                               AND k.conrelid = pc.oid
+                                               AND k.contype IN ('p', 'u') LIMIT 1),
+                             'attached_to', (SELECT pic.relname
+                                               FROM pg_inherits ii
+                                               JOIN pg_class pic ON pic.oid = ii.inhparent
+                                              WHERE ii.inhrelid = ix.indexrelid LIMIT 1)))
+                      FROM pg_index ix JOIN pg_class ic ON ic.oid = ix.indexrelid
+                     WHERE ix.indrelid = pc.oid), '{}'::jsonb))
+                 ORDER BY pn.nspname, pc.relname)
+          FROM pg_inherits pi
+          JOIN pg_class pc ON pc.oid = pi.inhrelid
+          JOIN pg_namespace pn ON pn.oid = pc.relnamespace
+         WHERE pi.inhparent = t.oid AND t.relkind = 'p'), '[]'::jsonb),
      -- Partition-key text, e.g. "RANGE (at)". The planner needs the key COLUMN
      -- to render the CHECK constraint that turns an ATTACH from a full scan
      -- into a catalog change (measured: 98ms vs 0.9ms on 2M rows).

@@ -1359,11 +1359,37 @@ attaches each child, and then checks validity: the parent index stays
 .Va indisvalid
 false until the last attachment lands, and an index that exists, is invalid and
 is never used would otherwise pass silently.
-A unique index there is refused rather than planned, because PostgreSQL
-requires it to include the partition key and this planner does not read the
-partition key -- emitting a recipe whose final
-.Ic ATTACH
-would fail is worse than declining.
+A unique index there is built the same way when its columns include every
+partition column, and refused in PostgreSQL's words when they do not
+.Pq Qq unique constraint on partitioned table must include all partitioning columns
+or when the partition key is an expression.
+.Pp
+.Cm add_unique_constraint
+and
+.Cm add_primary_key
+on a partitioned table are a recipe too.
+One
+.Ic ADD CONSTRAINT
+would build a unique index on every partition under
+.Va AccessExclusiveLock
+on the parent, and the concurrent recipe begins with
+.Ic CREATE UNIQUE INDEX CONCURRENTLY
+on the parent, which PostgreSQL refuses.
+So the constraint is added on
+.Ic ONLY
+the parent \(em a catalog change, its index invalid and empty \(em and then,
+partition by partition, a unique index is built concurrently, adopted as that
+partition's own constraint with
+.Ic USING INDEX
+.Pq without which PostgreSQL will not attach it ,
+and attached.
+The parent's constraint is valid when the last partition's is attached; a
+partition created meanwhile gets it by itself.
+A recipe that stops \(em a duplicate in the fifth partition \(em resumes there
+when the specification is applied again: what each partition already has is
+read, and an index left invalid is dropped and built again.
+A partition that is itself partitioned is refused for now, for an index and for
+a constraint: the recipe would have to descend into it.
 .Pp
 A dry run cannot cover such a recipe: the concurrent builds cannot run inside a
 transaction block, so the attaches that follow have nothing to attach.

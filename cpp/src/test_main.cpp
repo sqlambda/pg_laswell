@@ -1966,23 +1966,119 @@ TEST(Planner, APartitionedTableGetsThePerPartitionRecipe) {
   ASSERT_NE(find_step(plan, "verify_index_valid"), nullptr) << plan.render();
 }
 
-TEST(Planner, AUniqueIndexOnAPartitionedTableIsRefusedRatherThanPlannedToFail) {
-  // PostgreSQL requires such an index to include the partition key, which this
-  // planner does not read. Emitting a recipe whose final ATTACH would fail is
-  // worse than refusing.
+TEST(Planner, AUniqueIndexOnAPartitionedTableMustContainThePartitionKey) {
+  // Measured: "unique constraint on partitioned table must include all
+  // partitioning columns". Refused here, in those words, rather than by the
+  // recipe's own statements in the job.
   auto obs = observations(1024, 10, 0, "partitioned_table");
   obs.tables["shop.orders"]["partitions"] = json::array({"shop.orders_2024"});
+  obs.tables["shop.orders"]["partition_key"] = "RANGE (shipped_on)";
   json doc = minimal_spec();
   for (auto& i : doc["intents"]) {
     if (i["kind"] == "create_index") i["unique"] = true;
   }
-  const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(doc), obs, {});
+  auto plan = pglaswell::plan_migration(pglaswell::parse_spec(doc), obs, {});
   EXPECT_FALSE(plan.ok) << plan.render();
   bool named = false;
   for (const auto& c : plan.conflicts) {
-    if (c.find("partition key") != std::string::npos) named = true;
+    if (c.find("must include all partitioning columns") != std::string::npos &&
+        c.find("Add shipped_on to the index") != std::string::npos) named = true;
   }
   EXPECT_TRUE(named) << json(plan.conflicts).dump(2);
+
+  // With the partition column in it, the per-partition recipe, UNIQUE on each.
+  std::string leading;
+  for (auto& i : doc["intents"]) {
+    if (i["kind"] != "create_index") continue;
+    leading = i["columns"][0].get<std::string>();
+  }
+  obs.tables["shop.orders"]["partition_key"] = "RANGE (" + leading + ")";
+  plan = pglaswell::plan_migration(pglaswell::parse_spec(doc), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto steps = steps_of(plan, "create_index");
+  ASSERT_GE(steps.size(), 3u) << plan.render();
+  EXPECT_NE(all_sql(*steps[0]).find("CREATE UNIQUE INDEX CONCURRENTLY"), std::string::npos)
+      << all_sql(*steps[0]);
+  EXPECT_NE(all_sql(*steps[1]).find("CREATE UNIQUE INDEX"), std::string::npos);
+  EXPECT_NE(all_sql(*steps[1]).find(" ON ONLY "), std::string::npos) << all_sql(*steps[1]);
+
+  // A partition that is itself partitioned takes no concurrent build.
+  obs.tables["shop.orders"]["partition_parts"] =
+      json::array({json{{"relation", "shop.orders_2024"}, {"partitioned", true},
+                        {"indexes", json::object()}}});
+  plan = pglaswell::plan_migration(pglaswell::parse_spec(doc), obs, {});
+  EXPECT_FALSE(plan.ok) << plan.render();
+}
+
+// The key's columns, out of pg_get_partkeydef's text.
+TEST(Planner, ThePartitionKeysColumnsAreReadOutOfItsDefinition) {
+  using pglaswell::detail::partition_key_columns;
+  EXPECT_EQ(partition_key_columns("RANGE (at)"), (std::vector<std::string>{"at"}));
+  EXPECT_EQ(partition_key_columns("LIST (region, kind)"),
+            (std::vector<std::string>{"region", "kind"}));
+  EXPECT_EQ(partition_key_columns("RANGE (\"end\", at text_ops)"),
+            (std::vector<std::string>{"end", "at"}));
+  EXPECT_EQ(partition_key_columns("HASH (id COLLATE \"C\")"), (std::vector<std::string>{"id"}));
+  // An expression: no unique key can contain it.
+  EXPECT_TRUE(partition_key_columns("RANGE (date_trunc('day'::text, at))").empty());
+}
+
+// The constraint kinds on a partitioned table: never one statement over every
+// partition, never CONCURRENTLY on the parent.
+TEST(Planner, AUniqueConstraintOnAPartitionedTableIsARecipeOverItsPartitions) {
+  auto obs = observations(8LL << 30, 50000000, 0, "partitioned_table");
+  auto& t = obs.tables["shop.orders"];
+  t["partition_key"] = "RANGE (created_at)";
+  t["columns"]["created_at"] = json{{"type", "timestamp with time zone"}, {"not_null", true}};
+  t["columns"]["id"] = json{{"type", "bigint"}, {"not_null", true}};
+  t["partition_parts"] = json::array(
+      {json{{"relation", "shop.orders_2024"}, {"partitioned", false},
+            {"indexes", json::object()}},
+       json{{"relation", "shop.orders_2025"}, {"partitioned", false},
+            {"indexes", json{{"orders_2025_orders_key",
+                              json{{"valid", true}, {"unique", true},
+                                   {"constraint", "orders_2025_orders_key"},
+                                   {"attached_to", nullptr}}}}}}});
+  const auto with_columns = [&](json columns) {
+    return pglaswell::plan_migration(
+        spec_of(json::array({json{{"kind", "add_unique_constraint"}, {"schema", "shop"},
+                                  {"table", "orders"}, {"name", "orders_key"},
+                                  {"columns", std::move(columns)}}})),
+        obs, {});
+  };
+  auto plan = with_columns(json::array({"id"}));
+  EXPECT_FALSE(plan.ok) << plan.render();
+  ASSERT_FALSE(plan.conflicts.empty());
+  EXPECT_NE(plan.conflicts[0].find("does not contain created_at"), std::string::npos)
+      << plan.conflicts[0];
+
+  plan = with_columns(json::array({"created_at", "id"}));
+  ASSERT_TRUE(plan.ok) << plan.render();
+  std::vector<std::string> sql;
+  for (const auto& s : plan.steps) sql.push_back(all_sql(s));
+  // Parent alone; 2024 built, adopted, attached; 2025 -- already built and
+  // adopted by an earlier attempt -- only attached; then the check.
+  ASSERT_EQ(sql.size(), 6u) << plan.render();
+  EXPECT_NE(sql[0].find("LOCK TABLE \"shop\".\"orders\" IN SHARE UPDATE EXCLUSIVE MODE;"),
+            std::string::npos) << sql[0];
+  EXPECT_NE(sql[0].find("ALTER TABLE ONLY \"shop\".\"orders\" ADD CONSTRAINT \"orders_key\" "
+                        "UNIQUE (\"created_at\", \"id\");"),
+            std::string::npos) << sql[0];
+  EXPECT_EQ(sql[1], "CREATE UNIQUE INDEX CONCURRENTLY \"orders_2024_orders_key\" ON "
+                    "\"shop\".\"orders_2024\" (\"created_at\", \"id\");\n");
+  EXPECT_EQ(plan.steps[1].txn_class, pglaswell::TxnClass::kForbidden);
+  EXPECT_NE(sql[2].find("ALTER TABLE \"shop\".\"orders_2024\" ADD CONSTRAINT "
+                        "\"orders_2024_orders_key\" UNIQUE USING INDEX \"orders_2024_orders_key\";"),
+            std::string::npos) << sql[2];
+  EXPECT_EQ(sql[3], "ALTER INDEX \"shop\".\"orders_key\" ATTACH PARTITION "
+                    "\"shop\".\"orders_2024_orders_key\";\n");
+  EXPECT_EQ(sql[4], "ALTER INDEX \"shop\".\"orders_key\" ATTACH PARTITION "
+                    "\"shop\".\"orders_2025_orders_key\";\n");
+  EXPECT_EQ(plan.steps[5].kind, "verify_index_valid");
+  for (const auto& q : sql) {
+    EXPECT_EQ(q.find("CONCURRENTLY \"orders_key\""), std::string::npos)
+        << "nothing concurrent on the parent: " << q;
+  }
 }
 
 TEST(Planner, APartitionedTableWithNoPartitionsIsRefused) {
@@ -5200,6 +5296,92 @@ TEST_F(ToolTest, TheTriggerRecipeFillsAHypertableAndStopsAtTheKeyItStartedBelow)
       pqxx::params{started["jobId"].get<std::string>()});
   ASSERT_EQ(cur.size(), 1u);
   EXPECT_EQ(cur[0][0].as<int>(), 6000);
+}
+
+// A unique constraint on a partitioned table, end to end, and resumed. One ADD
+// CONSTRAINT locks every partition for every build; the concurrent recipe's
+// first statement is refused on a partitioned parent. So: the constraint on
+// ONLY the parent, then each partition's index built concurrently, adopted as
+// its constraint and attached.
+TEST_F(ToolTest, AUniqueConstraintOnAPartitionedTableIsBuiltAPartitionAtATimeAndResumes) {
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/parts");
+    w.txn().exec("DROP SCHEMA IF EXISTS shop CASCADE");
+    w.txn().exec("CREATE SCHEMA shop");
+    w.txn().exec("CREATE TABLE shop.ev(id bigint NOT NULL, day int NOT NULL, v text)"
+                 " PARTITION BY RANGE (day)");
+    w.txn().exec("CREATE TABLE shop.ev_a PARTITION OF shop.ev FOR VALUES FROM (0) TO (10)");
+    w.txn().exec("CREATE TABLE shop.ev_b PARTITION OF shop.ev FOR VALUES FROM (10) TO (20)");
+    w.txn().exec("INSERT INTO shop.ev SELECT g, g % 20, 'x' FROM generate_series(1, 2000) g");
+    // A duplicate in the second partition: its build must fail.
+    w.txn().exec("INSERT INTO shop.ev VALUES (15, 15, 'again')");
+    w.commit();
+  }
+  const auto spec_for = [&](const char* id) {
+    json doc = minimal_spec();
+    doc["id"] = id;
+    doc["description"] = "One event per id and day.";
+    doc["intents"] = json::array(
+        {json{{"kind", "add_unique_constraint"}, {"schema", "shop"}, {"table", "ev"},
+              {"name", "ev_day_id_key"}, {"columns", json::array({"day", "id"})}}});
+    const auto parsed = pglaswell::parse_spec(doc);
+    doc["signatures"] = json::array({{{"key_id", test_key().key_id},
+                                      {"algorithm", "ed25519"},
+                                      {"signature", base64(sign(parsed.canonical_bytes))}}});
+    return doc;
+  };
+
+  const auto doc = spec_for("0014-ev-unique");
+  const auto plan = payload(call("planMigration", json{{"spec", doc}}));
+  ASSERT_TRUE(plan.value("ok", false)) << plan.dump(2);
+  // Parent alone; then build, adopt, attach for each of two partitions; verify.
+  ASSERT_EQ(plan["steps"].size(), 8u) << plan.dump(2);
+  EXPECT_NE(plan["steps"][0]["sql"].dump().find("ALTER TABLE ONLY \\\"shop\\\".\\\"ev\\\""),
+            std::string::npos) << plan["steps"][0].dump(2);
+  EXPECT_EQ(plan.dump().find("CONCURRENTLY \\\"ev_day_id_key\\\" ON \\\"shop\\\".\\\"ev\\\" "),
+            std::string::npos) << "no concurrent build on the parent";
+
+  auto started = payload(call("startMigration", json{{"spec", doc}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, started["jobId"], [](const json& s) {
+    return s.value("state", "") == "failed";
+  })) << status_of(started["jobId"]).dump(2);
+  {
+    pglaswell::ReadSession r(cfg());
+    // The first partition is done and attached; the second's index is INVALID.
+    EXPECT_EQ(r.txn().exec("SELECT count(*) FROM pg_inherits WHERE inhparent ="
+                           " 'shop.ev_day_id_key'::regclass")[0][0].as<int>(), 1);
+    EXPECT_EQ(r.txn().exec("SELECT indisvalid FROM pg_index WHERE indexrelid ="
+                           " 'shop.ev_b_ev_day_id_key'::regclass")[0][0].as<bool>(), false);
+  }
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/parts-fix");
+    w.txn().exec("DELETE FROM shop.ev WHERE v = 'again'");
+    w.commit();
+  }
+
+  // Applied again: only what is missing -- the invalid index is dropped and
+  // rebuilt, adopted, attached.
+  const auto again = payload(call("planMigration", json{{"spec", doc}}));
+  ASSERT_TRUE(again.value("ok", false)) << again.dump(2);
+  ASSERT_EQ(again["steps"].size(), 4u) << again.dump(2);
+  EXPECT_NE(again["steps"][0]["sql"].dump().find("DROP INDEX CONCURRENTLY"), std::string::npos);
+  started = payload(call("startMigration", json{{"spec", doc}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, started["jobId"], [](const json& s) {
+    return s.value("state", "") == "succeeded";
+  })) << status_of(started["jobId"]).dump(2);
+
+  pglaswell::ReadSession r(cfg());
+  EXPECT_EQ(r.txn().exec("SELECT indisvalid FROM pg_index WHERE indexrelid ="
+                         " 'shop.ev_day_id_key'::regclass")[0][0].as<bool>(), true);
+  EXPECT_EQ(r.txn().exec("SELECT count(*) FROM pg_constraint WHERE conname LIKE"
+                         " '%ev_day_id_key' AND contype = 'u'")[0][0].as<int>(), 3);
+  // And it is then simply present.
+  const auto third = payload(call("planMigration", json{{"spec", doc}}));
+  EXPECT_EQ(third["steps"][0].value("action", ""), "satisfied") << third.dump(2);
 }
 
 // A paced select names its cursor by a key VALUE, and nothing makes that key

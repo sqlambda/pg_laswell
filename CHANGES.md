@@ -573,6 +573,32 @@ Found while measuring, and now in the man page: dropping a role that still has
 a job makes the pg_cron launcher exit and restart every second, and no job runs
 until the row is removed.
 
+### Unique constraints on a partitioned table, a partition at a time
+
+`add_unique_constraint` and `add_primary_key` did not know a partitioned table
+from a plain one. Quiet, they planned one `ADD CONSTRAINT`, which builds a
+unique index on every partition under `AccessExclusiveLock` on the parent --
+"size 0 B < 64 MiB". Busy, they planned `CREATE UNIQUE INDEX CONCURRENTLY` on
+the parent, which PostgreSQL refuses ("cannot create index on partitioned
+table concurrently"), in the job. `create_index` with `unique` was refused for
+a reason that was no longer true.
+
+All three are now the recipe PostgreSQL's documentation gives, measured on
+18.6: the constraint (or index) on `ONLY` the parent, a catalog change; then,
+for each partition, a unique index built `CONCURRENTLY`, adopted as that
+partition's constraint with `USING INDEX`, and attached. The parent's is valid
+when the last one lands.
+
+The constraint recipe resumes. A duplicate in one partition fails that
+partition's build, with the partitions before it done; applied again, the
+plan is only what is missing -- the invalid index dropped and rebuilt, adopted,
+attached. The parent's reading now carries each partition's indexes for this.
+
+Refused at planning, in PostgreSQL's words: a key that lacks a partition
+column, and a partition key that is an expression. Refused for now: a
+partition that is itself partitioned, where the recipe would have to descend --
+which the non-unique `create_index` recipe used to plan and fail on.
+
 ### A table whose parent holds no rows is sized by where the rows are
 
 `create_index` and `backfill` asked the module how much data a hypertable or a

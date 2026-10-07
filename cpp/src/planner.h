@@ -2373,6 +2373,40 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
 // time rather than together: two concurrent builds on one parent's children
 // contend for the same catalog rows without buying any parallelism worth
 // having.
+namespace detail {
+// "RANGE (at)" or "LIST (region, kind)" -> the key's columns. Empty when any
+// part of the key is an expression, which no unique key can contain.
+inline std::vector<std::string> partition_key_columns(const std::string& partkeydef) {
+  const auto open = partkeydef.find('(');
+  const auto close = partkeydef.rfind(')');
+  if (open == std::string::npos || close == std::string::npos || close < open) return {};
+  const std::string inner = partkeydef.substr(open + 1, close - open - 1);
+  if (inner.find('(') != std::string::npos) return {};
+  std::vector<std::string> columns;
+  std::size_t at = 0;
+  while (at <= inner.size()) {
+    auto comma = inner.find(',', at);
+    if (comma == std::string::npos) comma = inner.size();
+    std::string part = inner.substr(at, comma - at);
+    const auto first = part.find_first_not_of(' ');
+    if (first == std::string::npos) return {};
+    part = part.substr(first);
+    // The column, without an operator class or a collation after it.
+    std::string column;
+    if (part[0] == '"') {
+      const auto end = part.find('"', 1);
+      if (end == std::string::npos) return {};
+      column = part.substr(1, end - 1);
+    } else {
+      column = part.substr(0, part.find(' '));
+    }
+    columns.push_back(column);
+    at = comma + 1;
+  }
+  return columns;
+}
+}  // namespace detail
+
 inline void plan_partitioned_index(const Intent& in, const json& t, Plan& plan,
                                    std::vector<Step>& out, Step& parent_step) {
   const auto qualified = in.qualified_table();
@@ -2409,19 +2443,51 @@ inline void plan_partitioned_index(const Intent& in, const json& t, Plan& plan,
     return;
   }
 
-  // A unique index on a partitioned table must include the partition key, and
-  // this planner does not read the partition key. Refusing beats emitting a
-  // recipe whose last step fails.
+  // A unique index on a partitioned table must include every partition column
+  // (measured: "unique constraint on partitioned table must include all
+  // partitioning columns"), and cannot exist at all when the key is an
+  // expression. Said here, in PostgreSQL's words, rather than by the last
+  // step of the recipe.
   if (unique) {
+    const auto partkey = t.value("partition_key", std::string());
+    const auto key = detail::partition_key_columns(partkey);
+    std::string missing;
+    for (const auto& k : key) {
+      if (std::find(columns.begin(), columns.end(), k) == columns.end()) {
+        missing = k;
+        break;
+      }
+    }
+    if (key.empty() || !missing.empty()) {
+      parent_step.action = Action::kConflict;
+      parent_step.why = key.empty()
+                            ? "the partition key of " + qualified + " is an expression"
+                            : "the key does not contain the partition column " + missing;
+      plan.conflicts.push_back(
+          "\"" + name + "\" is UNIQUE on " + qualified + ", partitioned by " + partkey +
+          (key.empty()
+               ? ". PostgreSQL allows no unique index on a table whose partition key "
+                 "includes an expression."
+               : ", and its columns (" + detail::join(columns, ", ") + ") do not contain " +
+                     missing + ". PostgreSQL: \"unique constraint on partitioned table "
+                     "must include all partitioning columns\". Add " + missing +
+                     " to the index."));
+      return;
+    }
+  }
+  // A partition that is itself partitioned takes no concurrent build either:
+  // the recipe would fail there, in the job.
+  for (const auto& part : t.value("partition_parts", json::array())) {
+    if (!part.value("partitioned", false)) continue;
     parent_step.action = Action::kConflict;
-    parent_step.why = "a unique index on a partitioned table must include the "
-                      "partition key, which this planner does not read";
+    parent_step.why = part.value("relation", "") + " is itself partitioned";
     plan.conflicts.push_back(
-        "\"" + name + "\" is UNIQUE on the partitioned table " + qualified +
-        ". PostgreSQL requires such an index to include the partition key, and "
-        "pg_laswell does not read the partition key, so it will not emit a "
-        "recipe whose final ATTACH would fail. Add the constraint by hand, or "
-        "make the index non-unique.");
+        "\"" + name + "\" on " + qualified + ": its partition " + part.value("relation", "") +
+        " is itself partitioned, so no index can be built on it concurrently. "
+        "Create the index on " + part.value("relation", "") +
+        " first, in an intent of its own, is not enough -- this recipe builds and "
+        "attaches an index of its own name on each partition -- so build this one by "
+        "hand, as PostgreSQL's documentation of partitioned tables describes.");
     return;
   }
 
@@ -2450,7 +2516,8 @@ inline void plan_partitioned_index(const Intent& in, const json& t, Plan& plan,
     s.txn_class = TxnClass::kForbidden;
     s.own_transaction = true;
     s.lock = "ShareUpdateExclusiveLock on " + part;
-    s.sql.push_back("CREATE INDEX CONCURRENTLY " + detail::quote_identifier(child) + " ON " +
+    s.sql.push_back(std::string("CREATE ") + (unique ? "UNIQUE " : "") +
+                    "INDEX CONCURRENTLY " + detail::quote_identifier(child) + " ON " +
                     detail::quote_qualified(part) + tail + ";");
     s.why = "partition " + std::to_string(child_indexes.size()) + " of " +
             std::to_string(partitions.size()) +
@@ -2467,7 +2534,8 @@ inline void plan_partitioned_index(const Intent& in, const json& t, Plan& plan,
   parent.txn_class = TxnClass::kOptional;
   parent.own_transaction = true;
   parent.lock = "ShareLock on " + qualified + ", which holds no data itself";
-  parent.sql.push_back("CREATE INDEX " + detail::quote_identifier(name) + " ON ONLY " + sql_rel + tail + ";");
+  parent.sql.push_back(std::string("CREATE ") + (unique ? "UNIQUE " : "") + "INDEX " +
+                       detail::quote_identifier(name) + " ON ONLY " + sql_rel + tail + ";");
   parent.sql.push_back("COMMENT ON INDEX " + detail::quote_identifier(in.schema()) + "." + detail::quote_identifier(name) + " IS " +
                        detail::quote_literal(in.body.value("comment", "")) + ";");
   parent.why =
@@ -5979,6 +6047,215 @@ inline void plan_detach_partition(const Intent& in, const Observations& obs,
 // lock: 75ms on 2M rows nullable versus 0.6ms already NOT NULL. So a primary
 // key over a nullable column runs the set_not_null recipe first -- which exists
 // precisely to do that scan under a lock that does not block the application.
+// A unique constraint or primary key on a PARTITIONED table.
+//
+// The table holds no rows; its partitions do, and neither way core adds such a
+// constraint elsewhere works here. One ADD CONSTRAINT builds a unique index on
+// every partition under AccessExclusiveLock on the parent, which stops every
+// query on every partition for the whole of it. And the concurrent recipe
+// starts with CREATE UNIQUE INDEX CONCURRENTLY on the parent, which PostgreSQL
+// refuses ("cannot create index on partitioned table concurrently") -- in the
+// job, because the dry run cannot run it. Both were planned.
+//
+// Measured on 18.6, the recipe PostgreSQL's own documentation gives:
+//   1. ALTER TABLE ONLY <parent> ADD CONSTRAINT ...: AccessExclusiveLock on the
+//      parent for a catalog change. Its index is INVALID and holds nothing.
+//   2. per partition: CREATE UNIQUE INDEX CONCURRENTLY, then ADD CONSTRAINT ...
+//      USING INDEX on the partition (AccessExclusiveLock on that partition,
+//      briefly) -- required: an index that backs no constraint is refused at
+//      the next step ("belongs to a constraint in table ... but no constraint
+//      exists for index ...") -- then ALTER INDEX <parent's> ATTACH PARTITION.
+//   3. the parent's index is valid when the last partition's is attached, and
+//      a partition created meanwhile gets the constraint by itself.
+//
+// Every state on the way is in the reading (catalog.h, partition_parts), so a
+// recipe that stopped -- a duplicate found in the fifth partition -- resumes at
+// that partition when the specification is applied again.
+inline void plan_unique_on_partitions(const Intent& in, const json& t, bool primary,
+                                      const std::string& name,
+                                      const std::vector<std::string>& columns,
+                                      const std::vector<std::string>& quoted_columns,
+                                      Plan& plan, std::vector<Step>& out) {
+  const auto qualified = in.qualified_table();
+  const auto sql_rel = detail::quote_qualified(qualified);
+  const std::string kind_sql = primary ? "PRIMARY KEY" : "UNIQUE";
+  const std::string quoted_cols = detail::join(quoted_columns, ", ");
+  auto fail = [&](const std::string& why, const std::string& said) {
+    Step s;
+    s.kind = in.kind_name;
+    s.action = Action::kConflict;
+    s.why = why;
+    plan.conflicts.push_back(said);
+    out.push_back(std::move(s));
+  };
+  auto emit = [&](TxnClass klass, std::vector<std::string> sql, const std::string& lock,
+                  const std::string& why) -> Step& {
+    Step s;
+    s.kind = in.kind_name;
+    s.txn_class = klass;
+    s.own_transaction = true;
+    s.sql = std::move(sql);
+    s.lock = lock;
+    s.why = why;
+    s.detail["constraint"] = name;
+    out.push_back(std::move(s));
+    return out.back();
+  };
+
+  const auto partkey = t.value("partition_key", std::string());
+  const auto key = detail::partition_key_columns(partkey);
+  if (key.empty()) {
+    fail("the partition key of " + qualified + " is an expression",
+         qualified + " is partitioned by " + partkey + ", and PostgreSQL allows no " +
+             (primary ? "primary key" : "unique constraint") +
+             " on a table whose partition key includes an expression.");
+    return;
+  }
+  for (const auto& k : key) {
+    if (std::find(columns.begin(), columns.end(), k) != columns.end()) continue;
+    fail("the key does not contain the partition column " + k,
+         "\"" + name + "\" on " + qualified + ": the key (" + detail::join(columns, ", ") +
+             ") does not contain " + k + ", and " + qualified + " is partitioned by " +
+             partkey + ". PostgreSQL: \"unique constraint on partitioned table must "
+             "include all partitioning columns\". Add " + k + " to the key.");
+    return;
+  }
+
+  const json parts = t.value("partition_parts", json::array());
+  struct Part { std::string relation, index; json ix; };
+  std::vector<Part> todo;
+  for (const auto& p : parts) {
+    const auto relation = p.value("relation", "");
+    if (p.value("partitioned", false)) {
+      fail(relation + " is itself partitioned",
+           "\"" + name + "\" on " + qualified + ": its partition " + relation +
+               " is itself partitioned, so no index can be built on it "
+               "concurrently either. The recipe would have to descend into its "
+               "partitions, which pg_laswell does not plan yet; add the constraint "
+               "by hand, partition by partition, as PostgreSQL's documentation of "
+               "partitioned tables describes.");
+      return;
+    }
+    const auto bare = relation.substr(relation.find('.') + 1);
+    const auto child = bare + "_" + name;
+    if (child.size() > 63) {
+      fail("a per-partition constraint name would exceed 63 bytes",
+           "the constraint on " + relation + " would be named \"" + child +
+               "\", which PostgreSQL would truncate at 63 bytes -- and a truncated name "
+               "is not deterministic, so a resumed recipe could not find what it built. "
+               "Use a shorter constraint name.");
+      return;
+    }
+    const json ix = p.value("indexes", json::object()).value(child, json());
+    if (ix.is_object() && ix.value("valid", false) && !ix.value("unique", false)) {
+      fail("\"" + child + "\" exists and is not unique",
+           "an index named \"" + child + "\" already exists on " + relation +
+               " and is not unique, so it cannot back \"" + name +
+               "\". Drop or rename it in an earlier intent.");
+      return;
+    }
+    todo.push_back({relation, child, ix});
+  }
+
+  // No partitions: nothing to build on, and one statement on the parent is a
+  // catalog change that is valid at once.
+  if (todo.empty()) {
+    auto& s = emit(TxnClass::kRequired,
+                   {"ALTER TABLE " + sql_rel + " ADD CONSTRAINT " +
+                    detail::quote_identifier(name) + " " + kind_sql + " (" + quoted_cols + ");"},
+                   "AccessExclusiveLock on " + qualified + ", briefly: it has no partitions",
+                   qualified + " is partitioned and has no partitions yet, so the "
+                   "constraint is a catalog change; each partition created later gets it");
+    weaker_lock_first(s, {sql_rel});
+    return;
+  }
+
+  const bool parent_there = t.value("constraints", json::object()).contains(name);
+  if (!parent_there) {
+    auto& s = emit(TxnClass::kRequired,
+                   {"ALTER TABLE ONLY " + sql_rel + " ADD CONSTRAINT " +
+                    detail::quote_identifier(name) + " " + kind_sql + " (" + quoted_cols + ");"},
+                   "AccessExclusiveLock on " + qualified +
+                       " alone, briefly -- no partition is locked or read",
+                   "ON ONLY the parent the constraint is a catalog entry whose index holds "
+                   "nothing, so this scans nothing. It stays INVALID until every "
+                   "partition's index is attached, and a partition created meanwhile "
+                   "gets the constraint by itself");
+    weaker_lock_first(s, {sql_rel});
+  }
+
+  std::size_t n = 0;
+  for (const auto& p : todo) {
+    ++n;
+    const auto sql_part = detail::quote_qualified(p.relation);
+    const auto schema = p.relation.substr(0, p.relation.find('.'));
+    const auto sql_index = detail::quote_identifier(schema) + "." +
+                           detail::quote_identifier(p.index);
+    const std::string of = "partition " + std::to_string(n) + " of " +
+                           std::to_string(todo.size()) + " (" + p.relation + ")";
+    const bool built = p.ix.is_object() && p.ix.value("valid", false);
+    if (!built) {
+      std::vector<std::string> sql;
+      // An index left INVALID by a build that found a duplicate, or was
+      // interrupted: it is dropped and built again.
+      if (p.ix.is_object()) sql.push_back("DROP INDEX CONCURRENTLY " + sql_index + ";");
+      sql.push_back("CREATE UNIQUE INDEX CONCURRENTLY " + detail::quote_identifier(p.index) +
+                    " ON " + sql_part + " (" + quoted_cols + ");");
+      auto& s = emit(TxnClass::kForbidden, std::move(sql),
+                     "ShareUpdateExclusiveLock on " + p.relation + " -- reads and writes continue",
+                     of + ": the index is built concurrently on the partition itself, "
+                     "because CREATE INDEX CONCURRENTLY is refused on the parent");
+      s.detail["partition"] = p.relation;
+      s.detail["index"] = p.index;
+      s.detail["schema"] = schema;
+      if (p.ix.is_object()) s.detail["recovering_invalid_index"] = true;
+    }
+    const bool adopted = built && p.ix.value("constraint", json()).is_string();
+    if (!adopted) {
+      auto& s = emit(TxnClass::kRequired,
+                     {"ALTER TABLE " + sql_part + " ADD CONSTRAINT " +
+                      detail::quote_identifier(p.index) + " " + kind_sql + " USING INDEX " +
+                      detail::quote_identifier(p.index) + ";"},
+                     "AccessExclusiveLock on " + p.relation +
+                         ", briefly: no build and no scan under it",
+                     of + ": the index becomes the partition's own constraint, without "
+                     "which PostgreSQL will not attach it to the parent's");
+      weaker_lock_first(s, {sql_part});
+      s.detail["partition"] = p.relation;
+    }
+    const auto attached = p.ix.is_object() ? p.ix.value("attached_to", json()) : json();
+    if (!(built && attached.is_string() && attached.get<std::string>() == name)) {
+      const auto parent_schema = qualified.substr(0, qualified.find('.'));
+      auto& s = emit(TxnClass::kRequired,
+                     {"ALTER INDEX " + detail::quote_identifier(parent_schema) + "." +
+                      detail::quote_identifier(name) + " ATTACH PARTITION " + sql_index + ";"},
+                     "AccessExclusiveLock on the partition's index and "
+                     "ShareUpdateExclusiveLock on the parent's, briefly",
+                     of + ": attached; the constraint on " + qualified +
+                         " becomes valid when the last partition's is");
+      s.detail["partition"] = p.relation;
+    }
+  }
+
+  Step verify;
+  verify.kind = "verify_index_valid";
+  verify.txn_class = TxnClass::kOptional;
+  verify.lock = "none (catalog read)";
+  verify.why = "a partitioned constraint missing even one partition's index exists, is "
+               "INVALID, and enforces nothing across partitions -- and nothing else "
+               "would say so";
+  verify.detail = json{{"schema", qualified.substr(0, qualified.find('.'))}, {"index", name}};
+  out.push_back(std::move(verify));
+
+  plan.warnings.push_back(
+      "there is no NOT VALID form for a unique constraint, so each partition's index "
+      "build IS the validation. If (" + quoted_cols + ") holds duplicates in a partition "
+      "its build fails and leaves an INVALID index there, with the constraint on " +
+      qualified + " added and not yet valid. Remove the duplicates and apply the "
+      "specification again: it drops that index, builds it again, and carries on "
+      "from that partition.");
+}
+
 inline void plan_unique_like(const Intent& in, const Observations& obs,
                              Plan& plan, std::vector<Step>& out) {
   const bool primary = in.kind == IntentKind::kAddPrimaryKey;
@@ -6021,7 +6298,15 @@ inline void plan_unique_like(const Intent& in, const Observations& obs,
   }
 
   const json constraints = t.value("constraints", json::object());
-  if (constraints.contains(name)) {
+  // On a partitioned table the constraint can be there and unfinished: added
+  // on the parent alone, its index INVALID until every partition's is attached.
+  // That is a recipe to resume, not a constraint that is present.
+  const bool partitioned = t.value("kind", "") == "partitioned_table";
+  const bool unfinished =
+      partitioned && constraints.contains(name) &&
+      constraints[name].value("type", "") == (primary ? "p" : "u") &&
+      !t.value("indexes", json::object()).value(name, json::object()).value("is_valid", true);
+  if (constraints.contains(name) && !unfinished) {
     const auto type = constraints[name].value("type", "");
     if (type == (primary ? "p" : "u")) {
       Step s;
@@ -6037,7 +6322,7 @@ inline void plan_unique_like(const Intent& in, const Observations& obs,
              ". Drop it in an earlier intent if it is to be replaced.");
     return;
   }
-  if (primary) {
+  if (primary && !unfinished) {
     for (const auto& [cname, c] : constraints.items()) {
       if (c.value("type", "") == "p") {
         fail(qualified + " already has a primary key",
@@ -6074,6 +6359,11 @@ inline void plan_unique_like(const Intent& in, const Observations& obs,
           "AccessExclusiveLock -- measured at 75ms on 2M rows against 0.6ms "
           "when the column is already NOT NULL, and it grows with the table.");
     }
+  }
+
+  if (partitioned) {
+    plan_unique_on_partitions(in, t, primary, name, columns, quoted_columns, plan, out);
+    return;
   }
 
   // An existing valid unique index over exactly these columns is the whole
