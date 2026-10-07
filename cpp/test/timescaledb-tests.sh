@@ -104,11 +104,16 @@ for edition in tsl apache oldest; do
     "is not empty" \
     "SELECT create_hypertable('public.full_t', by_range('ts'))" \
     "table \"full_t\" is not empty"
-  clean "with migrate_data, its rows move (and roll back)" "$U" \
-    '{"kind":"timescaledb_create_hypertable","schema":"public","table":"full_t","time_column":"ts","migrate_data":true}'
+  # Moving rows into chunks holds AccessExclusiveLock for the whole copy, so the
+  # dry run plans it and leaves it to the job.
+  migrate='{"kind":"timescaledb_create_hypertable","schema":"public","table":"full_t","time_column":"ts","migrate_data":true}'
+  clean "with migrate_data, the plan is accepted" "$U" "$migrate"
+  plan "$U" "$migrate" | grep -q '"unverifiedSteps":\[0\]' \
+    && ok "the copy into chunks is left to the job, and listed as not rehearsed" \
+    || bad "the dry run should not move the rows of a populated table" "$(plan "$U" "$migrate")"
   [ "$(q "$U" "SELECT count(*) FROM ONLY public.full_t")" = 5000 ] \
-    && ok "the rehearsal left the rows where they were" \
-    || bad "the rehearsal should roll the migration back" "$(q "$U" "SELECT count(*) FROM ONLY public.full_t")"
+    && ok "the rows are where they were" \
+    || bad "the dry run should leave the table alone" "$(q "$U" "SELECT count(*) FROM ONLY public.full_t")"
 
   q "$U" "SELECT create_hypertable('public.m', by_range('ts', INTERVAL '1 day'))" >/dev/null
   q "$U" "INSERT INTO public.m SELECT g, now() - (g || ' seconds')::interval, g % 10, random()

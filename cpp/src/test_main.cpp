@@ -9746,6 +9746,46 @@ TEST(Planner, AddForeignKeySplitsIntoNotValidThenValidate) {
 // field: three seconds without one insert on a 3 GB table, all of them before
 // the job began. The planner marks the steps; the rehearsal leaves them out and
 // says why.
+// The other statements that read or rewrite a whole table under a lock that
+// blocks writes. The dry run executed each on the live table, for as long as
+// dry_run_statement_timeout_ms allowed, holding the lock to its rollback.
+TEST(Planner, AStatementThatRewritesOrReadsTheWholeTableIsNotRehearsed) {
+  const auto obs = observations(2LL << 30, 8000000);
+  const auto marked = [&](const json& intent, const char* kind, bool gap) {
+    const auto plan = pglaswell::plan_migration(spec_of(json::array({intent})), obs, {});
+    EXPECT_TRUE(plan.ok) << plan.render();
+    const auto steps = steps_of(plan, kind);
+    ASSERT_FALSE(steps.empty()) << plan.render();
+    const auto& d = steps.back()->detail;
+    ASSERT_TRUE(d.contains("not_rehearsed")) << kind << ": " << plan.render();
+    EXPECT_NE(d.value("not_rehearsed", "").find("blocks writes"), std::string::npos);
+    EXPECT_EQ(d.value("not_rehearsed_leaves_gap", !gap), gap) << kind;
+  };
+  // A later step may read the column in its new type: a gap.
+  marked(json{{"kind", "alter_column_type"}, {"schema", "shop"}, {"table", "orders"},
+              {"column", "warehouse_id"}, {"type", "numeric"}},
+         "alter_column_type", true);
+  // Nothing later depends on where or how the pages are stored.
+  marked(json{{"kind", "set_logged"}, {"schema", "shop"}, {"table", "orders"},
+              {"logged", false}},
+         "set_logged", false);
+  marked(json{{"kind", "set_tablespace"}, {"schema", "shop"}, {"table", "orders"},
+              {"tablespace", "fast"}},
+         "set_tablespace", false);
+
+  // ATTACH: in the dry run its CHECK was never validated, so it would scan.
+  const auto attach = pglaswell::plan_migration(attach_spec(), obs_partitioned(), {});
+  ASSERT_TRUE(attach.ok) << attach.render();
+  bool found = false;
+  for (const auto* s : steps_of(attach, "attach_partition")) {
+    if (all_sql(*s).find("ATTACH PARTITION") == std::string::npos) continue;
+    found = true;
+    ASSERT_TRUE(s->detail.contains("not_rehearsed")) << attach.render();
+    EXPECT_TRUE(s->detail.value("not_rehearsed_leaves_gap", false));
+  }
+  EXPECT_TRUE(found) << attach.render();
+}
+
 TEST(Planner, TheScanOfASplitRecipeIsMarkedNotToBeRehearsed) {
   auto obs = observations(2LL << 30, 8000000);
   const auto nn = pglaswell::plan_migration(

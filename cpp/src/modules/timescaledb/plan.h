@@ -209,6 +209,12 @@ inline void plan_timescaledb_create_hypertable(const Intent& in, const Observati
   // included -- rolls back, leaving the plain table with its rows.
   step.detail["rehearse_by"] = "execution";
   step.sql.push_back("SELECT create_hypertable(" + args + ");");
+  // Not where it moves rows: the table is unreadable for the whole copy, and
+  // the dry run would do that to the live table. Pages as well as rows: a table
+  // never analysed reads no rows and is not empty.
+  if (migrate && (rows > 0 || t.value("size_estimate", 0LL) > 0)) {
+    do_not_rehearse(step, detail::kHeavyNotRehearsed, /*leaves_gap=*/true);
+  }
   if (migrate && rows > 0) {
     step.lock = "AccessExclusiveLock on " + qualified + " while its rows move into chunks";
     step.why = qualified + " becomes a hypertable on " + column + ", and its ~" +

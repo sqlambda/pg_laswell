@@ -298,7 +298,7 @@ Almost all PostgreSQL DDL is transactional, which is what makes this possible,
 and nothing weaker works: a backfill referencing a column that step 0 adds does
 not parse until step 0 has run, and that is the ordinary case.
 .Pp
-Four costs, all bounded and all reported:
+Five costs, all bounded and all reported:
 .Bl -bullet -compact
 .It
 It takes the real locks, on the live schema, and holds each until the rollback
@@ -347,6 +347,46 @@ constraint already committed \(em not before anything ran.
 Applying the specification again resumes at the scan: a constraint that is
 there and not valid is validated, not added a second time.
 The chain rehearsal below runs the scans, since it is not for a live database.
+.It
+A statement that reads or rewrites a whole table under a lock that blocks
+writes is not run either, whatever the table's size: the dry run would do it to
+the live table and hold the lock until its rollback.
+That is
+.Cm alter_column_type ;
+.Ic ATTACH PARTITION ,
+which scans the candidate where its check was not validated and scans a
+.Li DEFAULT
+partition always;
+.Cm create_table
+with
+.Va partition_of
+beside a
+.Li DEFAULT
+partition;
+.Cm set_logged ,
+.Cm set_tablespace
+and
+.Cm set_access_method ;
+.Ic SET NOT NULL
+on a domain;
+.Cm replace_view
+on a materialized view; a constraint a module makes validate in the statement
+that adds it, and an index or unique constraint a module makes build without
+.Ic CONCURRENTLY
+on a table too large or too busy for a plain build; a primary key over a
+column that is still nullable in the dry run; and the module kinds that copy a
+populated table \(em distributing it with the blocking form, making it a
+reference table, altering or undistributing a distributed table,
+.Cm timescaledb_create_hypertable
+with
+.Va migrate_data .
+Each is listed as unverified with its reason, and a later step that needs what
+one of them would have made is reported as depending on a step that was not
+rehearsed, not as a failure of its own.
+What this gives up: a
+.Va using
+expression that fails on a row, or a partition bound that overlaps, is found by
+the job.
 .It
 Queries are planned with
 .Ic EXPLAIN Pq Cm GENERIC_PLAN ,

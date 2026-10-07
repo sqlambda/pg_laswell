@@ -549,8 +549,10 @@ inline json plan_migration_tool(ToolContext& ctx, const json& args) {
             "not run -- one that cannot run inside a transaction block (CREATE "
             "INDEX CONCURRENTLY), or the scan of a split recipe (VALIDATE "
             "CONSTRAINT), which in this one transaction would run under the "
-            "lock the recipe exists to release first -- and unverifiedWhy says "
-            "which. They were skipped rather than silently passed."}};
+            "lock the recipe exists to release first, or a statement that "
+            "reads or rewrites a whole table under a lock that blocks writes "
+            "-- and unverifiedWhy says which. They were skipped rather than "
+            "silently passed."}};
     if (!dry.skipped_reason.empty()) d["skippedReason"] = dry.skipped_reason;
     // Named separately from the note, which a later branch may overwrite: a
     // reader deciding whether to trust this plan needs to see that some of it

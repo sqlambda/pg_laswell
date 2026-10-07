@@ -255,6 +255,37 @@ A batch now ends on a whole key: the limit finds the last key, and the batch is
 every row up to and including it. It is therefore larger than `batch_rows` by
 the rows that share its last key.
 
+### The dry run no longer rewrites or reads a whole table under a write-blocking lock
+
+The scan of a split recipe was left to the job; the statements that are a scan
+or a rewrite in themselves were still executed by the dry run, on the live
+table, for as long as `dry_run_statement_timeout_ms` allowed and holding their
+lock until the final rollback. They are now planned, listed under
+`unverifiedSteps` with the reason, and left to the job, whatever the table's
+size:
+
+- `alter_column_type`;
+- `ATTACH PARTITION` -- in the dry run its check was never validated, so it
+  scanned the candidate itself, and a DEFAULT partition is scanned whatever the
+  check says;
+- `create_table` with `partition_of` beside a DEFAULT partition;
+- `set_logged`, `set_tablespace`, `set_access_method`;
+- `SET NOT NULL` on a domain;
+- `replace_view` on a materialized view;
+- a constraint a module makes validate in the statement that adds it, and an
+  index or unique constraint a module makes build without `CONCURRENTLY` on a
+  table too large or too busy for a plain build;
+- a primary key over a column that is still nullable in the dry run;
+- the module kinds that copy a populated table: `citus_distribute_table` in its
+  blocking form, `citus_create_reference_table`, `citus_alter_distributed_table`,
+  `citus_undistribute_table`, and `timescaledb_create_hypertable` with
+  `migrate_data`.
+
+A later step that needs what one of them would have made is reported as
+depending on a step that was not rehearsed, not as a failure of its own. What
+this gives up: a `using` expression that fails on a row, or a partition bound
+that overlaps, is found by the job. The chain rehearsal still runs them all.
+
 ### Plans that could not run
 
 - `detach_partition` chose `DETACH ... CONCURRENTLY` for a large or busy

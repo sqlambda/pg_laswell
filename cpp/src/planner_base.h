@@ -636,6 +636,22 @@ inline json compute_budget(const Observations& obs, const ExecutorConfig& cfg) {
   return b;
 }
 
+// What a step left out of the dry run says when it is not the scan of a split
+// recipe but a statement that reads or rewrites the whole table itself.
+inline constexpr const char* kHeavyNotRehearsed =
+    "it reads or rewrites the whole table under a lock that blocks writes, and "
+    "the dry run would do that to the live table and hold the lock until its "
+    "final rollback. What it would refuse is found when the job reaches this "
+    "step";
+
 }  // namespace detail
+
+// A step the dry run must not execute. `leaves_gap` says that later steps may
+// need what this one would have made: they are then reported as depending on a
+// step that was not rehearsed, not as failures of their own.
+inline void do_not_rehearse(Step& step, const std::string& why, bool leaves_gap) {
+  step.detail["not_rehearsed"] = why;
+  step.detail["not_rehearsed_leaves_gap"] = leaves_gap;
+}
 
 }  // namespace pglaswell

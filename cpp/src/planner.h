@@ -244,11 +244,6 @@ inline void weaker_lock_first(Step& step, const std::vector<std::string>& sql_re
               "asked for with a short timeout and retried";
 }
 
-inline void do_not_rehearse(Step& step, const std::string& why, bool leaves_gap) {
-  step.detail["not_rehearsed"] = why;
-  step.detail["not_rehearsed_leaves_gap"] = leaves_gap;
-}
-
 namespace detail {
 inline constexpr const char* kScanNotRehearsed =
     "the scan: the dry run runs in one transaction, where the lock of the step "
@@ -1526,6 +1521,8 @@ inline void validate_in_one_step(Step& step, Plan& plan, const ConstraintTraits&
              "fail on the second -> validated by the statement that adds it" + over;
   step.detail["validated_in_one_step_by"] = by;
   if (traits.rows >= 0) step.detail["rows"] = traits.rows;
+  // The statement IS the scan, under its own lock: not for the dry run.
+  do_not_rehearse(step, detail::kHeavyNotRehearsed, /*leaves_gap=*/true);
   plan.warnings.push_back(
       what + " on " + qualified + " is validated in one statement: " + by +
       " allows no separate VALIDATE CONSTRAINT here. " + blocks + " " + scope +
@@ -2224,6 +2221,11 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
                : "") +
           ". Writes to " + scope + " block for the whole build, over " +
           detail::human_bytes(size) + ". Schedule it for a quiet window.");
+    }
+    // A plain build of any size, because the module allows no other: writes
+    // wait for the whole of it, in the dry run as in the job.
+    if (!(small_enough && quiet)) {
+      do_not_rehearse(step, detail::kHeavyNotRehearsed, /*leaves_gap=*/true);
     }
   } else if (plain) {
     step.txn_class = TxnClass::kOptional;
@@ -3631,6 +3633,7 @@ inline void plan_physical(const Intent& in, const Observations& obs, Plan& plan,
                (logged ? ", and every byte of it is written to WAL as it goes"
                        : ""),
            /*own=*/true);
+      do_not_rehearse(out.back(), detail::kHeavyNotRehearsed, /*leaves_gap=*/false);
       if (!logged) {
         plan.warnings.push_back(
             "UNLOGGED means " + qualified +
@@ -3656,6 +3659,7 @@ inline void plan_physical(const Intent& in, const Observations& obs, Plan& plan,
            "moving a table copies every page to the new location under an "
            "exclusive lock: " + detail::human_bytes(size) + " to write",
            /*own=*/true);
+      do_not_rehearse(out.back(), detail::kHeavyNotRehearsed, /*leaves_gap=*/false);
       plan.warnings.push_back(
           "the move needs " + detail::human_bytes(size) +
           " free in the destination tablespace WHILE the source still holds "
@@ -3680,6 +3684,7 @@ inline void plan_physical(const Intent& in, const Observations& obs, Plan& plan,
            "changing access method rewrites the table in the new method's "
            "format: " + detail::human_bytes(size) + " under an exclusive lock",
            /*own=*/true);
+      do_not_rehearse(out.back(), detail::kHeavyNotRehearsed, /*leaves_gap=*/false);
       plan.warnings.push_back(
           "measured only for a no-op change (heap to heap, which does not "
           "rewrite). A real change of access method does rewrite, and this plan "
@@ -4030,6 +4035,10 @@ inline void plan_alter_misc(const Intent& in, const Observations& obs,
                  "is scanned: reads continue, writes to those tables wait"
                : "none on the tables using the domain",
            "a domain change reaches every column of that type", /*own=*/false);
+      // SET NOT NULL scans every column of the type, writes waiting.
+      if (in.body.value("not_null", false)) {
+        do_not_rehearse(out.back(), detail::kHeavyNotRehearsed, /*leaves_gap=*/false);
+      }
       if (in.body.value("not_null", false)) {
         plan.warnings.push_back(
             "SET NOT NULL on a domain scans every column of type " + qualified_obj +
@@ -5164,8 +5173,9 @@ inline void plan_create_partition(const Intent& in, const Observations& obs,
                                 " estimated rows)"
                           : std::string()) +
         ", every row of it is read under lock to prove none belongs to the new "
-        "bound -- measured, 47 ms for 1M rows. One that does fails the step; "
-        "the dry run executes it, so that is found before anything commits.");
+        "bound -- measured, 47 ms for 1M rows. One that does fails the step, "
+        "in the job: the dry run does not read the default under that lock.");
+    do_not_rehearse(step, detail::kHeavyNotRehearsed, /*leaves_gap=*/true);
   }
   if (in.body.value("unlogged", false)) {
     plan.warnings.push_back(
@@ -5703,10 +5713,6 @@ inline void plan_attach_partition(const Intent& in, const Observations& obs,
            "application survives. Measured: ATTACH without this took 98ms on 2M "
            "rows against 0.9ms with it",
            /*own=*/true);
-      // The ATTACH after it IS rehearsed, because it is what finds an
-      // overlapping bound: in the dry run it scans the candidate under the
-      // candidate's own lock, which the parent's readers and writers do not
-      // wait on.
       do_not_rehearse(out.back(), detail::kScanNotRehearsed, /*leaves_gap=*/false);
     }
   }
@@ -5729,6 +5735,15 @@ inline void plan_attach_partition(const Intent& in, const Observations& obs,
            : "step 3 of 4: attaching, now a catalog change because the "
              "validated CHECK already proves the bounds",
        /*own=*/true);
+  // Not rehearsed either. In the dry run the CHECK was never validated, so the
+  // ATTACH would scan the candidate itself -- and a DEFAULT partition is
+  // scanned whatever the CHECK says, under AccessExclusiveLock on it. An
+  // overlapping bound is found when the job reaches this step.
+  do_not_rehearse(out.back(),
+                  check_expr.empty() || p.value("default_partition", json()).is_string()
+                      ? detail::kHeavyNotRehearsed
+                      : detail::kNeedsTheScan,
+                  /*leaves_gap=*/true);
 
   // Step 4: the CHECK is redundant once the partition bound enforces the same
   // thing, and a redundant constraint costs time on every insert forever.
@@ -5972,9 +5987,11 @@ inline void plan_unique_like(const Intent& in, const Observations& obs,
   // AccessExclusiveLock. Run the recipe that does that scan under a lock the
   // application survives, rather than letting ADD PRIMARY KEY do it the
   // expensive way.
+  bool key_was_nullable = false;
   if (primary) {
     for (const auto& c : columns) {
       if (cols[c].value("not_null", false)) continue;
+      key_was_nullable = true;
       Intent nn;
       nn.kind = IntentKind::kSetNotNull;
       nn.kind_name = "set_not_null";
@@ -6063,6 +6080,11 @@ inline void plan_unique_like(const Intent& in, const Observations& obs,
              ") and is valid and unique, so the constraint is a catalog change "
              "over a build that is already paid for",
          /*own=*/true);
+    // The SET NOT NULL composed above is not rehearsed, so in the dry run the
+    // column is still nullable and the primary key would scan for it itself.
+    if (key_was_nullable) {
+      do_not_rehearse(out.back(), detail::kNeedsTheScan, /*leaves_gap=*/true);
+    }
     return;
   }
 
@@ -6076,6 +6098,11 @@ inline void plan_unique_like(const Intent& in, const Observations& obs,
              " < 64 MiB and no lock waiters, so one statement is briefer than "
              "a concurrent build plus a second exclusive lock",
          /*own=*/false);
+    // One statement of any size, because the module allows no concurrent
+    // build: the index builds under AccessExclusiveLock, in the dry run too.
+    if (no_concurrent && !(size < (64LL << 20) && waiters == 0)) {
+      do_not_rehearse(out.back(), detail::kHeavyNotRehearsed, /*leaves_gap=*/true);
+    }
     return;
   }
 
@@ -6211,6 +6238,8 @@ inline void plan_replace_view(const Intent& in, const Observations& obs,
   step.sql.push_back("DROP MATERIALIZED VIEW " + sql_rel + ";");
   step.sql.push_back("CREATE MATERIALIZED VIEW " + sql_rel + " AS " +
                      definition + ";");
+  // The query runs in full while the old view is locked against its readers.
+  do_not_rehearse(step, detail::kHeavyNotRehearsed, /*leaves_gap=*/true);
   const auto owner = v.value("owner", "");
   if (!owner.empty()) {
     step.sql.push_back("ALTER MATERIALIZED VIEW " + sql_rel + " OWNER TO " +
@@ -6349,6 +6378,9 @@ inline void plan_alter_column_type(const Intent& in, const Observations& obs,
                           : "") +
                      ";");
   detail::emit_view_recreates(views, rebuild, step);
+  // A rewrite, or at the least every index and dependent materialized view
+  // rebuilt, under AccessExclusiveLock.
+  do_not_rehearse(step, detail::kHeavyNotRehearsed, /*leaves_gap=*/true);
 
   step.lock = "AccessExclusiveLock on " + qualified +
               (rebuild.empty() ? "" : " and on every view rebuilt with it");
