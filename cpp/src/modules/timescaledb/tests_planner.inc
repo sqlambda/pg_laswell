@@ -100,6 +100,24 @@ json ts_index(json columns, bool unique = false) {
 // The parent of a hypertable holds no rows, and the kinds that state a size or
 // a row count read it there: "deleting 0 estimated rows", "rewrites the whole
 // table: 0 B". They take the module's figure, as create_index and backfill do.
+// Measured on 2.30.2: "hypertables do not support adding a constraint using an
+// existing index". Core adopts a matching unique index wherever it finds one.
+TEST(TimescaledbPlanner, AConstraintCannotAdoptAnIndexOnAHypertable) {
+  auto obs = ts_hypertable_obs();
+  obs.tables["public.m"]["indexes"]["m_id_ts_u"] =
+      json{{"is_valid", true}, {"is_unique", true}, {"is_primary", false},
+           {"leading_column", "id"}, {"columns", json::array({"id", "ts"})},
+           {"predicate", ""}, {"has_expressions", false}};
+  const json pk = {{"kind", "add_primary_key"}, {"schema", "public"}, {"table", "m"},
+                   {"name", "m_pk"}, {"columns", json::array({"id", "ts"})}};
+  const auto refused = ts_plan(pk, obs);
+  EXPECT_TRUE(ts_conflict(refused, "do not support adding a constraint using an existing index"))
+      << refused.render();
+  EXPECT_TRUE(ts_conflict(refused, "Drop m_id_ts_u")) << refused.render();
+  // Without such an index there is nothing to adopt, and nothing to refuse.
+  EXPECT_FALSE(ts_conflict(ts_plan(pk, ts_hypertable_obs()), "using an existing index"));
+}
+
 TEST(TimescaledbPlanner, TheKindsThatStateASizeReadTheChunksNotTheEmptyParent) {
   const auto del = ts_plan(json{{"kind", "delete_rows"}, {"schema", "public"}, {"table", "m"},
                                 {"key", "id"}, {"where", "v < 0"}},
@@ -229,8 +247,8 @@ TEST(TimescaledbPlanner, WithTheColumnstoreAConstraintIsValidatedByTheStatementT
             {"name", "m_dev_fk"}, {"columns", json::array({"dev"})},
             {"references_schema", "public"}, {"references_table", "d"},
             {"references_columns", json::array({"id"})}},
-       "ALTER TABLE \"public\".\"m\" ADD CONSTRAINT \"m_dev_fk\" FOREIGN KEY (dev) "
-       "REFERENCES public.d (id);",
+       "ALTER TABLE \"public\".\"m\" ADD CONSTRAINT \"m_dev_fk\" FOREIGN KEY (\"dev\") "
+       "REFERENCES \"public\".\"d\" (\"id\");",
        "ShareRowExclusiveLock on public.m and each of its 15 chunks, held for the whole scan; "
        "ShareRowExclusiveLock on public.d for as long"}};
   for (const auto& c : cases) {

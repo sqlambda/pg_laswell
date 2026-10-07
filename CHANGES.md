@@ -573,6 +573,19 @@ Found while measuring, and now in the man page: dropping a role that still has
 a job makes the pg_cron launcher exit and restart every second, and no job runs
 until the row is removed.
 
+### Names quoted where they were not, and one more TimescaleDB refusal
+
+- `attach_partition` wrote the partition's name unquoted in the three
+  statements that add, validate and drop its bound check, and `add_foreign_key`
+  wrote the referenced table and both column lists unquoted. A partition or a
+  table named with a reserved word -- `order`, a column `end` -- was a syntax
+  error in those statements and nowhere else in the plan.
+- `add_primary_key` and `add_unique_constraint` adopt a matching unique index
+  where there is one. On a hypertable that is refused (measured on 2.30.2:
+  "hypertables do not support adding a constraint using an existing index"),
+  and it was the only statement planned. Refused at planning now, saying what
+  works: drop the index, and the constraint builds its own.
+
 ### A list of columns as the key of a row-level kind
 
 `update_rows` and `merge_rows` required a unique index on their key column

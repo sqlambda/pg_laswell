@@ -137,6 +137,35 @@ inline void timescaledb_plan_refusals(const Spec& spec, const Observations& obs,
       }
     }
 
+    // A constraint cannot adopt an index that is already there. Measured on
+    // 2.30.2: "hypertables do not support adding a constraint using an existing
+    // index". Core adopts a matching unique index wherever it finds one -- a
+    // catalog change instead of a build -- and on a hypertable that was the
+    // only statement it planned, with no way forward when the dry run refused.
+    // Not when the constraint is there already: its own index is such an
+    // index, and the intent is then simply satisfied.
+    if ((in.kind == IntentKind::kAddPrimaryKey || in.kind == IntentKind::kAddUniqueConstraint) &&
+        missing_dim(h, key).empty() &&
+        !obs.table(q).value("constraints", json::object()).contains(in.body.value("name", ""))) {
+      const json indexes = obs.table(q).value("indexes", json::object());
+      for (const auto& [iname, ix] : indexes.items()) {
+        if (!ix.value("is_unique", false) || !ix.value("is_valid", false)) continue;
+        if (!ix.value("predicate", "").empty()) continue;
+        std::vector<std::string> have;
+        for (const auto& c : ix.value("columns", json::array())) {
+          if (c.is_string()) have.push_back(c.get<std::string>());
+        }
+        if (have != key) continue;
+        refuse(what + ": the unique index \"" + iname + "\" already covers (" +
+               detail::join(key, ", ") + "), and on a plain table the constraint would "
+               "adopt it. TimescaleDB: \"hypertables do not support adding a constraint "
+               "using an existing index\". Drop " + iname + " in an earlier intent "
+               "(drop_index); the constraint then builds its own index, in one "
+               "statement, which blocks writes for the build.");
+        break;
+      }
+    }
+
     // VALIDATE CONSTRAINT is refused once the columnstore is enabled. That is
     // not a refusal here: constraint.h tells core, which validates in the
     // statement that adds the constraint.

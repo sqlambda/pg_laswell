@@ -5933,7 +5933,7 @@ inline void plan_attach_partition(const Intent& in, const Observations& obs,
     const auto have = detail::constraint_state(c, check_name);
     if (have == detail::ConstraintState::kAbsent) {
       emit(TxnClass::kRequired,
-           "ALTER TABLE " + child + " ADD CONSTRAINT " + detail::quote_identifier(check_name) + " CHECK (" +
+           "ALTER TABLE " + sql_child + " ADD CONSTRAINT " + detail::quote_identifier(check_name) + " CHECK (" +
                check_expr + ") NOT VALID;",
            "AccessExclusiveLock on " + child + ", briefly; NOT VALID means no scan",
            "step 1 of 4: the CHECK is what lets ATTACH skip its scan, and adding "
@@ -5942,7 +5942,7 @@ inline void plan_attach_partition(const Intent& in, const Observations& obs,
     }
     if (have != detail::ConstraintState::kValid) {
       emit(TxnClass::kRequired,
-           "ALTER TABLE " + child + " VALIDATE CONSTRAINT " + detail::quote_identifier(check_name) + ";",
+           "ALTER TABLE " + sql_child + " VALIDATE CONSTRAINT " + detail::quote_identifier(check_name) + ";",
            "ShareUpdateExclusiveLock on " + child + " -- does NOT block reads or writes",
            "step 2 of 4: the scan happens here instead, under a lock the "
            "application survives. Measured: ATTACH without this took 98ms on 2M "
@@ -5984,7 +5984,7 @@ inline void plan_attach_partition(const Intent& in, const Observations& obs,
   // thing, and a redundant constraint costs time on every insert forever.
   if (!check_expr.empty()) {
     emit(TxnClass::kRequired,
-         "ALTER TABLE " + child + " DROP CONSTRAINT " + detail::quote_identifier(check_name) + ";",
+         "ALTER TABLE " + sql_child + " DROP CONSTRAINT " + detail::quote_identifier(check_name) + ";",
          "AccessExclusiveLock on " + child + ", briefly",
          "step 4 of 4: the partition bound now enforces what the CHECK did, "
          "and PostgreSQL evaluates both on every insert if it is left behind",
@@ -7358,9 +7358,14 @@ inline void plan_add_foreign_key(const Intent& in, const Observations& obs,
         " to check this constraint. Add the index first, in an earlier intent.");
   }
 
+  // Quoted, every name: a table called "order" or a column called "end" is a
+  // reserved word, and unquoted this statement was a syntax error for it.
+  std::vector<std::string> quoted_cols, quoted_refs;
+  for (const auto& c : cols) quoted_cols.push_back(detail::quote_identifier(c));
+  for (const auto& c : refs) quoted_refs.push_back(detail::quote_identifier(c));
   std::string clause =
-      "FOREIGN KEY (" + detail::join(cols, ", ") + ") REFERENCES " + parent +
-      " (" + detail::join(refs, ", ") + ")";
+      "FOREIGN KEY (" + detail::join(quoted_cols, ", ") + ") REFERENCES " +
+      detail::quote_qualified(parent) + " (" + detail::join(quoted_refs, ", ") + ")";
   if (in.body.contains("on_delete")) {
     clause += " ON DELETE " + in.body.value("on_delete", "");
   }
