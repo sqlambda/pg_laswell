@@ -309,6 +309,48 @@ pglaswell::Plan pv_plan_cfg(json intents, const pglaswell::Observations& obs,
 }
 }  // namespace
 
+// Two modules, one table. The first to answer used to win: on a hypertable
+// with a vector column, either pgvector's memory request hid TimescaleDB's "no
+// concurrent build" (and CREATE INDEX CONCURRENTLY was planned, which a
+// hypertable refuses, in the job), or TimescaleDB's answer hid the memory
+// request. The answers are merged: each says what it knows.
+TEST(PgvectorPlanner, OnAHypertableTheBuildIsTimescaledbsAndTheMemoryIsPgvectors) {
+  if (std::string(PGLASWELL_MODULE_SET).find("timescaledb") == std::string::npos) {
+    GTEST_SKIP() << "built without the timescaledb module";
+  }
+  auto obs = pv_observations();
+  obs.server["maintenance_work_mem_kb"] = 65536;
+  obs.server["shared_buffers_bytes"] = 4LL << 30;
+  // The parent of a hypertable holds no rows; its chunks hold 100 000.
+  obs.tables["public.docs"]["reltuples"] = 0;
+  obs.tables["public.docs"]["stats"] = json{{"n_live_tup", 0}};
+  obs.tables["public.docs"]["size_estimate"] = 0;
+  obs.extensions["timescaledb"] =
+      json{{"version", "2.28.3"},
+           {"license", "timescale"},
+           {"hypertables",
+            json{{"public.docs",
+                  json{{"dimensions", json::array({json{{"column", "ts"}, {"kind", "time"}}})},
+                       {"num_chunks", 12}, {"compressed_chunks", 0}, {"columnstore", false},
+                       {"size_bytes", 2LL << 30}, {"rows", 100000}}}}}};
+  pglaswell::ExecutorConfig cfg;
+  cfg.max_concurrent_jobs = 2;
+  const auto p = pv_plan_cfg(pv_index(json::array({pv_col("embedding", "vector_cosine_ops")})),
+                             obs, cfg);
+  ASSERT_TRUE(p.ok) << p.render();
+  const auto& s = p.steps[0];
+  const auto sql = pglaswell::detail::join(s.sql, " ");
+  EXPECT_EQ(sql.find("CONCURRENTLY"), std::string::npos)
+      << "a hypertable refuses a concurrent build: " << sql;
+  EXPECT_EQ(s.detail.value("index_build_by", ""), "timescaledb") << s.detail.dump();
+  // 100 000 rows are TimescaleDB's count; what a row costs is pgvector's.
+  EXPECT_EQ(s.detail.value("maintenance_work_mem_mb", 0), 656) << s.detail.dump();
+  EXPECT_EQ(s.detail.value("memory_wanted_by", ""), "pgvector");
+  for (const auto& adv : p.advisories) {
+    EXPECT_EQ(adv.find("reads as empty"), std::string::npos) << adv;
+  }
+}
+
 TEST(PgvectorPlanner, AnHnswBuildIsGivenTheMemoryItNeedsUpToAShareOfSharedBuffers) {
   // 100 000 rows of vector(1536), m 16: about 656 MB of graph. shared_buffers
   // 4 GB, two concurrent jobs: the limit is 2048 MB, so it gets all 656.

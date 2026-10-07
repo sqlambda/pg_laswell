@@ -573,6 +573,23 @@ Found while measuring, and now in the man page: dropping a role that still has
 a job makes the pg_cron launcher exit and restart every second, and no job runs
 until the row is removed.
 
+### Two modules on one table: their index answers are merged
+
+Core asked each module how an index may be built on a table and took the first
+answer. On a hypertable with a vector column that was whichever the build
+listed first: pgvector's memory request hid TimescaleDB's "no concurrent
+build" -- so `CREATE INDEX CONCURRENTLY` was planned, which a hypertable
+refuses, in the job -- or TimescaleDB's answer hid the memory request. On a
+Citus table pgvector was never asked, and would have read the coordinator's
+empty relation if it had been.
+
+Every module is now asked and the answers merged: "no concurrent build" from
+any module stands, the size and row count are the largest reported, and the
+memory is the largest asked for. pgvector says what a row of the graph costs,
+and on a table whose rows another module counts, core multiplies by that count;
+the raise applies to each chunk's build as well. The same count keeps
+pgvector's advisories from calling a full hypertable empty.
+
 ### pgvector: an HNSW build gets the memory it needs, within a deduced limit
 
 pgvector now tells core how much `maintenance_work_mem` an HNSW graph needs, by

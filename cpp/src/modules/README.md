@@ -96,6 +96,12 @@ keeps the design safe rather than merely tidy.
   table?* The answer is facts: whether CONCURRENTLY works there, the name of a
   storage parameter that builds one part at a time and whether it takes UNIQUE,
   and the data's real size when the relation's own relpages does not hold it.
+  Every module is asked and the answers are merged (2026-10-07): they are
+  separate questions, and a hypertable with a vector column has two modules
+  that each know half. "No concurrent build" from any module stands; the size
+  and row count are the largest reported; memory is the largest asked for, by
+  total or by `memory_per_row` times another module's rows. A module must
+  therefore leave alone every field it has nothing to say about.
   Core decides from them -- plain, per-part or, for UNIQUE, plain with a warning
   -- and emits every statement; the module contributes a parameter NAME, which
   core validates as a (namespaced) identifier before it reaches SQL, the way

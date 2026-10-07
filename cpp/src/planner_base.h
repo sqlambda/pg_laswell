@@ -271,6 +271,15 @@ inline long long index_build_mwm_bytes(const json& budget, long long wanted) {
 //                     lock text: "public.m and each of its 15 chunks".
 //   memory_wanted     bytes this build would like in maintenance_work_mem
 //                     (an HNSW graph), or 0; see index_build_mwm_bytes.
+//   memory_per_row    the same as a rate, for a module that knows what a row
+//                     costs and not how many there are -- on a table whose
+//                     rows another module counts (a hypertable, a distributed
+//                     table), core multiplies by that module's `rows`.
+//   memory_by         set by core: the module the memory request came from.
+//
+// Every module is asked and the answers are MERGED (planner.h, index_traits):
+// each of these is a separate question, and one table can be a hypertable with
+// a vector column, where two modules each know half.
 // One relation that holds part of a table's rows, and the indexes on it:
 // name -> valid.
 struct IndexPart {
@@ -293,6 +302,8 @@ struct IndexTraits {
   long long rows = -1;
   std::string scope;
   long long memory_wanted = 0;
+  long long memory_per_row = 0;
+  std::string memory_by;
 };
 
 // What a module tells core about validating a constraint on one table. Facts

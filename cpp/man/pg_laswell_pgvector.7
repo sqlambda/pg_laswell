@@ -288,6 +288,15 @@ The step's reason names what it was raised to and why, and
 names pgvector.
 The advisory remains when the limit leaves the build short, naming what it
 still needs and the setting that would give it all of it.
+.Pp
+On a table whose rows another module counts \(em a TimescaleDB hypertable, a
+Citus distributed table, where the relation itself reads empty \(em pgvector
+says what a row costs and core multiplies by that module's count.
+How the index is built there is the other module's answer, not pgvector's: on
+a hypertable there is no
+.Ic CREATE INDEX CONCURRENTLY ,
+whichever module is asked first.
+The same count keeps a full hypertable from being advised as an empty table.
 Not given for
 .Li sparsevec ,
 whose size is its count of non-zero elements, a property of the data.

@@ -1460,28 +1460,78 @@ inline void project(const Intent& in, const Step& step, Observations& projected)
 }
 
 // Every enabled module's answer to: how may an index be built and dropped on
-// this table? (planner_base.h, IndexTraits). The first module to answer wins,
-// for the reason required_confinement() gives. `decided_by` names it.
+// this table? (planner_base.h, IndexTraits). EVERY module is asked and the
+// answers are merged, because they answer different questions: how to build,
+// how much data, how much memory. The first to answer used to win, and on a
+// hypertable with a vector column that was whichever the build listed first --
+// pgvector's memory request hid TimescaleDB's "no concurrent build", or
+// TimescaleDB's answer hid the memory request.
+//
+//   concurrent      false if any module says so: the restriction is real
+//                   whoever else has no objection.
+//   size, rows      the largest reported; a module reports them only for a
+//                   table whose own relation does not hold the rows.
+//   per-part option, parts, scope    the first given.
+//   memory          the largest asked for, by total or by row times `rows`.
+//
+// `decided_by` names the module that decided the BUILD: the one that ruled out
+// a concurrent build, else the first to give a size, parts or an option, else
+// the first that answered at all. `memory_by` in the result names the one that
+// asked for memory.
 #include "modules/enabled_index_headers.h"
 // `in` is the intent being planned, read-only, so a module can say how much
 // memory THIS index would like (an HNSW graph depends on its columns and m).
 inline IndexTraits index_traits(const Observations& obs, const std::string& qualified,
                                 const Intent& in, std::string& decided_by) {
-#define PGLASWELL_INDEX_TRAITS(module_name, traits_fn)      \
-  {                                                          \
-    auto t = traits_fn(obs, qualified, in);                  \
-    if (t.answered) {                                        \
-      decided_by = module_name;                              \
-      return t;                                              \
-    }                                                        \
+  IndexTraits merged;
+  std::string first, first_build, not_concurrent, per_row_by;
+#define PGLASWELL_INDEX_TRAITS(module_name, traits_fn)                              \
+  {                                                                                  \
+    auto t = traits_fn(obs, qualified, in);                                          \
+    if (t.answered) {                                                                \
+      if (first.empty()) first = module_name;                                        \
+      merged.answered = true;                                                        \
+      if (!t.concurrent) {                                                           \
+        merged.concurrent = false;                                                   \
+        if (not_concurrent.empty()) not_concurrent = module_name;                    \
+      }                                                                              \
+      if (first_build.empty() &&                                                     \
+          (t.size_bytes >= 0 || !t.parts.empty() || !t.per_part_option.empty())) {   \
+        first_build = module_name;                                                   \
+      }                                                                              \
+      if (merged.per_part_option.empty() && !t.per_part_option.empty()) {            \
+        merged.per_part_option = t.per_part_option;                                  \
+        merged.per_part_unique = t.per_part_unique;                                  \
+      }                                                                              \
+      if (t.size_bytes > merged.size_bytes) merged.size_bytes = t.size_bytes;        \
+      if (t.rows > merged.rows) merged.rows = t.rows;                                \
+      if (merged.scope.empty()) merged.scope = t.scope;                              \
+      if (merged.parts.empty()) merged.parts = std::move(t.parts);                   \
+      if (t.memory_wanted > merged.memory_wanted) {                                  \
+        merged.memory_wanted = t.memory_wanted;                                      \
+        merged.memory_by = module_name;                                              \
+      }                                                                              \
+      if (t.memory_per_row > merged.memory_per_row) {                                \
+        merged.memory_per_row = t.memory_per_row;                                    \
+        per_row_by = module_name;                                                    \
+      }                                                                              \
+    }                                                                                \
   }
 #include "modules/enabled_index_traits.h"
 #undef PGLASWELL_INDEX_TRAITS
   (void)obs;
   (void)qualified;
   (void)in;
-  decided_by.clear();
-  return {};
+  // A module that knows what a row costs, on a table whose rows another counts.
+  if (merged.memory_per_row > 0 && merged.rows > 0 &&
+      merged.rows * merged.memory_per_row > merged.memory_wanted) {
+    merged.memory_wanted = merged.rows * merged.memory_per_row;
+    merged.memory_by = per_row_by;
+  }
+  decided_by = !not_concurrent.empty() ? not_concurrent
+               : !first_build.empty()  ? first_build
+                                       : first;
+  return merged;
 }
 
 // Every enabled module's answer to: can a constraint on this table be
@@ -1590,6 +1640,33 @@ inline int index_parts_missing(const IndexTraits& traits, const std::string& nam
 // Resumable from the reading: a part that has its index, valid, is left
 // alone, and one whose concurrent build failed has the invalid index dropped
 // first. Each concurrent build gets its own validity check, as any does.
+namespace detail {
+// A build that says how much memory it wants (an HNSW graph, from pgvector)
+// is raised toward it when no ceiling is configured -- the configured case
+// is applied to every index step, and wins. The limit is deduced from
+// shared_buffers (index_build_mwm_bytes), so the raise is bounded by the one
+// memory figure every server is tuned by.
+inline void raise_build_memory(Step& step, const IndexTraits& traits,
+                               const Observations& obs, const ExecutorConfig& cfg) {
+  if (!traits.answered || traits.memory_wanted <= 0 || cfg.maintenance_work_mem_mb != 0) return;
+  const auto budget = detail::compute_budget(obs, cfg);
+  const long long server = budget["maintenanceWorkMem"].value("serverDefaultKb", 0LL) * 1024;
+  const long long eff = index_build_mwm_bytes(budget, traits.memory_wanted);
+  if (eff <= server) return;
+  const long long mb = (eff + (1LL << 20) - 1) >> 20;
+  step.detail["maintenance_work_mem_mb"] = mb;
+  step.detail["memory_wanted_by"] = traits.memory_by;
+  step.why += "; maintenance_work_mem raised to " + std::to_string(mb) +
+              "MB for this build: " + traits.memory_by + " says it needs about " +
+              detail::human_bytes(traits.memory_wanted) +
+              (eff < traits.memory_wanted
+                   ? ", limited to " +
+                         budget["maintenanceWorkMem"].value("derivedFrom", std::string())
+                   : std::string()) +
+              " (no maintenance_work_mem_mb configured)";
+}
+}  // namespace detail
+
 inline void plan_index_by_parts(const Intent& in, const IndexTraits& traits,
                                 const std::string& by, const std::string& using_tail,
                                 bool parent_exists, Plan& plan, std::vector<Step>& out) {
@@ -2172,7 +2249,15 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
       !traits.parts.empty() && index_parts_missing(traits, name) >= 0) {
     // No concurrent build on the table itself, but one on each of its parts.
     handed_off = true;
+    const auto before = out.size();
     plan_index_by_parts(in, traits, traits_by, using_tail, /*parent_exists=*/false, plan, out);
+    // Each part's build is a build: the memory asked for is the whole
+    // table's, which is the most any one part can need.
+    for (auto s = before; s < out.size(); ++s) {
+      if (out[s].txn_class == TxnClass::kForbidden && out[s].kind == in.kind_name) {
+        detail::raise_build_memory(out[s], traits, obs, cfg);
+      }
+    }
     return;
   }
   if (traits.answered && !traits.concurrent && !plain) {
@@ -2258,31 +2343,7 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
         "will DROP INDEX CONCURRENTLY before rebuilding";
   }
 
-  // A build that says how much memory it wants (an HNSW graph, from pgvector)
-  // is raised toward it when no ceiling is configured -- the configured case
-  // is applied to every index step below, and wins. The limit is deduced from
-  // shared_buffers (index_build_mwm_bytes), so the raise is bounded by the one
-  // memory figure every server is tuned by.
-  if (traits.answered && traits.memory_wanted > 0 && cfg.maintenance_work_mem_mb == 0) {
-    const auto budget = detail::compute_budget(obs, cfg);
-    const long long server =
-        budget["maintenanceWorkMem"].value("serverDefaultKb", 0LL) * 1024;
-    const long long eff = index_build_mwm_bytes(budget, traits.memory_wanted);
-    if (eff > server) {
-      const long long mb = (eff + (1LL << 20) - 1) >> 20;
-      const auto human = [](long long b) { return detail::human_bytes(b); };
-      step.detail["maintenance_work_mem_mb"] = mb;
-      step.detail["memory_wanted_by"] = traits_by;
-      step.why += "; maintenance_work_mem raised to " + std::to_string(mb) +
-                  "MB for this build: " + traits_by + " says it needs about " +
-                  human(traits.memory_wanted) +
-                  (eff < traits.memory_wanted
-                       ? ", limited to " +
-                             budget["maintenanceWorkMem"].value("derivedFrom", std::string())
-                       : std::string()) +
-                  " (no maintenance_work_mem_mb configured)";
-    }
-  }
+  detail::raise_build_memory(step, traits, obs, cfg);
 
   step.sql.push_back("COMMENT ON INDEX " + detail::quote_identifier(in.schema()) + "." + detail::quote_identifier(name) + " IS " +
                      detail::quote_literal(in.body.value("comment", "")) + ";");
