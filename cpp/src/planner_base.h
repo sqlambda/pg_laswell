@@ -271,8 +271,21 @@ inline long long index_build_mwm_bytes(const json& budget, long long wanted) {
 //                     lock text: "public.m and each of its 15 chunks".
 //   memory_wanted     bytes this build would like in maintenance_work_mem
 //                     (an HNSW graph), or 0; see index_build_mwm_bytes.
+// One relation that holds part of a table's rows, and the indexes on it:
+// name -> valid.
+struct IndexPart {
+  std::string relation;                // schema.name
+  std::map<std::string, bool> indexes;
+};
+
+//   parts             the relations that hold the rows, when an index can be
+//                     built CONCURRENTLY on each of them by itself and an
+//                     index ON ONLY the parent then covers the parts created
+//                     later and counts those built by hand as its own. Empty
+//                     when that is not so, or has not been measured to be so.
 struct IndexTraits {
   bool answered = false;
+  std::vector<IndexPart> parts;
   bool concurrent = true;
   std::string per_part_option;
   bool per_part_unique = false;

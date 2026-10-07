@@ -859,8 +859,8 @@ jobs:
           ./examples/docker/timescale/run.sh | tee example.log
           grep -q 'held_for_epoch' example.log \
             || { echo "::error::the Apache server should hold the Timescale License specs"; exit 1; }
-          grep -q 'timescaledb.transaction_per_chunk' example.log \
-            || { echo "::error::the large hypertable's index was not planned per chunk"; exit 1; }
+          grep -q 'ON ONLY "public"."readings"' example.log \
+            || { echo "::error::the large hypertable's index was not planned on the parent only, then per chunk"; exit 1; }
           [ "$(grep -c 'repository : 0 pending' example.log)" = 2 ] \
             || { echo "::error::the second run had something to do"; exit 1; }
       - name: The module against the servers

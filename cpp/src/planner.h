@@ -1541,6 +1541,124 @@ inline std::string per_part_option_sql(const std::string& option) {
   return option;
 }
 
+// The name of the index on one part: <part>_<index>, as TimescaleDB names the
+// ones it makes itself. Empty when it would not fit an identifier.
+inline std::string index_part_name(const IndexPart& part, const std::string& name) {
+  const auto bare = part.relation.substr(part.relation.find('.') + 1);
+  const auto child = bare + "_" + name;
+  return child.size() > 63 ? std::string() : child;
+}
+
+// How many parts still lack a valid index of this name; -1 when a name would
+// not fit, in which case this recipe is not used at all.
+inline int index_parts_missing(const IndexTraits& traits, const std::string& name) {
+  int missing = 0;
+  for (const auto& part : traits.parts) {
+    const auto child = index_part_name(part, name);
+    if (child.empty()) return -1;
+    const auto it = part.indexes.find(child);
+    if (it == part.indexes.end() || !it->second) ++missing;
+  }
+  return missing;
+}
+
+// An index built on each part CONCURRENTLY, after an index ON ONLY the parent
+// (IndexTraits::parts). The parent first: it is a catalog change, and from
+// then on a part created while the rest are being built gets its index by
+// itself. Then each existing part, which blocks no write. A module said this
+// is possible here and what the parts are; every statement is core's.
+//
+// Resumable from the reading: a part that has its index, valid, is left
+// alone, and one whose concurrent build failed has the invalid index dropped
+// first. Each concurrent build gets its own validity check, as any does.
+inline void plan_index_by_parts(const Intent& in, const IndexTraits& traits,
+                                const std::string& by, const std::string& using_tail,
+                                bool parent_exists, Plan& plan, std::vector<Step>& out) {
+  const auto qualified = in.qualified_table();
+  const auto sql_rel = detail::quote_qualified(qualified);
+  const auto name = in.body.value("name", "");
+  const std::string scope = traits.scope.empty() ? qualified : traits.scope;
+  const std::string size =
+      traits.size_bytes >= 0 ? "size " + detail::human_bytes(traits.size_bytes) + ", and " : "";
+
+  if (!parent_exists) {
+    Step parent;
+    parent.kind = in.kind_name;
+    parent.txn_class = TxnClass::kRequired;
+    parent.own_transaction = true;
+    parent.lock = "ShareLock on " + scope + ", briefly: a catalog change, no part is read";
+    parent.sql.push_back("CREATE INDEX " + detail::quote_identifier(name) + " ON ONLY " +
+                         sql_rel + using_tail + ";");
+    parent.sql.push_back("COMMENT ON INDEX " + detail::quote_identifier(in.schema()) + "." +
+                         detail::quote_identifier(name) + " IS " +
+                         detail::quote_literal(in.body.value("comment", "")) + ";");
+    parent.why = size + by + " says a concurrent build is not possible on " + qualified +
+                 " itself but is on each of its parts -> the index is created on the "
+                 "parent ONLY, which reads nothing, and each part is then built "
+                 "concurrently. A part created from here on gets its index by itself";
+    parent.detail["index"] = name;
+    parent.detail["schema"] = in.schema();
+    parent.detail["index_build_by"] = by;
+    if (traits.rows >= 0) parent.detail["rows"] = traits.rows;
+    weaker_lock_first(parent, {sql_rel});
+    out.push_back(std::move(parent));
+  }
+
+  int position = 0, built = 0;
+  for (const auto& part : traits.parts) {
+    ++position;
+    const auto child = index_part_name(part, name);
+    const auto have = part.indexes.find(child);
+    if (have != part.indexes.end() && have->second) continue;  // already there, valid
+    const auto part_schema = part.relation.substr(0, part.relation.find('.'));
+    const auto sql_child = detail::quote_identifier(part_schema) + "." +
+                           detail::quote_identifier(child);
+    Step s;
+    s.kind = in.kind_name;
+    s.txn_class = TxnClass::kForbidden;
+    s.own_transaction = true;
+    s.lock = "ShareUpdateExclusiveLock on " + part.relation + " -- blocks neither reads nor writes";
+    if (have != part.indexes.end()) {
+      // A concurrent build that failed leaves an invalid index of this name.
+      s.sql.push_back("DROP INDEX CONCURRENTLY " + sql_child + ";");
+      s.detail["recovering_invalid_index"] = true;
+    }
+    s.sql.push_back("CREATE INDEX CONCURRENTLY " + detail::quote_identifier(child) + " ON " +
+                    detail::quote_qualified(part.relation) + using_tail + ";");
+    s.why = "part " + std::to_string(position) + " of " + std::to_string(traits.parts.size()) +
+            ": built concurrently on the part itself, so a write that touches every "
+            "part is not held behind it";
+    s.detail["partition"] = part.relation;
+    s.detail["index"] = child;
+    s.detail["schema"] = part_schema;
+    s.detail["must_verify_valid"] = true;
+    s.detail["failure_mode"] =
+        "a failed CREATE INDEX CONCURRENTLY leaves an INVALID index on this part; "
+        "the next step reads indisvalid, and a re-plan drops it and builds this "
+        "part again, leaving the parts already done alone";
+    out.push_back(std::move(s));
+    ++built;
+  }
+  if (parent_exists && built == 0) {
+    Step s;
+    s.kind = in.kind_name;
+    s.action = Action::kSatisfied;
+    s.why = "index already present, and valid on every part";
+    out.push_back(std::move(s));
+    return;
+  }
+  plan.warnings.push_back(
+      "\"" + name + "\" on " + qualified + " is built part by part: " +
+      std::to_string(built) + " of " + std::to_string(traits.parts.size()) +
+      " part(s) concurrently, each in a step of its own with its own validity "
+      "check" + (parent_exists ? ", continuing an earlier attempt" : "") + ". " + by +
+      " counts an index of the same definition on a part as the parent index's -- "
+      "that is what was measured, not something its documentation promises -- so "
+      "the last step of each part is the proof that it is there and valid. If the "
+      "job stops partway the index exists on some parts only; applying the "
+      "specification again builds the rest.");
+}
+
 inline void plan_create_index(const Intent& in, const Observations& obs,
                               const ExecutorConfig& cfg, Plan& plan,
                               std::vector<Step>& out) {
@@ -1586,6 +1704,19 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
   for (const auto& k : keys) columns.push_back(k.name);
   std::vector<std::string> quoted_columns;
   for (const auto& k : keys) quoted_columns.push_back(index_column_sql(k));
+  // Everything after the relation, for a recipe that names more than one
+  // (plan_index_by_parts): the same text for the parent and for each part.
+  std::string using_tail;
+  {
+    std::string include;
+    if (!include_columns.empty()) {
+      std::vector<std::string> q;
+      for (const auto& c : include_columns) q.push_back(detail::quote_identifier(c));
+      include = " INCLUDE (" + detail::join(q, ", ") + ")";
+    }
+    using_tail = " USING " + method + " (" + detail::join(quoted_columns, ", ") + ")" +
+                 include + index_with_sql(in.body) + (where.empty() ? "" : " WHERE " + where);
+  }
   const auto want_order = index_order_terms(keys);
 
   if (!t.value("exists", false)) {
@@ -1606,6 +1737,20 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
     if (!existing.value("is_valid", false)) {
       rebuild_after_drop = true;
     } else {
+      // Present and valid on the table -- but where the index is built part
+      // by part, the parent's is a catalog entry, and "done" means every part
+      // has its own. An attempt that stopped partway is continued here.
+      {
+        std::string parts_by;
+        const auto parts_traits = index_traits(obs, qualified, in, parts_by);
+        if (!parts_traits.parts.empty() && !unique &&
+            index_parts_missing(parts_traits, name) > 0) {
+          handed_off = true;
+          plan_index_by_parts(in, parts_traits, parts_by, using_tail,
+                              /*parent_exists=*/true, plan, out);
+          return;
+        }
+      }
       step.action = Action::kSatisfied;
       step.why = "index already present and valid";
       step.detail["existing_definition"] = existing.value("definition", "");
@@ -2000,6 +2145,13 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
   }
   const std::string scope = traits.scope.empty() ? qualified : traits.scope;
 
+  if (traits.answered && !traits.concurrent && !plain && !unique && !rebuild_after_drop &&
+      !traits.parts.empty() && index_parts_missing(traits, name) >= 0) {
+    // No concurrent build on the table itself, but one on each of its parts.
+    handed_off = true;
+    plan_index_by_parts(in, traits, traits_by, using_tail, /*parent_exists=*/false, plan, out);
+    return;
+  }
   if (traits.answered && !traits.concurrent && !plain) {
     // No concurrent build here. Two ways remain, and the reading says which.
     const bool per_part = !traits.per_part_option.empty() &&

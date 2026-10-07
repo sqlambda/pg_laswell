@@ -122,13 +122,47 @@ for edition in tsl apache oldest; do
   # ceiling only by the hypertable's own size: the parent reads 0 pages. (At
   # 400 000 rows, 23 MiB, a plain build is the right plan, and is what came out.)
   sql=$(plan_sql "$U" "$(idx m_dev '["dev"]')")
-  if echo "$sql" | grep -q 'transaction_per_chunk' && ! echo "$sql" | grep -q CONCURRENTLY; then
-    ok "an index on a large hypertable is planned per chunk, not concurrently"
+  if [ "$edition" = oldest ]; then
+    # 2.28: the per-chunk option, one statement. The part-by-part concurrent
+    # build below has not been measured on it, so the module does not offer it.
+    if echo "$sql" | grep -q 'transaction_per_chunk' && ! echo "$sql" | grep -q CONCURRENTLY; then
+      ok "an index on a large hypertable is planned per chunk, not concurrently"
+    else
+      bad "a large hypertable's index should be per chunk" "$sql"
+    fi
   else
-    bad "a large hypertable's index should be per chunk" "$sql"
+    # 2.30: the index on the parent ONLY, then each chunk concurrently. The
+    # per-chunk option holds a write-blocking lock on chunk after chunk, and a
+    # write that does not name the time column waits behind all of them.
+    chunks=$(q "$U" "SELECT count(*) FROM timescaledb_information.chunks WHERE hypertable_name = 'm'")
+    if echo "$sql" | grep -q '^CREATE INDEX "m_dev" ON ONLY "public"."m"' \
+       && [ "$(echo "$sql" | grep -c '^CREATE INDEX CONCURRENTLY "_hyper_')" = "$chunks" ] \
+       && ! echo "$sql" | grep -q transaction_per_chunk; then
+      ok "an index on a large hypertable is planned on the parent only, then on each of its $chunks chunks concurrently"
+    else
+      bad "expected ON ONLY and one concurrent build per chunk ($chunks)" "$sql"
+    fi
   fi
   raw=$(echo "$sql" | grep '^CREATE INDEX' | psql -X -q "$U" 2>&1)
-  [ -z "$raw" ] && ok "and the server builds it as planned" || bad "the planned per-chunk build should run" "$raw"
+  [ -z "$raw" ] && ok "and the server builds it as planned" || bad "the planned build should run" "$raw"
+  if [ "$edition" != oldest ]; then
+    left=$(q "$U" "SELECT count(*) FROM timescaledb_information.chunks c WHERE c.hypertable_name = 'm'
+                    AND NOT EXISTS (SELECT 1 FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid
+                                     WHERE i.indrelid = format('%I.%I', c.chunk_schema, c.chunk_name)::regclass
+                                       AND i.indisvalid AND ic.relname = c.chunk_name || '_m_dev')")
+    [ "$left" = 0 ] && ok "every chunk has its index, valid" || bad "chunks without the index" "$left"
+    # Built by hand on each chunk, and TimescaleDB's all the same: planned
+    # again it is done, and a chunk made afterwards gets one by itself.
+    out=$(plan "$U" "$(idx m_dev '["dev"]')")
+    echo "$out" | grep -q '"action":"satisfied"' && ok "and planned again, it is satisfied" \
+      || bad "a finished part-by-part index should be satisfied" "$out"
+    q "$U" "INSERT INTO public.m VALUES (0, now() + interval '40 days', 1, 0)" >/dev/null
+    got=$(q "$U" "SELECT count(*) FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid
+                   WHERE ic.relname LIKE '%\_m\_dev' AND i.indrelid = (SELECT format('%I.%I', chunk_schema, chunk_name)::regclass
+                         FROM timescaledb_information.chunks WHERE hypertable_name = 'm' ORDER BY range_start DESC LIMIT 1)")
+    [ "$got" = 1 ] && ok "a chunk created afterwards gets the index by itself" || bad "the new chunk has no index" "$got"
+    q "$U" "DELETE FROM public.m WHERE id = 0" >/dev/null
+  fi
   raw=$(q "$U" "CREATE INDEX CONCURRENTLY m_cic ON public.m (v)")
   echo "$raw" | grep -qF "hypertables do not support concurrent index creation" \
     && ok "while the concurrent build it avoids is refused" \

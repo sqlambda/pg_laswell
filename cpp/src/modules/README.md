@@ -177,7 +177,7 @@ weaker than "I tried to break it":
 | `TOPOLOGY` merge | counts only ever raised | compliant |
 | `OBSERVE` | writes only `extensions[<module>]` | compliant |
 | `CONFINEMENT` | a function `(const Observations&, table) -> column`; it cannot reach the plan or name another table | compliant by construction |
-| `INDEX_TRAITS` | a function `(const Observations&, table) -> IndexTraits`, a struct of facts; the one string in it that reaches SQL is validated by core as a (namespaced) identifier, and anything else throws | compliant by construction |
+| `INDEX_TRAITS` | a function `(const Observations&, table) -> IndexTraits`, a struct of facts, among them the table's parts (relations and the index names on each) where an index can be built on each part concurrently; the one string in it that reaches SQL is validated by core as a (namespaced) identifier, and anything else throws | compliant by construction |
 | `CONSTRAINT_TRAITS` | a function `(const Observations&, table) -> ConstraintTraits`, a struct of facts; none of it reaches SQL -- the strings go into the step's lock and reason text only | compliant by construction |
 
 Every close is the same move, and it is the only one worth making: **pass a hook

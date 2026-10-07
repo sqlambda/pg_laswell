@@ -62,7 +62,9 @@ say "5. An index on a large hypertable"
 echo "  1.2 million readings: over 100 MB with their index, in chunks. The parent reads"
 echo "  0 pages, so without the module core would size the build as tiny -- and"
 echo "  for a larger table it would plan CREATE INDEX CONCURRENTLY, which"
-echo "  TimescaleDB refuses. The plan:"
+echo "  TimescaleDB refuses on the hypertable. It accepts one on each chunk, so"
+echo "  the index is created on the parent only and then built chunk by chunk,"
+echo "  blocking no write. The first steps of the plan:"
 psql -X -q -c "INSERT INTO public.readings SELECT now() - (g || ' seconds')::interval, g % 50, random()
                FROM generate_series(1, 1200000) g" -c "ANALYZE public.readings" "$(url "$APACHE_PORT" metrics)"
 "$PG_LASWELL_MCP" --call planMigration --args '{"spec":{"laswell_spec_version":1,
@@ -72,10 +74,11 @@ psql -X -q -c "INSERT INTO public.readings SELECT now() - (g || ' seconds')::int
    "skipTrustChecks":true}' "$(url "$APACHE_PORT" metrics)" \
   | python3 -c 'import json,sys
 d = json.load(sys.stdin)
-for s in d["steps"]:
+for s in d["steps"][:3]:
     print("  why: ", s["why"])
     print("  lock:", s["lock"])
-    for q in s["sql"]: print("  sql: ", q)'
+    for q in s["sql"]: print("  sql: ", q)
+print("  ... and", len(d["steps"]) - 3, "more steps: a build and a check for each chunk")'
 
 say "6. Run both again: nothing to do"
 run "$PG_LASWELL" --repo "$build" "$(url "$APACHE_PORT" metrics)"

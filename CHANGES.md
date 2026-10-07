@@ -113,6 +113,28 @@ remains for a Citus distributed table, where it is required. The end-of-group
 commit now fires only once the transaction holds a batch of rows, and the
 refusal no longer suggests an index: it says what the walk needs.
 
+### TimescaleDB: an index built on each chunk concurrently
+
+A ninth finding, from the change under load on a hypertable. The per-chunk
+index build (`WITH (timescaledb.transaction_per_chunk)`) holds a write-blocking
+lock on one chunk after another, and a write that does not name the time column
+has to lock every chunk: updates by id were at zero for four seconds while a
+7.8 GiB index was built, with inserts unaffected.
+
+Measured on 2.30.2: an index can be created `ON ONLY` the hypertable, which
+reads no chunk; `CREATE INDEX CONCURRENTLY` then works on each chunk directly; a
+chunk created afterwards gets the index by itself; and TimescaleDB counts the
+ones built by hand as the hypertable index's own. On a 1.2 GB hypertable of 19
+chunks the per-chunk option took 4.6 s with an update by id waiting up to
+3,491 ms; this took 2.5 s with the worst update at 43 ms.
+
+The module now tells core the chunks and the indexes each carries, and core
+plans the index on the parent only, then one concurrent build per chunk, each
+with its own validity check. It resumes from the reading: a chunk that has its
+index is left alone, and one whose build failed is dropped and built again.
+Offered where it was measured -- 2.30 and later, without the columnstore -- and
+not for a UNIQUE index; elsewhere the per-chunk option stands.
+
 ### The composite walk finds its partition
 
 A tenth finding: on a hypertable the composite walk ran at about 40,000 rows a
