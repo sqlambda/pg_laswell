@@ -931,8 +931,24 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
                        "[]");
     }
     const std::string tuple = "(" + detail::join(cols, ", ") + ")";
+    // The rows are named by the tuple. Each column is ALSO tested against its
+    // own array, which names nothing new and tells the planner something the
+    // tuple cannot: on a partitioned table, which partitions the batch is in.
+    //
+    // Found in the field on a hypertable, where the walk ran at a third of a
+    // plain table's speed. Measured on one of 18 chunks, 3.4 million rows:
+    // with the tuple alone the update is planned against every chunk and
+    // probes them row by row, 74 000 rows a second; with `col = ANY(array)`
+    // beside it, 151 000, a plain table's rate. On a plain table keyed
+    // (tenant, id) the extra tests cost nothing (190 000 against 195 000 rows a
+    // second, and 169 000 against 175 000, in alternating runs).
+    std::vector<std::string> each;
+    for (std::size_t c = 0; c < cols.size(); ++c) {
+      each.push_back(cols[c] + " = ANY(" + arrays[c] + ")");
+    }
     const std::string in_batch =
-        tuple + " IN (SELECT * FROM unnest(" + detail::join(arrays, ", ") + "))";
+        tuple + " IN (SELECT * FROM unnest(" + detail::join(arrays, ", ") + ")) AND " +
+        detail::join(each, " AND ");
     step.sql.push_back(
         "SELECT " + detail::join(cols, ", ") + "\n"
         "  FROM " + sql_rel + (from.empty() ? "" : ", " + from) + "\n"

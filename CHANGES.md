@@ -113,6 +113,16 @@ remains for a Citus distributed table, where it is required. The end-of-group
 commit now fires only once the transaction holds a batch of rows, and the
 refusal no longer suggests an index: it says what the walk needs.
 
+### The composite walk finds its partition
+
+A tenth finding: on a hypertable the composite walk ran at about 40,000 rows a
+second, a third of a plain table's rate. The batch's update named its rows by a
+tuple, from which a partitioned table cannot tell which partitions they are in,
+so it was planned against every chunk and probed them row by row. Each key
+column is now also tested against its own array, which names no new row and
+tells the planner where to look: 74,000 rows a second became 151,000 on a
+hypertable of 18 chunks, and a plain table keyed `(tenant, id)` is unaffected.
+
 ### Citus: a distributed table is sized by its shards
 
 From a probe of the same change on Citus 14: the coordinator's relation for a
