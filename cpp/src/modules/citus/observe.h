@@ -158,9 +158,16 @@ SELECT JSONB_BUILD_OBJECT(
   -- not answer contributes nothing, and a table no node reported has no entry,
   -- which the module reads as "not known" rather than as zero.
   'sizes', COALESCE((
-     SELECT JSONB_OBJECT_AGG(z.t, JSONB_BUILD_OBJECT('size_bytes', z.b, 'rows', z.r))
+     -- A reference table, or one Citus manages as local, is held WHOLE by each
+     -- node that has it: summed, it read once per node (measured: 1 056 kB for
+     -- a table of 352 kB on three nodes). For those the largest copy is the
+     -- table; a distributed table is the sum of its shards.
+     SELECT JSONB_OBJECT_AGG(z.t, JSONB_BUILD_OBJECT(
+              'size_bytes', CASE WHEN whole.is THEN z.b_one ELSE z.b END,
+              'rows', CASE WHEN whole.is THEN z.r_one ELSE z.r END))
        FROM (
-         SELECT x->>'t' AS t, sum((x->>'b')::bigint) AS b, sum((x->>'r')::bigint) AS r
+         SELECT x->>'t' AS t, sum((x->>'b')::bigint) AS b, sum((x->>'r')::bigint) AS r,
+                max((x->>'b')::bigint) AS b_one, max((x->>'r')::bigint) AS r_one
            FROM (
              SELECT w.result AS result
                FROM run_command_on_workers($w$
@@ -188,7 +195,13 @@ SELECT JSONB_BUILD_OBJECT(
                JOIN pg_class c ON c.oid = x.logicalrelid
                JOIN pg_namespace n ON n.oid = c.relnamespace
            ) every_node, json_array_elements(every_node.result::json) AS x
-          GROUP BY 1) z), '{}'::jsonb),
+          GROUP BY 1) z
+       CROSS JOIN LATERAL (
+         SELECT EXISTS (SELECT 1 FROM pg_dist_partition dp
+                          JOIN pg_class dc ON dc.oid = dp.logicalrelid
+                          JOIN pg_namespace dn ON dn.oid = dc.relnamespace
+                         WHERE dn.nspname || '.' || dc.relname = z.t
+                           AND dp.partmethod = 'n') AS is) whole), '{}'::jsonb),
   'tables', COALESCE((
      SELECT JSONB_OBJECT_AGG(t.nspname || '.' || t.relname, t.entry)
        FROM (

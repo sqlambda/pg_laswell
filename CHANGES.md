@@ -197,6 +197,28 @@ matched `citus_table_size` to the byte. On the probe's table the plan now reads
 "size 346.0 MiB >= 64 MiB ceiling -> concurrent build" and "1000000 rows
 estimated".
 
+### Citus: core DDL a distributed table refuses is refused at planning
+
+The module spoke for its own kinds and for `add_column` with `fill`; for the
+rest of core's DDL on a distributed or reference table it said nothing, and
+Citus's refusal arrived from the dry run or, where the dry run cannot go, from
+the job. Each of these is measured on Citus 14.0 and now refused at planning in
+Citus's words:
+
+- `create_index` with `unique`, `add_unique_constraint` and `add_primary_key`
+  whose columns lack the distribution column. A unique index is built
+  `CONCURRENTLY`, which no dry run rehearses, so this one failed in the job.
+- `create_trigger` and `set_trigger_state` on a distributed or reference table.
+- `drop_column` and `alter_column_type` of the distribution column.
+
+The pass follows the specification in order: a table distributed by an earlier
+intent is distributed for the intents after it, though no reading says so yet.
+
+A reference table's size was the sum over every node, and each node holds the
+whole table: 1,056 kB for a table of 352 kB on three nodes. It is now one copy's
+size, which is what decides a plain build against a concurrent one and what a
+backfill's estimate is made from.
+
 ### Citus: the trigger recipe is refused, and says what works instead
 
 `add_column` with `fill` and no `default` creates a trigger, and Citus allows

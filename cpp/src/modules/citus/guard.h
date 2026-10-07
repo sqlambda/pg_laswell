@@ -65,6 +65,98 @@ inline void citus_plan_refusals(const Spec& spec, const Observations& obs,
            "trigger is created, and the backfill writes the rows whose value differs.");
   }
 
+  // 0b. WHAT CITUS REFUSES OF CORE'S OWN DDL on a distributed or reference
+  // table. Each measured on Citus 14.0, the statement run by hand:
+  //
+  //   a unique index, unique constraint or primary key without the
+  //   distribution column: "creating unique indexes on non-partition columns
+  //   is currently unsupported"; "Distributed relations cannot have UNIQUE,
+  //   EXCLUDE, or PRIMARY KEY constraints that do not include the partition
+  //   column". With it, and ADD CONSTRAINT ... USING INDEX with it, accepted.
+  //
+  //   CREATE TRIGGER, and ALTER TABLE ... DISABLE TRIGGER: "triggers are not
+  //   supported on distributed tables" / "... on reference tables".
+  //
+  //   DROP COLUMN and ALTER COLUMN TYPE of the distribution column: "cannot
+  //   execute ALTER TABLE command involving partition column". Of another
+  //   column, accepted.
+  //
+  // The unique kinds matter most: a unique index is built CONCURRENTLY, which
+  // the dry run cannot rehearse, so Citus's refusal came in the job, after
+  // whatever the specification did before it had committed.
+  //
+  // This pass follows the specification in order: a table distributed by an
+  // earlier intent is distributed for the ones after it, though no reading
+  // says so yet.
+  {
+    struct Declared { std::string kind, column; };
+    std::map<std::string, Declared> declared;
+    const auto now = [&](const std::string& q) -> Declared {
+      const auto d = declared.find(q);
+      if (d != declared.end()) return d->second;
+      const auto it = tables.find(q);
+      // A reference table's distribution column is recorded as null.
+      const json column = it == tables.end() ? json() : it->value("distribution_column", json());
+      return {kind_of(q), column.is_string() ? column.get<std::string>() : std::string()};
+    };
+    for (const auto& in : spec.intents) {
+      const auto q = in.qualified_table();
+      if (in.kind == IntentKind::kCitusDistributeTable) {
+        declared[q] = {"distributed", in.body.value("distribution_column", "")};
+        continue;
+      }
+      if (in.kind == IntentKind::kCitusCreateReferenceTable) {
+        declared[q] = {"reference", ""};
+        continue;
+      }
+      if (in.kind == IntentKind::kCitusUndistributeTable) {
+        declared[q] = {"local", ""};
+        continue;
+      }
+      const auto is = now(q);
+      if (is.kind == "local") continue;
+      const std::string what = in.kind_name + " on " + q;
+
+      if (in.kind == IntentKind::kCreateTrigger || in.kind == IntentKind::kSetTriggerState) {
+        refuse(what + ": " + q + " is a " + is.kind + " table. Citus: \"triggers are not "
+               "supported on " + is.kind + " tables\" -- for CREATE TRIGGER and for "
+               "ENABLE or DISABLE TRIGGER alike -- unless citus.enable_unsafe_triggers is "
+               "on, which pg_laswell will not turn on for you.");
+        continue;
+      }
+      if (is.kind != "distributed" || is.column.empty()) continue;
+
+      std::vector<std::string> key;
+      bool unique = false;
+      if (in.kind == IntentKind::kCreateIndex && in.body.value("unique", false)) {
+        unique = true;
+        for (const auto& c : in.body.value("columns", json::array())) {
+          key.push_back(c.is_string() ? c.get<std::string>() : c.value("name", ""));
+        }
+      } else if (in.kind == IntentKind::kAddPrimaryKey ||
+                 in.kind == IntentKind::kAddUniqueConstraint) {
+        unique = true;
+        for (const auto& c : in.body.value("columns", json::array())) {
+          key.push_back(c.get<std::string>());
+        }
+      }
+      if (unique && std::find(key.begin(), key.end(), is.column) == key.end()) {
+        refuse(what + ": the key (" + detail::join(key, ", ") + ") does not contain " +
+               is.column + ", and " + q + " is distributed on it. Citus: \"Distributed "
+               "relations cannot have UNIQUE, EXCLUDE, or PRIMARY KEY constraints that do "
+               "not include the partition column\". Add " + is.column + " to the key.");
+        continue;
+      }
+      if ((in.kind == IntentKind::kDropColumn || in.kind == IntentKind::kAlterColumnType) &&
+          in.body.value("column", "") == is.column) {
+        refuse(what + ": " + is.column + " is the column " + q + " is distributed on. "
+               "Citus: \"cannot execute ALTER TABLE command involving partition column\". "
+               "Changing it means undistributing the table and distributing it again, "
+               "which moves every row and is its own decision.");
+      }
+    }
+  }
+
   // 1. DDL PROPAGATION. DECIDED: a hard refusal, not a warning. Whether it
   // should refuse or warn was an open question; this is the decision, with
   // the reason.

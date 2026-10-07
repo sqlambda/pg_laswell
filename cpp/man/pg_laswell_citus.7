@@ -839,6 +839,36 @@ as well, the column is
 .Ic NOT NULL
 from the start, no trigger is created, and one backfill writes the rows whose
 value differs, a distribution value at a time.
+.It Core DDL that Citus refuses
+Each measured on Citus 14.0 and refused at planning in Citus's own words,
+following the specification in order, so a table distributed by an earlier
+intent counts as distributed for the ones after it.
+.Bl -dash -compact
+.It
+.Cm create_index
+with
+.Va unique ,
+.Cm add_unique_constraint
+and
+.Cm add_primary_key
+whose columns do not include the distribution column
+.Pq Qq Distributed relations cannot have UNIQUE, EXCLUDE, or PRIMARY KEY constraints that do not include the partition column .
+A unique index is built
+.Ic CONCURRENTLY ,
+which no dry run rehearses, so without the refusal Citus said this in the job.
+.It
+.Cm create_trigger
+and
+.Cm set_trigger_state
+on a distributed or reference table
+.Pq Qq triggers are not supported on distributed tables .
+.It
+.Cm drop_column
+and
+.Cm alter_column_type
+of the distribution column
+.Pq Qq cannot execute ALTER TABLE command involving partition column .
+.El
 .It A walk whose key is the distribution column
 .Cm backfill
 and
@@ -856,7 +886,10 @@ The
 .Li citus
 extension is not installed in this database.
 .It
-A unique constraint or primary key does not include the distribution column.
+A unique constraint or primary key does not include the distribution column,
+when the table is distributed by a
+.Cm citus_
+kind; for the core kinds see above.
 .It
 The distribution column does not exist on the table.
 .It

@@ -1794,6 +1794,66 @@ TEST(CitusPlanner, AnIndexOnADistributedTableIsSizedByItsShardsNotByTheShell) {
   EXPECT_NE(bf.steps[0].why.find("1000000 rows estimated"), std::string::npos) << bf.steps[0].why;
 }
 
+// What Citus refuses of core's own DDL, each measured on 14.0 with the error
+// the guard quotes. The unique kinds are built CONCURRENTLY, which no dry run
+// rehearses: without this the refusal came from Citus, in the job.
+TEST(CitusPlanner, CoreDdlADistributedTableRefusesIsRefusedAtPlanning) {
+  auto shell = table_with_pk({"tenant_id", "message_id"}, 0);
+  shell["columns"]["v"] = json{{"type", "integer"}, {"not_null", false}};
+  const json distributed = {{"partmethod", "h"}, {"distribution_column", "tenant_id"}};
+  const json reference = {{"partmethod", "n"}, {"repmodel", "t"},
+                          {"distribution_column", nullptr}};
+  const auto plan_on = [&](const json& entry, const json& intent) {
+    return pglaswell::plan_migration(
+        pglaswell::parse_spec(citus_spec(intent)),
+        citus_observations(citus_obs(json{{"public.messages", entry}}),
+                           json{{"public.messages", shell}}), {});
+  };
+  const auto refused = [&](const json& entry, const json& intent, const char* needle) {
+    const auto plan = plan_on(entry, intent);
+    ASSERT_FALSE(plan.ok) << plan.render();
+    bool found = false;
+    for (const auto& c : plan.conflicts) {
+      if (c.find(needle) != std::string::npos) found = true;
+    }
+    EXPECT_TRUE(found) << needle << " in: " << plan.render();
+  };
+  const json base = {{"schema", "public"}, {"table", "messages"}};
+  auto with = [&](json extra) { json j = base; j.update(extra); return j; };
+
+  refused(distributed,
+          with({{"kind", "create_index"}, {"name", "m_u"}, {"unique", true},
+                {"columns", json::array({"message_id"})}, {"comment", "c"}}),
+          "does not contain tenant_id");
+  refused(distributed,
+          with({{"kind", "add_unique_constraint"}, {"name", "m_uq"},
+                {"columns", json::array({"message_id"})}}),
+          "Distributed relations cannot have UNIQUE");
+  refused(distributed,
+          with({{"kind", "set_trigger_state"}, {"trigger", "t"}, {"enabled", false}}),
+          "triggers are not supported on distributed tables");
+  refused(reference,
+          with({{"kind", "set_trigger_state"}, {"trigger", "t"}, {"enabled", false}}),
+          "triggers are not supported on reference tables");
+  refused(distributed, with({{"kind", "drop_column"}, {"column", "tenant_id"}}),
+          "involving partition column");
+  refused(distributed,
+          with({{"kind", "alter_column_type"}, {"column", "tenant_id"}, {"type", "numeric"}}),
+          "involving partition column");
+
+  // With the distribution column in the key, and for another column: not this
+  // guard's business.
+  for (const json& ok :
+       {with({{"kind", "add_unique_constraint"}, {"name", "m_uq"},
+              {"columns", json::array({"v", "tenant_id"})}}),
+        with({{"kind", "drop_column"}, {"column", "v"}})}) {
+    const auto plan = plan_on(distributed, ok);
+    for (const auto& c : plan.conflicts) {
+      EXPECT_EQ(c.find("Citus:"), std::string::npos) << c;
+    }
+  }
+}
+
 // add_column with "fill" and no default needs a trigger, and Citus allows none
 // on a distributed or reference table (measured on 14.0, with the two errors
 // the guard quotes). Refused at planning, in the module's words, naming the

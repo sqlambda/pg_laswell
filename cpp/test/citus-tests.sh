@@ -151,6 +151,57 @@ expect_form "insert_rows" allow "" \
 expect_form "copy_rows" allow "" \
   '{"kind":"copy_rows","schema":"ct","table":"dist","columns":["id","v"],"values":[[9002,1]]}'
 
+# WHAT CITUS REFUSES OF CORE'S OWN DDL. Each is refused at planning, and the
+# statement it pre-empts is also run by hand and must fail with the words the
+# refusal quotes -- a unique index is built CONCURRENTLY, which the dry run
+# cannot rehearse, so without the refusal Citus said this in the job.
+echo "citus: core DDL a distributed or reference table refuses"
+refused_as() {  # refused_as <label> <needle> <intent> <raw sql> <citus message>
+  local out; out=$(intent_plan "$3")
+  if ! echo "$out" | grep -q '"ok":false' || ! echo "$out" | grep -qF -- "$2"; then
+    bad "$1 should be refused, naming: $2" "$out"; return
+  fi
+  local raw; raw=$(q "BEGIN; $4; ROLLBACK;")
+  if echo "$raw" | grep -qF -- "$5"; then ok "$1 is refused, as Citus refuses it"
+  else bad "$1: Citus no longer raises what the refusal quotes" "expected [$5], got [$raw]"; fi
+}
+refused_as "a unique index without the distribution column" "does not contain id" \
+  '{"kind":"create_index","schema":"ct","table":"dist","name":"dist_v_u","columns":["v"],"unique":true,"comment":"c"}' \
+  "CREATE UNIQUE INDEX dist_v_u ON ct.dist (v)" "non-partition columns"
+refused_as "a unique constraint without the distribution column" "does not contain id" \
+  '{"kind":"add_unique_constraint","schema":"ct","table":"dist","name":"dist_v_uq","columns":["v"]}' \
+  "ALTER TABLE ct.dist ADD CONSTRAINT dist_v_uq UNIQUE (v)" "cannot create constraint"
+refused_as "enabling or disabling a trigger on a distributed table" "triggers are not supported on distributed tables" \
+  '{"kind":"set_trigger_state","schema":"ct","table":"dist","trigger":"t","enabled":false}' \
+  "ALTER TABLE ct.dist DISABLE TRIGGER USER" "triggers are not supported on distributed tables"
+refused_as "enabling or disabling a trigger on a reference table" "triggers are not supported on reference tables" \
+  '{"kind":"set_trigger_state","schema":"ct","table":"ref","trigger":"t","enabled":false}' \
+  "ALTER TABLE ct.ref DISABLE TRIGGER USER" "triggers are not supported on reference tables"
+refused_as "dropping the distribution column" "is distributed on" \
+  '{"kind":"drop_column","schema":"ct","table":"dist","column":"id"}' \
+  "ALTER TABLE ct.dist DROP COLUMN id" "involving partition column"
+refused_as "changing the type of the distribution column" "is distributed on" \
+  '{"kind":"alter_column_type","schema":"ct","table":"dist","column":"id","type":"numeric"}' \
+  "ALTER TABLE ct.dist ALTER COLUMN id TYPE numeric" "involving partition column"
+expect_form "a unique constraint that contains the distribution column" allow "" \
+  '{"kind":"add_unique_constraint","schema":"ct","table":"dist","name":"dist_id_v_uq","columns":["v","id"]}'
+# A table distributed earlier in the same specification has no reading yet.
+out=$(intent_plan '{"kind":"create_table","schema":"ct","table":"later","columns":[{"name":"t","type":"int","nullable":false,"comment":"c"},{"name":"id","type":"bigint","nullable":false,"comment":"c"}],"comment":"c"},{"kind":"citus_distribute_table","schema":"ct","table":"later","distribution_column":"t"},{"kind":"add_primary_key","schema":"ct","table":"later","name":"later_pk","columns":["id"]}')
+if echo "$out" | grep -q '"ok":false' && echo "$out" | grep -qF "does not contain t"; then
+  ok "a table distributed earlier in the specification is distributed for the intents after it"
+else
+  bad "the guard should follow the specification in order" "$out"
+fi
+# A reference table is held whole by every node: its size is one copy's.
+q "ANALYZE ct.ref" >/dev/null
+one=$(q "SELECT pg_table_size(to_regclass(shard_name('ct.ref'::regclass, shardid))) FROM pg_dist_shard WHERE logicalrelid = 'ct.ref'::regclass")
+seen=$("$MCP" --call planMigration --args '{"spec":{"laswell_spec_version":1,"id":"ct-refsize","description":"size","intents":[{"kind":"create_index","schema":"ct","table":"ref","name":"ref_v_idx","columns":["v"],"comment":"c"}]},"skipTrustChecks":true}' "$CITUS_URL" 2>&1)
+if echo "$seen" | grep -q '"ok":true' && [ -n "$one" ]; then
+  ok "an index on a reference table plans (one copy is $one bytes)"
+else
+  bad "an index on a reference table should plan" "$seen"
+fi
+
 # And the reference-table walk must actually MOVE THE ROWS. Planning cleanly is
 # not the claim being made; finishing is.
 echo "citus: the reference-table walk, executed"
