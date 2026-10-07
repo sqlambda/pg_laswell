@@ -1749,6 +1749,26 @@ inline long long drive_paced_step(const pglaswell::ConnConfig& cfg,
   const auto mode = step.detail.value("batch_mode", "");
   const bool two = mode == "two_statement" && step.sql.size() > 1;
   const bool grouped = mode == "grouped" && step.sql.size() > 2;
+  const bool composite_statement = mode == "composite_statement";
+  const bool composite = (mode == "composite" && step.sql.size() > 1) || composite_statement;
+  const auto key_columns = step.detail.value("key_columns", json::array()).size();
+
+  // The walk's upper bound, read once, as the executor reads it.
+  std::vector<std::optional<std::string>> upto;
+  if (step.detail.contains("upper_bound_sql")) {
+    pglaswell::WriteSession b(cfg);
+    b.begin(app_name);
+    const auto r = b.txn().exec(step.detail.value("upper_bound_sql", ""));
+    const auto n = static_cast<std::size_t>(step.detail.value("upper_bound_columns", 1));
+    for (std::size_t c = 0; c < n; ++c) {
+      if (r.empty() || r[0][static_cast<pqxx::row::size_type>(c)].is_null()) {
+        upto.emplace_back(std::nullopt);
+      } else {
+        upto.emplace_back(r[0][static_cast<pqxx::row::size_type>(c)].as<std::string>());
+      }
+    }
+    b.commit();
+  }
 
   std::string cursor = "0";
   long long considered = 0;
@@ -1765,10 +1785,15 @@ inline long long drive_paced_step(const pglaswell::ConnConfig& cfg,
       out = pglaswell::run_grouped_batch(b.txn(), strip(step.sql[0]),
                                          strip(step.sql[1]), strip(step.sql[2]),
                                          at, 1000, 1 << 20);
+    } else if (composite) {
+      out = pglaswell::run_composite_batch(
+          b.txn(), strip(step.sql[0]),
+          composite_statement ? std::string() : strip(step.sql[1]), cursor, 1000, 1 << 20,
+          key_columns, upto);
     } else {
       out = pglaswell::run_paced_batch(b.txn(), strip(step.sql[0]),
                                        two ? strip(step.sql[1]) : std::string(),
-                                       cursor, 1000, 1 << 20);
+                                       cursor, 1000, 1 << 20, upto);
     }
     b.commit();
     cursor = out.cursor;
@@ -1885,6 +1910,25 @@ TEST(Planner, AnInvalidIndexIsDroppedConcurrentlyBeforeRebuilding) {
   EXPECT_EQ(s->detail.value("recovering_invalid_index", false), true);
 }
 
+// The plain build is one transaction, and DROP INDEX CONCURRENTLY cannot run in
+// one (measured). On a small quiet table the invalid index is dropped plainly,
+// in the transaction that rebuilds it.
+TEST(Planner, AnInvalidIndexOnASmallQuietTableIsDroppedInTheTransactionThatRebuildsIt) {
+  auto obs = observations(1024, 10);
+  obs.tables["shop.orders"]["indexes"]["orders_open_by_region_idx"] =
+      json{{"is_valid", false}, {"is_unique", false},
+           {"definition", "CREATE INDEX ..."}, {"leading_column", "fulfilment_region"}};
+  const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(minimal_spec()), obs, {});
+  const auto* s = find_step(plan, "create_index");
+  ASSERT_NE(s, nullptr);
+  EXPECT_EQ(s->txn_class, pglaswell::TxnClass::kOptional) << plan.render();
+  ASSERT_GE(s->sql.size(), 3u) << all_sql(*s);
+  // The weaker lock first, as every step that blocks writes on a table has.
+  EXPECT_EQ(s->sql[0], "LOCK TABLE \"shop\".\"orders\" IN SHARE UPDATE EXCLUSIVE MODE;");
+  EXPECT_EQ(s->sql[1].rfind("DROP INDEX \"shop\".", 0), 0u) << s->sql[1];
+  EXPECT_EQ(all_sql(*s).find("CONCURRENTLY"), std::string::npos) << all_sql(*s);
+}
+
 TEST(Planner, AValidIndexOfTheSameNameIsSatisfiedNotRebuilt) {
   auto obs = observations(2LL << 30, 8100000);
   obs.tables["shop.orders"]["indexes"]["orders_open_by_region_idx"] =
@@ -1926,23 +1970,119 @@ TEST(Planner, APartitionedTableGetsThePerPartitionRecipe) {
   ASSERT_NE(find_step(plan, "verify_index_valid"), nullptr) << plan.render();
 }
 
-TEST(Planner, AUniqueIndexOnAPartitionedTableIsRefusedRatherThanPlannedToFail) {
-  // PostgreSQL requires such an index to include the partition key, which this
-  // planner does not read. Emitting a recipe whose final ATTACH would fail is
-  // worse than refusing.
+TEST(Planner, AUniqueIndexOnAPartitionedTableMustContainThePartitionKey) {
+  // Measured: "unique constraint on partitioned table must include all
+  // partitioning columns". Refused here, in those words, rather than by the
+  // recipe's own statements in the job.
   auto obs = observations(1024, 10, 0, "partitioned_table");
   obs.tables["shop.orders"]["partitions"] = json::array({"shop.orders_2024"});
+  obs.tables["shop.orders"]["partition_key"] = "RANGE (shipped_on)";
   json doc = minimal_spec();
   for (auto& i : doc["intents"]) {
     if (i["kind"] == "create_index") i["unique"] = true;
   }
-  const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(doc), obs, {});
+  auto plan = pglaswell::plan_migration(pglaswell::parse_spec(doc), obs, {});
   EXPECT_FALSE(plan.ok) << plan.render();
   bool named = false;
   for (const auto& c : plan.conflicts) {
-    if (c.find("partition key") != std::string::npos) named = true;
+    if (c.find("must include all partitioning columns") != std::string::npos &&
+        c.find("Add shipped_on to the index") != std::string::npos) named = true;
   }
   EXPECT_TRUE(named) << json(plan.conflicts).dump(2);
+
+  // With the partition column in it, the per-partition recipe, UNIQUE on each.
+  std::string leading;
+  for (auto& i : doc["intents"]) {
+    if (i["kind"] != "create_index") continue;
+    leading = i["columns"][0].get<std::string>();
+  }
+  obs.tables["shop.orders"]["partition_key"] = "RANGE (" + leading + ")";
+  plan = pglaswell::plan_migration(pglaswell::parse_spec(doc), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto steps = steps_of(plan, "create_index");
+  ASSERT_GE(steps.size(), 3u) << plan.render();
+  EXPECT_NE(all_sql(*steps[0]).find("CREATE UNIQUE INDEX CONCURRENTLY"), std::string::npos)
+      << all_sql(*steps[0]);
+  EXPECT_NE(all_sql(*steps[1]).find("CREATE UNIQUE INDEX"), std::string::npos);
+  EXPECT_NE(all_sql(*steps[1]).find(" ON ONLY "), std::string::npos) << all_sql(*steps[1]);
+
+  // A partition that is itself partitioned takes no concurrent build.
+  obs.tables["shop.orders"]["partition_parts"] =
+      json::array({json{{"relation", "shop.orders_2024"}, {"partitioned", true},
+                        {"indexes", json::object()}}});
+  plan = pglaswell::plan_migration(pglaswell::parse_spec(doc), obs, {});
+  EXPECT_FALSE(plan.ok) << plan.render();
+}
+
+// The key's columns, out of pg_get_partkeydef's text.
+TEST(Planner, ThePartitionKeysColumnsAreReadOutOfItsDefinition) {
+  using pglaswell::detail::partition_key_columns;
+  EXPECT_EQ(partition_key_columns("RANGE (at)"), (std::vector<std::string>{"at"}));
+  EXPECT_EQ(partition_key_columns("LIST (region, kind)"),
+            (std::vector<std::string>{"region", "kind"}));
+  EXPECT_EQ(partition_key_columns("RANGE (\"end\", at text_ops)"),
+            (std::vector<std::string>{"end", "at"}));
+  EXPECT_EQ(partition_key_columns("HASH (id COLLATE \"C\")"), (std::vector<std::string>{"id"}));
+  // An expression: no unique key can contain it.
+  EXPECT_TRUE(partition_key_columns("RANGE (date_trunc('day'::text, at))").empty());
+}
+
+// The constraint kinds on a partitioned table: never one statement over every
+// partition, never CONCURRENTLY on the parent.
+TEST(Planner, AUniqueConstraintOnAPartitionedTableIsARecipeOverItsPartitions) {
+  auto obs = observations(8LL << 30, 50000000, 0, "partitioned_table");
+  auto& t = obs.tables["shop.orders"];
+  t["partition_key"] = "RANGE (created_at)";
+  t["columns"]["created_at"] = json{{"type", "timestamp with time zone"}, {"not_null", true}};
+  t["columns"]["id"] = json{{"type", "bigint"}, {"not_null", true}};
+  t["partition_parts"] = json::array(
+      {json{{"relation", "shop.orders_2024"}, {"partitioned", false},
+            {"indexes", json::object()}},
+       json{{"relation", "shop.orders_2025"}, {"partitioned", false},
+            {"indexes", json{{"orders_2025_orders_key",
+                              json{{"valid", true}, {"unique", true},
+                                   {"constraint", "orders_2025_orders_key"},
+                                   {"attached_to", nullptr}}}}}}});
+  const auto with_columns = [&](json columns) {
+    return pglaswell::plan_migration(
+        spec_of(json::array({json{{"kind", "add_unique_constraint"}, {"schema", "shop"},
+                                  {"table", "orders"}, {"name", "orders_key"},
+                                  {"columns", std::move(columns)}}})),
+        obs, {});
+  };
+  auto plan = with_columns(json::array({"id"}));
+  EXPECT_FALSE(plan.ok) << plan.render();
+  ASSERT_FALSE(plan.conflicts.empty());
+  EXPECT_NE(plan.conflicts[0].find("does not contain created_at"), std::string::npos)
+      << plan.conflicts[0];
+
+  plan = with_columns(json::array({"created_at", "id"}));
+  ASSERT_TRUE(plan.ok) << plan.render();
+  std::vector<std::string> sql;
+  for (const auto& s : plan.steps) sql.push_back(all_sql(s));
+  // Parent alone; 2024 built, adopted, attached; 2025 -- already built and
+  // adopted by an earlier attempt -- only attached; then the check.
+  ASSERT_EQ(sql.size(), 6u) << plan.render();
+  EXPECT_NE(sql[0].find("LOCK TABLE ONLY \"shop\".\"orders\" IN SHARE UPDATE EXCLUSIVE MODE;"),
+            std::string::npos) << sql[0];
+  EXPECT_NE(sql[0].find("ALTER TABLE ONLY \"shop\".\"orders\" ADD CONSTRAINT \"orders_key\" "
+                        "UNIQUE (\"created_at\", \"id\");"),
+            std::string::npos) << sql[0];
+  EXPECT_EQ(sql[1], "CREATE UNIQUE INDEX CONCURRENTLY \"orders_2024_orders_key\" ON "
+                    "\"shop\".\"orders_2024\" (\"created_at\", \"id\");\n");
+  EXPECT_EQ(plan.steps[1].txn_class, pglaswell::TxnClass::kForbidden);
+  EXPECT_NE(sql[2].find("ALTER TABLE \"shop\".\"orders_2024\" ADD CONSTRAINT "
+                        "\"orders_2024_orders_key\" UNIQUE USING INDEX \"orders_2024_orders_key\";"),
+            std::string::npos) << sql[2];
+  EXPECT_EQ(sql[3], "ALTER INDEX \"shop\".\"orders_key\" ATTACH PARTITION "
+                    "\"shop\".\"orders_2024_orders_key\";\n");
+  EXPECT_EQ(sql[4], "ALTER INDEX \"shop\".\"orders_key\" ATTACH PARTITION "
+                    "\"shop\".\"orders_2025_orders_key\";\n");
+  EXPECT_EQ(plan.steps[5].kind, "verify_index_valid");
+  for (const auto& q : sql) {
+    EXPECT_EQ(q.find("CONCURRENTLY \"orders_key\""), std::string::npos)
+        << "nothing concurrent on the parent: " << q;
+  }
 }
 
 TEST(Planner, APartitionedTableWithNoPartitionsIsRefused) {
@@ -2003,7 +2143,7 @@ TEST(Planner, AddColumnIsPlannedWhenTheColumnIsAbsent) {
   EXPECT_EQ(s->txn_class, pglaswell::TxnClass::kRequired);
 }
 
-TEST(Planner, NotNullWithNoDefaultIsRefusedWithTheThreeStepAlternative) {
+TEST(Planner, NotNullWithNoDefaultAndNoFillIsRefusedNamingFill) {
   auto obs = observations(1024, 10);
   obs.tables["shop.orders"]["columns"].erase("fulfilment_region");
   const auto spec = spec_with(json::array({json::parse(R"({
@@ -2011,8 +2151,466 @@ TEST(Planner, NotNullWithNoDefaultIsRefusedWithTheThreeStepAlternative) {
       "type":"text","nullable":false,"comment":"c"})")}));
   const auto plan = pglaswell::plan_migration(spec, obs, {});
   EXPECT_FALSE(plan.ok);
-  EXPECT_NE(plan.conflicts[0].find("backfill it, then set NOT NULL"), std::string::npos)
+  EXPECT_NE(plan.conflicts[0].find("Give the value as \"fill\""), std::string::npos)
       << plan.conflicts[0];
+}
+
+namespace {
+json filled_column(const char* after = "drop_trigger") {
+  return json{{"kind", "add_column"}, {"schema", "shop"}, {"table", "orders"},
+              {"column", "region_code"}, {"type", "text"}, {"nullable", false},
+              {"fill", "upper(fulfilment_region)"}, {"after", after},
+              {"comment", "The region, as a code."}};
+}
+}  // namespace
+
+// A NOT NULL column with no default, as ONE intent: the column nullable and a
+// trigger that fills it in the same transaction, a paced backfill of the rows
+// already there, the NOT NULL recipe, and the trigger dropped or kept.
+TEST(Planner, ANotNullColumnWithAFillIsTheWholeRecipe) {
+  const auto obs = observations(2LL << 30, 8000000);
+  const auto plan = pglaswell::plan_migration(spec_with(json::array({filled_column()})), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  std::vector<std::string> kinds;
+  for (const auto& s : plan.steps) kinds.push_back(s.kind);
+  ASSERT_EQ(kinds, (std::vector<std::string>{"add_column", "backfill", "set_not_null",
+                                             "set_not_null", "set_not_null", "set_not_null",
+                                             "add_column"}))
+      << plan.render();
+
+  // Step 1: column and trigger commit TOGETHER, so no new row arrives without
+  // a value. The column is nullable here; NOT NULL comes last.
+  const auto& first = plan.steps[0];
+  ASSERT_EQ(first.sql.size(), 5u) << plan.render();
+  // The weaker lock first: it waits out an autovacuum without queueing the
+  // application, which a pending exclusive request would (measured: an insert
+  // of 1 027 ms behind the request, 30 ms behind this).
+  EXPECT_EQ(first.sql[0], "LOCK TABLE \"shop\".\"orders\" IN SHARE UPDATE EXCLUSIVE MODE;");
+  EXPECT_TRUE(first.detail.value("exclusive_retry", false));
+  EXPECT_EQ(first.sql[1], "ALTER TABLE \"shop\".\"orders\" ADD COLUMN \"region_code\" text;");
+  EXPECT_NE(first.sql[2].find("COMMENT ON COLUMN"), std::string::npos);
+  // ONE expression, evaluated over the new row under the table's own name.
+  EXPECT_NE(first.sql[3].find("IF NEW.\"region_code\" IS NULL THEN"), std::string::npos);
+  EXPECT_NE(first.sql[3].find("SELECT (upper(fulfilment_region)) INTO NEW.\"region_code\" "
+                              "FROM (SELECT NEW.*) AS \"orders\";"),
+            std::string::npos) << first.sql[3];
+  EXPECT_EQ(first.sql[4],
+            "CREATE TRIGGER \"orders_region_code_laswell_fill\" BEFORE INSERT OR UPDATE ON "
+            "\"shop\".\"orders\" FOR EACH ROW EXECUTE FUNCTION "
+            "\"shop\".\"orders_region_code_laswell_fill\"();");
+  EXPECT_TRUE(first.own_transaction);
+
+  // Step 2: the same expression, over the rows still null -- so it resumes.
+  const auto bf = all_sql(plan.steps[1]);
+  EXPECT_NE(bf.find("SET \"region_code\" = (upper(fulfilment_region))"), std::string::npos) << bf;
+  EXPECT_NE(bf.find("\"orders\".\"region_code\" IS NULL"), std::string::npos) << bf;
+  EXPECT_GT(plan.steps[1].txn_group, first.txn_group) << "the trigger must be committed first";
+
+  // Step 3: the NOT NULL recipe, its scan left out of the rehearsal.
+  EXPECT_NE(all_sql(plan.steps[3]).find("VALIDATE CONSTRAINT"), std::string::npos);
+  EXPECT_TRUE(plan.steps[3].detail.contains("not_rehearsed"));
+  EXPECT_NE(all_sql(plan.steps[4]).find("SET NOT NULL"), std::string::npos);
+
+  // Step 4: the trigger and its function go, last.
+  const auto& last = plan.steps.back();
+  EXPECT_EQ(last.sql.at(1), "DROP TRIGGER \"orders_region_code_laswell_fill\" ON \"shop\".\"orders\";");
+  EXPECT_EQ(last.sql.at(2), "DROP FUNCTION \"shop\".\"orders_region_code_laswell_fill\"();");
+
+  bool says_null = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("stays null") != std::string::npos) says_null = true;
+  }
+  EXPECT_TRUE(says_null) << "a row the expression cannot fill must be said: " << plan.render();
+
+  // keep_trigger: no drop, and the plan says the trigger stays.
+  const auto kept = pglaswell::plan_migration(
+      spec_with(json::array({filled_column("keep_trigger")})), obs, {});
+  ASSERT_TRUE(kept.ok) << kept.render();
+  EXPECT_EQ(kept.steps.size(), plan.steps.size() - 1);
+  EXPECT_EQ(all_sql(kept.steps.back()).find("DROP TRIGGER"), std::string::npos);
+  bool says_stays = false;
+  for (const auto& w : kept.warnings) {
+    if (w.find("STAYS") != std::string::npos) says_stays = true;
+  }
+  EXPECT_TRUE(says_stays);
+
+  // A later intent in the same specification sees the column, NOT NULL.
+  const auto then = pglaswell::plan_migration(
+      spec_with(json::array(
+          {filled_column(),
+           json{{"kind", "create_index"}, {"schema", "shop"}, {"table", "orders"},
+                {"name", "orders_region_code_idx"}, {"columns", json::array({"region_code"})},
+                {"comment", "By code."}}})),
+      obs, {});
+  EXPECT_TRUE(then.ok) << then.render();
+}
+
+// Every part is resumable from the catalog alone.
+TEST(Planner, AFilledColumnResumesFromWhereverAnAttemptStopped) {
+  auto obs = observations(2LL << 30, 8000000);
+  auto& tbl = obs.tables["shop.orders"];
+  const auto plan_of = [&](const char* after = "drop_trigger") {
+    return pglaswell::plan_migration(spec_with(json::array({filled_column(after)})), obs, {});
+  };
+  // The column is there, nullable, with its trigger: nothing is added again.
+  tbl["columns"]["region_code"] = json{{"type", "text"}, {"not_null", false}};
+  tbl["triggers"]["orders_region_code_laswell_fill"] = json::object();
+  auto p = plan_of();
+  ASSERT_TRUE(p.ok) << p.render();
+  EXPECT_EQ(p.steps[0].kind, "backfill") << p.render();
+  // The column without the trigger (added by hand, or the trigger dropped):
+  // the trigger first, and no ADD COLUMN.
+  tbl["triggers"].erase("orders_region_code_laswell_fill");
+  p = plan_of();
+  ASSERT_TRUE(p.ok) << p.render();
+  EXPECT_EQ(all_sql(p.steps[0]).find("ADD COLUMN"), std::string::npos);
+  EXPECT_NE(all_sql(p.steps[0]).find("CREATE TRIGGER"), std::string::npos);
+  // NOT NULL already, trigger still there: only the last step is left.
+  tbl["columns"]["region_code"]["not_null"] = true;
+  tbl["triggers"]["orders_region_code_laswell_fill"] = json::object();
+  p = plan_of();
+  ASSERT_TRUE(p.ok) << p.render();
+  ASSERT_EQ(p.steps.size(), 1u) << p.render();
+  EXPECT_NE(all_sql(p.steps[0]).find("DROP TRIGGER"), std::string::npos);
+  // ... and where the trigger is to be kept, or is gone: satisfied.
+  EXPECT_EQ(plan_of("keep_trigger").steps[0].action, pglaswell::Action::kSatisfied);
+  tbl["triggers"].erase("orders_region_code_laswell_fill");
+  EXPECT_EQ(plan_of().steps[0].action, pglaswell::Action::kSatisfied);
+  // Another type under that name is a conflict, as for any add_column.
+  tbl["columns"]["region_code"] = json{{"type", "integer"}, {"not_null", false}};
+  EXPECT_FALSE(plan_of().ok);
+}
+
+// Consecutive filled columns on one table are ONE recipe: one trigger, one
+// walk that sets them all, one validation scan. Planned one after the other
+// every row would be rewritten once per column.
+TEST(Planner, ConsecutiveFilledColumnsOnOneTableShareOneTriggerOneWalkAndOneScan) {
+  const auto obs = observations(2LL << 30, 8000000);
+  auto second = filled_column();
+  second["column"] = "region_len";
+  second["type"] = "integer";
+  second["fill"] = "length(fulfilment_region)";
+  second["comment"] = "Its length.";
+  const auto plan = pglaswell::plan_migration(
+      spec_with(json::array({filled_column(), second})), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+
+  int triggers = 0, walks = 0, scans = 0, adds = 0;
+  for (const auto& s : plan.steps) {
+    const auto sql = all_sql(s);
+    if (sql.find("CREATE TRIGGER") != std::string::npos) ++triggers;
+    if (s.kind == "backfill") ++walks;
+    if (sql.find("VALIDATE CONSTRAINT") != std::string::npos) ++scans;
+    for (const auto& q : s.sql) if (q.find("ADD COLUMN") != std::string::npos) ++adds;
+  }
+  EXPECT_EQ(adds, 2) << plan.render();
+  EXPECT_EQ(triggers, 1) << plan.render();
+  EXPECT_EQ(walks, 1) << plan.render();
+  EXPECT_EQ(scans, 1) << plan.render();
+
+  // The one function fills both, each from its own expression.
+  const auto first = all_sql(plan.steps[0]);
+  EXPECT_NE(first.find("SELECT (upper(fulfilment_region)) INTO NEW.\"region_code\""),
+            std::string::npos) << first;
+  EXPECT_NE(first.find("SELECT (length(fulfilment_region)) INTO NEW.\"region_len\""),
+            std::string::npos) << first;
+  // The one walk sets both, over rows in which EITHER is still null.
+  const auto bf = all_sql(plan.steps[1]);
+  // COALESCE over the column itself: the walk selects a row when EITHER is
+  // null, and must not write over the other -- which the application may have
+  // set to a value of its own.
+  EXPECT_NE(bf.find("\"region_code\" = COALESCE(\"orders\".\"region_code\", (upper(fulfilment_region)))"),
+            std::string::npos) << bf;
+  EXPECT_NE(bf.find("\"region_len\" = COALESCE(\"orders\".\"region_len\", (length(fulfilment_region)))"),
+            std::string::npos) << bf;
+  EXPECT_NE(bf.find("\"orders\".\"region_code\" IS NULL OR \"orders\".\"region_len\" IS NULL"),
+            std::string::npos) << bf;
+  // One check proves both (measured: PostgreSQL then skips the scan for each),
+  // and one statement sets both.
+  std::string rest;
+  for (std::size_t i = 2; i < plan.steps.size(); ++i) rest += all_sql(plan.steps[i]) + "\n";
+  EXPECT_NE(rest.find("CHECK (\"region_code\" IS NOT NULL AND \"region_len\" IS NOT NULL) NOT VALID"),
+            std::string::npos) << rest;
+  EXPECT_NE(rest.find("ALTER COLUMN \"region_code\" SET NOT NULL, ALTER COLUMN \"region_len\" SET NOT NULL;"),
+            std::string::npos) << rest;
+  // The second intent says where its work went, and walks nothing.
+  const auto& said = plan.steps.back();
+  EXPECT_EQ(said.action, pglaswell::Action::kSatisfied);
+  EXPECT_NE(said.why.find("planned together with intent 0"), std::string::npos) << said.why;
+
+  // A later intent sees BOTH columns.
+  auto with_index = json::array({filled_column(), second,
+      json{{"kind", "create_index"}, {"schema", "shop"}, {"table", "orders"},
+           {"name", "orders_region_len_idx"}, {"columns", json::array({"region_len"})},
+           {"comment", "By length."}}});
+  EXPECT_TRUE(pglaswell::plan_migration(spec_with(with_index), obs, {}).ok);
+
+  // Resumed after the first step: nothing is added again, one walk remains.
+  auto resumed = obs;
+  resumed.tables["shop.orders"]["columns"]["region_code"] = json{{"type", "text"}, {"not_null", false}};
+  resumed.tables["shop.orders"]["columns"]["region_len"] = json{{"type", "integer"}, {"not_null", false}};
+  resumed.tables["shop.orders"]["triggers"]["orders_region_code_laswell_fill"] = json::object();
+  const auto again = pglaswell::plan_migration(
+      spec_with(json::array({filled_column(), second})), resumed, {});
+  ASSERT_TRUE(again.ok) << again.render();
+  EXPECT_EQ(again.steps[0].kind, "backfill") << again.render();
+}
+
+// "fill" as a LIST: the first source that gives a value. The trigger gets one
+// COALESCE; the backfill gets one JOINED pass per source, each over the rows
+// still null.
+TEST(Planner, AListOfSourcesIsOneCoalesceInTheTriggerAndOneJoinedPassPerSource) {
+  const auto obs = observations(2LL << 30, 8000000);
+  auto in = filled_column();
+  in["fill"] = json::array(
+      {json{{"from", "shop.warehouse AS w"}, {"on", "w.id = orders.warehouse_id"},
+            {"value", "w.region"}},
+       json{{"from", "shop.legacy AS l"}, {"on", "l.order_id = orders.id"},
+            {"value", "l.region"}},
+       "upper(fulfilment_region)",
+       "'unknown'"});
+  const auto plan = pglaswell::plan_migration(spec_with(json::array({in})), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+
+  const auto first = all_sql(plan.steps[0]);
+  EXPECT_NE(first.find("SELECT (COALESCE("
+                       "(SELECT (w.region) FROM shop.warehouse AS w WHERE w.id = orders.warehouse_id), "
+                       "(SELECT (l.region) FROM shop.legacy AS l WHERE l.order_id = orders.id), "
+                       "upper(fulfilment_region), 'unknown')) INTO NEW.\"region_code\""),
+            std::string::npos) << first;
+
+  std::vector<const pglaswell::Step*> walks;
+  for (const auto& s : plan.steps) if (s.kind == "backfill") walks.push_back(&s);
+  ASSERT_EQ(walks.size(), 4u) << plan.render();
+  // Source 1: a join, over rows still null, and only where it HAS a value.
+  const auto w0 = all_sql(*walks[0]);
+  EXPECT_NE(w0.find("FROM shop.warehouse AS w"), std::string::npos) << w0;
+  EXPECT_NE(w0.find("(w.id = orders.warehouse_id) AND ((\"orders\".\"region_code\" IS NULL AND "
+                    "(w.region) IS NOT NULL))"), std::string::npos) << w0;
+  EXPECT_NE(w0.find("\"region_code\" = COALESCE(\"orders\".\"region_code\", (w.region))"),
+            std::string::npos) << w0;
+  EXPECT_NE(walks[0]->why.find("source 1 of 4"), std::string::npos) << walks[0]->why;
+  EXPECT_NE(all_sql(*walks[1]).find("FROM shop.legacy AS l"), std::string::npos);
+  // Sources 3 and 4: expressions over the row, no join.
+  EXPECT_EQ(all_sql(*walks[2]).find(" FROM shop."), std::string::npos) << all_sql(*walks[2]);
+  EXPECT_NE(all_sql(*walks[3]).find("COALESCE(\"orders\".\"region_code\", ('unknown'))"),
+            std::string::npos);
+  // In order, each after the one before has committed.
+  for (std::size_t i = 1; i < walks.size(); ++i) {
+    EXPECT_GT(walks[i]->txn_group, walks[i - 1]->txn_group);
+  }
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("must match at most one row") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned) << "the trigger fails on two matches and the join does not";
+
+  // Two columns whose first source is the same table found the same way share
+  // that pass; their later sources each get their own.
+  auto other = in;
+  other["column"] = "region_name";
+  other["fill"] = json::array(
+      {json{{"from", "shop.warehouse AS w"}, {"on", "w.id = orders.warehouse_id"},
+            {"value", "initcap(w.region)"}},
+       "'?'"});
+  const auto two = pglaswell::plan_migration(spec_with(json::array({in, other})), obs, {});
+  ASSERT_TRUE(two.ok) << two.render();
+  int n = 0, shared = 0;
+  for (const auto& s : two.steps) {
+    if (s.kind != "backfill") continue;
+    ++n;
+    const auto sql = all_sql(s);
+    if (sql.find("\"region_code\" = ") != std::string::npos &&
+        sql.find("\"region_name\" = ") != std::string::npos) ++shared;
+  }
+  EXPECT_EQ(n, 5) << "warehouse (both), legacy, '?', upper(...), 'unknown': " << two.render();
+  EXPECT_EQ(shared, 1) << two.render();
+}
+
+TEST(Spec, AFillListTakesExpressionsAndSourceObjectsAndNothingElse) {
+  const auto refused = [](json fill, const char* needle) {
+    auto in = filled_column();
+    in["fill"] = std::move(fill);
+    try {
+      pglaswell::parse_spec(json{{"laswell_spec_version", 1}, {"id", "s"},
+                                 {"description", "d"}, {"intents", json::array({in})}});
+    } catch (const pglaswell::SpecError& e) {
+      return std::string(e.what()).find(needle) != std::string::npos;
+    }
+    return false;
+  };
+  EXPECT_TRUE(refused(json::array(), "or a list of sources"));
+  EXPECT_TRUE(refused(json::array({""}), "fill[0] is an empty expression"));
+  EXPECT_TRUE(refused(json::array({"a", 7}), "fill[1] is neither an expression nor a source object"));
+  EXPECT_TRUE(refused(json::array({json{{"from", "t AS s"}, {"on", "s.id = 1"}}}),
+                      "fill[0] needs a non-empty \"value\""));
+  EXPECT_TRUE(refused(json::array({json{{"from", "t AS s"}, {"on", "s.id = 1"}, {"value", "s.v"},
+                                        {"where", "true"}}}),
+                      "fill[0] has an unknown key \"where\""));
+  EXPECT_FALSE(refused(json::array({json{{"from", "t AS s"}, {"on", "s.id = 1"}, {"value", "s.v"}},
+                                    "0"}), ""));
+}
+
+// "default" WITH "fill": the column NOT NULL with its default in one catalog-
+// only step, then a walk that writes ONLY the rows whose value differs. No
+// trigger, no check, no validation scan, no SET NOT NULL -- and the one
+// exclusive lock comes before the walk, not after it.
+TEST(Planner, ADefaultWithAFillWritesOnlyTheRowsThatDifferFromTheDefault) {
+  const auto obs = observations(2LL << 30, 8000000);
+  auto in = filled_column();
+  in.erase("after");
+  in["default"] = "'none'";
+  const auto plan = pglaswell::plan_migration(spec_with(json::array({in})), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  ASSERT_EQ(plan.steps.size(), 2u) << plan.render();
+  EXPECT_NE(all_sql(plan.steps[0]).find("ADD COLUMN \"region_code\" text DEFAULT 'none' NOT NULL"),
+            std::string::npos) << all_sql(plan.steps[0]);
+  ASSERT_EQ(plan.steps[1].kind, "backfill");
+  const auto bf = all_sql(plan.steps[1]);
+  // Only while the row still HOLDS the default, and only if the value differs.
+  EXPECT_NE(bf.find("\"orders\".\"region_code\" IS NOT DISTINCT FROM ('none') AND "
+                    "(upper(fulfilment_region)) IS NOT NULL AND "
+                    "(upper(fulfilment_region)) IS DISTINCT FROM ('none')"),
+            std::string::npos) << bf;
+  for (const auto& s : plan.steps) {
+    const auto sql = all_sql(s);
+    EXPECT_EQ(sql.find("TRIGGER"), std::string::npos) << sql;
+    EXPECT_EQ(sql.find("VALIDATE"), std::string::npos) << sql;
+    EXPECT_EQ(sql.find("SET NOT NULL"), std::string::npos) << sql;
+  }
+
+  // Resumed: the column is there, so only the walk is planned again.
+  auto resumed = obs;
+  resumed.tables["shop.orders"]["columns"]["region_code"] = json{{"type", "text"}, {"not_null", true}};
+  const auto again = pglaswell::plan_migration(spec_with(json::array({in})), resumed, {});
+  ASSERT_TRUE(again.ok) << again.render();
+  ASSERT_EQ(again.steps.size(), 2u);
+  EXPECT_EQ(again.steps[0].action, pglaswell::Action::kSatisfied);
+  EXPECT_EQ(again.steps[1].kind, "backfill");
+
+  // One joined source is a join; a list is one pass over one COALESCE, since
+  // with a default "still to do" cannot be told from "already given".
+  in["fill"] = json::array({json{{"from", "shop.warehouse AS w"},
+                                 {"on", "w.id = orders.warehouse_id"}, {"value", "w.region"}}});
+  auto joined = pglaswell::plan_migration(spec_with(json::array({in})), obs, {});
+  ASSERT_TRUE(joined.ok) << joined.render();
+  EXPECT_NE(all_sql(joined.steps[1]).find("FROM shop.warehouse AS w"), std::string::npos);
+  in["fill"].push_back("upper(fulfilment_region)");
+  auto listed = pglaswell::plan_migration(spec_with(json::array({in})), obs, {});
+  ASSERT_TRUE(listed.ok) << listed.render();
+  int walks = 0;
+  for (const auto& s : listed.steps) if (s.kind == "backfill") ++walks;
+  EXPECT_EQ(walks, 1) << listed.render();
+  EXPECT_NE(all_sql(listed.steps[1]).find("COALESCE((SELECT (w.region) FROM shop.warehouse AS w"),
+            std::string::npos) << all_sql(listed.steps[1]);
+
+  // Two such columns, consecutive, share ONE walk: a row is selected when
+  // either still holds its default and has another value to take, and each
+  // column is written only where that is so for IT. (Found in the field as
+  // two walks, every row rewritten twice.)
+  in["fill"] = "upper(fulfilment_region)";
+  auto second = in;
+  second["column"] = "region_len";
+  second["type"] = "integer";
+  second["default"] = "0";
+  second["fill"] = "length(fulfilment_region)";
+  const auto two = pglaswell::plan_migration(spec_with(json::array({in, second})), obs, {});
+  ASSERT_TRUE(two.ok) << two.render();
+  walks = 0;
+  int adds = 0;
+  std::string walk;
+  for (const auto& s : two.steps) {
+    if (s.kind == "backfill") { ++walks; walk = all_sql(s); }
+    if (all_sql(s).find("ADD COLUMN") != std::string::npos) ++adds;
+  }
+  EXPECT_EQ(walks, 1) << two.render();
+  EXPECT_EQ(adds, 2) << two.render();
+  EXPECT_NE(walk.find("\"region_code\" = CASE WHEN \"orders\".\"region_code\" IS NOT DISTINCT FROM "
+                      "('none') AND (upper(fulfilment_region)) IS NOT NULL AND "
+                      "(upper(fulfilment_region)) IS DISTINCT FROM ('none') THEN "
+                      "(upper(fulfilment_region)) ELSE \"orders\".\"region_code\" END"),
+            std::string::npos) << walk;
+  EXPECT_NE(walk.find("\"region_len\" = CASE WHEN \"orders\".\"region_len\" IS NOT DISTINCT FROM (0)"),
+            std::string::npos) << walk;
+  EXPECT_NE(walk.find(") OR (\"orders\".\"region_len\" IS NOT DISTINCT FROM (0)"),
+            std::string::npos) << walk;
+  EXPECT_NE(two.steps.back().why.find("planned together with intent 0"), std::string::npos);
+  // A defaulted column and a trigger-filled one are different recipes.
+  auto triggered = filled_column();
+  triggered["column"] = "region_len";
+  triggered["type"] = "integer";
+  triggered["fill"] = "length(fulfilment_region)";
+  const auto mixed = pglaswell::plan_migration(spec_with(json::array({in, triggered})), obs, {});
+  ASSERT_TRUE(mixed.ok) << mixed.render();
+  walks = 0;
+  for (const auto& s : mixed.steps) if (s.kind == "backfill") ++walks;
+  EXPECT_EQ(walks, 2) << mixed.render();
+}
+
+// What is NOT merged, and so planned one after the other as before.
+TEST(Planner, FilledColumnsAreNotMergedWhereOneRecipeWouldNotMeanTheSame) {
+  const auto obs = observations(2LL << 30, 8000000);
+  const auto walks = [&](const json& intents) {
+    const auto p = pglaswell::plan_migration(spec_with(intents), obs, {});
+    EXPECT_TRUE(p.ok) << p.render();
+    int n = 0;
+    for (const auto& s : p.steps) if (s.kind == "backfill") ++n;
+    return n;
+  };
+  auto second = filled_column();
+  second["column"] = "region_len";
+  second["type"] = "integer";
+  second["fill"] = "length(fulfilment_region)";
+  ASSERT_EQ(walks(json::array({filled_column(), second})), 1);
+
+  // One expression names the other column: the trigger would fill in order
+  // and one UPDATE would not, so they are planned in order instead.
+  auto entangled = second;
+  entangled["fill"] = "length(region_code)";
+  EXPECT_EQ(walks(json::array({filled_column(), entangled})), 2);
+  // A different "after": two triggers with two fates.
+  auto kept = second;
+  kept["after"] = "keep_trigger";
+  EXPECT_EQ(walks(json::array({filled_column(), kept})), 2);
+  // Not consecutive: the planner does not reorder intents.
+  EXPECT_EQ(walks(json::array({filled_column(),
+                               json{{"kind", "create_schema"}, {"schema", "other"},
+                                    {"comment", "Between."}},
+                               second})), 2);
+}
+
+TEST(Spec, FillIsOnlyForANotNullColumnWithoutADefaultAndMustSayWhatFollows) {
+  const auto refused = [](json in, const char* needle) {
+    try {
+      pglaswell::parse_spec(json{{"laswell_spec_version", 1}, {"id", "s"},
+                                 {"description", "d"}, {"intents", json::array({in})}});
+    } catch (const pglaswell::SpecError& e) {
+      return std::string(e.what()).find(needle) != std::string::npos;
+    }
+    return false;
+  };
+  auto in = filled_column();
+  in.erase("after");
+  EXPECT_TRUE(refused(in, "after must be \"drop_trigger\" or \"keep_trigger\""));
+  in = filled_column("later");
+  EXPECT_TRUE(refused(in, "after must be"));
+  in = filled_column();
+  in["nullable"] = true;
+  EXPECT_TRUE(refused(in, "nullable false"));
+  // With a default there is no trigger, so nothing for "after" to decide.
+  in = filled_column();
+  in["default"] = "'x'";
+  EXPECT_TRUE(refused(in, ".after does not apply when the column has a default"));
+  in = filled_column();
+  in.erase("fill");
+  EXPECT_TRUE(refused(in, ".after is only meaningful together with a fill"));
+  in.erase("after");
+  in["key"] = "id";
+  EXPECT_TRUE(refused(in, ".key is only meaningful together with a fill"));
+  // PostgreSQL truncates at 63 bytes; a truncated trigger name is never found.
+  in = filled_column();
+  in["column"] = std::string(50, 'c');
+  EXPECT_TRUE(refused(in, "is 70 bytes"));
 }
 
 TEST(Planner, BackfillWithoutAUniqueKeyIsRefusedNamingTheIndexNeeded) {
@@ -2022,11 +2620,15 @@ TEST(Planner, BackfillWithoutAUniqueKeyIsRefusedNamingTheIndexNeeded) {
   EXPECT_FALSE(plan.ok);
   bool names_the_fix = false;
   for (const auto& c : plan.conflicts) {
-    if (c.find("CREATE UNIQUE INDEX CONCURRENTLY") != std::string::npos) {
+    // What the walk needs, said without a recipe: it used to offer CREATE
+    // UNIQUE INDEX CONCURRENTLY ... (key), which a hypertable refuses twice
+    // over, and what index a table can have is its owner's to know.
+    if (c.find("needs a unique index that contains id") != std::string::npos &&
+        c.find("CONCURRENTLY") == std::string::npos) {
       names_the_fix = true;
     }
   }
-  EXPECT_TRUE(names_the_fix) << "the refusal must name the index to create";
+  EXPECT_TRUE(names_the_fix) << "the refusal must say what index the walk needs";
 }
 
 TEST(Planner, TheBackfillBatchUsesForUpdateWithoutSkipLocked) {
@@ -2283,6 +2885,47 @@ TEST_F(DatabaseTest, ObservesStructureSizeAndLockStateOfARealTable) {
   pglaswell::WriteSession w(cfg);
   w.begin("pg_laswell/test/cleanup");
   w.txn().exec("DROP TABLE laswell_obs");
+  w.commit();
+}
+
+// A partitioned table holds nothing itself: relpages 0 always, reltuples 0
+// until someone analyses the parent. Every decision by size or rows was being
+// made about an empty table. The reading is its leaves' total.
+TEST_F(DatabaseTest, APartitionedTableIsSizedByItsPartitions) {
+  pglaswell::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = url_;
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/part-size");
+    w.txn().exec("DROP TABLE IF EXISTS laswell_parts");
+    w.txn().exec("CREATE TABLE laswell_parts(id int, at int, pad text) PARTITION BY RANGE (at)");
+    w.txn().exec("CREATE TABLE laswell_parts_1 PARTITION OF laswell_parts"
+                 " FOR VALUES FROM (0) TO (10) PARTITION BY RANGE (id)");
+    w.txn().exec("CREATE TABLE laswell_parts_1a PARTITION OF laswell_parts_1"
+                 " FOR VALUES FROM (0) TO (100000)");
+    w.txn().exec("CREATE TABLE laswell_parts_2 PARTITION OF laswell_parts"
+                 " FOR VALUES FROM (10) TO (20)");
+    w.txn().exec("INSERT INTO laswell_parts SELECT g, g % 20, repeat('x', 200)"
+                 " FROM generate_series(1, 4000) g");
+    // The leaves, as autovacuum would: the parent is never analysed by it.
+    w.txn().exec("ANALYZE laswell_parts_1a");
+    w.txn().exec("ANALYZE laswell_parts_2");
+    w.commit();
+  }
+  pglaswell::Catalog cat(cfg);
+  const auto obs = cat.observe({"public", "public"}, {"laswell_parts", "laswell_parts_2"});
+  const auto& parent = obs.table("public.laswell_parts");
+  EXPECT_EQ(parent.value("kind", ""), "partitioned_table");
+  // Both leaves, the one two levels down included.
+  EXPECT_EQ(parent.value("reltuples", 0LL), 4000) << parent.dump(2);
+  EXPECT_GT(parent.value("size_estimate", 0LL), 800000) << parent.dump(2);
+  // A leaf is still its own.
+  EXPECT_EQ(obs.table("public.laswell_parts_2").value("reltuples", 0LL), 2000);
+
+  pglaswell::WriteSession w(cfg);
+  w.begin("pg_laswell/test/cleanup");
+  w.txn().exec("DROP TABLE laswell_parts");
   w.commit();
 }
 
@@ -2570,6 +3213,78 @@ TEST_F(BootstrappedTest, StatusReportsAUsableLedgerAndItsTrustedKeys) {
   EXPECT_TRUE(st.usable) << st.error;
   ASSERT_EQ(st.trusted_key_ids.size(), 1u);
   EXPECT_EQ(st.trusted_key_ids[0], test_key().key_id);
+}
+
+// A module's reading is one statement over a vendor's catalogs, and one that
+// raises used to fail the whole observation -- every plan on that server --
+// with the vendor's raw error. Measured: as a role without USAGE on a schema
+// that holds a hypertable, the TimescaleDB reading raises "permission denied
+// for schema". It now fails that module's reading alone; the planner refuses,
+// because without the reading a hypertable would be planned as a plain table,
+// and says which module and what the server said.
+TEST_F(DatabaseTest, AModuleReadingThatRaisesIsContainedAndNamed) {
+  pglaswell::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = url_;
+  if (std::string(PGLASWELL_MODULE_SET).find("timescaledb") == std::string::npos) {
+    GTEST_SKIP() << "built without the timescaledb module";
+  }
+  {
+    pglaswell::ReadSession r(cfg);
+    if (r.txn().exec("SELECT 1 FROM pg_available_extensions WHERE name = 'timescaledb'").empty()) {
+      GTEST_SKIP() << "TimescaleDB is not installed on this server";
+    }
+  }
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/hidden-hypertable");
+    w.txn().exec("CREATE EXTENSION IF NOT EXISTS timescaledb");
+    w.txn().exec("DROP SCHEMA IF EXISTS laswell_hidden CASCADE");
+    w.txn().exec("DROP TABLE IF EXISTS laswell_seen");
+    w.txn().exec("DROP ROLE IF EXISTS laswell_blind");
+    w.txn().exec("CREATE ROLE laswell_blind LOGIN PASSWORD 'laswell_blind'");
+    w.txn().exec("CREATE SCHEMA laswell_hidden");
+    w.txn().exec("CREATE TABLE laswell_hidden.h(ts timestamptz NOT NULL, v int)");
+    w.txn().exec("SELECT create_hypertable('laswell_hidden.h', by_range('ts'))");
+    w.txn().exec("CREATE TABLE laswell_seen(id int PRIMARY KEY, v text)");
+    w.txn().exec("GRANT SELECT ON laswell_seen TO laswell_blind");
+    w.commit();
+  }
+  pglaswell::ConnConfig as_role = cfg;
+  as_role.conninfo =
+      pglaswell::detail::is_conninfo_uri(url_)
+          ? url_ + (url_.find('?') == std::string::npos ? "?" : "&") +
+                "user=laswell_blind&password=laswell_blind"
+          : url_ + " user=laswell_blind password=laswell_blind";
+
+  pglaswell::Catalog cat(as_role);
+  pglaswell::Observations obs;
+  // It answers: the table is read, and the module's failure is recorded.
+  ASSERT_NO_THROW(obs = cat.observe({"public"}, {"laswell_seen"}));
+  EXPECT_TRUE(obs.table("public.laswell_seen").value("exists", false));
+  EXPECT_TRUE(obs.extension("timescaledb").empty());
+  ASSERT_TRUE(obs.extension_errors.contains("timescaledb")) << obs.extension_errors.dump();
+  EXPECT_NE(obs.extension_errors["timescaledb"].get<std::string>().find("permission denied"),
+            std::string::npos) << obs.extension_errors.dump();
+
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "add_column"}, {"schema", "public"},
+                                {"table", "laswell_seen"}, {"column", "n"}, {"type", "int"},
+                                {"nullable", true}, {"comment", "c"}}})),
+      obs, {});
+  EXPECT_FALSE(plan.ok);
+  ASSERT_FALSE(plan.conflicts.empty());
+  EXPECT_NE(plan.conflicts[0].find("the timescaledb module could not read this database"),
+            std::string::npos) << plan.conflicts[0];
+  EXPECT_NE(plan.conflicts[0].find("permission denied for schema laswell_hidden"),
+            std::string::npos) << plan.conflicts[0];
+
+  pglaswell::WriteSession w(cfg);
+  w.begin("pg_laswell/test/hidden-hypertable-drop");
+  w.txn().exec("DROP SCHEMA laswell_hidden CASCADE");
+  w.txn().exec("DROP TABLE laswell_seen");
+  w.txn().exec("DROP ROLE laswell_blind");
+  w.commit();
 }
 
 // A role the bootstrap did not name: the ledger is there, and this role has no
@@ -3889,6 +4604,1155 @@ TEST_F(ToolTest, AStatementCeilingHoldsAcrossConcurrentJobs) {
   pglaswell::ReadSession r(cfg());
   EXPECT_EQ(r.txn().exec("SELECT count(*) FROM shop.widgets WHERE tag IS NULL")[0][0]
                 .as<int>(), 0);
+}
+
+// The dry run does not run the scan of a split recipe (see the planner test of
+// the same subject), and this is what that costs and what makes the cost
+// acceptable, against a real server: a null the rehearsal no longer looks for
+// is found by the JOB at its VALIDATE, the NOT VALID check stays committed, and
+// the next plan resumes at the scan instead of failing on the check's name.
+TEST_F(ToolTest, TheDryRunLeavesTheScanToTheJobAndAFailedScanIsResumed) {
+  make_shop(cfg());
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/null-row");
+    w.txn().exec("INSERT INTO shop.orders(warehouse_id) VALUES (NULL)");
+    w.commit();
+  }
+  const auto signed_nn = [&] {
+    json doc = minimal_spec();
+    doc["id"] = "0002-orders-warehouse-not-null";
+    doc["description"] = "Every order has a warehouse.";
+    doc["intents"] = json::array({json{{"kind", "set_not_null"}, {"schema", "shop"},
+                                       {"table", "orders"}, {"column", "warehouse_id"}}});
+    const auto parsed = pglaswell::parse_spec(doc);
+    doc["signatures"] = json::array({{{"key_id", test_key().key_id},
+                                      {"algorithm", "ed25519"},
+                                      {"signature", base64(sign(parsed.canonical_bytes))}}});
+    return doc;
+  }();
+
+  const auto plan = payload(call("planMigration", json{{"spec", signed_nn}}));
+  ASSERT_TRUE(plan.value("ok", false)) << plan.dump(2);
+  const auto& dry = plan["dryRun"];
+  ASSERT_TRUE(dry.value("ran", false)) << dry.dump(2);
+  // Nothing found: the row is there, and the rehearsal did not scan for it.
+  EXPECT_FALSE(dry.contains("problems")) << dry.dump(2);
+  ASSERT_EQ(plan["steps"].size(), 4u);
+  EXPECT_EQ(dry["unverifiedSteps"], json::array({1, 2})) << dry.dump(2);
+  EXPECT_NE(dry["unverifiedWhy"].value("1", "").find("the scan"), std::string::npos);
+  EXPECT_NE(dry["unverifiedWhy"].value("2", "").find("exclusive lock"), std::string::npos);
+  EXPECT_TRUE(dry.contains("durationMs")) << "the time spent before any job exists";
+  {
+    pglaswell::ReadSession r(cfg());
+    EXPECT_EQ(r.txn().exec("SELECT count(*) FROM pg_constraint WHERE conname ="
+                           " 'orders_warehouse_id_laswell_nn'")[0][0].as<int>(), 0)
+        << "the dry run committed something";
+  }
+
+  // The job finds the null, at step 1, and stops with the check in place.
+  auto started = payload(call("startMigration", json{{"spec", signed_nn}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, started["jobId"], [](const json& s) {
+    return s.value("state", "") == "failed";
+  })) << status_of(started["jobId"]).dump(2);
+  {
+    pglaswell::ReadSession r(cfg());
+    const auto c = r.txn().exec("SELECT convalidated FROM pg_constraint WHERE conname ="
+                                " 'orders_warehouse_id_laswell_nn'");
+    ASSERT_EQ(c.size(), 1u) << "the NOT VALID check should have been committed by step 0";
+    EXPECT_FALSE(c[0][0].as<bool>());
+    // The plan the ledger keeps for the job carries the rehearsal's duration.
+    const auto kept = r.txn().exec(
+        "SELECT plan->'dryRun'->>'durationMs' FROM laswell.job WHERE job_id = $1::uuid",
+        pqxx::params{started["jobId"].get<std::string>()});
+    ASSERT_EQ(kept.size(), 1u);
+    EXPECT_FALSE(kept[0][0].is_null()) << "the rehearsal left no trace with the job";
+  }
+
+  // Repaired, the same specification resumes at the scan and finishes.
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/repair");
+    w.txn().exec("UPDATE shop.orders SET warehouse_id = 1 WHERE warehouse_id IS NULL");
+    w.commit();
+  }
+  const auto again = payload(call("planMigration", json{{"spec", signed_nn}}));
+  ASSERT_TRUE(again.value("ok", false)) << again.dump(2);
+  ASSERT_EQ(again["steps"].size(), 3u) << again.dump(2);
+  EXPECT_NE(again["steps"][0]["sql"][0].get<std::string>().find("VALIDATE CONSTRAINT"),
+            std::string::npos);
+  started = payload(call("startMigration", json{{"spec", signed_nn}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, started["jobId"], [](const json& s) {
+    return s.value("state", "") == "succeeded";
+  })) << status_of(started["jobId"]).dump(2);
+  pglaswell::ReadSession r(cfg());
+  EXPECT_TRUE(r.txn().exec("SELECT attnotnull FROM pg_attribute WHERE attrelid ="
+                           " 'shop.orders'::regclass AND attname = 'warehouse_id'")[0][0].as<bool>());
+  EXPECT_EQ(r.txn().exec("SELECT count(*) FROM pg_constraint WHERE conname ="
+                         " 'orders_warehouse_id_laswell_nn'")[0][0].as<int>(), 0);
+}
+
+// add_column with "fill", against a real server and through a real job: the
+// whole recipe runs, a row the expression cannot fill stops it at the scan
+// with the trigger still protecting new rows, and the same specification
+// finishes once the row is repaired.
+TEST_F(ToolTest, AFilledNotNullColumnIsAppliedEndToEndAndResumesAfterANull) {
+  make_shop(cfg());
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/unfillable");
+    // One row the expression yields NULL for.
+    w.txn().exec("INSERT INTO shop.orders(warehouse_id) VALUES (NULL)");
+    w.commit();
+  }
+  const auto signed_fill = [&](const char* id, const char* column, const char* after) {
+    json doc = minimal_spec();
+    doc["id"] = id;
+    doc["description"] = "A code for the warehouse, on every order.";
+    doc["intents"] = json::array(
+        {json{{"kind", "add_column"}, {"schema", "shop"}, {"table", "orders"},
+              {"column", column}, {"type", "text"}, {"nullable", false},
+              {"fill", "'W' || orders.warehouse_id"}, {"after", after},
+              {"comment", "The warehouse, as a code."}}});
+    const auto parsed = pglaswell::parse_spec(doc);
+    doc["signatures"] = json::array({{{"key_id", test_key().key_id},
+                                      {"algorithm", "ed25519"},
+                                      {"signature", base64(sign(parsed.canonical_bytes))}}});
+    return doc;
+  };
+  const auto one = [&](const std::string& sql) {
+    pglaswell::ReadSession r(cfg());
+    return r.txn().exec(sql)[0][0].as<std::string>();
+  };
+  const auto spec = signed_fill("0003-orders-warehouse-code", "warehouse_code", "drop_trigger");
+
+  const auto plan = payload(call("planMigration", json{{"spec", spec}}));
+  ASSERT_TRUE(plan.value("ok", false)) << plan.dump(2);
+  EXPECT_FALSE(plan["dryRun"].contains("problems")) << plan["dryRun"].dump(2);
+
+  // First attempt: stops at the scan, on the row that could not be filled.
+  auto started = payload(call("startMigration", json{{"spec", spec}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, started["jobId"], [](const json& s) {
+    return s.value("state", "") == "failed";
+  })) << status_of(started["jobId"]).dump(2);
+  EXPECT_EQ(one("SELECT count(*) FROM shop.orders WHERE warehouse_code IS NULL"), "1")
+      << "every row but the unfillable one should have been backfilled";
+  EXPECT_EQ(one("SELECT count(*) FROM pg_trigger WHERE tgname = 'orders_warehouse_code_laswell_fill'"), "1")
+      << "the trigger must still be there: the column is not safe without it yet";
+  EXPECT_EQ(one("SELECT attnotnull FROM pg_attribute WHERE attrelid = 'shop.orders'::regclass"
+                " AND attname = 'warehouse_code'"), "f");
+  // While it is stopped, the application keeps writing and gets its value.
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/app-writes");
+    w.txn().exec("INSERT INTO shop.orders(warehouse_id) VALUES (3)");
+    w.txn().exec("UPDATE shop.orders SET warehouse_id = 2 WHERE warehouse_id IS NULL");
+    w.commit();
+  }
+  EXPECT_EQ(one("SELECT count(*) FROM shop.orders WHERE warehouse_code IS NULL"), "0")
+      << "the trigger fills a new row, and an old row when the application touches it";
+
+  // Second attempt: nothing is added twice, and it finishes.
+  const auto again = payload(call("planMigration", json{{"spec", spec}}));
+  ASSERT_TRUE(again.value("ok", false)) << again.dump(2);
+  EXPECT_EQ(again["steps"][0].value("kind", ""), "backfill") << again.dump(2);
+  started = payload(call("startMigration", json{{"spec", spec}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, started["jobId"], [](const json& s) {
+    return s.value("state", "") == "succeeded";
+  })) << status_of(started["jobId"]).dump(2);
+  EXPECT_EQ(one("SELECT attnotnull FROM pg_attribute WHERE attrelid = 'shop.orders'::regclass"
+                " AND attname = 'warehouse_code'"), "t");
+  EXPECT_EQ(one("SELECT count(*) FROM shop.orders WHERE warehouse_code <> 'W' || warehouse_id"), "0");
+  EXPECT_EQ(one("SELECT count(*) FROM pg_trigger WHERE tgname = 'orders_warehouse_code_laswell_fill'"), "0");
+  EXPECT_EQ(one("SELECT count(*) FROM pg_proc WHERE proname = 'orders_warehouse_code_laswell_fill'"), "0");
+  EXPECT_EQ(one("SELECT count(*) FROM pg_constraint WHERE conname = 'orders_warehouse_code_laswell_nn'"), "0");
+
+  // keep_trigger: the application never learns the column, and still inserts.
+  const auto kept = signed_fill("0004-orders-warehouse-tag", "warehouse_tag", "keep_trigger");
+  started = payload(call("startMigration", json{{"spec", kept}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, started["jobId"], [](const json& s) {
+    return s.value("state", "") == "succeeded";
+  })) << status_of(started["jobId"]).dump(2);
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/app-still-writes");
+    w.txn().exec("INSERT INTO shop.orders(warehouse_id, warehouse_code) VALUES (4, 'W4')");
+    w.commit();
+  }
+  EXPECT_EQ(one("SELECT warehouse_tag FROM shop.orders ORDER BY id DESC LIMIT 1"), "W4");
+
+  // Two columns in consecutive intents: one job, and the server agrees that
+  // one check was enough for both.
+  json pair = minimal_spec();
+  pair["id"] = "0005-orders-two-codes";
+  pair["description"] = "Two more codes, in one pass.";
+  pair["intents"] = json::array(
+      {json{{"kind", "add_column"}, {"schema", "shop"}, {"table", "orders"},
+            {"column", "code_a"}, {"type", "text"}, {"nullable", false},
+            {"fill", "'A' || orders.warehouse_id"}, {"after", "drop_trigger"},
+            {"comment", "A."}},
+       json{{"kind", "add_column"}, {"schema", "shop"}, {"table", "orders"},
+            {"column", "code_b"}, {"type", "bigint"}, {"nullable", false},
+            {"fill", "warehouse_id * 10"}, {"after", "drop_trigger"},
+            {"comment", "B."}}});
+  {
+    const auto parsed = pglaswell::parse_spec(pair);
+    pair["signatures"] = json::array({{{"key_id", test_key().key_id},
+                                       {"algorithm", "ed25519"},
+                                       {"signature", base64(sign(parsed.canonical_bytes))}}});
+  }
+  started = payload(call("startMigration", json{{"spec", pair}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, started["jobId"], [](const json& s) {
+    return s.value("state", "") == "succeeded";
+  })) << status_of(started["jobId"]).dump(2);
+  EXPECT_EQ(one("SELECT count(*) FROM pg_attribute WHERE attrelid = 'shop.orders'::regclass"
+                " AND attname IN ('code_a', 'code_b') AND attnotnull"), "2");
+  EXPECT_EQ(one("SELECT count(*) FROM shop.orders WHERE code_a <> 'A' || warehouse_id"
+                " OR code_b <> warehouse_id * 10"), "0");
+  EXPECT_EQ(one("SELECT count(*) FROM pg_trigger WHERE tgname LIKE '%laswell_fill'"
+                " AND tgrelid = 'shop.orders'::regclass"), "1")
+      << "only the kept trigger of the earlier specification should remain";
+  EXPECT_EQ(one("SELECT count(*) FROM pg_constraint WHERE conname LIKE '%laswell_nn'"), "0");
+
+  // A LIST of sources: another table first, a second table for what the first
+  // does not have, then a constant. The first that gives a value wins, a row
+  // found with a NULL falls through, and a value the application set stays.
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/sources");
+    w.txn().exec("CREATE TABLE shop.tier_a(order_id bigint PRIMARY KEY, tier text)");
+    w.txn().exec("CREATE TABLE shop.tier_b(order_id bigint PRIMARY KEY, tier text)");
+    // a: every 2nd order, but every 10th of ITS rows is there with a NULL
+    w.txn().exec("INSERT INTO shop.tier_a SELECT id, CASE WHEN id % 10 = 0 THEN NULL ELSE 'a' END"
+                 "  FROM shop.orders WHERE id % 2 = 0");
+    // b: every 3rd order
+    w.txn().exec("INSERT INTO shop.tier_b SELECT id, 'b' FROM shop.orders WHERE id % 3 = 0");
+    w.commit();
+  }
+  json listed = minimal_spec();
+  listed["id"] = "0006-orders-tier";
+  listed["description"] = "A tier for every order, from wherever it is known.";
+  listed["intents"] = json::array(
+      {json{{"kind", "add_column"}, {"schema", "shop"}, {"table", "orders"},
+            {"column", "tier"}, {"type", "text"}, {"nullable", false},
+            {"fill", json::array(
+                {json{{"from", "shop.tier_a AS a"}, {"on", "a.order_id = orders.id"},
+                      {"value", "a.tier"}},
+                 json{{"from", "shop.tier_b AS b"}, {"on", "b.order_id = orders.id"},
+                      {"value", "b.tier"}},
+                 "'none'"})},
+            {"after", "keep_trigger"}, {"comment", "Tier."}}});
+  {
+    const auto parsed = pglaswell::parse_spec(listed);
+    listed["signatures"] = json::array({{{"key_id", test_key().key_id},
+                                         {"algorithm", "ed25519"},
+                                         {"signature", base64(sign(parsed.canonical_bytes))}}});
+  }
+  const auto listed_plan = payload(call("planMigration", json{{"spec", listed}}));
+  ASSERT_TRUE(listed_plan.value("ok", false)) << listed_plan.dump(2);
+  EXPECT_FALSE(listed_plan["dryRun"].contains("problems")) << listed_plan["dryRun"].dump(2);
+  started = payload(call("startMigration", json{{"spec", listed}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, started["jobId"], [](const json& s) {
+    return s.value("state", "") == "succeeded";
+  })) << status_of(started["jobId"]).dump(2);
+  EXPECT_EQ(one("SELECT attnotnull FROM pg_attribute WHERE attrelid = 'shop.orders'::regclass"
+                " AND attname = 'tier'"), "t");
+  // What each row SHOULD have got, computed independently of the plan.
+  EXPECT_EQ(one("SELECT count(*) FROM shop.orders o"
+                "  LEFT JOIN shop.tier_a a ON a.order_id = o.id"
+                "  LEFT JOIN shop.tier_b b ON b.order_id = o.id"
+                " WHERE o.tier IS DISTINCT FROM COALESCE(a.tier, b.tier, 'none')"), "0");
+  EXPECT_NE(one("SELECT count(*) FROM shop.orders WHERE tier = 'a'"), "0");
+  EXPECT_NE(one("SELECT count(*) FROM shop.orders WHERE tier = 'b'"), "0");
+  EXPECT_NE(one("SELECT count(*) FROM shop.orders WHERE tier = 'none'"), "0");
+  // The ledger says how many rows each source filled: a step per pass.
+  EXPECT_EQ(one("SELECT count(*) FROM laswell.step WHERE job_id = '" +
+                started["jobId"].get<std::string>() + "'::uuid AND kind = 'backfill'"), "3");
+  // The trigger agrees with the passes, for a row written afterwards.
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/sources-new-row");
+    // code_a and code_b lost their trigger above ("drop_trigger"), so the
+    // application supplies them, as that choice says it must.
+    const std::string row = "INSERT INTO shop.orders(warehouse_id, warehouse_code, code_a, code_b)"
+                            " VALUES (1, 'W1', 'A1', 10)";
+    w.txn().exec(row);
+    w.txn().exec("INSERT INTO shop.tier_b SELECT max(id) + 1, 'b' FROM shop.orders");
+    w.txn().exec(row);
+    w.commit();
+  }
+  EXPECT_EQ(one("SELECT string_agg(tier, ',' ORDER BY id) FROM (SELECT id, tier FROM shop.orders"
+                " ORDER BY id DESC LIMIT 2) x"), "none,b");
+
+  // A DEFAULT with a fill: NOT NULL at once, and only the rows that differ are
+  // written. Counted by the server: n_tup_upd before and after the job.
+  const auto updates = [&] {
+    pglaswell::WriteSession w(cfg());
+    w.exec_nontransactional("SELECT pg_stat_force_next_flush()");
+    return std::stoll(one("SELECT n_tup_upd FROM pg_stat_user_tables WHERE relid ="
+                          " 'shop.orders'::regclass"));
+  };
+  json dflt = minimal_spec();
+  dflt["id"] = "0007-orders-priority";
+  dflt["description"] = "A priority; almost every order is normal.";
+  dflt["intents"] = json::array(
+      {json{{"kind", "add_column"}, {"schema", "shop"}, {"table", "orders"},
+            {"column", "priority"}, {"type", "text"}, {"nullable", false},
+            {"default", "'normal'"},
+            {"fill", "CASE WHEN orders.id % 50 = 0 THEN 'high' ELSE 'normal' END"},
+            {"comment", "Priority."}}});
+  {
+    const auto parsed = pglaswell::parse_spec(dflt);
+    dflt["signatures"] = json::array({{{"key_id", test_key().key_id},
+                                       {"algorithm", "ed25519"},
+                                       {"signature", base64(sign(parsed.canonical_bytes))}}});
+  }
+  const auto total = std::stoll(one("SELECT count(*) FROM shop.orders"));
+  const auto expected_high = std::stoll(one("SELECT count(*) FROM shop.orders WHERE id % 50 = 0"));
+  ASSERT_GT(expected_high, 0);
+  const auto before_updates = updates();
+  started = payload(call("startMigration", json{{"spec", dflt}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, started["jobId"], [](const json& s) {
+    return s.value("state", "") == "succeeded";
+  })) << status_of(started["jobId"]).dump(2);
+  EXPECT_EQ(one("SELECT count(*) FROM shop.orders WHERE priority = 'high'"),
+            std::to_string(expected_high));
+  EXPECT_EQ(one("SELECT count(*) FROM shop.orders WHERE priority = 'normal'"),
+            std::to_string(total - expected_high));
+  EXPECT_EQ(one("SELECT attnotnull FROM pg_attribute WHERE attrelid = 'shop.orders'::regclass"
+                " AND attname = 'priority'"), "t");
+  EXPECT_EQ(updates() - before_updates, expected_high)
+      << "the walk wrote rows whose value did not differ from the default";
+
+  // Two defaulted columns in consecutive intents: ONE walk, and a row that
+  // differs in only one of them has only that one written.
+  json pair2 = minimal_spec();
+  pair2["id"] = "0009-orders-two-flags";
+  pair2["description"] = "Two flags; most orders have neither.";
+  pair2["intents"] = json::array(
+      {json{{"kind", "add_column"}, {"schema", "shop"}, {"table", "orders"},
+            {"column", "flag_a"}, {"type", "integer"}, {"nullable", false}, {"default", "0"},
+            {"fill", "CASE WHEN orders.id % 40 = 0 THEN 1 ELSE 0 END"}, {"comment", "A."}},
+       json{{"kind", "add_column"}, {"schema", "shop"}, {"table", "orders"},
+            {"column", "flag_b"}, {"type", "integer"}, {"nullable", false}, {"default", "0"},
+            {"fill", "CASE WHEN orders.id % 60 = 0 THEN 2 ELSE 0 END"}, {"comment", "B."}}});
+  {
+    const auto parsed = pglaswell::parse_spec(pair2);
+    pair2["signatures"] = json::array({{{"key_id", test_key().key_id},
+                                        {"algorithm", "ed25519"},
+                                        {"signature", base64(sign(parsed.canonical_bytes))}}});
+  }
+  const auto touched = std::stoll(one("SELECT count(*) FROM shop.orders"
+                                      " WHERE id % 40 = 0 OR id % 60 = 0"));
+  ASSERT_GT(touched, 0);
+  const auto before_pair = updates();
+  started = payload(call("startMigration", json{{"spec", pair2}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, started["jobId"], [](const json& s) {
+    return s.value("state", "") == "succeeded";
+  })) << status_of(started["jobId"]).dump(2);
+  EXPECT_EQ(one("SELECT count(*) FROM shop.orders WHERE flag_a <> CASE WHEN id % 40 = 0 THEN 1"
+                " ELSE 0 END OR flag_b <> CASE WHEN id % 60 = 0 THEN 2 ELSE 0 END"), "0");
+  EXPECT_EQ(one("SELECT count(*) FROM laswell.step WHERE job_id = '" +
+                started["jobId"].get<std::string>() + "'::uuid AND kind = 'backfill'"), "1");
+  EXPECT_EQ(updates() - before_pair, touched)
+      << "one write per row that differs in either column, and none for the rest";
+}
+
+// An exclusive step behind a long APPLICATION transaction. It used to wait all
+// of lock_timeout with every other session queued behind its request, and then
+// fail the job. Now each attempt waits a fraction of a second, is rolled back,
+// and is tried again: the application gets through between attempts, and the
+// job finishes when the transaction in its way does.
+TEST_F(ToolTest, AnExclusiveStepBehindALongTransactionRetriesAndLetsTheApplicationThrough) {
+  make_shop(cfg());
+  json doc = minimal_spec();
+  doc["id"] = "0008-orders-warehouse-required";
+  doc["description"] = "Every order has a warehouse.";
+  doc["intents"] = json::array({json{{"kind", "set_not_null"}, {"schema", "shop"},
+                                     {"table", "orders"}, {"column", "warehouse_id"}}});
+  {
+    const auto parsed = pglaswell::parse_spec(doc);
+    doc["signatures"] = json::array({{{"key_id", test_key().key_id},
+                                      {"algorithm", "ed25519"},
+                                      {"signature", base64(sign(parsed.canonical_bytes))}}});
+  }
+  // The dry run first, on a quiet table; the job is started once the blocker
+  // is in place, without a second rehearsal that would itself wait on it.
+  ASSERT_TRUE(payload(call("planMigration", json{{"spec", doc}})).value("ok", false));
+
+  // An application transaction that has written a row and not finished.
+  // A bare connection, not a WriteSession: that sets
+  // idle_in_transaction_session_timeout, and the server would end this
+  // transaction for us long before the test is done with it.
+  pqxx::connection app_conn(cfg().conninfo);
+  pqxx::work app(app_conn);
+  app.exec("UPDATE shop.orders SET status = status WHERE id = 1");
+
+  const auto started = payload(call("startMigration", json{{"spec", doc}, {"dryRun", false}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  const auto job_id = started["jobId"].get<std::string>();
+
+  // Well past one attempt, and past what lock_timeout used to allow in total.
+  std::this_thread::sleep_for(std::chrono::milliseconds(cfg().executor.lock_timeout_ms + 500));
+  EXPECT_EQ(status_of(job_id).value("state", ""), "running")
+      << "the step should still be trying, not failed: " << status_of(job_id).dump(2);
+
+  // Meanwhile another session writes. Behind a pending exclusive request it
+  // would wait until that request gave up; between attempts it goes through.
+  long long worst_ms = 0;
+  for (int i = 0; i < 5; ++i) {
+    const auto t0 = std::chrono::steady_clock::now();
+    pglaswell::WriteSession other(cfg());
+    other.begin("pg_laswell/test/another-writer");
+    other.txn().exec("INSERT INTO shop.orders(warehouse_id) VALUES (2)");
+    other.commit();
+    worst_ms = std::max<long long>(
+        worst_ms, std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - t0).count());
+  }
+  EXPECT_LT(worst_ms, cfg().executor.lock_timeout_ms / 2)
+      << "an insert waited " << worst_ms << " ms behind the exclusive request";
+
+  app.commit();
+  ASSERT_TRUE(wait_for_status(*this, job_id, [](const json& st) {
+    return st.value("state", "") == "succeeded";
+  })) << status_of(job_id).dump(2);
+
+  pglaswell::ReadSession r(cfg());
+  const auto attempts = r.txn().exec(
+      "SELECT (detail->>'lockAttempts')::int FROM laswell.step"
+      " WHERE job_id = $1::uuid AND ordinal = 0", pqxx::params{job_id});
+  ASSERT_EQ(attempts.size(), 1u);
+  EXPECT_GT(attempts[0][0].as<int>(), 1) << "the first step should have needed more than one try";
+  EXPECT_TRUE(r.txn().exec("SELECT attnotnull FROM pg_attribute WHERE attrelid ="
+                           " 'shop.orders'::regclass AND attname = 'warehouse_id'")[0][0].as<bool>());
+}
+
+// The dry run asks for the same exclusive lock the job will, and the
+// application queues behind that request in a planning call as it does in a
+// job. So it waits as briefly as one attempt of the job, and a lock that does
+// not come is not a defect in the plan: the rest is unverified, and said so.
+TEST_F(ToolTest, TheDryRunDoesNotQueueTheApplicationForAnExclusiveLock) {
+  make_shop(cfg());
+  json doc = minimal_spec();
+  doc["id"] = "0010-orders-note";
+  doc["description"] = "A note on each order.";
+  doc["intents"] = json::array(
+      {json{{"kind", "add_column"}, {"schema", "shop"}, {"table", "orders"},
+            {"column", "note"}, {"type", "text"}, {"nullable", true},
+            {"comment", "Free text."}}});
+  {
+    const auto parsed = pglaswell::parse_spec(doc);
+    doc["signatures"] = json::array({{{"key_id", test_key().key_id},
+                                      {"algorithm", "ed25519"},
+                                      {"signature", base64(sign(parsed.canonical_bytes))}}});
+  }
+  pqxx::connection app_conn(cfg().conninfo);
+  pqxx::work app(app_conn);
+  app.exec("UPDATE shop.orders SET status = status WHERE id = 1");
+
+  const auto plan = payload(call("planMigration", json{{"spec", doc}}));
+  app.commit();
+
+  EXPECT_TRUE(plan.value("ok", false)) << plan.dump(2);
+  const auto& dry = plan["dryRun"];
+  EXPECT_FALSE(dry.contains("problems")) << dry.dump(2);
+  EXPECT_EQ(dry.value("lockUnavailableAtStep", -1), 0) << dry.dump(2);
+  EXPECT_EQ(dry["unverifiedSteps"], json::array({0})) << dry.dump(2);
+  // Not timed here: under valgrind the call itself takes seconds. That the
+  // step is reported this way at all is the short wait -- the two-second one
+  // ended as a problem with the plan.
+}
+
+// The retry is the GROUP's. Two intents that commit together still do when the
+// second cannot get its lock: the transaction is rolled back -- the first
+// intent's work with it -- and the group is run again from its first step.
+// Nothing of it is ever visible half-applied.
+TEST_F(ToolTest, AGroupWhoseExclusiveStepCannotGetItsLockIsRolledBackAndRunAgainWhole) {
+  make_shop(cfg());
+  json doc = minimal_spec();
+  doc["id"] = "0009-orders-note-and-log";
+  doc["description"] = "A note on each order, and a log of who changed it.";
+  doc["intents"] = json::array(
+      {json{{"kind", "create_table"}, {"schema", "shop"}, {"table", "order_log"},
+            {"comment", "Who changed an order."},
+            {"columns", json::array({json{{"name", "id"}, {"type", "bigint"},
+                                          {"nullable", false}, {"comment", "The order."}}})}},
+       json{{"kind", "add_column"}, {"schema", "shop"}, {"table", "orders"},
+            {"column", "note"}, {"type", "text"}, {"nullable", true},
+            {"comment", "Free text."}}});
+  {
+    const auto parsed = pglaswell::parse_spec(doc);
+    doc["signatures"] = json::array({{{"key_id", test_key().key_id},
+                                      {"algorithm", "ed25519"},
+                                      {"signature", base64(sign(parsed.canonical_bytes))}}});
+  }
+  const auto plan = payload(call("planMigration", json{{"spec", doc}}));
+  ASSERT_TRUE(plan.value("ok", false)) << plan.dump(2);
+  ASSERT_EQ(plan["steps"].size(), 2u) << plan.dump(2);
+  ASSERT_EQ(plan["steps"][0]["txnGroup"], plan["steps"][1]["txnGroup"])
+      << "the two intents must share a transaction for this test to mean anything";
+
+  // An application transaction holding a row of the table the SECOND step alters.
+  pqxx::connection app_conn(cfg().conninfo);
+  pqxx::work app(app_conn);
+  app.exec("UPDATE shop.orders SET status = status WHERE id = 1");
+
+  const auto started = payload(call("startMigration", json{{"spec", doc}, {"dryRun", false}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  const auto job_id = started["jobId"].get<std::string>();
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(cfg().executor.lock_timeout_ms + 500));
+  EXPECT_EQ(status_of(job_id).value("state", ""), "running") << status_of(job_id).dump(2);
+  {
+    // The first intent's table is not there: its transaction was rolled back
+    // with the attempt, or has not committed. Never half a group.
+    pglaswell::ReadSession r(cfg());
+    EXPECT_TRUE(r.txn().exec("SELECT to_regclass('shop.order_log')")[0][0].is_null());
+  }
+  // And the application is not queued behind the pending request.
+  const auto t0 = std::chrono::steady_clock::now();
+  {
+    pglaswell::WriteSession other(cfg());
+    other.begin("pg_laswell/test/another-writer");
+    other.txn().exec("INSERT INTO shop.orders(warehouse_id) VALUES (2)");
+    other.commit();
+  }
+  EXPECT_LT(std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count(),
+            cfg().executor.lock_timeout_ms / 2);
+
+  app.commit();
+  ASSERT_TRUE(wait_for_status(*this, job_id, [](const json& st) {
+    return st.value("state", "") == "succeeded";
+  })) << status_of(job_id).dump(2);
+
+  pglaswell::ReadSession r(cfg());
+  EXPECT_FALSE(r.txn().exec("SELECT to_regclass('shop.order_log')")[0][0].is_null());
+  EXPECT_EQ(r.txn().exec("SELECT count(*) FROM pg_attribute WHERE attrelid ="
+                         " 'shop.orders'::regclass AND attname = 'note'")[0][0].as<int>(), 1);
+  const auto rows = r.txn().exec(
+      "SELECT ordinal, state, (detail->>'lockAttempts')::int FROM laswell.step"
+      " WHERE job_id = $1::uuid ORDER BY ordinal", pqxx::params{job_id});
+  ASSERT_EQ(rows.size(), 2u);
+  EXPECT_EQ(rows[0][1].as<std::string>(), "succeeded");
+  EXPECT_EQ(rows[1][1].as<std::string>(), "succeeded");
+  EXPECT_GT(rows[1][2].as<int>(), 1) << "the second step should have needed more than one try";
+  // The job's own record holds each step once, not once an attempt.
+  EXPECT_EQ(status_of(job_id)["steps"].size(), 2u) << status_of(job_id).dump(2);
+}
+
+// THE COMPOSITE WALK. A key unique only together with other columns -- a tenant
+// column first, or a time column on a partitioned table -- is walked along the
+// whole unique index, a full batch at a time, whatever the size of a "group".
+// Found in the field on a hypertable keyed (time, id): the walk by group made
+// every timestamp a group of one row, 550 rows a second.
+// The trigger fills every row made after the walk starts, so the walk stops at
+// the highest key there was. Without the bound, on a table partitioned by time,
+// each batch read in full every partition made since it began.
+TEST(Planner, TheTriggerRecipesWalkStopsAtTheHighestKeyThereWasWhenItStarted) {
+  auto obs = observations(2LL << 30, 8000000);
+  auto plan = pglaswell::plan_migration(spec_with(json::array({filled_column()})), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto* s = find_step(plan, "backfill");
+  ASSERT_NE(s, nullptr);
+  EXPECT_EQ(s->detail.value("upper_bound_sql", ""),
+            "SELECT \"orders\".\"id\" FROM \"shop\".\"orders\" ORDER BY \"orders\".\"id\" "
+            "DESC LIMIT 1;");
+  EXPECT_EQ(s->detail.value("upper_bound_columns", 0), 1);
+  // After the cursor and the limit; NULL -- an empty table -- is no bound.
+  EXPECT_NE(s->sql[0].find("\"orders\".\"id\" > $1 AND (\"orders\".\"id\" <= $3 OR $3 IS NULL)"),
+            std::string::npos) << s->sql[0];
+
+  // A composite key: the bound is the whole key, after its two cursor marks
+  // and the limit.
+  auto& t = obs.tables["shop.orders"];
+  t["columns"]["created_at"] = json{{"type", "timestamp with time zone"}, {"not_null", true}};
+  t["columns"]["id"] = json{{"type", "bigint"}, {"not_null", true}};
+  t["indexes"] = json{{"orders_pkey",
+                       {{"is_valid", true}, {"is_unique", true}, {"is_primary", true},
+                        {"leading_column", "id"},
+                        {"columns", json::array({"id", "created_at"})}, {"predicate", ""},
+                        {"has_expressions", false}}}};
+  plan = pglaswell::plan_migration(spec_with(json::array({filled_column()})), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  s = find_step(plan, "backfill");
+  EXPECT_NE(s->sql[0].find("AND ((\"orders\".\"id\", \"orders\".\"created_at\") <= ($4, $5) "
+                           "OR $4 IS NULL)"),
+            std::string::npos) << s->sql[0];
+  EXPECT_EQ(s->detail.value("upper_bound_columns", 0), 2);
+
+  // A key that does not grow bounds nothing: new rows land everywhere below it.
+  t["columns"]["id"]["type"] = "uuid";
+  plan = pglaswell::plan_migration(spec_with(json::array({filled_column()})), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  EXPECT_FALSE(find_step(plan, "backfill")->detail.contains("upper_bound_sql"));
+
+  // And a backfill the author wrote has no trigger behind it: no bound.
+  json doc = minimal_spec();
+  plan = pglaswell::plan_migration(pglaswell::parse_spec(doc), observations(2LL << 30, 8000000), {});
+  ASSERT_NE(find_step(plan, "backfill"), nullptr);
+  EXPECT_FALSE(find_step(plan, "backfill")->detail.contains("upper_bound_sql"));
+}
+
+// "non-volatile default is catalog-only" was said of every default, checked
+// for none. Measured: a constant and now() did not rewrite the table;
+// gen_random_uuid() did, under AccessExclusiveLock. What a function is, is in
+// pg_proc and not in the text, so the plan stops claiming and says how to know.
+TEST(Planner, ADefaultThatCallsAFunctionIsNotClaimedToBeCatalogOnly) {
+  const auto obs = observations(2LL << 30, 8000000);
+  const auto with_default = [&](const char* dflt) {
+    return pglaswell::plan_migration(
+        spec_of(json::array({json{{"kind", "add_column"}, {"schema", "shop"},
+                                  {"table", "orders"}, {"column", "token"}, {"type", "text"},
+                                  {"nullable", false}, {"default", dflt},
+                                  {"comment", "A token."}}})),
+        obs, {});
+  };
+  auto plan = with_default("'none'");
+  ASSERT_TRUE(plan.ok) << plan.render();
+  EXPECT_NE(plan.steps[0].why.find("a constant default is catalog-only"), std::string::npos)
+      << plan.steps[0].why;
+  for (const auto& w : plan.warnings) EXPECT_EQ(w.find("calls a function"), std::string::npos);
+  // A parenthesis inside a string is not a call.
+  plan = with_default("'a (b)'");
+  EXPECT_NE(plan.steps[0].why.find("a constant default"), std::string::npos);
+
+  plan = with_default("gen_random_uuid()::text");
+  ASSERT_TRUE(plan.ok) << plan.render();
+  EXPECT_NE(plan.steps[0].why.find("only if that function is not volatile"), std::string::npos)
+      << plan.steps[0].why;
+  EXPECT_EQ(plan.steps[0].detail.value("expected", ""),
+            "metadata only, unless the default is volatile");
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("REWRITES the whole table") != std::string::npos &&
+        w.find("provolatile") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned) << plan.render();
+}
+
+// A table keyed (time, id) has no single-column primary key, and the fill
+// refused it -- while the walk it hands to takes such a key whole.
+TEST(Planner, AFillWithNoKeyWalksACompositePrimaryKey) {
+  auto obs = observations(2LL << 30, 8000000);
+  auto& t = obs.tables["shop.orders"];
+  t["columns"]["created_at"] = json{{"type", "timestamp with time zone"}, {"not_null", true}};
+  t["columns"]["id"] = json{{"type", "bigint"}, {"not_null", true}};
+  t["indexes"] = json{{"orders_pkey",
+                       {{"is_valid", true}, {"is_unique", true}, {"is_primary", true},
+                        {"leading_column", "created_at"},
+                        {"columns", json::array({"created_at", "id"})}, {"predicate", ""},
+                        {"has_expressions", false}}}};
+  const auto plan = pglaswell::plan_migration(spec_with(json::array({filled_column()})), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto* s = find_step(plan, "backfill");
+  ASSERT_NE(s, nullptr);
+  EXPECT_EQ(s->detail.value("batch_mode", ""), "composite") << plan.render();
+  EXPECT_EQ(s->detail["key_columns"], json::array({"created_at", "id"}));
+}
+
+TEST(Planner, AKeyUniqueOnlyWithOtherColumnsIsWalkedAlongTheWholeIndex) {
+  auto obs = observations(64 << 20, 1000000);
+  auto& t = obs.tables["shop.orders"];
+  t["columns"]["created_at"] = json{{"type", "timestamp with time zone"}, {"not_null", true}};
+  t["columns"]["id"] = json{{"type", "bigint"}, {"not_null", true}};
+  const auto with_key = [&](json cols) {
+    t["indexes"] = json{{"orders_pkey",
+                         {{"is_valid", true}, {"is_unique", true}, {"is_primary", true},
+                          {"leading_column", cols[0]}, {"columns", cols}, {"predicate", ""},
+                          {"has_expressions", false}}}};
+    json doc = minimal_spec();
+    doc["intents"] = json::array({json{{"kind", "backfill"}, {"schema", "shop"},
+                                       {"table", "orders"}, {"key", "id"},
+                                       {"set", {{"fulfilment_region", "'x'"}}},
+                                       {"where", "orders.fulfilment_region IS NULL"}}});
+    return pglaswell::plan_migration(pglaswell::parse_spec(doc), obs, {});
+  };
+
+  // (time, id): the key is second -- what the walk by group used to take.
+  auto plan = with_key(json::array({"created_at", "id"}));
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto* s = find_step(plan, "backfill");
+  ASSERT_NE(s, nullptr);
+  EXPECT_EQ(s->detail.value("batch_mode", ""), "composite") << plan.render();
+  EXPECT_EQ(s->detail["key_columns"], json::array({"created_at", "id"}));
+  ASSERT_EQ(s->sql.size(), 2u);
+  EXPECT_NE(s->sql[0].find("WHERE ((\"orders\".\"created_at\", \"orders\".\"id\") > ($1, $2) "
+                           "OR $1 IS NULL) AND (orders.fulfilment_region IS NULL)"),
+            std::string::npos) << s->sql[0];
+  EXPECT_NE(s->sql[0].find("ORDER BY \"orders\".\"created_at\", \"orders\".\"id\"\n LIMIT $3"),
+            std::string::npos) << s->sql[0];
+  EXPECT_NE(s->sql[0].find("FOR UPDATE OF \"orders\""), std::string::npos);
+  // Each column against its own array finds the rows, and on a partitioned
+  // table the partitions. The tuple is a FILTER beside them, not a join: as a
+  // join the planner ran it as a nested loop with 499 500 comparisons discarded
+  // for a batch of 1 000 (found in the field on a hypertable under load).
+  EXPECT_NE(s->sql[1].find(
+                " WHERE \"orders\".\"created_at\" = ANY($1::timestamp with time zone[]) AND "
+                "\"orders\".\"id\" = ANY($2::bigint[]) AND ((\"orders\".\"created_at\", "
+                "\"orders\".\"id\") IN (SELECT * FROM unnest($1::timestamp with time zone[], "
+                "$2::bigint[]))) IS TRUE AND (orders.fulfilment_region IS NULL)"),
+            std::string::npos) << s->sql[1];
+  EXPECT_NE(s->why.find("keyset walk on (created_at, id) together"), std::string::npos) << s->why;
+
+  // (id, time): the key is FIRST, which the walk by group refused outright.
+  plan = with_key(json::array({"id", "created_at"}));
+  ASSERT_TRUE(plan.ok) << plan.render();
+  s = find_step(plan, "backfill");
+  EXPECT_EQ(s->detail["key_columns"], json::array({"id", "created_at"}));
+  EXPECT_NE(s->sql[0].find("(\"orders\".\"id\", \"orders\".\"created_at\") > ($1, $2)"),
+            std::string::npos) << s->sql[0];
+
+  // A NULLABLE column in the index: rows with a NULL there are passed over by
+  // a row comparison, so that index is not a key to walk.
+  t["columns"]["created_at"]["not_null"] = false;
+  plan = with_key(json::array({"id", "created_at"}));
+  EXPECT_FALSE(plan.ok) << plan.render();
+}
+
+// A grouped walk must not ask which group is next while it holds the row locks
+// of the batches before. Found in the field, under load on Citus: that
+// question ran inside the transaction, took up to 1.5 s, and updates to rows
+// the walk had just touched waited for it. So the walk commits at the end of a
+// group FIRST. Proved here by making every other commit trigger unreachable:
+// the commits that then happen mid-walk can only be those.
+TEST_F(ToolTest, AGroupedWalkCommitsAtTheEndOfAGroupBeforeLookingForTheNext) {
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/tenants");
+    w.txn().exec("DROP SCHEMA IF EXISTS shop CASCADE");
+    w.txn().exec("CREATE SCHEMA shop");
+    // Unique only as (tenant_id, id), and tenant_id NULLABLE: the composite
+    // walk needs every key column NOT NULL, so this table is still walked by
+    // group -- which off Citus is now the only way to reach that walk.
+    w.txn().exec("CREATE TABLE shop.entries(tenant_id int, id bigint NOT NULL,"
+                 " flag boolean, UNIQUE (tenant_id, id))");
+    w.txn().exec("INSERT INTO shop.entries SELECT t, g, NULL FROM generate_series(1, 6) t,"
+                 " generate_series(1, 300) g");
+    // Tenants 2 and 3 have nothing left: groups the walk must pass, which the
+    // next-group question no longer filters out.
+    w.txn().exec("UPDATE shop.entries SET flag = true WHERE tenant_id IN (2, 3)");
+    w.commit();
+    w.exec_nontransactional("ANALYZE shop.entries");
+  }
+  auto e = cfg().executor;
+  e.batch_rows = 100;
+  e.commit_interval_ms = 600000;  // unreachable here
+  e.batch_cap_rows = 100000000;   // unreachable here
+  e.pause_waiters = 1000;
+  set_executor(e);
+
+  json doc = minimal_spec();
+  doc["id"] = "0010-entries-flag";
+  doc["description"] = "Flag every entry.";
+  doc["intents"] = json::array({json{{"kind", "backfill"}, {"schema", "shop"},
+                                     {"table", "entries"}, {"key", "id"},
+                                     {"set", json{{"flag", "true"}}},
+                                     {"where", "entries.flag IS NULL"}}});
+  {
+    const auto parsed = pglaswell::parse_spec(doc);
+    doc["signatures"] = json::array({{{"key_id", test_key().key_id},
+                                      {"algorithm", "ed25519"},
+                                      {"signature", base64(sign(parsed.canonical_bytes))}}});
+  }
+  const auto started = payload(call("startMigration", json{{"spec", doc}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, started["jobId"], [](const json& s) {
+    return s.value("state", "") == "succeeded";
+  })) << status_of(started["jobId"]).dump(2);
+
+  pglaswell::ReadSession r(cfg());
+  EXPECT_EQ(r.txn().exec("SELECT count(*) FROM shop.entries WHERE flag IS NOT TRUE")[0][0].as<int>(), 0);
+  const auto st = status_of(started["jobId"]);
+  ASSERT_TRUE(st.contains("backfill")) << st.dump(2);
+  const auto& reasons = st["backfill"]["commitReasons"];
+  // Four tenants had work (1, 4, 5, 6). Each ends with uncommitted batches,
+  // and each of those ends is a commit of its own before the next is sought.
+  EXPECT_GE(reasons.value("group_end", 0), 4) << st["backfill"].dump(2);
+  EXPECT_EQ(reasons.value("interval", 0) + reasons.value("batch_cap", 0), 0)
+      << "another trigger was reachable, so group_end proves nothing: " << reasons.dump();
+  EXPECT_EQ(r.txn().exec("SELECT rows_done FROM laswell.backfill_cursor WHERE job_id = $1::uuid",
+                         pqxx::params{started["jobId"].get<std::string>()})[0][0].as<int>(),
+            1200) << "only the rows that had work are walked: " << st["backfill"].dump(2);
+}
+
+// The composite walk through a real job: a table keyed (stamp, id) with one row
+// per stamp -- the shape that made the walk by group a row at a time -- filled
+// in full batches, the pre-image captured by the whole key, and resumed after
+// a cancel from a cursor that is the last row's whole key.
+TEST_F(ToolTest, ACompositeWalkFillsATableKeyedByTimeAndIdInFullBatches) {
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/events");
+    w.txn().exec("DROP SCHEMA IF EXISTS shop CASCADE");
+    w.txn().exec("CREATE SCHEMA shop");
+    w.txn().exec("CREATE TABLE shop.events(stamp timestamptz NOT NULL, id bigint NOT NULL,"
+                 " payload jsonb NOT NULL, customer bigint, PRIMARY KEY (stamp, id))");
+    // Every stamp distinct: 5 000 groups of one row each.
+    w.txn().exec("INSERT INTO shop.events SELECT '2026-01-01'::timestamptz + g * interval"
+                 " '1 second', g, jsonb_build_object('customer', g * 7), NULL"
+                 " FROM generate_series(1, 5000) g");
+    w.commit();
+    w.exec_nontransactional("ANALYZE shop.events");
+  }
+  auto e = cfg().executor;
+  e.batch_rows = 500;
+  e.commit_interval_ms = 600000;  // unreachable: commits come from the row cap
+  e.batch_cap_rows = 1000;
+  set_executor(e);
+
+  json doc = minimal_spec();
+  doc["id"] = "0011-events-customer";
+  doc["description"] = "The customer, out of the payload.";
+  doc["intents"] = json::array(
+      {json{{"kind", "backfill"}, {"schema", "shop"}, {"table", "events"}, {"key", "id"},
+            {"set", json{{"customer", "(payload->>'customer')::bigint"}}},
+            {"where", "events.customer IS NULL"},
+            {"preserve", json{{"schema", "shop"}, {"table", "events_before"}}}}});
+  {
+    const auto parsed = pglaswell::parse_spec(doc);
+    doc["signatures"] = json::array({{{"key_id", test_key().key_id},
+                                      {"algorithm", "ed25519"},
+                                      {"signature", base64(sign(parsed.canonical_bytes))}}});
+  }
+  const auto plan = payload(call("planMigration", json{{"spec", doc}}));
+  ASSERT_TRUE(plan.value("ok", false)) << plan.dump(2);
+  EXPECT_FALSE(plan["dryRun"].contains("problems")) << plan["dryRun"].dump(2);
+
+  const auto started = payload(call("startMigration", json{{"spec", doc}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, started["jobId"], [](const json& s) {
+    return s.value("state", "") == "succeeded";
+  })) << status_of(started["jobId"]).dump(2);
+
+  pglaswell::ReadSession r(cfg());
+  EXPECT_EQ(r.txn().exec("SELECT count(*) FROM shop.events WHERE customer IS DISTINCT FROM"
+                         " id * 7")[0][0].as<int>(), 0);
+  // Full batches, not a row each: 5 000 rows at a cap of 1 000 a transaction is
+  // five commits and the final one. The walk by group made 5 000.
+  const auto cur = r.txn().exec(
+      "SELECT rows_done, commits, last_key FROM laswell.backfill_cursor WHERE job_id = $1::uuid",
+      pqxx::params{started["jobId"].get<std::string>()});
+  ASSERT_EQ(cur.size(), 1u);
+  EXPECT_EQ(cur[0][0].as<int>(), 5000);
+  EXPECT_LE(cur[0][1].as<int>(), 7) << "a commit per row is what this walk exists to avoid";
+  // The cursor is the last row's WHOLE key.
+  const auto last = json::parse(cur[0][2].as<std::string>());
+  ASSERT_TRUE(last.is_array());
+  EXPECT_EQ(last.size(), 2u) << last.dump();
+  EXPECT_EQ(last[1], "5000") << last.dump();
+  // The pre-image names each row by its whole key and holds what it had.
+  EXPECT_EQ(r.txn().exec("SELECT count(*) FROM shop.events_before b JOIN shop.events e"
+                         " ON e.stamp = b.stamp AND e.id = b.id WHERE b.customer IS NULL")
+                [0][0].as<int>(), 5000);
+}
+
+// The whole trigger recipe on a hypertable keyed (id, time), where TimescaleDB
+// is installed: the composite walk, its upper bound, and the batch update whose
+// tuple test is a filter -- under TimescaleDB's own update path, which a plain
+// table does not exercise.
+TEST_F(ToolTest, TheTriggerRecipeFillsAHypertableAndStopsAtTheKeyItStartedBelow) {
+  {
+    pglaswell::ReadSession r(cfg());
+    if (r.txn().exec("SELECT 1 FROM pg_available_extensions WHERE name = 'timescaledb'").empty()) {
+      GTEST_SKIP() << "TimescaleDB is not installed on this server";
+    }
+  }
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/hyper");
+    w.txn().exec("CREATE EXTENSION IF NOT EXISTS timescaledb");
+    w.txn().exec("DROP SCHEMA IF EXISTS shop CASCADE");
+    w.txn().exec("CREATE SCHEMA shop");
+    w.txn().exec("CREATE TABLE shop.msg(id bigint NOT NULL, stamp timestamptz NOT NULL,"
+                 " payload jsonb NOT NULL, PRIMARY KEY (id, stamp))");
+    w.txn().exec("SELECT create_hypertable('shop.msg', by_range('stamp', interval '10 minutes'))");
+    // Six chunks of a thousand rows.
+    w.txn().exec("INSERT INTO shop.msg SELECT g, '2026-01-01'::timestamptz + g * interval"
+                 " '0.6 second', jsonb_build_object('customer', g * 7)"
+                 " FROM generate_series(1, 6000) g");
+    w.commit();
+    w.exec_nontransactional("ANALYZE shop.msg");
+  }
+  auto e = cfg().executor;
+  e.batch_rows = 500;
+  set_executor(e);
+
+  json doc = minimal_spec();
+  doc["id"] = "0013-msg-customer";
+  doc["description"] = "The customer, out of the payload.";
+  doc["intents"] = json::array(
+      {json{{"kind", "add_column"}, {"schema", "shop"}, {"table", "msg"},
+            {"column", "customer"}, {"type", "bigint"}, {"nullable", false},
+            {"fill", "(payload->>'customer')::bigint"}, {"after", "drop_trigger"},
+            {"comment", "The customer the message was sent to."}}});
+  {
+    const auto parsed = pglaswell::parse_spec(doc);
+    doc["signatures"] = json::array({{{"key_id", test_key().key_id},
+                                      {"algorithm", "ed25519"},
+                                      {"signature", base64(sign(parsed.canonical_bytes))}}});
+  }
+  const auto plan = payload(call("planMigration", json{{"spec", doc}}));
+  ASSERT_TRUE(plan.value("ok", false)) << plan.dump(2);
+  EXPECT_FALSE(plan["dryRun"].contains("problems")) << plan["dryRun"].dump(2);
+
+  const auto started = payload(call("startMigration", json{{"spec", doc}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, started["jobId"], [](const json& s) {
+    return s.value("state", "") == "succeeded";
+  })) << status_of(started["jobId"]).dump(2);
+
+  pglaswell::ReadSession r(cfg());
+  EXPECT_EQ(r.txn().exec("SELECT count(*) FROM shop.msg WHERE customer IS DISTINCT FROM id * 7")
+                [0][0].as<int>(), 0);
+  EXPECT_EQ(r.txn().exec("SELECT attnotnull FROM pg_attribute WHERE attrelid ="
+                         " 'shop.msg'::regclass AND attname = 'customer'")[0][0].as<bool>(),
+            true);
+  const auto cur = r.txn().exec(
+      "SELECT rows_done FROM laswell.backfill_cursor WHERE job_id = $1::uuid",
+      pqxx::params{started["jobId"].get<std::string>()});
+  ASSERT_EQ(cur.size(), 1u);
+  EXPECT_EQ(cur[0][0].as<int>(), 6000);
+}
+
+// A unique constraint on a partitioned table, end to end, and resumed. One ADD
+// CONSTRAINT locks every partition for every build; the concurrent recipe's
+// first statement is refused on a partitioned parent. So: the constraint on
+// ONLY the parent, then each partition's index built concurrently, adopted as
+// its constraint and attached.
+TEST_F(ToolTest, AUniqueConstraintOnAPartitionedTableIsBuiltAPartitionAtATimeAndResumes) {
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/parts");
+    w.txn().exec("DROP SCHEMA IF EXISTS shop CASCADE");
+    w.txn().exec("CREATE SCHEMA shop");
+    w.txn().exec("CREATE TABLE shop.ev(id bigint NOT NULL, day int NOT NULL, v text)"
+                 " PARTITION BY RANGE (day)");
+    w.txn().exec("CREATE TABLE shop.ev_a PARTITION OF shop.ev FOR VALUES FROM (0) TO (10)");
+    w.txn().exec("CREATE TABLE shop.ev_b PARTITION OF shop.ev FOR VALUES FROM (10) TO (20)");
+    w.txn().exec("INSERT INTO shop.ev SELECT g, g % 20, 'x' FROM generate_series(1, 2000) g");
+    // A duplicate in the second partition: its build must fail.
+    w.txn().exec("INSERT INTO shop.ev VALUES (15, 15, 'again')");
+    w.commit();
+  }
+  const auto spec_for = [&](const char* id) {
+    json doc = minimal_spec();
+    doc["id"] = id;
+    doc["description"] = "One event per id and day.";
+    doc["intents"] = json::array(
+        {json{{"kind", "add_unique_constraint"}, {"schema", "shop"}, {"table", "ev"},
+              {"name", "ev_day_id_key"}, {"columns", json::array({"day", "id"})}}});
+    const auto parsed = pglaswell::parse_spec(doc);
+    doc["signatures"] = json::array({{{"key_id", test_key().key_id},
+                                      {"algorithm", "ed25519"},
+                                      {"signature", base64(sign(parsed.canonical_bytes))}}});
+    return doc;
+  };
+
+  const auto doc = spec_for("0014-ev-unique");
+  const auto plan = payload(call("planMigration", json{{"spec", doc}}));
+  ASSERT_TRUE(plan.value("ok", false)) << plan.dump(2);
+  // Parent alone; then build, adopt, attach for each of two partitions; verify.
+  ASSERT_EQ(plan["steps"].size(), 8u) << plan.dump(2);
+  EXPECT_NE(plan["steps"][0]["sql"].dump().find("ALTER TABLE ONLY \\\"shop\\\".\\\"ev\\\""),
+            std::string::npos) << plan["steps"][0].dump(2);
+  EXPECT_EQ(plan.dump().find("CONCURRENTLY \\\"ev_day_id_key\\\" ON \\\"shop\\\".\\\"ev\\\" "),
+            std::string::npos) << "no concurrent build on the parent";
+
+  auto started = payload(call("startMigration", json{{"spec", doc}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, started["jobId"], [](const json& s) {
+    return s.value("state", "") == "failed";
+  })) << status_of(started["jobId"]).dump(2);
+  {
+    pglaswell::ReadSession r(cfg());
+    // The first partition is done and attached; the second's index is INVALID.
+    EXPECT_EQ(r.txn().exec("SELECT count(*) FROM pg_inherits WHERE inhparent ="
+                           " 'shop.ev_day_id_key'::regclass")[0][0].as<int>(), 1);
+    EXPECT_EQ(r.txn().exec("SELECT indisvalid FROM pg_index WHERE indexrelid ="
+                           " 'shop.ev_b_ev_day_id_key'::regclass")[0][0].as<bool>(), false);
+  }
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/parts-fix");
+    w.txn().exec("DELETE FROM shop.ev WHERE v = 'again'");
+    w.commit();
+  }
+
+  // Applied again: only what is missing -- the invalid index is dropped and
+  // rebuilt, adopted, attached.
+  const auto again = payload(call("planMigration", json{{"spec", doc}}));
+  ASSERT_TRUE(again.value("ok", false)) << again.dump(2);
+  ASSERT_EQ(again["steps"].size(), 4u) << again.dump(2);
+  EXPECT_NE(again["steps"][0]["sql"].dump().find("DROP INDEX CONCURRENTLY"), std::string::npos);
+  started = payload(call("startMigration", json{{"spec", doc}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, started["jobId"], [](const json& s) {
+    return s.value("state", "") == "succeeded";
+  })) << status_of(started["jobId"]).dump(2);
+
+  pglaswell::ReadSession r(cfg());
+  EXPECT_EQ(r.txn().exec("SELECT indisvalid FROM pg_index WHERE indexrelid ="
+                         " 'shop.ev_day_id_key'::regclass")[0][0].as<bool>(), true);
+  EXPECT_EQ(r.txn().exec("SELECT count(*) FROM pg_constraint WHERE conname LIKE"
+                         " '%ev_day_id_key' AND contype = 'u'")[0][0].as<int>(), 3);
+  // And it is then simply present.
+  const auto third = payload(call("planMigration", json{{"spec", doc}}));
+  EXPECT_EQ(third["steps"][0].value("action", ""), "satisfied") << third.dump(2);
+}
+
+// A table keyed (tenant, id) has no single column that names a row, and no
+// unique index on one can be made where the table is distributed, partitioned
+// or a hypertable. update_rows and merge_rows refused it outright, delete_rows
+// by values deleted every tenant's row with a listed id, and insert_rows
+// refused two tenants with the same id as "the same key twice". A list of
+// columns as the key names the row.
+TEST_F(ToolTest, AListOfColumnsAsKeyNamesTheRowOnATableKeyedByTwo) {
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/two-keys");
+    w.txn().exec("DROP SCHEMA IF EXISTS shop CASCADE");
+    w.txn().exec("CREATE SCHEMA shop");
+    w.txn().exec("CREATE TABLE shop.lines(tenant int NOT NULL, id bigint NOT NULL, v text,"
+                 " PRIMARY KEY (tenant, id))");
+    // Three tenants, the same 400 ids each.
+    w.txn().exec("INSERT INTO shop.lines SELECT t, g, 'old' FROM generate_series(1, 400) g,"
+                 " generate_series(1, 3) t");
+    w.txn().exec("CREATE TABLE shop.staged(tenant int NOT NULL, id bigint NOT NULL, v text)");
+    // Tenant 2 only, in an order that is not the key's.
+    w.txn().exec("INSERT INTO shop.staged SELECT 2, g, 'new' FROM generate_series(400, 1, -1) g");
+    w.commit();
+  }
+  auto e = cfg().executor;
+  e.batch_rows = 50;
+  set_executor(e);
+  const json key = json::array({"tenant", "id"});
+  const auto run = [&](const char* id, json intent) {
+    json doc = minimal_spec();
+    doc["id"] = id;
+    doc["description"] = "Rows named by tenant and id.";
+    doc["intents"] = json::array({std::move(intent)});
+    const auto parsed = pglaswell::parse_spec(doc);
+    doc["signatures"] = json::array({{{"key_id", test_key().key_id},
+                                      {"algorithm", "ed25519"},
+                                      {"signature", base64(sign(parsed.canonical_bytes))}}});
+    const auto plan = payload(call("planMigration", json{{"spec", doc}}));
+    EXPECT_TRUE(plan.value("ok", false)) << plan.dump(2);
+    EXPECT_FALSE(plan["dryRun"].contains("problems")) << plan["dryRun"].dump(2);
+    const auto started = payload(call("startMigration", json{{"spec", doc}}));
+    EXPECT_TRUE(started.value("accepted", false)) << started.dump(2);
+    EXPECT_TRUE(wait_for_status(*this, started["jobId"], [](const json& st) {
+      return st.value("state", "") == "succeeded";
+    })) << status_of(started["jobId"]).dump(2);
+  };
+  const auto count = [&](const std::string& where) {
+    pglaswell::ReadSession r(cfg());
+    return r.txn().exec("SELECT count(*) FROM shop.lines WHERE " + where)[0][0].as<int>();
+  };
+
+  // update_rows, paced, with a pre-image: 400 rows of one tenant, in batches of
+  // 50 along (tenant, id). Nothing of tenants 1 and 3 moves.
+  run("0015-lines-update",
+      json{{"kind", "update_rows"}, {"schema", "shop"}, {"table", "lines"}, {"key", key},
+           {"columns", json::array({"tenant", "id", "v"})},
+           {"select", "SELECT tenant, id, v FROM shop.staged"},
+           {"preserve", json{{"schema", "shop"}, {"table", "lines_before"}}}});
+  EXPECT_EQ(count("v = 'new'"), 400);
+  EXPECT_EQ(count("v = 'new' AND tenant <> 2"), 0);
+  {
+    pglaswell::ReadSession r(cfg());
+    EXPECT_EQ(r.txn().exec("SELECT count(*) FROM shop.lines_before WHERE tenant = 2 AND v = 'old'")
+                  [0][0].as<int>(), 400);
+  }
+
+  // update_rows by values: the same id for two tenants is two rows.
+  run("0016-lines-two",
+      json{{"kind", "update_rows"}, {"schema", "shop"}, {"table", "lines"}, {"key", key},
+           {"columns", json::array({"tenant", "id", "v"})},
+           {"values", json::array({json::array({1, 7, "one"}), json::array({3, 7, "three"})})}});
+  EXPECT_EQ(count("tenant = 1 AND id = 7 AND v = 'one'"), 1);
+  EXPECT_EQ(count("tenant = 3 AND id = 7 AND v = 'three'"), 1);
+  EXPECT_EQ(count("tenant = 2 AND id = 7 AND v = 'new'"), 1);
+
+  // delete_rows by values: one tenant's row, not every tenant's.
+  run("0017-lines-delete",
+      json{{"kind", "delete_rows"}, {"schema", "shop"}, {"table", "lines"}, {"key", key},
+           {"columns", json::array({"tenant", "id"})},
+           {"values", json::array({json::array({1, 9})})}});
+  EXPECT_EQ(count("id = 9"), 2);
+  EXPECT_EQ(count("tenant = 1 AND id = 9"), 0);
+
+  // merge_rows: one matched, one new.
+  run("0018-lines-merge",
+      json{{"kind", "merge_rows"}, {"schema", "shop"}, {"table", "lines"}, {"key", key},
+           {"columns", json::array({"tenant", "id", "v"})},
+           {"values", json::array({json::array({3, 8, "merged"}),
+                                   json::array({3, 5000, "added"})})}});
+  EXPECT_EQ(count("tenant = 3 AND id = 8 AND v = 'merged'"), 1);
+  EXPECT_EQ(count("tenant = 3 AND id = 5000 AND v = 'added'"), 1);
+  EXPECT_EQ(count("id = 8 AND v = 'merged'"), 1);
+
+  // insert_rows: the same id under two tenants is not the same key twice.
+  run("0019-lines-insert",
+      json{{"kind", "insert_rows"}, {"schema", "shop"}, {"table", "lines"}, {"key", key},
+           {"columns", json::array({"tenant", "id", "v"})},
+           {"values", json::array({json::array({1, 6000, "a"}), json::array({2, 6000, "b"})})}});
+  EXPECT_EQ(count("id = 6000"), 2);
+}
+
+// A paced select names its cursor by a key VALUE, and nothing makes that key
+// unique in the source. Cut at LIMIT alone, the rows sharing a batch's last key
+// but past its limit were below the next cursor and never considered -- 6 000
+// source rows loaded as fewer, with no error. A batch ends on a whole key.
+TEST_F(ToolTest, APacedSelectLoadsEveryRowWhenTheKeyRepeatsInTheSource) {
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/ties");
+    w.txn().exec("DROP SCHEMA IF EXISTS shop CASCADE");
+    w.txn().exec("CREATE SCHEMA shop");
+    w.txn().exec("CREATE TABLE shop.staged(tenant int NOT NULL, id bigint NOT NULL, v text)");
+    // Every id three times, once a tenant: no batch of 100 ends between ids.
+    w.txn().exec("INSERT INTO shop.staged SELECT t, g, 'v' FROM generate_series(1, 2000) g,"
+                 " generate_series(1, 3) t");
+    w.txn().exec("CREATE TABLE shop.lines(tenant int NOT NULL, id bigint NOT NULL, v text,"
+                 " PRIMARY KEY (tenant, id))");
+    w.commit();
+  }
+  auto e = cfg().executor;
+  e.batch_rows = 100;
+  set_executor(e);
+
+  json doc = minimal_spec();
+  doc["id"] = "0012-lines-load";
+  doc["description"] = "Every staged line, for every tenant.";
+  doc["intents"] = json::array(
+      {json{{"kind", "insert_rows"}, {"schema", "shop"}, {"table", "lines"}, {"key", "id"},
+            {"columns", json::array({"tenant", "id", "v"})},
+            {"select", "SELECT tenant, id, v FROM shop.staged"}}});
+  {
+    const auto parsed = pglaswell::parse_spec(doc);
+    doc["signatures"] = json::array({{{"key_id", test_key().key_id},
+                                      {"algorithm", "ed25519"},
+                                      {"signature", base64(sign(parsed.canonical_bytes))}}});
+  }
+  const auto started = payload(call("startMigration", json{{"spec", doc}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, started["jobId"], [](const json& s) {
+    return s.value("state", "") == "succeeded";
+  })) << status_of(started["jobId"]).dump(2);
+
+  pglaswell::ReadSession r(cfg());
+  EXPECT_EQ(r.txn().exec("SELECT count(*) FROM shop.lines")[0][0].as<int>(), 6000);
 }
 
 TEST_F(ToolTest, AFailedStepFailsTheJobAndTheLedgerSaysWhich) {
@@ -5560,6 +7424,13 @@ TEST(Planner, ABackfillWhoseKeyIsUniqueOnlyWithinAGroupWalksGroupByGroup) {
   const auto* s = find_step(plan, "backfill");
   ASSERT_NE(s, nullptr);
   EXPECT_EQ(s->detail.value("batch_mode", ""), "grouped") << plan.render();
+  // WHICH GROUP IS NEXT is the next value and nothing more: no predicate and
+  // no DISTINCT, so it is a probe of the index the walk already requires. With
+  // the predicate it read every row of a finished group to pass it (measured:
+  // 359 ms against 0.017 ms; on a Citus shard in the field, up to 1.5 s).
+  EXPECT_EQ(s->sql.at(0).find("DISTINCT"), std::string::npos) << s->sql.at(0);
+  EXPECT_EQ(s->sql.at(0).find(" AND ("), std::string::npos) << s->sql.at(0);
+  EXPECT_NE(s->sql.at(0).find("ORDER BY"), std::string::npos) << s->sql.at(0);
   EXPECT_EQ(s->detail.value("group_column", ""), "tenant_id");
   EXPECT_EQ(s->detail.value("supporting_index", ""), "ledger_pkey");
   // No module decided this -- and none may be credited with it.
@@ -5895,6 +7766,30 @@ TEST(Planner, DetachingALargePartitionUsesConcurrentlyOutsideATransaction) {
   }
   EXPECT_TRUE(warned) << "the recoverable-but-awkward state must be stated: "
                       << plan.render();
+}
+
+// Measured on 18.6: "cannot detach partitions concurrently when a default
+// partition exists". Planned CONCURRENTLY it failed in the job, outside any
+// transaction, where the dry run never went.
+TEST(Planner, BesideADefaultPartitionTheDetachIsPlainAndSaysWhatItBlocks) {
+  auto obs = obs_partitioned(/*with_default=*/true);
+  obs.server_version = 180006;
+  const auto plan = pglaswell::plan_migration(detach_spec(), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto* step = steps_of(plan, "detach_partition")[0];
+  EXPECT_EQ(all_sql(*step).find("CONCURRENTLY"), std::string::npos) << all_sql(*step);
+  EXPECT_EQ(step->txn_class, pglaswell::TxnClass::kRequired);
+  EXPECT_EQ(step->detail.value("method", ""), "plain");
+  EXPECT_NE(step->lock.find("the DEFAULT partition shop.events_def"), std::string::npos)
+      << step->lock;
+  EXPECT_NE(step->why.find("refuses DETACH ... CONCURRENTLY beside one"), std::string::npos)
+      << step->why;
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("EVERY partition") != std::string::npos &&
+        w.find("shop.events_def") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned) << plan.render();
 }
 
 TEST(Planner, ASmallQuietPartitionIsDetachedPlainly) {
@@ -6537,10 +8432,14 @@ TEST(Planner, AddColumnIsNotBlockedByViewsButWarnsTheColumnIsInvisible) {
   // statement list rather than on one forbidden keyword, so a future change
   // that starts emitting view DDL here fails loudly.
   const auto* step = steps_of(plan, "add_column")[0];
-  ASSERT_EQ(step->sql.size(), 2u) << all_sql(*step);
-  EXPECT_NE(step->sql[0].find("ALTER TABLE \"shop\".\"orders\" ADD COLUMN \"region\""),
-            std::string::npos) << step->sql[0];
-  EXPECT_NE(step->sql[1].find("COMMENT ON COLUMN"), std::string::npos)
+  ASSERT_EQ(step->sql.size(), 3u) << all_sql(*step);
+  // A plain ADD COLUMN asks for AccessExclusiveLock like any other: the
+  // weaker lock first, and the short-timeout retry.
+  EXPECT_EQ(step->sql[0], "LOCK TABLE \"shop\".\"orders\" IN SHARE UPDATE EXCLUSIVE MODE;");
+  EXPECT_TRUE(step->detail.value("exclusive_retry", false));
+  EXPECT_NE(step->sql[1].find("ALTER TABLE \"shop\".\"orders\" ADD COLUMN \"region\""),
+            std::string::npos) << step->sql[1];
+  EXPECT_NE(step->sql[2].find("COMMENT ON COLUMN"), std::string::npos)
       << step->sql[1];
   const auto sql = all_sql(*step);
   for (const char* forbidden : {"DROP VIEW", "CREATE VIEW", "CREATE OR REPLACE",
@@ -7003,6 +8902,130 @@ TEST(Planner, UpdateRowsRefusesWithoutAUniqueIndexOnItsKey) {
     if (c.find("with no error anywhere") != std::string::npos) named = true;
   }
   EXPECT_TRUE(named) << plan.render();
+}
+
+// The refusal used to end "Create one first: CREATE UNIQUE INDEX CONCURRENTLY
+// ... ON t (key)". On a hypertable, a distributed table or a partitioned one
+// that index cannot exist, so the advice could not be followed. It names what
+// can be done: the columns of a unique index, as a list.
+TEST(Planner, TheRefusalForAnUnprovenKeyOffersTheListFormNotAnImpossibleIndex) {
+  auto obs = obs_dml();
+  obs.tables["shop.orders"]["indexes"]["orders_pkey"]["is_unique"] = false;
+  for (const char* kind : {"update_rows", "merge_rows"}) {
+    const auto plan = pglaswell::plan_migration(
+        spec_of(json::array({json{{"kind", kind}, {"schema", "shop"},
+                                  {"table", "orders"}, {"key", "id"},
+                                  {"columns", json::array({"id", "fulfilment_region"})},
+                                  {"values", json::array({json::array({1, "NA"})})}}})),
+        obs, {});
+    ASSERT_FALSE(plan.ok) << plan.render();
+    const auto all = json(plan.conflicts).dump();
+    EXPECT_EQ(all.find("CREATE UNIQUE INDEX"), std::string::npos) << all;
+    EXPECT_NE(all.find("a list is accepted"), std::string::npos) << all;
+  }
+}
+
+// A key of several columns: proven by a unique index whose columns are all
+// among them, matched on all of them, and walked along all of them.
+TEST(Planner, AListOfColumnsAsKeyIsMatchedAndWalkedWhole) {
+  auto obs = obs_dml();
+  auto& t = obs.tables["shop.orders"];
+  t["columns"]["tenant"] = json{{"type", "integer"}, {"not_null", true}};
+  t["indexes"] = json{{"orders_pkey",
+                       {{"is_valid", true}, {"is_unique", true}, {"is_primary", true},
+                        {"leading_column", "tenant"},
+                        {"columns", json::array({"tenant", "id"})}, {"predicate", ""},
+                        {"has_expressions", false}}}};
+  const json key = json::array({"tenant", "id"});
+  const auto columns = json::array({"tenant", "id", "fulfilment_region"});
+
+  // By id alone nothing proves a row is named: refused, as before.
+  auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "update_rows"}, {"schema", "shop"}, {"table", "orders"},
+                                {"key", "id"}, {"columns", json::array({"id", "fulfilment_region"})},
+                                {"values", json::array({json::array({1, "NA"})})}}})),
+      obs, {});
+  EXPECT_FALSE(plan.ok) << plan.render();
+
+  // By (tenant, id): the join is on both, and the key is not among what is set.
+  plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "update_rows"}, {"schema", "shop"}, {"table", "orders"},
+                                {"key", key}, {"columns", columns},
+                                {"values", json::array({json::array({1, 7, "NA"}),
+                                                        json::array({2, 7, "EU"})})}}})),
+      obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  auto sql = all_sql(*only_step(plan, "update_rows"));
+  EXPECT_NE(sql.find("WHERE \"shop\".\"orders\".\"tenant\" = v.\"tenant\" AND "
+                     "\"shop\".\"orders\".\"id\" = v.\"id\""),
+            std::string::npos) << sql;
+  EXPECT_NE(sql.find("SET \"fulfilment_region\" = v.\"fulfilment_region\"\n"), std::string::npos)
+      << sql;
+
+  // The same pair twice is still the same key twice.
+  plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "update_rows"}, {"schema", "shop"}, {"table", "orders"},
+                                {"key", key}, {"columns", columns},
+                                {"values", json::array({json::array({1, 7, "NA"}),
+                                                        json::array({1, 7, "EU"})})}}})),
+      obs, {});
+  EXPECT_FALSE(plan.ok) << plan.render();
+  EXPECT_NE(json(plan.conflicts).dump().find("(1, 7)"), std::string::npos)
+      << json(plan.conflicts).dump();
+
+  // Paced: the cursor is the whole key, a parameter a column and the limit
+  // after them, and the batch ends on a whole key.
+  plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "merge_rows"}, {"schema", "shop"}, {"table", "orders"},
+                                {"key", key}, {"columns", columns},
+                                {"select", "SELECT tenant, id, fulfilment_region FROM shop.staged"}}})),
+      obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto* step = only_step(plan, "merge_rows");
+  EXPECT_EQ(step->detail.value("batch_mode", ""), "composite_statement");
+  EXPECT_EQ(step->detail["key_columns"], key);
+  sql = all_sql(*step);
+  EXPECT_NE(sql.find("((src.\"tenant\", src.\"id\") > ($1, $2) OR $1 IS NULL)"), std::string::npos)
+      << sql;
+  EXPECT_NE(sql.find("LIMIT $3"), std::string::npos) << sql;
+  EXPECT_NE(sql.find("ON \"shop\".\"orders\".\"tenant\" = batch.\"tenant\" AND "
+                     "\"shop\".\"orders\".\"id\" = batch.\"id\""),
+            std::string::npos) << sql;
+  EXPECT_NE(sql.find("SELECT batch.\"tenant\", batch.\"id\" FROM batch ORDER BY "
+                     "batch.\"tenant\", batch.\"id\";"),
+            std::string::npos) << sql;
+}
+
+TEST(Spec, AKeyIsAColumnOrAListOfDistinctColumnsTheRowsCarry) {
+  const auto parse = [](json intent) {
+    return pglaswell::parse_spec(json{{"laswell_spec_version", 1}, {"id", "0001-keys"},
+                                      {"description", "keys"},
+                                      {"intents", json::array({std::move(intent)})}});
+  };
+  json update = {{"kind", "update_rows"}, {"schema", "s"}, {"table", "t"},
+                 {"key", json::array({"tenant", "id"})},
+                 {"columns", json::array({"tenant", "id", "v"})},
+                 {"values", json::array({json::array({1, 1, "x"})})}};
+  EXPECT_NO_THROW(parse(update));
+  auto bad = update;
+  bad["key"] = json::array({"tenant", "tenant"});
+  EXPECT_THROW(parse(bad), std::exception);
+  bad["key"] = json::array();
+  EXPECT_THROW(parse(bad), std::exception);
+  bad["key"] = json::array({"tenant", 3});
+  EXPECT_THROW(parse(bad), std::exception);
+  // Every column of the key has to be among the values each row supplies.
+  bad["key"] = json::array({"tenant", "other"});
+  EXPECT_THROW(parse(bad), std::exception);
+  // Only the key, and nothing to set.
+  bad = update;
+  bad["columns"] = json::array({"tenant", "id"});
+  bad["values"] = json::array({json::array({1, 1})});
+  EXPECT_THROW(parse(bad), std::exception);
+  // The predicate form walks by one column, which need not be unique.
+  EXPECT_THROW(parse(json{{"kind", "delete_rows"}, {"schema", "s"}, {"table", "t"},
+                          {"key", json::array({"tenant", "id"})}, {"where", "v IS NULL"}}),
+               std::exception);
 }
 
 // The gap that was measured, not inferred. A table with UNIQUE (id, tenant)
@@ -8518,7 +10541,231 @@ TEST(Planner, AddForeignKeySplitsIntoNotValidThenValidate) {
   // The lock people are surprised by: a statement naming one table locks two.
   EXPECT_NE(s[0]->lock.find("shop.warehouse"), std::string::npos) << s[0]->lock;
   EXPECT_NE(s[0]->why.find("names one table and locks two"), std::string::npos);
-  EXPECT_NE(s[1]->lock.find("does NOT block reads or writes"), std::string::npos);
+  EXPECT_NE(s[1]->lock.find("neither blocks reads or writes"), std::string::npos) << s[1]->lock;
+  // Measured on 18.6 with pg_locks: the NOT VALID add takes
+  // ShareRowExclusiveLock on BOTH tables. RowShareLock on the referenced one is
+  // what the VALIDATE takes, and the plan used to name it for the add.
+  EXPECT_NE(s[0]->lock.find("ShareRowExclusiveLock on shop.orders and on shop.warehouse"),
+            std::string::npos) << s[0]->lock;
+  EXPECT_EQ(s[0]->lock.find("RowShareLock on"), std::string::npos) << s[0]->lock;
+  EXPECT_NE(s[1]->lock.find("RowShareLock on shop.warehouse"), std::string::npos) << s[1]->lock;
+}
+
+// THE DRY RUN MUST NOT RUN THE SCAN OF A SPLIT RECIPE. It applies every step in
+// one rolled-back transaction, so the lock of the NOT VALID add would be held
+// across the VALIDATE -- on the live table, before every apply. Found in the
+// field: three seconds without one insert on a 3 GB table, all of them before
+// the job began. The planner marks the steps; the rehearsal leaves them out and
+// says why.
+// The other statements that read or rewrite a whole table under a lock that
+// blocks writes. The dry run executed each on the live table, for as long as
+// dry_run_statement_timeout_ms allowed, holding the lock to its rollback.
+TEST(Planner, AStatementThatRewritesOrReadsTheWholeTableIsNotRehearsed) {
+  const auto obs = observations(2LL << 30, 8000000);
+  const auto marked = [&](const json& intent, const char* kind, bool gap) {
+    const auto plan = pglaswell::plan_migration(spec_of(json::array({intent})), obs, {});
+    EXPECT_TRUE(plan.ok) << plan.render();
+    const auto steps = steps_of(plan, kind);
+    ASSERT_FALSE(steps.empty()) << plan.render();
+    const auto& d = steps.back()->detail;
+    ASSERT_TRUE(d.contains("not_rehearsed")) << kind << ": " << plan.render();
+    EXPECT_NE(d.value("not_rehearsed", "").find("blocks writes"), std::string::npos);
+    EXPECT_EQ(d.value("not_rehearsed_leaves_gap", !gap), gap) << kind;
+  };
+  // A later step may read the column in its new type: a gap.
+  marked(json{{"kind", "alter_column_type"}, {"schema", "shop"}, {"table", "orders"},
+              {"column", "warehouse_id"}, {"type", "numeric"}},
+         "alter_column_type", true);
+  // Nothing later depends on where or how the pages are stored.
+  marked(json{{"kind", "set_logged"}, {"schema", "shop"}, {"table", "orders"},
+              {"logged", false}},
+         "set_logged", false);
+  marked(json{{"kind", "set_tablespace"}, {"schema", "shop"}, {"table", "orders"},
+              {"tablespace", "fast"}},
+         "set_tablespace", false);
+
+  // ATTACH: in the dry run its CHECK was never validated, so it would scan.
+  const auto attach = pglaswell::plan_migration(attach_spec(), obs_partitioned(), {});
+  ASSERT_TRUE(attach.ok) << attach.render();
+  bool found = false;
+  for (const auto* s : steps_of(attach, "attach_partition")) {
+    if (all_sql(*s).find("ATTACH PARTITION") == std::string::npos) continue;
+    found = true;
+    ASSERT_TRUE(s->detail.contains("not_rehearsed")) << attach.render();
+    EXPECT_TRUE(s->detail.value("not_rehearsed_leaves_gap", false));
+  }
+  EXPECT_TRUE(found) << attach.render();
+}
+
+TEST(Planner, TheScanOfASplitRecipeIsMarkedNotToBeRehearsed) {
+  auto obs = observations(2LL << 30, 8000000);
+  const auto nn = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "set_not_null"}, {"schema", "shop"},
+                                {"table", "orders"}, {"column", "fulfilment_region"}}})),
+      obs, {});
+  ASSERT_TRUE(nn.ok) << nn.render();
+  const auto s = steps_of(nn, "set_not_null");
+  ASSERT_EQ(s.size(), 4u);
+  // Measured on 18.6: a CHECK is added under AccessExclusiveLock, NOT VALID or
+  // not. The plan said ShareRowExclusiveLock, under which readers would not wait.
+  EXPECT_NE(s[0]->lock.find("AccessExclusiveLock"), std::string::npos) << s[0]->lock;
+  EXPECT_EQ(s[0]->lock.find("ShareRowExclusiveLock"), std::string::npos) << s[0]->lock;
+  EXPECT_NE(s[0]->lock.find("reads and writes wait"), std::string::npos) << s[0]->lock;
+  EXPECT_FALSE(s[0]->detail.contains("not_rehearsed")) << "the catalog change IS rehearsed";
+  // The VALIDATE: not run, and nothing later can see that it was not.
+  ASSERT_TRUE(s[1]->detail.contains("not_rehearsed"));
+  EXPECT_FALSE(s[1]->detail.value("not_rehearsed_leaves_gap", true));
+  // SET NOT NULL: cheap only after the scan, so it would scan under its
+  // exclusive lock in the dry run -- and a later step may need the column so.
+  ASSERT_TRUE(s[2]->detail.contains("not_rehearsed"));
+  EXPECT_TRUE(s[2]->detail.value("not_rehearsed_leaves_gap", false));
+  EXPECT_FALSE(s[3]->detail.contains("not_rehearsed")) << "the drop is a catalog change";
+
+  for (const json& in : {json{{"kind", "add_check_constraint"}, {"schema", "shop"},
+                              {"table", "orders"}, {"name", "orders_ck"},
+                              {"expression", "warehouse_id > 0"}},
+                         json{{"kind", "add_foreign_key"}, {"schema", "shop"},
+                              {"table", "orders"}, {"name", "orders_wh_fk"},
+                              {"columns", json::array({"warehouse_id"})},
+                              {"references_schema", "shop"},
+                              {"references_table", "warehouse"},
+                              {"references_columns", json::array({"id"})}}}) {
+    const auto p = pglaswell::plan_migration(spec_of(json::array({in})), obs, {});
+    ASSERT_TRUE(p.ok) << p.render();
+    const auto t = steps_of(p, in.value("kind", "").c_str());
+    ASSERT_EQ(t.size(), 2u);
+    EXPECT_FALSE(t[0]->detail.contains("not_rehearsed"));
+    ASSERT_TRUE(t[1]->detail.contains("not_rehearsed")) << in.dump();
+    EXPECT_FALSE(t[1]->detail.value("not_rehearsed_leaves_gap", true));
+  }
+  const auto ck = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "add_check_constraint"}, {"schema", "shop"},
+                                {"table", "orders"}, {"name", "orders_ck"},
+                                {"expression", "warehouse_id > 0"}}})),
+      obs, {});
+  EXPECT_NE(steps_of(ck, "add_check_constraint")[0]->lock.find("AccessExclusiveLock"),
+            std::string::npos);
+}
+
+// Which steps take the weaker lock first: every one that asks for an exclusive
+// lock on the table, and not the VALIDATE, which asks for the weaker one itself.
+TEST(Planner, StepsThatNeedAnExclusiveLockTakeTheWeakerOneFirst) {
+  auto obs = observations(2LL << 30, 8000000);
+  const auto gate = std::string("LOCK TABLE \"shop\".\"orders\" IN SHARE UPDATE EXCLUSIVE MODE;");
+  const auto nn = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "set_not_null"}, {"schema", "shop"},
+                                {"table", "orders"}, {"column", "fulfilment_region"}}})),
+      obs, {});
+  ASSERT_TRUE(nn.ok) << nn.render();
+  const auto s = steps_of(nn, "set_not_null");
+  ASSERT_EQ(s.size(), 4u);
+  for (const std::size_t i : {std::size_t{0}, std::size_t{2}, std::size_t{3}}) {
+    EXPECT_EQ(s[i]->sql.at(0), gate) << i;
+    EXPECT_TRUE(s[i]->detail.value("exclusive_retry", false)) << i;
+  }
+  EXPECT_EQ(all_sql(*s[1]).find("LOCK TABLE"), std::string::npos) << "the VALIDATE";
+  EXPECT_FALSE(s[1]->detail.contains("exclusive_retry"));
+
+  // A foreign key locks two tables, and autovacuum may be on either.
+  const auto fk = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "add_foreign_key"}, {"schema", "shop"},
+                                {"table", "orders"}, {"name", "orders_wh_fk"},
+                                {"columns", json::array({"warehouse_id"})},
+                                {"references_schema", "shop"},
+                                {"references_table", "warehouse"},
+                                {"references_columns", json::array({"id"})}}})),
+      obs, {});
+  ASSERT_TRUE(fk.ok) << fk.render();
+  const auto f = steps_of(fk, "add_foreign_key");
+  EXPECT_EQ(f[0]->sql.at(0), gate);
+  EXPECT_EQ(f[0]->sql.at(1), "LOCK TABLE \"shop\".\"warehouse\" IN SHARE UPDATE EXCLUSIVE MODE;");
+  EXPECT_EQ(f[0]->detail.value("weaker_lock_first", 0), 2);
+}
+
+// What the rehearsal is handed: the marked steps as nothing to run. One that
+// leaves a gap is treated as a step that cannot run in a transaction is; one
+// that leaves none is listed as not run. The chain rehearsal -- for an empty
+// database or a restored copy -- runs them all, because finding the violating
+// row is what it is for.
+TEST(Planner, TheRehearsalIsHandedNothingToRunForAMarkedStep) {
+  auto obs = observations(2LL << 30, 8000000);
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "set_not_null"}, {"schema", "shop"},
+                                {"table", "orders"}, {"column", "fulfilment_region"}}})),
+      obs, {});
+  ASSERT_TRUE(plan.ok);
+  const auto in = pglaswell::detail::rehearsal_inputs(plan);
+  ASSERT_EQ(in.steps.size(), 4u);
+  EXPECT_FALSE(in.steps[0].second.empty());
+  EXPECT_TRUE(in.steps[1].second.empty()) << "the VALIDATE must not reach the server";
+  EXPECT_TRUE(in.steps[2].second.empty()) << "nor the SET NOT NULL that leans on it";
+  EXPECT_FALSE(in.steps[3].second.empty());
+  EXPECT_EQ(in.forbidden, (std::vector<bool>{false, false, true, false}));
+  EXPECT_EQ(in.not_run, std::vector<int>{in.steps[1].first});
+
+  pglaswell::Catalog::DryRun dry;
+  dry.unverified_steps.push_back(in.steps[2].first);  // as the loop records a skip
+  pglaswell::detail::note_not_run(in, dry);
+  EXPECT_EQ(dry.unverified_steps, (std::vector<int>{in.steps[1].first, in.steps[2].first}));
+  const auto why = pglaswell::detail::unverified_reasons(plan, dry.unverified_steps);
+  EXPECT_NE(why[std::to_string(in.steps[1].first)].get<std::string>().find("the scan"),
+            std::string::npos);
+  EXPECT_NE(why[std::to_string(in.steps[2].first)].get<std::string>().find("exclusive lock"),
+            std::string::npos);
+
+  const auto chain = pglaswell::detail::rehearsal_inputs(plan, /*run_scans=*/true);
+  for (const auto& st : chain.steps) EXPECT_FALSE(st.second.empty());
+  EXPECT_TRUE(chain.not_run.empty());
+}
+
+// With the scan out of the rehearsal, a violating row is found by the JOB, at
+// the VALIDATE, with the NOT VALID constraint already committed. The next plan
+// must resume there: adding the constraint again would fail on its own name.
+TEST(Planner, AConstraintLeftNotValidByAFailedAttemptIsResumedAtItsScan) {
+  auto obs = observations(2LL << 30, 8000000);
+  auto& cs = obs.tables["shop.orders"]["constraints"];
+
+  // set_not_null: the temporary check is there, not yet valid.
+  cs["orders_fulfilment_region_laswell_nn"] = json{{"type", "c"}, {"validated", false}};
+  const json nn = {{"kind", "set_not_null"}, {"schema", "shop"}, {"table", "orders"},
+                   {"column", "fulfilment_region"}};
+  auto p = pglaswell::plan_migration(spec_of(json::array({nn})), obs, {});
+  ASSERT_TRUE(p.ok) << p.render();
+  auto s = steps_of(p, "set_not_null");
+  ASSERT_EQ(s.size(), 3u) << p.render();
+  EXPECT_NE(all_sql(*s[0]).find("VALIDATE CONSTRAINT"), std::string::npos);
+  EXPECT_EQ(all_sql(*s[0]).find("NOT VALID"), std::string::npos);
+  // ... and valid: the scan is done, so SET NOT NULL is cheap and IS rehearsed.
+  cs["orders_fulfilment_region_laswell_nn"]["validated"] = true;
+  p = pglaswell::plan_migration(spec_of(json::array({nn})), obs, {});
+  s = steps_of(p, "set_not_null");
+  ASSERT_EQ(s.size(), 2u) << p.render();
+  EXPECT_NE(all_sql(*s[0]).find("SET NOT NULL"), std::string::npos);
+  EXPECT_FALSE(s[0]->detail.contains("not_rehearsed"));
+
+  // add_check_constraint and add_foreign_key the same way.
+  const json ck = {{"kind", "add_check_constraint"}, {"schema", "shop"}, {"table", "orders"},
+                   {"name", "orders_ck"}, {"expression", "warehouse_id > 0"}};
+  const json fk = {{"kind", "add_foreign_key"}, {"schema", "shop"}, {"table", "orders"},
+                   {"name", "orders_wh_fk"}, {"columns", json::array({"warehouse_id"})},
+                   {"references_schema", "shop"}, {"references_table", "warehouse"},
+                   {"references_columns", json::array({"id"})}};
+  for (const json& in : {ck, fk}) {
+    const auto name = in.value("name", "");
+    const auto kind = in.value("kind", "");
+    cs[name] = json{{"type", kind == "add_check_constraint" ? "c" : "f"}, {"validated", false}};
+    auto q = pglaswell::plan_migration(spec_of(json::array({in})), obs, {});
+    ASSERT_TRUE(q.ok) << q.render();
+    auto t = steps_of(q, kind.c_str());
+    ASSERT_EQ(t.size(), 1u) << q.render();
+    EXPECT_NE(all_sql(*t[0]).find("VALIDATE CONSTRAINT"), std::string::npos);
+    EXPECT_NE(t[0]->why.find("an earlier attempt added it"), std::string::npos) << t[0]->why;
+    cs[name]["validated"] = true;
+    q = pglaswell::plan_migration(spec_of(json::array({in})), obs, {});
+    t = steps_of(q, kind.c_str());
+    ASSERT_EQ(t.size(), 1u);
+    EXPECT_EQ(t[0]->action, pglaswell::Action::kSatisfied) << q.render();
+  }
 }
 
 TEST(Planner, AnUnindexedForeignKeyColumnWarns) {
@@ -10071,8 +12318,8 @@ TEST_F(DatabaseTest, ConstraintObservationsMatchWhatPostgresqlActuallyRefuses) {
   {
     pglaswell::WriteSession w(cfg);
     w.begin("pg_laswell/test/constraints-apply");
-    const std::string stmt = steps[0]->sql[0];
-    w.txn().exec(stmt.substr(0, stmt.size() - 1));
+    // Every statement of the step: the weaker lock, then the drop.
+    for (const auto& stmt : steps[0]->sql) w.txn().exec(stmt.substr(0, stmt.size() - 1));
     w.commit();
   }
   const auto after = cat.observe({"public"}, {"laswell_c"});
@@ -11090,7 +13337,9 @@ TEST(Planner, APartitionTakesItsColumnsFromItsParentAndSaysWhatItLocks) {
       spec_of(json::array({partition_intent(range_2027())})), partitioned_orders(), {});
   ASSERT_TRUE(plan.ok) << plan.render();
   const auto* step = only_step(plan, "create_table");
-  EXPECT_EQ(step->sql.front(),
+  // The parent is what the application queues on: the weaker lock on it first.
+  EXPECT_EQ(step->sql.front(), "LOCK TABLE \"shop\".\"orders\" IN SHARE UPDATE EXCLUSIVE MODE;");
+  EXPECT_EQ(step->sql.at(1),
             "CREATE TABLE \"shop\".\"orders_2027\" PARTITION OF \"shop\".\"orders\" "
             "FOR VALUES FROM ('2027-01-01') TO ('2028-01-01');");
   // Measured: AccessExclusiveLock on the parent; a SELECT on it waited.

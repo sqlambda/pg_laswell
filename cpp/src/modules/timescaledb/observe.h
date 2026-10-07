@@ -51,6 +51,21 @@ SELECT JSONB_BUILD_OBJECT(
       JSONB_BUILD_OBJECT(
         'num_chunks', h.num_chunks,
         'columnstore', h.compression_enabled,
+        -- Every chunk, oldest first, with the indexes it carries and whether
+        -- each is valid: what an index built one chunk at a time, concurrently,
+        -- needs in order to know what is left to build (index.h).
+        'chunks', COALESCE((SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
+                      'relation', c.chunk_schema || '.' || c.chunk_name,
+                      'indexes', COALESCE((SELECT JSONB_OBJECT_AGG(ic.relname, i.indisvalid)
+                                             FROM pg_index i
+                                             JOIN pg_class ic ON ic.oid = i.indexrelid
+                                            WHERE i.indrelid = format('%I.%I', c.chunk_schema,
+                                                                      c.chunk_name)::regclass),
+                                          '{}'::jsonb))
+                      ORDER BY c.range_start, c.chunk_name)
+                    FROM timescaledb_information.chunks c
+                   WHERE c.hypertable_schema = h.hypertable_schema
+                     AND c.hypertable_name = h.hypertable_name), '[]'::jsonb),
         'compressed_chunks', (SELECT count(*) FROM timescaledb_information.chunks c
                                WHERE c.hypertable_schema = h.hypertable_schema
                                  AND c.hypertable_name = h.hypertable_name

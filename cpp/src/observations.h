@@ -38,6 +38,11 @@ struct Observations {
   // cannot tell "Citus is not installed" from "Citus is installed with nothing
   // distributed yet" refuses the wrong things in both directions.
   json extensions = json::object();
+  // A module whose reading RAISED, with the server's message. Its slot above
+  // is then absent -- which every module reads as "not installed" -- so this
+  // is what keeps a plan from being made as if the extension were not there:
+  // the planner refuses while any entry is here (planner.h).
+  json extension_errors = json::object();
   json gathered_at = json();
 
   const json& table(const std::string& qualified) const {

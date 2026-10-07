@@ -2,15 +2,17 @@ Plan for 0009-reserved-words  (digest 13523d18c4aa…)
 
 -- transaction group 1 ---------------- atomic --
  0. add_column
+    LOCK TABLE "user"."order" IN SHARE UPDATE EXCLUSIVE MODE;
     ALTER TABLE "user"."order" ADD COLUMN "table" text;
     COMMENT ON COLUMN "user"."order"."table" IS 'Reserved.';
     lock: AccessExclusiveLock
-    why:  column absent; nullable with no default is catalog-only
+    why:  column absent; nullable with no default is catalog-only. SHARE UPDATE EXCLUSIVE is taken first: it waits out an autovacuum without queueing reads or writes, and the exclusive lock after it is asked for with a short timeout and retried
  1. create_index
+    LOCK TABLE "user"."order" IN SHARE UPDATE EXCLUSIVE MODE;
     CREATE INDEX "limit" ON "user"."order" USING btree ("desc");
     COMMENT ON INDEX "user"."limit" IS 'Reserved.';
     lock: ShareLock (blocks writes for the whole build)
-    why:  size 8.0 KiB < 64 MiB ceiling, 0 lock waiters -> plain build (transactional, cannot leave an invalid index)
+    why:  size 8.0 KiB < 64 MiB ceiling, 0 lock waiters -> plain build (transactional, cannot leave an invalid index). SHARE UPDATE EXCLUSIVE is taken first: it waits out an autovacuum without queueing reads or writes, and the exclusive lock after it is asked for with a short timeout and retried
 
 -- transaction group 2 ---------------- NOT atomic: paced, many commits --
  2. backfill
@@ -33,7 +35,12 @@ RETURNING "order"."end";
   SELECT * FROM (VALUES (1::bigint, 'a'::text),
         (2, 'b')) AS v ("end", "desc")
 ), batch AS (
-  SELECT * FROM src WHERE src."end" > $1 ORDER BY src."end" LIMIT $2
+  SELECT * FROM src
+   WHERE src."end" > $1
+     AND src."end" <= (SELECT upto."end" FROM (
+           SELECT src."end" FROM src WHERE src."end" > $1
+            ORDER BY src."end" LIMIT $2) AS upto
+          ORDER BY upto."end" DESC LIMIT 1)
 ), ins AS (
   INSERT INTO "user"."order" ("end", "desc")
   SELECT batch."end", batch."desc" FROM batch
@@ -49,7 +56,12 @@ SELECT batch."end" FROM batch ORDER BY batch."end";
   SELECT * FROM (VALUES (1::bigint, 'c'::text),
         (2, 'd')) AS v ("end", "desc")
 ), batch AS (
-  SELECT * FROM src WHERE src."end" > $1 ORDER BY src."end" LIMIT $2
+  SELECT * FROM src
+   WHERE src."end" > $1
+     AND src."end" <= (SELECT upto."end" FROM (
+           SELECT src."end" FROM src WHERE src."end" > $1
+            ORDER BY src."end" LIMIT $2) AS upto
+          ORDER BY upto."end" DESC LIMIT 1)
 ), upd AS (
   UPDATE "user"."order"
      SET "desc" = batch."desc"
@@ -67,7 +79,12 @@ SELECT batch."end" FROM batch ORDER BY batch."end";
   SELECT * FROM (VALUES (1::bigint),
         (2)) AS v ("end")
 ), batch AS (
-  SELECT * FROM src WHERE src."end" > $1 ORDER BY src."end" LIMIT $2
+  SELECT * FROM src
+   WHERE src."end" > $1
+     AND src."end" <= (SELECT upto."end" FROM (
+           SELECT src."end" FROM src WHERE src."end" > $1
+            ORDER BY src."end" LIMIT $2) AS upto
+          ORDER BY upto."end" DESC LIMIT 1)
 ), del AS (
   DELETE FROM "user"."order"
    USING batch
@@ -83,7 +100,12 @@ SELECT batch."end" FROM batch ORDER BY batch."end";
     WITH src AS (
   SELECT * FROM (VALUES (3::bigint, 'e'::text)) AS v ("end", "desc")
 ), batch AS (
-  SELECT * FROM src WHERE src."end" > $1 ORDER BY src."end" LIMIT $2
+  SELECT * FROM src
+   WHERE src."end" > $1
+     AND src."end" <= (SELECT upto."end" FROM (
+           SELECT src."end" FROM src WHERE src."end" > $1
+            ORDER BY src."end" LIMIT $2) AS upto
+          ORDER BY upto."end" DESC LIMIT 1)
 ), m AS (
   MERGE INTO "user"."order" USING batch
      ON "user"."order"."end" = batch."end"

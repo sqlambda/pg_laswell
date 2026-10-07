@@ -188,8 +188,798 @@ inline void plan_partitioned_index(const Intent& in, const json& t, Plan& plan,
 inline void plan_set_not_null(const Intent& in, const Observations& obs,
                               Plan& plan, std::vector<Step>& out);
 
-inline void plan_add_column(const Intent& in, const Observations& obs, Plan& plan,
+// A step the dry run must NOT execute, because executing it there is the harm
+// the recipe exists to avoid.
+//
+// The dry run applies every transactional step in ONE rolled-back transaction.
+// A split recipe -- ADD ... NOT VALID, then VALIDATE in a transaction of its
+// own -- is split so the exclusive lock of the first is not held across the
+// scan of the second; in one transaction it is, on the live table, before every
+// apply. Measured in the field on a 3 GB table under load: three seconds with
+// no insert at all, every one of them before the job started.
+//
+// So the scan is not rehearsed. `leaves_gap` says whether a later step may
+// fail in the dry run only because this one did not run (a SET NOT NULL that
+// did not happen, a partition that was not attached): the dry run then reports
+// such a failure as unverified rather than as a defect, as it does after a
+// CREATE INDEX CONCURRENTLY. A VALIDATE leaves no gap -- nothing a later
+// statement can see changes when it is skipped.
+//
+// What is lost, and said in the plan: a row that violates the constraint is
+// found by the job, at this step, with the NOT VALID constraint already
+// committed -- not before anything ran. The re-plan resumes from there.
+// A step that needs an exclusive lock on a busy table, taken so that the
+// application does not queue behind the REQUEST.
+//
+// A pending AccessExclusiveLock blocks every reader and writer that arrives
+// after it, for as long as it waits. Measured in the field and reproduced on a
+// 1.5 GB table with autovacuum running on it: ADD CONSTRAINT waited 1.05 s
+// (deadlock_timeout, after which PostgreSQL cancels the autovacuum), and an
+// insert that arrived meanwhile took 1 027 ms. With
+//     LOCK TABLE t IN SHARE UPDATE EXCLUSIVE MODE
+// first, in the same transaction, the step still waited 1.04 s -- but that
+// lock conflicts with autovacuum and NOT with inserts and updates, so the
+// worst insert was 30 ms, as before it. Once it is held autovacuum cannot
+// start again, and the exclusive lock is then granted almost at once.
+//
+// That is the autovacuum case. The other is a long APPLICATION transaction,
+// which the weaker lock passes straight through: there the exclusive statement
+// waits with the application queued. So the step is also marked for the
+// executor to run with a short lock timeout and retry (executor.h,
+// run_exclusive): the application then queues for a fraction of a second at a
+// time rather than for all of lock_timeout.
+//
+// The LOCK is written into the step, so the plan shows what will run.
+inline void weaker_lock_first(Step& step, const std::vector<std::string>& sql_rels) {
+  std::vector<std::string> sql;
+  for (const auto& rel : sql_rels) {
+    sql.push_back("LOCK TABLE " + rel + " IN SHARE UPDATE EXCLUSIVE MODE;");
+  }
+  sql.insert(sql.end(), step.sql.begin(), step.sql.end());
+  step.sql = std::move(sql);
+  step.detail["exclusive_retry"] = true;
+  step.detail["weaker_lock_first"] = static_cast<long long>(sql_rels.size());
+  step.why += ". SHARE UPDATE EXCLUSIVE is taken first: it waits out an autovacuum "
+              "without queueing reads or writes, and the exclusive lock after it is "
+              "asked for with a short timeout and retried";
+}
+
+namespace detail {
+inline constexpr const char* kScanNotRehearsed =
+    "the scan: the dry run runs in one transaction, where the lock of the step "
+    "before would be held across it. A violating row is found when the job "
+    "reaches this step";
+inline constexpr const char* kNeedsTheScan =
+    "it is cheap only because the scan before it proved the rows; in the dry "
+    "run that scan did not run, so this would scan under its exclusive lock";
+
+// A constraint by name, as the table's reading has it: absent, there and NOT
+// VALID (an earlier attempt added it and failed at its VALIDATE), or valid.
+enum class ConstraintState { kAbsent, kNotValid, kValid };
+inline ConstraintState constraint_state(const json& table, const std::string& name) {
+  const auto cs = table.find("constraints");
+  if (cs == table.end() || !cs->is_object() || !cs->contains(name)) {
+    return ConstraintState::kAbsent;
+  }
+  return (*cs)[name].value("validated", true) ? ConstraintState::kValid
+                                              : ConstraintState::kNotValid;
+}
+}  // namespace detail
+
+// Defined further down, with the dispatcher over the enabled modules.
+inline ConstraintTraits constraint_traits(const Observations& obs, const std::string& qualified,
+                                          std::string& decided_by);
+
+// --- add_column with "fill": a NOT NULL column that has no default ---------
+//
+// ADD COLUMN ... NOT NULL without a default fails on the first existing row.
+// The way through is known and has four parts, and an author asked to write
+// them as four intents gets the one that matters wrong: nothing covers the
+// rows inserted while the backfill runs. So it is one intent, and the plan is
+// the whole recipe:
+//
+//   1. ADD COLUMN, nullable -- catalog-only -- and, in the SAME transaction, a
+//      BEFORE INSERT OR UPDATE trigger that fills the column when it is null.
+//      From this commit on no new row lacks a value, and an old row the
+//      application touches gets one.
+//   2. A paced backfill of the rows that were already there.
+//   3. The set_not_null recipe: its scan finds every row filled.
+//   4. The trigger dropped, or kept, as the specification says.
+//
+// ONE expression serves the trigger and the backfill, so they cannot disagree.
+// Measured on 18.6: inside the trigger it is evaluated as
+//     SELECT (<fill>) INTO NEW.col FROM (SELECT NEW.*) AS "<table>";
+// which gives the row's columns the names they have in
+//     UPDATE <table> SET col = (<fill>) ...
+// bare or qualified by the table's own name. New rows were filled, an old row
+// touched by an UPDATE was filled, and a value the application supplied was
+// kept. CREATE TRIGGER took ShareRowExclusiveLock.
+//
+// Every part is resumable from the catalog alone -- the column, the trigger,
+// rows still null, the temporary check -- so a job that fails partway is
+// continued by applying the same specification again.
+// "fill" as the planner uses it: the sources of one column's value, in the
+// order they are tried. A plain expression over the row has no `from`.
+//
+// A LIST of sources means: the first that gives a value. Measured on 18.6:
+// COALESCE over scalar subqueries stops at the first that is not null -- of
+// 100 000 rows the second table was probed for the 50 000 the first had no
+// value for -- so the trigger evaluates one COALESCE. The backfill does not
+// probe row by row: it makes one JOINED pass per source, each over the rows
+// still null, which PostgreSQL plans as a join per batch (measured, one
+// source: 17.5 ms a batch of 5 000 against 30 ms for the subquery form).
+//
+// "Found" means a value: a row that is there with a NULL falls through to the
+// next source, since NULL can never be the answer for a NOT NULL column.
+namespace detail {
+struct FillSource {
+  std::string from, on, value;
+  bool joined() const { return !from.empty(); }
+  bool operator==(const FillSource&) const = default;
+};
+inline std::vector<FillSource> fill_sources(const json& body) {
+  std::vector<FillSource> out;
+  const auto it = body.find("fill");
+  if (it == body.end()) return out;
+  if (it->is_string()) {
+    out.push_back(FillSource{"", "", it->get<std::string>()});
+    return out;
+  }
+  for (const auto& src : *it) {
+    if (src.is_string()) {
+      out.push_back(FillSource{"", "", src.get<std::string>()});
+    } else {
+      out.push_back(FillSource{src.value("from", ""), src.value("on", ""),
+                               src.value("value", "")});
+    }
+  }
+  return out;
+}
+// Every piece of text a fill carries, for the checks made on the text itself.
+inline std::string fill_text(const json& body) {
+  std::string all;
+  for (const auto& src : fill_sources(body)) all += src.from + " " + src.on + " " + src.value + " ";
+  return all;
+}
+// One expression for the whole list, as the trigger evaluates it over the row.
+inline std::string fill_expression(const std::vector<FillSource>& sources) {
+  const auto one = [](const FillSource& src) {
+    return src.joined() ? "(SELECT (" + src.value + ") FROM " + src.from + " WHERE " + src.on + ")"
+                        : src.value;
+  };
+  if (sources.size() == 1 && !sources[0].joined()) return sources[0].value;
+  std::vector<std::string> parts;
+  for (const auto& src : sources) parts.push_back(one(src));
+  return sources.size() == 1 ? parts[0] : "COALESCE(" + join(parts, ", ") + ")";
+}
+// In words, for the plan.
+inline std::string fill_described(const std::vector<FillSource>& sources) {
+  std::vector<std::string> parts;
+  for (const auto& src : sources) {
+    parts.push_back(src.joined() ? "(" + src.value + ") from " + src.from + " on " + src.on
+                                 : "(" + src.value + ")");
+  }
+  return join(parts, ", then ");
+}
+}  // namespace detail
+
+// SEVERAL such columns on one table, written as consecutive intents, are
+// planned as ONE recipe (filled_column_group, below): one trigger, one walk
+// that sets them all, one validation scan. Planned one after the other they
+// would rewrite every row once per column. Measured on 18.6, 6 million rows:
+// one CHECK (a IS NOT NULL AND b IS NOT NULL), validated once, is enough for
+// PostgreSQL to skip the scan for both columns -- "existing constraints on
+// column ... are sufficient to prove that it does not contain nulls" -- and
+// both SET NOT NULL ran in one statement in 4 ms, against 344 ms for a bare one.
+namespace detail {
+// The key a fill walks when the specification names none: a column of the
+// primary key. Alone when the key is one column; of a composite key, the first
+// column a module does not confine batches to (on a Citus table the walk goes
+// within the distribution column, not along it). The backfill then walks the
+// whole key in its order. INCLUDE columns are not key columns.
+inline std::string default_fill_key(const Observations& obs, const std::string& qualified) {
+  const auto& t = obs.table(qualified);
+  const json indexes = t.value("indexes", json::object());
+  std::string confined_by;
+  const std::string confined = required_confinement(obs, qualified, confined_by);
+  for (const auto& [name, ix] : indexes.items()) {
+    (void)name;
+    if (!ix.value("is_primary", false)) continue;
+    const json cols = ix.value("columns", json::array());
+    const auto keys = static_cast<std::size_t>(
+        ix.value("key_column_count", static_cast<int>(cols.size())));
+    for (std::size_t c = 0; c < keys && c < cols.size(); ++c) {
+      if (!cols[c].is_string()) continue;
+      if (keys > 1 && cols[c].get<std::string>() == confined) continue;
+      return cols[c].get<std::string>();
+    }
+  }
+  return {};
+}
+}  // namespace detail
+
+inline void plan_add_columns_filled(const std::vector<const Intent*>& group,
+                                    const Observations& obs, const ExecutorConfig& cfg,
+                                    Plan& plan, std::vector<Step>& out) {
+  const Intent& in = *group.front();
+  const auto qualified = in.qualified_table();
+  const auto sql_rel = detail::quote_qualified(qualified);
+  const auto& t = obs.table(qualified);
+  const bool drop_after = in.body.value("after", "") == "drop_trigger";
+  // One name for the trigger and its function, in the table's schema: the
+  // first column's, so a single column is named exactly as it always was.
+  const auto filler = in.table() + "_" + in.body.value("column", "") + "_laswell_fill";
+  const auto sql_filler = detail::quote_identifier(in.schema()) + "." +
+                          detail::quote_identifier(filler);
+  const auto rel_alias = detail::quote_identifier(in.table());
+
+  std::vector<std::string> names;
+  for (const auto* g : group) names.push_back(g->body.value("column", ""));
+  const std::string all_names = detail::join(names, ", ");
+
+  const auto verdict = [&](Action a, const std::string& why, bool conflict = false) {
+    Step s;
+    s.kind = in.kind_name;
+    s.action = a;
+    s.why = why;
+    if (conflict) plan.conflicts.push_back(why);
+    out.push_back(std::move(s));
+  };
+
+  if (!t.value("exists", false)) {
+    verdict(Action::kConflict,
+            qualified + " does not exist, so " + all_names + " cannot be added to it", true);
+    return;
+  }
+  const json columns = t.value("columns", json::object());
+  // What is left to do for each column, read from the catalog.
+  std::vector<const Intent*> missing, pending;  // not there; there or not, still nullable
+  for (const auto* g : group) {
+    const auto column = g->body.value("column", "");
+    const auto type = g->body.value("type", "");
+    if (!columns.contains(column)) {
+      missing.push_back(g);
+      pending.push_back(g);
+      continue;
+    }
+    const auto existing_type = columns[column].value("type", "");
+    if (existing_type != type && !type.empty()) {
+      verdict(Action::kConflict,
+              qualified + "." + column + " exists as " + existing_type +
+                  ", spec declares " + type, true);
+      return;
+    }
+    if (!columns[column].value("not_null", false)) pending.push_back(g);
+  }
+  const json triggers = t.value("triggers", json::object());
+  const bool has_trigger = triggers.contains(filler);
+
+  const auto drop_filler = [&](const std::string& why) {
+    Step s;
+    s.kind = in.kind_name;
+    s.txn_class = TxnClass::kRequired;
+    s.own_transaction = true;
+    s.lock = "AccessExclusiveLock on " + qualified + ", briefly";
+    s.sql.push_back("DROP TRIGGER " + detail::quote_identifier(filler) + " ON " + sql_rel + ";");
+    s.sql.push_back("DROP FUNCTION " + sql_filler + "();");
+    s.why = why;
+    s.detail["trigger"] = filler;
+    weaker_lock_first(s, {sql_rel});
+    out.push_back(std::move(s));
+  };
+
+  // Already NOT NULL: the recipe finished, or all of it but its last step.
+  if (pending.empty()) {
+    if (drop_after && has_trigger) {
+      drop_filler(all_names + (group.size() == 1 ? " is" : " are") +
+                  " NOT NULL and the trigger that filled " +
+                  (group.size() == 1 ? "it" : "them") +
+                  " is still there: an earlier attempt stopped before dropping it");
+    } else if (group.size() == 1) {
+      verdict(Action::kSatisfied, "column already present as " +
+                                      columns[names[0]].value("type", "") + " NOT NULL");
+    } else {
+      verdict(Action::kSatisfied, "columns " + all_names + " already present, NOT NULL");
+    }
+    return;
+  }
+
+  // The walk needs a unique key. The primary key, unless the spec names one.
+  std::string key = in.body.value("key", "");
+  if (key.empty()) {
+    key = detail::default_fill_key(obs, qualified);
+    if (key.empty()) {
+      verdict(Action::kConflict,
+              qualified + " has no primary key to walk while filling " +
+                  all_names + ". Name in \"key\" a column that is unique, or "
+                  "that a unique index over NOT NULL columns contains.", true);
+      return;
+    }
+  }
+
+  // Step 1. The columns and the trigger commit together, so there is no moment
+  // at which a column exists and a new row can arrive without a value.
+  if (!missing.empty() || !has_trigger) {
+    Step s;
+    s.kind = in.kind_name;
+    s.txn_class = TxnClass::kRequired;
+    s.own_transaction = true;
+    for (const auto* g : missing) {
+      const auto c = detail::quote_identifier(g->body.value("column", ""));
+      s.sql.push_back("ALTER TABLE " + sql_rel + " ADD COLUMN " + c + " " +
+                      g->body.value("type", "") + ";");
+      s.sql.push_back("COMMENT ON COLUMN " + sql_rel + "." + c + " IS " +
+                      detail::quote_literal(g->body.value("comment", "")) + ";");
+    }
+    std::string every_fill;
+    for (const auto* g : group) every_fill += detail::fill_text(g->body);
+    std::string tag = "laswell_fill";
+    while (every_fill.find("$" + tag + "$") != std::string::npos) tag += "_";
+    std::string body;
+    for (const auto* g : group) {
+      const auto c = detail::quote_identifier(g->body.value("column", ""));
+      body += "  IF NEW." + c + " IS NULL THEN\n    SELECT (" +
+              detail::fill_expression(detail::fill_sources(g->body)) +
+              ") INTO NEW." + c + " FROM (SELECT NEW.*) AS " + rel_alias + ";\n  END IF;\n";
+    }
+    s.sql.push_back("CREATE OR REPLACE FUNCTION " + sql_filler +
+                    "() RETURNS trigger LANGUAGE plpgsql AS $" + tag + "$\nBEGIN\n" + body +
+                    "  RETURN NEW;\nEND\n$" + tag + "$;");
+    if (!has_trigger) {
+      s.sql.push_back("CREATE TRIGGER " + detail::quote_identifier(filler) +
+                      " BEFORE INSERT OR UPDATE ON " + sql_rel +
+                      " FOR EACH ROW EXECUTE FUNCTION " + sql_filler + "();");
+    }
+    const bool plural = group.size() > 1;
+    s.lock = missing.empty()
+                 ? "ShareRowExclusiveLock on " + qualified + " -- blocks writes, not reads"
+                 : "AccessExclusiveLock on " + qualified +
+                       ", briefly: a nullable column with no default is catalog-only";
+    s.why = missing.empty()
+        ? std::string(plural ? "the columns are" : "the column is") +
+              " there, nullable, without the trigger that fills " + (plural ? "them" : "it") +
+              ": an earlier attempt was interrupted, or " + (plural ? "they were" : "the column was") +
+              " added by hand. The trigger first, so no row arrives without a value while "
+              "the rest runs"
+        : std::string("step 1: ") +
+              (plural ? std::to_string(group.size()) + " columns are added nullable"
+                      : "the column is added nullable") +
+              " -- catalog-only, no rewrite -- and, in the same transaction, " +
+              (plural ? "ONE trigger that fills them" : "a trigger that fills it") +
+              " for every row inserted or updated from this commit on. NOT NULL comes "
+              "last, when every row has a value";
+    s.detail["trigger"] = filler;
+    s.detail["columns"] = names;
+    s.detail["expected"] = "metadata only, no table rewrite";
+    weaker_lock_first(s, {sql_rel});
+    out.push_back(std::move(s));
+  }
+
+  // What the steps above leave, for the recipes composed below: they are
+  // planned against the columns as they will be, not as they are.
+  Observations after = obs;
+  for (const auto* g : missing) {
+    after.tables[qualified]["columns"][g->body.value("column", "")] =
+        json{{"type", g->body.value("type", "")}, {"not_null", false}};
+  }
+  after.tables[qualified]["triggers"][filler] = json::object();
+
+  // Step 2. The rows that were already there. Every pass is resumable: its
+  // predicate selects only rows in which something is still null.
+  //
+  // Columns filled from ONE expression each share ONE walk, whatever their
+  // number. A list of sources is a pass per source, in order, each a join over
+  // the rows still null -- and columns whose source at the same position is
+  // the same table found the same way share that pass too.
+  std::vector<std::string> not_null_terms, set_not_null_terms;
+  std::size_t rounds = 0;
+  bool simple = pending.size() == 1;  // one column, one plain expression: as it always was
+  for (const auto* g : pending) {
+    const auto c = detail::quote_identifier(g->body.value("column", ""));
+    not_null_terms.push_back(c + " IS NOT NULL");
+    set_not_null_terms.push_back("ALTER COLUMN " + c + " SET NOT NULL");
+    const auto sources = detail::fill_sources(g->body);
+    rounds = std::max(rounds, sources.size());
+    if (sources.size() != 1 || sources[0].joined()) simple = false;
+  }
+  for (std::size_t round = 0; round < rounds; ++round) {
+    // The passes of this round, in the order their first column was written.
+    std::vector<std::pair<detail::FillSource, std::vector<const Intent*>>> passes;
+    for (const auto* g : pending) {
+      const auto sources = detail::fill_sources(g->body);
+      if (round >= sources.size()) continue;
+      detail::FillSource where{sources[round].from, sources[round].on, ""};
+      auto it = std::find_if(passes.begin(), passes.end(),
+                             [&](const auto& p) { return p.first == where; });
+      if (it == passes.end()) {
+        passes.emplace_back(where, std::vector<const Intent*>{});
+        it = passes.end() - 1;
+      }
+      it->second.push_back(g);
+    }
+    for (const auto& [where, cols] : passes) {
+      json set = json::object();
+      std::vector<std::string> terms, what;
+      for (const auto* g : cols) {
+        const auto column = g->body.value("column", "");
+        const auto c = rel_alias + "." + detail::quote_identifier(column);
+        const auto value = detail::fill_sources(g->body)[round].value;
+        // Never over a value already there: one the application wrote, or an
+        // earlier source gave. Only the single-expression, single-column walk
+        // needs no such care, since its predicate is that column being null.
+        set[column] = simple ? "(" + value + ")" : "COALESCE(" + c + ", (" + value + "))";
+        terms.push_back(where.joined() ? "(" + c + " IS NULL AND (" + value + ") IS NOT NULL)"
+                                       : c + " IS NULL");
+        what.push_back(column);
+      }
+      Intent bf;
+      bf.kind = IntentKind::kBackfill;
+      bf.kind_name = "backfill";
+      bf.ordinal = in.ordinal;
+      bf.body = json{{"schema", in.schema()}, {"table", in.table()}, {"key", key}, {"set", set}};
+      // The trigger made in step 1 fills every row inserted from here on, so
+      // this walk need not go past the highest key there is when it starts.
+      // Not part of the specification's language: plan_backfill reads it.
+      bf.body["new_rows_are_filled"] = true;
+      if (where.joined()) {
+        bf.body["from"] = where.from;
+        bf.body["where"] = "(" + where.on + ") AND (" + detail::join(terms, " OR ") + ")";
+      } else {
+        bf.body["where"] = detail::join(terms, " OR ");
+      }
+      const auto before = out.size();
+      plan_backfill(bf, after, cfg, plan, out);
+      for (std::size_t i = before; i < out.size(); ++i) {
+        if (out[i].action == Action::kConflict) return;  // said by the backfill itself
+        if (rounds > 1 || where.joined()) {
+          out[i].detail["fill_source"] = round + 1;
+          out[i].why = "source " + std::to_string(round + 1) + " of " + std::to_string(rounds) +
+                       " for " + detail::join(what, ", ") +
+                       (where.joined() ? ": joined to " + where.from + " on " + where.on
+                                       : ": an expression over the row") +
+                       ", over the rows still null. " + out[i].why;
+        }
+      }
+    }
+  }
+
+  // Step 3. NOT NULL, by the recipe whose scan runs under a lock the
+  // application works through.
+  std::string traits_by;
+  const auto traits = constraint_traits(after, qualified, traits_by);
+  const bool one_scan = pending.size() > 1 &&
+                        !(traits.answered && !traits.separate_validation);
+  if (!one_scan) {
+    // One column -- or a table whose vendor allows no separate VALIDATE, where
+    // each column goes through the recipe that knows what to do about that.
+    for (const auto* g : pending) {
+      Intent nn;
+      nn.kind = IntentKind::kSetNotNull;
+      nn.kind_name = "set_not_null";
+      nn.ordinal = in.ordinal;
+      nn.body = json{{"schema", in.schema()}, {"table", in.table()},
+                     {"column", g->body.value("column", "")}};
+      plan_set_not_null(nn, after, plan, out);
+    }
+  } else {
+    // Several columns, ONE scan: a single check over all of them proves each
+    // (measured, above), so they are set NOT NULL in one statement after it.
+    const auto check = in.table() + "_" + in.body.value("column", "") + "_laswell_nn";
+    const auto sql_check = detail::quote_identifier(check);
+    const auto have = detail::constraint_state(t, check);
+    const auto make = [&](const std::string& sql, const std::string& lock,
+                          const std::string& why) {
+      Step s;
+      s.kind = "set_not_null";
+      s.txn_class = TxnClass::kRequired;
+      s.own_transaction = true;
+      s.sql.push_back(sql);
+      s.lock = lock;
+      s.why = why;
+      s.detail["columns"] = names;
+      s.detail["qualified"] = qualified;
+      if (sql.find("VALIDATE CONSTRAINT") == std::string::npos) weaker_lock_first(s, {sql_rel});
+      out.push_back(std::move(s));
+    };
+    if (have == detail::ConstraintState::kAbsent) {
+      make("ALTER TABLE " + sql_rel + " ADD CONSTRAINT " + sql_check + " CHECK (" +
+               detail::join(not_null_terms, " AND ") + ") NOT VALID;",
+           "AccessExclusiveLock, briefly: reads and writes wait while it is "
+           "requested and held; NOT VALID means no scan",
+           "one check over all " + std::to_string(pending.size()) + " columns, NOT VALID: "
+           "no scan, so the exclusive lock is held for the catalog change only");
+    }
+    if (have != detail::ConstraintState::kValid) {
+      make("ALTER TABLE " + sql_rel + " VALIDATE CONSTRAINT " + sql_check + ";",
+           "ShareUpdateExclusiveLock -- does NOT block reads or writes",
+           "the ONE scan for all " + std::to_string(pending.size()) + " columns, under a "
+           "lock that lets the application keep working. Its own transaction, or the "
+           "lock of the step before would be held across it");
+      do_not_rehearse(out.back(), detail::kScanNotRehearsed, /*leaves_gap=*/false);
+    }
+    make("ALTER TABLE " + sql_rel + " " + detail::join(set_not_null_terms, ", ") + ";",
+         "AccessExclusiveLock, but no scan",
+         "still an exclusive lock, but PostgreSQL skips the scan for every column: "
+         "the validated check proves each has no nulls (measured: both of two "
+         "columns in one statement, 4 ms on 6 million rows, against 344 ms for one "
+         "bare SET NOT NULL)");
+    if (have != detail::ConstraintState::kValid) {
+      do_not_rehearse(out.back(), detail::kNeedsTheScan, /*leaves_gap=*/true);
+    }
+    make("ALTER TABLE " + sql_rel + " DROP CONSTRAINT " + sql_check + ";",
+         "AccessExclusiveLock, briefly",
+         "the check is redundant once the columns are NOT NULL, and a redundant "
+         "constraint costs time on every insert");
+  }
+
+  std::vector<std::string> sources;
+  bool any_joined = false;
+  for (const auto* g : group) {
+    const auto list = detail::fill_sources(g->body);
+    for (const auto& src : list) any_joined = any_joined || src.joined();
+    sources.push_back(g->body.value("column", "") + " from " + detail::fill_described(list));
+  }
+  if (any_joined) {
+    plan.warnings.push_back(
+        "a source's \"on\" must match at most one row of its table. The trigger "
+        "takes the value by a subquery and FAILS the write when two rows match "
+        "(\"more than one row returned by a subquery\"); the backfill joins, "
+        "and takes one of them without saying which. A unique key on what "
+        "\"on\" compares is what makes the two agree. The value is copied when "
+        "the row is written: a later change in the other table does not follow.");
+  }
+  plan.warnings.push_back(
+      qualified + ": " + detail::join(sources, "; ") + " -- filled by trigger " + filler +
+      " for rows written from step 1 on and by a backfill for the rest. A row for "
+      "which no source gives a value stays null, and the VALIDATE before SET NOT NULL "
+      "then fails on it: the job stops there with the column nullable and the "
+      "trigger in place, and the same specification resumes once the row is "
+      "repaired. The dry run does not look for such a row.");
+  plan.warnings.push_back(
+      "trigger " + filler + " and its function are created by this plan in schema " +
+      in.schema() + ", and run as the role writing the row: names inside an "
+      "expression resolve through that role's search_path, so qualify what it "
+      "calls. The row's own columns are written bare or as " + in.table() + ".<column>.");
+
+  // Step 4.
+  if (drop_after) {
+    drop_filler("last step: NOT NULL is set and the application writes " +
+                std::string(group.size() == 1 ? "the column" : "the columns") +
+                " itself (\"after\": \"drop_trigger\"), so the trigger and its function "
+                "go. An insert that does not supply " +
+                (group.size() == 1 ? "it" : "them") + " fails from here on");
+  } else {
+    plan.warnings.push_back(
+        "trigger " + filler + " STAYS (\"after\": \"keep_trigger\"): it runs on "
+        "every insert and update of " + qualified + " until a later specification "
+        "drops it with drop_trigger and drop_function.");
+  }
+}
+
+// Which consecutive add_column intents with "fill" are planned as one recipe:
+// same table, same "after", same "key". Returns, for the intent at `first`,
+// the intents planned with it (itself first).
+//
+// Not merged, and so planned one after the other, where one column's
+// expression names another column of the group: the trigger fills in order,
+// so the second expression would see the first column filled, while one
+// UPDATE evaluates every expression against the row as it was. One after the
+// other is the only reading under which the trigger and the backfill agree.
+inline std::vector<const Intent*> filled_column_group(const Spec& spec, std::size_t first) {
+  std::vector<const Intent*> group;
+  const Intent& lead = spec.intents[first];
+  if (lead.kind != IntentKind::kAddColumn || !lead.body.contains("fill")) return group;
+  group.push_back(&lead);
+  // A column with a default has no trigger and no NOT NULL recipe to share,
+  // but it has a walk, and that is shared among columns of its own kind.
+  const auto defaulted = [](const Intent& i) {
+    return i.body.contains("default") && !i.body["default"].is_null();
+  };
+  const auto names_word = [](const std::string& text, const std::string& word) {
+    std::size_t at = 0;
+    const auto ident = [](char ch) {
+      return std::isalnum(static_cast<unsigned char>(ch)) != 0 || ch == '_';
+    };
+    while ((at = text.find(word, at)) != std::string::npos) {
+      const bool left = at == 0 || !ident(text[at - 1]);
+      const bool right = at + word.size() >= text.size() || !ident(text[at + word.size()]);
+      if (left && right) return true;
+      ++at;
+    }
+    return false;
+  };
+  for (std::size_t i = first + 1; i < spec.intents.size(); ++i) {
+    const Intent& next = spec.intents[i];
+    if (next.kind != IntentKind::kAddColumn || !next.body.contains("fill")) break;
+    if (defaulted(next) != defaulted(lead)) break;
+    if (next.qualified_table() != lead.qualified_table()) break;
+    if (next.body.value("after", "") != lead.body.value("after", "")) break;
+    if (next.body.value("key", "") != lead.body.value("key", "")) break;
+    bool entangled = false;
+    for (const auto* g : group) {
+      if (names_word(detail::fill_text(next.body), g->body.value("column", "")) ||
+          names_word(detail::fill_text(g->body), next.body.value("column", ""))) {
+        entangled = true;
+      }
+    }
+    if (entangled) break;
+    group.push_back(&next);
+  }
+  return group;
+}
+
+// --- add_column with "default" AND "fill" ------------------------------------
+//
+// Where most rows keep one value, the column is added NOT NULL with that value
+// as its default: catalog-only (measured, a non-volatile default), and every
+// existing row reads it without being rewritten. What is left is to write the
+// rows whose value DIFFERS -- and only those, so the walk reads the table once
+// and writes, logs and leaves dead rows for the exceptions alone.
+//
+// There is nothing after it: no check, no validation scan, no SET NOT NULL.
+// The one exclusive lock is the ADD COLUMN, taken BEFORE the walk, so it never
+// lands behind the autovacuum a backfill provokes.
+//
+// No trigger (decided with the form): a row written after the column exists
+// gets the default unless the application supplies a value. So the walk
+// touches a row only while it still HOLDS the default -- a value the
+// application wrote is never overwritten -- and a row no source has a value
+// for keeps the default.
+//
+// Several such columns on one table, written as consecutive intents, share ONE
+// walk: it selects a row when ANY of them still holds its default and has
+// another value to take, and writes each column only where that is so for it.
+inline void plan_defaulted_fill(const std::vector<const Intent*>& group,
+                                const Observations& obs, const ExecutorConfig& cfg,
+                                Plan& plan, std::vector<Step>& out) {
+  const Intent& in = *group.front();
+  const auto qualified = in.qualified_table();
+  const auto rel = detail::quote_identifier(in.table());
+
+  std::string key = in.body.value("key", "");
+  if (key.empty()) {
+    key = detail::default_fill_key(obs, qualified);
+    if (key.empty()) {
+      Step s;
+      s.kind = in.kind_name;
+      s.action = Action::kConflict;
+      s.why = qualified + " has no primary key to walk while filling " +
+              in.body.value("column", "") + ". Name in \"key\" a column that is "
+              "unique, or that a unique index over NOT NULL columns contains.";
+      plan.conflicts.push_back(s.why);
+      out.push_back(std::move(s));
+      return;
+    }
+  }
+
+  // One joined source, the same for every column, is a join. Anything else is
+  // one pass over the expression a trigger would use -- a COALESCE over the
+  // sources: with a default in the column, "still to do" cannot be told apart
+  // from "an earlier source gave the default's own value", so the sources
+  // cannot be walked one after the other as they are without a default.
+  const auto first_sources = detail::fill_sources(in.body);
+  bool join = first_sources.size() == 1 && first_sources[0].joined();
+  for (const auto* g : group) {
+    const auto src = detail::fill_sources(g->body);
+    if (src.size() != 1 || !src[0].joined() || src[0].from != first_sources[0].from ||
+        src[0].on != first_sources[0].on) {
+      join = false;
+    }
+  }
+
+  json set = json::object();
+  std::vector<std::string> any, described;
+  for (const auto* g : group) {
+    const auto column = g->body.value("column", "");
+    const auto c = rel + "." + detail::quote_identifier(column);
+    const auto dflt = "(" + g->body.value("default", "") + ")";
+    const auto sources = detail::fill_sources(g->body);
+    const std::string value = join ? sources[0].value : detail::fill_expression(sources);
+    // "Still holds the default, and there is another value to take."
+    const std::string differs = c + " IS NOT DISTINCT FROM " + dflt + " AND (" + value +
+                                ") IS NOT NULL AND (" + value + ") IS DISTINCT FROM " + dflt;
+    // Alone, the walk's predicate IS that condition. Among several, a row is
+    // selected for any of them, so each column is written only where it holds
+    // for THAT column.
+    set[column] = group.size() == 1
+                      ? "(" + value + ")"
+                      : "CASE WHEN " + differs + " THEN (" + value + ") ELSE " + c + " END";
+    any.push_back(group.size() == 1 ? differs : "(" + differs + ")");
+    described.push_back(column + " (default " + dflt + ") from " +
+                        detail::fill_described(sources));
+  }
+  Intent bf;
+  bf.kind = IntentKind::kBackfill;
+  bf.kind_name = "backfill";
+  bf.ordinal = in.ordinal;
+  bf.body = json{{"schema", in.schema()}, {"table", in.table()}, {"key", key}, {"set", set}};
+  if (join) {
+    bf.body["from"] = first_sources[0].from;
+    bf.body["where"] = "(" + first_sources[0].on + ") AND " +
+                       (group.size() == 1 ? any[0] : "(" + detail::join(any, " OR ") + ")");
+  } else {
+    bf.body["where"] = detail::join(any, " OR ");
+  }
+  const auto before = out.size();
+  plan_backfill(bf, obs, cfg, plan, out);
+  for (std::size_t i = before; i < out.size(); ++i) {
+    if (out[i].action == Action::kConflict) return;
+    out[i].why = "only the rows whose value differs from the default are written: " +
+                 detail::join(described, "; ") + ". " + out[i].why;
+  }
+  plan.warnings.push_back(
+      qualified + ": " + detail::join(described, "; ") + " -- NOT NULL with " +
+      (group.size() == 1 ? "its default" : "their defaults") + " from the first "
+      "step, and no trigger is created. A row written from then on gets the default "
+      "unless the application supplies a value; the backfill writes a column only while "
+      "it still holds the default, so a value the application wrote is kept -- and a "
+      "row it deliberately set to the default is indistinguishable from one it never "
+      "set, and is given the computed value. A row no source has a value for keeps "
+      "the default.");
+}
+
+inline void plan_add_column_plain(const Intent& in, const Observations& obs, Plan& plan,
+                                  std::vector<Step>& out);
+
+// Consecutive add_column intents with a default AND a fill, as one recipe:
+// every column added as any defaulted column is -- or found already there --
+// and then ONE walk.
+inline void plan_add_columns_defaulted(const std::vector<const Intent*>& group,
+                                       const Observations& obs, const ExecutorConfig& cfg,
+                                       Plan& plan, std::vector<Step>& out) {
+  const auto before = out.size();
+  Observations after = obs;
+  for (const auto* g : group) {
+    plan_add_column_plain(*g, obs, plan, out);
+    after.tables[g->qualified_table()]["columns"][g->body.value("column", "")] =
+        json{{"type", g->body.value("type", "")}, {"not_null", true}};
+  }
+  for (std::size_t i = before; i < out.size(); ++i) {
+    if (out[i].action == Action::kConflict) return;
+  }
+  plan_defaulted_fill(group, after, cfg, plan, out);
+}
+
+
+inline void plan_add_column(const Intent& in, const Observations& obs,
+                            const ExecutorConfig& cfg, Plan& plan,
                             std::vector<Step>& out) {
+  const bool has_fill = in.body.contains("fill");
+  const bool has_default = in.body.contains("default") && !in.body["default"].is_null();
+  if (has_fill && !has_default) {
+    plan_add_columns_filled({&in}, obs, cfg, plan, out);
+    return;
+  }
+  const auto before = out.size();
+  plan_add_column_plain(in, obs, plan, out);
+  if (!has_fill) return;
+  // With a default AND a fill: the column as any defaulted column is added --
+  // or found already there, when an earlier attempt stopped during the walk --
+  // and then the walk, which is its own predicate and so simply runs again.
+  for (std::size_t i = before; i < out.size(); ++i) {
+    if (out[i].action == Action::kConflict) return;
+  }
+  Observations after = obs;
+  after.tables[in.qualified_table()]["columns"][in.body.value("column", "")] =
+      json{{"type", in.body.value("type", "")}, {"not_null", true}};
+  plan_defaulted_fill({&in}, after, cfg, plan, out);
+}
+
+namespace detail {
+// Whether an SQL expression calls anything: a parenthesis outside a quoted
+// string. "now()" and "gen_random_uuid()" do; "0", "'a (b)'" and "true" do not.
+inline bool calls_a_function(const std::string& expr) {
+  bool quoted = false;
+  for (const char c : expr) {
+    if (c == '\'') quoted = !quoted;
+    if (c == '(' && !quoted) return true;
+  }
+  return false;
+}
+}  // namespace detail
+
+inline void plan_add_column_plain(const Intent& in, const Observations& obs, Plan& plan,
+                                  std::vector<Step>& out) {
   Step step;
   step.kind = in.kind_name;
   struct Emit { std::vector<Step>& o; Step& s; ~Emit() { o.push_back(s); } } emit{out, step};
@@ -281,15 +1071,42 @@ inline void plan_add_column(const Intent& in, const Observations& obs, Plan& pla
     plan.conflicts.push_back(
         qualified + "." + column +
         " is declared NOT NULL with no default; on a non-empty table that "
-        "fails outright. Add the column nullable, backfill it, then set NOT "
-        "NULL in a later spec.");
+        "fails outright. Give the value as \"fill\" -- one expression over the "
+        "row's own columns, with \"after\" saying what becomes of the trigger -- "
+        "and the plan adds the column nullable, fills new rows by trigger and "
+        "existing ones by a paced backfill, and sets NOT NULL last. Or give a "
+        "\"default\", which is catalog-only.");
     return;
   }
 
-  step.why = has_default
-                 ? "column absent; non-volatile default is catalog-only on PG 11+"
-                 : "column absent; nullable with no default is catalog-only";
-  step.detail["expected"] = "metadata only, no table rewrite";
+  // What is known of the default is its text. A constant is catalog-only
+  // (measured), and so is a call to a function that is not volatile -- now()
+  // did not rewrite. A VOLATILE one rewrites the table under
+  // AccessExclusiveLock: measured, gen_random_uuid() changed the relfilenode.
+  // Which a function is, is in pg_proc and not in the text, and this does not
+  // guess from a name: it stops claiming, and says how to find out.
+  const std::string default_text =
+      has_default ? (in.body["default"].is_string() ? in.body["default"].get<std::string>()
+                                                    : in.body["default"].dump())
+                  : std::string();
+  const bool calls = has_default && detail::calls_a_function(default_text);
+  step.why = !has_default ? "column absent; nullable with no default is catalog-only"
+             : !calls     ? "column absent; a constant default is catalog-only on PG 11+"
+                          : "column absent; the default calls a function, and is "
+                            "catalog-only on PG 11+ only if that function is not volatile";
+  step.detail["expected"] = calls ? "metadata only, unless the default is volatile"
+                                  : "metadata only, no table rewrite";
+  if (calls) {
+    plan.warnings.push_back(
+        qualified + "." + column + " takes the default " + default_text +
+        ", which calls a function. PostgreSQL keeps a default in the catalog when "
+        "it is not volatile -- measured: a constant, and now() -- and REWRITES the "
+        "whole table under AccessExclusiveLock when it is: measured, "
+        "gen_random_uuid(). pg_laswell does not know which this is. "
+        "SELECT proname, provolatile FROM pg_proc WHERE proname = '<the function>' "
+        "says: 'v' is volatile. For a volatile value on a table of any size, add "
+        "the column without the default and give the value as \"fill\".");
+  }
 }
 
 // Applies a planned step's effect to the projected catalog, so that later
@@ -679,29 +1496,180 @@ inline void project(const Intent& in, const Step& step, Observations& projected)
   }
 }
 
+namespace detail {
+// EVERY step that asks for a lock the application queues behind, on a table
+// that is already there, takes the weaker lock first and is marked for the
+// executor's short-timeout retry (weaker_lock_first, above).
+//
+// The recipes had it where a field report found the queue: set_not_null, the
+// NOT VALID adds, the fill recipe. The same request is made by a plain ADD
+// COLUMN, a DROP COLUMN, a rename, a trigger, a policy -- an audit counted
+// some thirty kinds -- and behind an autovacuum or one long transaction each
+// of them stops the application for all of lock_timeout in the same way. So
+// it is done here, once, for whatever a kind's planner emitted, rather than
+// remembered at thirty sites.
+//
+// Not a scan (VALIDATE takes only the weaker lock anyway), not a step outside
+// a transaction, not one that already has it, and not a statement on an index
+// alone. Only an ordinary or partitioned table can be named in LOCK TABLE.
+inline void take_weaker_lock_first(const Intent& in, const Observations& obs,
+                                   std::vector<Step>& steps) {
+  std::vector<std::string> tables;
+  switch (in.kind) {
+    case IntentKind::kAddColumn:
+    case IntentKind::kDropColumn:
+    case IntentKind::kAlterColumnType:
+    case IntentKind::kDropConstraint:
+    case IntentKind::kRenameTable:
+    case IntentKind::kRenameColumn:
+    case IntentKind::kRenameConstraint:
+    case IntentKind::kDropTable:
+    case IntentKind::kCreateTrigger:
+    case IntentKind::kDropTrigger:
+    case IntentKind::kSetTriggerState:
+    case IntentKind::kSetRowSecurity:
+    case IntentKind::kCreatePolicy:
+    case IntentKind::kAlterPolicy:
+    case IntentKind::kDropPolicy:
+    case IntentKind::kAlterColumnDefault:
+    case IntentKind::kDropNotNull:
+    case IntentKind::kSetIdentity:
+    case IntentKind::kDropExpression:
+    case IntentKind::kSetColumnOptions:
+    case IntentKind::kSetLogged:
+    case IntentKind::kSetTablespace:
+    case IntentKind::kSetAccessMethod:
+    case IntentKind::kSetReplicaIdentity:
+    case IntentKind::kCreateRule:
+    case IntentKind::kDropRule:
+    case IntentKind::kSetOwner:
+    case IntentKind::kAddPrimaryKey:
+    case IntentKind::kAddUniqueConstraint:
+    case IntentKind::kAddCheckConstraint:
+    case IntentKind::kAddForeignKey:
+    case IntentKind::kSetNotNull:
+    case IntentKind::kCreateIndex:
+    case IntentKind::kDropIndex:
+      tables.push_back(in.qualified_table());
+      break;
+    case IntentKind::kAttachPartition:
+      tables.push_back(in.body.value("schema", "") + "." + in.body.value("partition", ""));
+      break;
+    case IntentKind::kDetachPartition:
+      tables.push_back(in.qualified_table());
+      tables.push_back(in.body.value("schema", "") + "." + in.body.value("partition", ""));
+      break;
+    case IntentKind::kCreateTable:
+      if (in.body.contains("partition_of") && in.body["partition_of"].is_string()) {
+        tables.push_back(in.body["partition_of"].get<std::string>());
+      }
+      break;
+    default:
+      return;
+  }
+  std::vector<std::string> lockable;
+  for (const auto& q : tables) {
+    const auto& t = obs.table(q);
+    const auto kind = t.value("kind", "");
+    if (t.value("exists", false) && (kind == "table" || kind == "partitioned_table")) {
+      lockable.push_back(quote_qualified(q));
+    }
+  }
+  if (lockable.empty()) return;
+  for (auto& step : steps) {
+    if (step.action != Action::kApply || step.sql.empty()) continue;
+    if (step.txn_class != TxnClass::kRequired && step.txn_class != TxnClass::kOptional) continue;
+    if (step.detail.value("exclusive_retry", false)) continue;
+    // Only a lock that readers or writers wait behind.
+    if (step.lock.find("AccessExclusiveLock") == std::string::npos &&
+        step.lock.find("ShareRowExclusiveLock") == std::string::npos &&
+        step.lock.find("ShareLock") == std::string::npos) {
+      continue;
+    }
+    bool skip = false;
+    for (const auto& q : step.sql) {
+      if (q.find("VALIDATE CONSTRAINT") != std::string::npos) skip = true;
+    }
+    if (step.sql.front().rfind("ALTER INDEX ", 0) == 0) skip = true;
+    if (skip) continue;
+    weaker_lock_first(step, lockable);
+  }
+}
+}  // namespace detail
+
 // Every enabled module's answer to: how may an index be built and dropped on
-// this table? (planner_base.h, IndexTraits). The first module to answer wins,
-// for the reason required_confinement() gives. `decided_by` names it.
+// this table? (planner_base.h, IndexTraits). EVERY module is asked and the
+// answers are merged, because they answer different questions: how to build,
+// how much data, how much memory. The first to answer used to win, and on a
+// hypertable with a vector column that was whichever the build listed first --
+// pgvector's memory request hid TimescaleDB's "no concurrent build", or
+// TimescaleDB's answer hid the memory request.
+//
+//   concurrent      false if any module says so: the restriction is real
+//                   whoever else has no objection.
+//   size, rows      the largest reported; a module reports them only for a
+//                   table whose own relation does not hold the rows.
+//   per-part option, parts, scope    the first given.
+//   memory          the largest asked for, by total or by row times `rows`.
+//
+// `decided_by` names the module that decided the BUILD: the one that ruled out
+// a concurrent build, else the first to give a size, parts or an option, else
+// the first that answered at all. `memory_by` in the result names the one that
+// asked for memory.
 #include "modules/enabled_index_headers.h"
 // `in` is the intent being planned, read-only, so a module can say how much
 // memory THIS index would like (an HNSW graph depends on its columns and m).
 inline IndexTraits index_traits(const Observations& obs, const std::string& qualified,
                                 const Intent& in, std::string& decided_by) {
-#define PGLASWELL_INDEX_TRAITS(module_name, traits_fn)      \
-  {                                                          \
-    auto t = traits_fn(obs, qualified, in);                  \
-    if (t.answered) {                                        \
-      decided_by = module_name;                              \
-      return t;                                              \
-    }                                                        \
+  IndexTraits merged;
+  std::string first, first_build, not_concurrent, per_row_by;
+#define PGLASWELL_INDEX_TRAITS(module_name, traits_fn)                              \
+  {                                                                                  \
+    auto t = traits_fn(obs, qualified, in);                                          \
+    if (t.answered) {                                                                \
+      if (first.empty()) first = module_name;                                        \
+      merged.answered = true;                                                        \
+      if (!t.concurrent) {                                                           \
+        merged.concurrent = false;                                                   \
+        if (not_concurrent.empty()) not_concurrent = module_name;                    \
+      }                                                                              \
+      if (first_build.empty() &&                                                     \
+          (t.size_bytes >= 0 || !t.parts.empty() || !t.per_part_option.empty())) {   \
+        first_build = module_name;                                                   \
+      }                                                                              \
+      if (merged.per_part_option.empty() && !t.per_part_option.empty()) {            \
+        merged.per_part_option = t.per_part_option;                                  \
+        merged.per_part_unique = t.per_part_unique;                                  \
+      }                                                                              \
+      if (t.size_bytes > merged.size_bytes) merged.size_bytes = t.size_bytes;        \
+      if (t.rows > merged.rows) merged.rows = t.rows;                                \
+      if (merged.scope.empty()) merged.scope = t.scope;                              \
+      if (merged.parts.empty()) merged.parts = std::move(t.parts);                   \
+      if (t.memory_wanted > merged.memory_wanted) {                                  \
+        merged.memory_wanted = t.memory_wanted;                                      \
+        merged.memory_by = module_name;                                              \
+      }                                                                              \
+      if (t.memory_per_row > merged.memory_per_row) {                                \
+        merged.memory_per_row = t.memory_per_row;                                    \
+        per_row_by = module_name;                                                    \
+      }                                                                              \
+    }                                                                                \
   }
 #include "modules/enabled_index_traits.h"
 #undef PGLASWELL_INDEX_TRAITS
   (void)obs;
   (void)qualified;
   (void)in;
-  decided_by.clear();
-  return {};
+  // A module that knows what a row costs, on a table whose rows another counts.
+  if (merged.memory_per_row > 0 && merged.rows > 0 &&
+      merged.rows * merged.memory_per_row > merged.memory_wanted) {
+    merged.memory_wanted = merged.rows * merged.memory_per_row;
+    merged.memory_by = per_row_by;
+  }
+  decided_by = !not_concurrent.empty() ? not_concurrent
+               : !first_build.empty()  ? first_build
+                                       : first;
+  return merged;
 }
 
 // Every enabled module's answer to: can a constraint on this table be
@@ -745,6 +1713,8 @@ inline void validate_in_one_step(Step& step, Plan& plan, const ConstraintTraits&
              "fail on the second -> validated by the statement that adds it" + over;
   step.detail["validated_in_one_step_by"] = by;
   if (traits.rows >= 0) step.detail["rows"] = traits.rows;
+  // The statement IS the scan, under its own lock: not for the dry run.
+  do_not_rehearse(step, detail::kHeavyNotRehearsed, /*leaves_gap=*/true);
   plan.warnings.push_back(
       what + " on " + qualified + " is validated in one statement: " + by +
       " allows no separate VALIDATE CONSTRAINT here. " + blocks + " " + scope +
@@ -776,6 +1746,151 @@ inline std::string per_part_option_sql(const std::string& option) {
                            "(namespaced) identifier: " + option);
   }
   return option;
+}
+
+// The name of the index on one part: <part>_<index>, as TimescaleDB names the
+// ones it makes itself. Empty when it would not fit an identifier.
+inline std::string index_part_name(const IndexPart& part, const std::string& name) {
+  const auto bare = part.relation.substr(part.relation.find('.') + 1);
+  const auto child = bare + "_" + name;
+  return child.size() > 63 ? std::string() : child;
+}
+
+// How many parts still lack a valid index of this name; -1 when a name would
+// not fit, in which case this recipe is not used at all.
+inline int index_parts_missing(const IndexTraits& traits, const std::string& name) {
+  int missing = 0;
+  for (const auto& part : traits.parts) {
+    const auto child = index_part_name(part, name);
+    if (child.empty()) return -1;
+    const auto it = part.indexes.find(child);
+    if (it == part.indexes.end() || !it->second) ++missing;
+  }
+  return missing;
+}
+
+// An index built on each part CONCURRENTLY, after an index ON ONLY the parent
+// (IndexTraits::parts). The parent first: it is a catalog change, and from
+// then on a part created while the rest are being built gets its index by
+// itself. Then each existing part, which blocks no write. A module said this
+// is possible here and what the parts are; every statement is core's.
+//
+// Resumable from the reading: a part that has its index, valid, is left
+// alone, and one whose concurrent build failed has the invalid index dropped
+// first. Each concurrent build gets its own validity check, as any does.
+namespace detail {
+// A build that says how much memory it wants (an HNSW graph, from pgvector)
+// is raised toward it when no ceiling is configured -- the configured case
+// is applied to every index step, and wins. The limit is deduced from
+// shared_buffers (index_build_mwm_bytes), so the raise is bounded by the one
+// memory figure every server is tuned by.
+inline void raise_build_memory(Step& step, const IndexTraits& traits,
+                               const Observations& obs, const ExecutorConfig& cfg) {
+  if (!traits.answered || traits.memory_wanted <= 0 || cfg.maintenance_work_mem_mb != 0) return;
+  const auto budget = detail::compute_budget(obs, cfg);
+  const long long server = budget["maintenanceWorkMem"].value("serverDefaultKb", 0LL) * 1024;
+  const long long eff = index_build_mwm_bytes(budget, traits.memory_wanted);
+  if (eff <= server) return;
+  const long long mb = (eff + (1LL << 20) - 1) >> 20;
+  step.detail["maintenance_work_mem_mb"] = mb;
+  step.detail["memory_wanted_by"] = traits.memory_by;
+  step.why += "; maintenance_work_mem raised to " + std::to_string(mb) +
+              "MB for this build: " + traits.memory_by + " says it needs about " +
+              detail::human_bytes(traits.memory_wanted) +
+              (eff < traits.memory_wanted
+                   ? ", limited to " +
+                         budget["maintenanceWorkMem"].value("derivedFrom", std::string())
+                   : std::string()) +
+              " (no maintenance_work_mem_mb configured)";
+}
+}  // namespace detail
+
+inline void plan_index_by_parts(const Intent& in, const IndexTraits& traits,
+                                const std::string& by, const std::string& using_tail,
+                                bool parent_exists, Plan& plan, std::vector<Step>& out) {
+  const auto qualified = in.qualified_table();
+  const auto sql_rel = detail::quote_qualified(qualified);
+  const auto name = in.body.value("name", "");
+  const std::string scope = traits.scope.empty() ? qualified : traits.scope;
+  const std::string size =
+      traits.size_bytes >= 0 ? "size " + detail::human_bytes(traits.size_bytes) + ", and " : "";
+
+  if (!parent_exists) {
+    Step parent;
+    parent.kind = in.kind_name;
+    parent.txn_class = TxnClass::kRequired;
+    parent.own_transaction = true;
+    parent.lock = "ShareLock on " + scope + ", briefly: a catalog change, no part is read";
+    parent.sql.push_back("CREATE INDEX " + detail::quote_identifier(name) + " ON ONLY " +
+                         sql_rel + using_tail + ";");
+    parent.sql.push_back("COMMENT ON INDEX " + detail::quote_identifier(in.schema()) + "." +
+                         detail::quote_identifier(name) + " IS " +
+                         detail::quote_literal(in.body.value("comment", "")) + ";");
+    parent.why = size + by + " says a concurrent build is not possible on " + qualified +
+                 " itself but is on each of its parts -> the index is created on the "
+                 "parent ONLY, which reads nothing, and each part is then built "
+                 "concurrently. A part created from here on gets its index by itself";
+    parent.detail["index"] = name;
+    parent.detail["schema"] = in.schema();
+    parent.detail["index_build_by"] = by;
+    if (traits.rows >= 0) parent.detail["rows"] = traits.rows;
+    weaker_lock_first(parent, {sql_rel});
+    out.push_back(std::move(parent));
+  }
+
+  int position = 0, built = 0;
+  for (const auto& part : traits.parts) {
+    ++position;
+    const auto child = index_part_name(part, name);
+    const auto have = part.indexes.find(child);
+    if (have != part.indexes.end() && have->second) continue;  // already there, valid
+    const auto part_schema = part.relation.substr(0, part.relation.find('.'));
+    const auto sql_child = detail::quote_identifier(part_schema) + "." +
+                           detail::quote_identifier(child);
+    Step s;
+    s.kind = in.kind_name;
+    s.txn_class = TxnClass::kForbidden;
+    s.own_transaction = true;
+    s.lock = "ShareUpdateExclusiveLock on " + part.relation + " -- blocks neither reads nor writes";
+    if (have != part.indexes.end()) {
+      // A concurrent build that failed leaves an invalid index of this name.
+      s.sql.push_back("DROP INDEX CONCURRENTLY " + sql_child + ";");
+      s.detail["recovering_invalid_index"] = true;
+    }
+    s.sql.push_back("CREATE INDEX CONCURRENTLY " + detail::quote_identifier(child) + " ON " +
+                    detail::quote_qualified(part.relation) + using_tail + ";");
+    s.why = "part " + std::to_string(position) + " of " + std::to_string(traits.parts.size()) +
+            ": built concurrently on the part itself, so a write that touches every "
+            "part is not held behind it";
+    s.detail["partition"] = part.relation;
+    s.detail["index"] = child;
+    s.detail["schema"] = part_schema;
+    s.detail["must_verify_valid"] = true;
+    s.detail["failure_mode"] =
+        "a failed CREATE INDEX CONCURRENTLY leaves an INVALID index on this part; "
+        "the next step reads indisvalid, and a re-plan drops it and builds this "
+        "part again, leaving the parts already done alone";
+    out.push_back(std::move(s));
+    ++built;
+  }
+  if (parent_exists && built == 0) {
+    Step s;
+    s.kind = in.kind_name;
+    s.action = Action::kSatisfied;
+    s.why = "index already present, and valid on every part";
+    out.push_back(std::move(s));
+    return;
+  }
+  plan.warnings.push_back(
+      "\"" + name + "\" on " + qualified + " is built part by part: " +
+      std::to_string(built) + " of " + std::to_string(traits.parts.size()) +
+      " part(s) concurrently, each in a step of its own with its own validity "
+      "check" + (parent_exists ? ", continuing an earlier attempt" : "") + ". " + by +
+      " counts an index of the same definition on a part as the parent index's -- "
+      "that is what was measured, not something its documentation promises -- so "
+      "the last step of each part is the proof that it is there and valid. If the "
+      "job stops partway the index exists on some parts only; applying the "
+      "specification again builds the rest.");
 }
 
 inline void plan_create_index(const Intent& in, const Observations& obs,
@@ -823,6 +1938,19 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
   for (const auto& k : keys) columns.push_back(k.name);
   std::vector<std::string> quoted_columns;
   for (const auto& k : keys) quoted_columns.push_back(index_column_sql(k));
+  // Everything after the relation, for a recipe that names more than one
+  // (plan_index_by_parts): the same text for the parent and for each part.
+  std::string using_tail;
+  {
+    std::string include;
+    if (!include_columns.empty()) {
+      std::vector<std::string> q;
+      for (const auto& c : include_columns) q.push_back(detail::quote_identifier(c));
+      include = " INCLUDE (" + detail::join(q, ", ") + ")";
+    }
+    using_tail = " USING " + method + " (" + detail::join(quoted_columns, ", ") + ")" +
+                 include + index_with_sql(in.body) + (where.empty() ? "" : " WHERE " + where);
+  }
   const auto want_order = index_order_terms(keys);
 
   if (!t.value("exists", false)) {
@@ -843,6 +1971,20 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
     if (!existing.value("is_valid", false)) {
       rebuild_after_drop = true;
     } else {
+      // Present and valid on the table -- but where the index is built part
+      // by part, the parent's is a catalog entry, and "done" means every part
+      // has its own. An attempt that stopped partway is continued here.
+      {
+        std::string parts_by;
+        const auto parts_traits = index_traits(obs, qualified, in, parts_by);
+        if (!parts_traits.parts.empty() && !unique &&
+            index_parts_missing(parts_traits, name) > 0) {
+          handed_off = true;
+          plan_index_by_parts(in, parts_traits, parts_by, using_tail,
+                              /*parent_exists=*/true, plan, out);
+          return;
+        }
+      }
       step.action = Action::kSatisfied;
       step.why = "index already present and valid";
       step.detail["existing_definition"] = existing.value("definition", "");
@@ -1220,7 +2362,11 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
     // Where a concurrent drop is not possible (a hypertable: measured, "DROP
     // INDEX CONCURRENTLY does not support dropping multiple objects"), the
     // invalid index goes with a plain DROP.
-    step.sql.push_back(std::string(traits.answered && !traits.concurrent
+    // And where the build itself is plain -- one transaction, on a small quiet
+    // table -- the drop joins it: DROP INDEX CONCURRENTLY cannot run inside a
+    // transaction block (measured), and dropped and rebuilt in one transaction
+    // the table is never without the index.
+    step.sql.push_back(std::string((traits.answered && !traits.concurrent) || plain
                                        ? "DROP INDEX "
                                        : "DROP INDEX CONCURRENTLY ") +
                        detail::quote_identifier(in.schema()) + "." +
@@ -1237,6 +2383,21 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
   }
   const std::string scope = traits.scope.empty() ? qualified : traits.scope;
 
+  if (traits.answered && !traits.concurrent && !plain && !unique && !rebuild_after_drop &&
+      !traits.parts.empty() && index_parts_missing(traits, name) >= 0) {
+    // No concurrent build on the table itself, but one on each of its parts.
+    handed_off = true;
+    const auto before = out.size();
+    plan_index_by_parts(in, traits, traits_by, using_tail, /*parent_exists=*/false, plan, out);
+    // Each part's build is a build: the memory asked for is the whole
+    // table's, which is the most any one part can need.
+    for (auto s = before; s < out.size(); ++s) {
+      if (out[s].txn_class == TxnClass::kForbidden && out[s].kind == in.kind_name) {
+        detail::raise_build_memory(out[s], traits, obs, cfg);
+      }
+    }
+    return;
+  }
   if (traits.answered && !traits.concurrent && !plain) {
     // No concurrent build here. Two ways remain, and the reading says which.
     const bool per_part = !traits.per_part_option.empty() &&
@@ -1288,6 +2449,11 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
           ". Writes to " + scope + " block for the whole build, over " +
           detail::human_bytes(size) + ". Schedule it for a quiet window.");
     }
+    // A plain build of any size, because the module allows no other: writes
+    // wait for the whole of it, in the dry run as in the job.
+    if (!(small_enough && quiet)) {
+      do_not_rehearse(step, detail::kHeavyNotRehearsed, /*leaves_gap=*/true);
+    }
   } else if (plain) {
     step.txn_class = TxnClass::kOptional;
     step.lock = "ShareLock (blocks writes for the whole build)";
@@ -1315,31 +2481,7 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
         "will DROP INDEX CONCURRENTLY before rebuilding";
   }
 
-  // A build that says how much memory it wants (an HNSW graph, from pgvector)
-  // is raised toward it when no ceiling is configured -- the configured case
-  // is applied to every index step below, and wins. The limit is deduced from
-  // shared_buffers (index_build_mwm_bytes), so the raise is bounded by the one
-  // memory figure every server is tuned by.
-  if (traits.answered && traits.memory_wanted > 0 && cfg.maintenance_work_mem_mb == 0) {
-    const auto budget = detail::compute_budget(obs, cfg);
-    const long long server =
-        budget["maintenanceWorkMem"].value("serverDefaultKb", 0LL) * 1024;
-    const long long eff = index_build_mwm_bytes(budget, traits.memory_wanted);
-    if (eff > server) {
-      const long long mb = (eff + (1LL << 20) - 1) >> 20;
-      const auto human = [](long long b) { return detail::human_bytes(b); };
-      step.detail["maintenance_work_mem_mb"] = mb;
-      step.detail["memory_wanted_by"] = traits_by;
-      step.why += "; maintenance_work_mem raised to " + std::to_string(mb) +
-                  "MB for this build: " + traits_by + " says it needs about " +
-                  human(traits.memory_wanted) +
-                  (eff < traits.memory_wanted
-                       ? ", limited to " +
-                             budget["maintenanceWorkMem"].value("derivedFrom", std::string())
-                       : std::string()) +
-                  " (no maintenance_work_mem_mb configured)";
-    }
-  }
+  detail::raise_build_memory(step, traits, obs, cfg);
 
   step.sql.push_back("COMMENT ON INDEX " + detail::quote_identifier(in.schema()) + "." + detail::quote_identifier(name) + " IS " +
                      detail::quote_literal(in.body.value("comment", "")) + ";");
@@ -1369,6 +2511,40 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
 // time rather than together: two concurrent builds on one parent's children
 // contend for the same catalog rows without buying any parallelism worth
 // having.
+namespace detail {
+// "RANGE (at)" or "LIST (region, kind)" -> the key's columns. Empty when any
+// part of the key is an expression, which no unique key can contain.
+inline std::vector<std::string> partition_key_columns(const std::string& partkeydef) {
+  const auto open = partkeydef.find('(');
+  const auto close = partkeydef.rfind(')');
+  if (open == std::string::npos || close == std::string::npos || close < open) return {};
+  const std::string inner = partkeydef.substr(open + 1, close - open - 1);
+  if (inner.find('(') != std::string::npos) return {};
+  std::vector<std::string> columns;
+  std::size_t at = 0;
+  while (at <= inner.size()) {
+    auto comma = inner.find(',', at);
+    if (comma == std::string::npos) comma = inner.size();
+    std::string part = inner.substr(at, comma - at);
+    const auto first = part.find_first_not_of(' ');
+    if (first == std::string::npos) return {};
+    part = part.substr(first);
+    // The column, without an operator class or a collation after it.
+    std::string column;
+    if (part[0] == '"') {
+      const auto end = part.find('"', 1);
+      if (end == std::string::npos) return {};
+      column = part.substr(1, end - 1);
+    } else {
+      column = part.substr(0, part.find(' '));
+    }
+    columns.push_back(column);
+    at = comma + 1;
+  }
+  return columns;
+}
+}  // namespace detail
+
 inline void plan_partitioned_index(const Intent& in, const json& t, Plan& plan,
                                    std::vector<Step>& out, Step& parent_step) {
   const auto qualified = in.qualified_table();
@@ -1405,19 +2581,51 @@ inline void plan_partitioned_index(const Intent& in, const json& t, Plan& plan,
     return;
   }
 
-  // A unique index on a partitioned table must include the partition key, and
-  // this planner does not read the partition key. Refusing beats emitting a
-  // recipe whose last step fails.
+  // A unique index on a partitioned table must include every partition column
+  // (measured: "unique constraint on partitioned table must include all
+  // partitioning columns"), and cannot exist at all when the key is an
+  // expression. Said here, in PostgreSQL's words, rather than by the last
+  // step of the recipe.
   if (unique) {
+    const auto partkey = t.value("partition_key", std::string());
+    const auto key = detail::partition_key_columns(partkey);
+    std::string missing;
+    for (const auto& k : key) {
+      if (std::find(columns.begin(), columns.end(), k) == columns.end()) {
+        missing = k;
+        break;
+      }
+    }
+    if (key.empty() || !missing.empty()) {
+      parent_step.action = Action::kConflict;
+      parent_step.why = key.empty()
+                            ? "the partition key of " + qualified + " is an expression"
+                            : "the key does not contain the partition column " + missing;
+      plan.conflicts.push_back(
+          "\"" + name + "\" is UNIQUE on " + qualified + ", partitioned by " + partkey +
+          (key.empty()
+               ? ". PostgreSQL allows no unique index on a table whose partition key "
+                 "includes an expression."
+               : ", and its columns (" + detail::join(columns, ", ") + ") do not contain " +
+                     missing + ". PostgreSQL: \"unique constraint on partitioned table "
+                     "must include all partitioning columns\". Add " + missing +
+                     " to the index."));
+      return;
+    }
+  }
+  // A partition that is itself partitioned takes no concurrent build either:
+  // the recipe would fail there, in the job.
+  for (const auto& part : t.value("partition_parts", json::array())) {
+    if (!part.value("partitioned", false)) continue;
     parent_step.action = Action::kConflict;
-    parent_step.why = "a unique index on a partitioned table must include the "
-                      "partition key, which this planner does not read";
+    parent_step.why = part.value("relation", "") + " is itself partitioned";
     plan.conflicts.push_back(
-        "\"" + name + "\" is UNIQUE on the partitioned table " + qualified +
-        ". PostgreSQL requires such an index to include the partition key, and "
-        "pg_laswell does not read the partition key, so it will not emit a "
-        "recipe whose final ATTACH would fail. Add the constraint by hand, or "
-        "make the index non-unique.");
+        "\"" + name + "\" on " + qualified + ": its partition " + part.value("relation", "") +
+        " is itself partitioned, so no index can be built on it concurrently. "
+        "Create the index on " + part.value("relation", "") +
+        " first, in an intent of its own, is not enough -- this recipe builds and "
+        "attaches an index of its own name on each partition -- so build this one by "
+        "hand, as PostgreSQL's documentation of partitioned tables describes.");
     return;
   }
 
@@ -1446,7 +2654,8 @@ inline void plan_partitioned_index(const Intent& in, const json& t, Plan& plan,
     s.txn_class = TxnClass::kForbidden;
     s.own_transaction = true;
     s.lock = "ShareUpdateExclusiveLock on " + part;
-    s.sql.push_back("CREATE INDEX CONCURRENTLY " + detail::quote_identifier(child) + " ON " +
+    s.sql.push_back(std::string("CREATE ") + (unique ? "UNIQUE " : "") +
+                    "INDEX CONCURRENTLY " + detail::quote_identifier(child) + " ON " +
                     detail::quote_qualified(part) + tail + ";");
     s.why = "partition " + std::to_string(child_indexes.size()) + " of " +
             std::to_string(partitions.size()) +
@@ -1463,7 +2672,8 @@ inline void plan_partitioned_index(const Intent& in, const json& t, Plan& plan,
   parent.txn_class = TxnClass::kOptional;
   parent.own_transaction = true;
   parent.lock = "ShareLock on " + qualified + ", which holds no data itself";
-  parent.sql.push_back("CREATE INDEX " + detail::quote_identifier(name) + " ON ONLY " + sql_rel + tail + ";");
+  parent.sql.push_back(std::string("CREATE ") + (unique ? "UNIQUE " : "") + "INDEX " +
+                       detail::quote_identifier(name) + " ON ONLY " + sql_rel + tail + ";");
   parent.sql.push_back("COMMENT ON INDEX " + detail::quote_identifier(in.schema()) + "." + detail::quote_identifier(name) + " IS " +
                        detail::quote_literal(in.body.value("comment", "")) + ";");
   parent.why =
@@ -1477,7 +2687,11 @@ inline void plan_partitioned_index(const Intent& in, const json& t, Plan& plan,
     Step s;
     s.kind = in.kind_name;
     s.txn_class = TxnClass::kOptional;
-    s.lock = "AccessExclusiveLock on the two indexes, briefly";
+    // Measured on 18.6: AccessExclusiveLock on the partition's index,
+    // ShareUpdateExclusiveLock on the parent index, AccessShareLock on both
+    // tables.
+    s.lock = "AccessExclusiveLock on the partition's index and "
+             "ShareUpdateExclusiveLock on the parent index, briefly";
     s.sql.push_back("ALTER INDEX " + detail::quote_identifier(in.schema()) + "." + detail::quote_identifier(name) +
                     " ATTACH PARTITION " + detail::quote_identifier(in.schema()) + "." + detail::quote_identifier(child_indexes[i]) + ";");
     s.why = "attach " + std::to_string(i + 1) + " of " +
@@ -1536,17 +2750,39 @@ inline void plan_add_check_constraint(const Intent& in, const Observations& obs,
     return;
   }
 
+  // An earlier attempt may have committed the NOT VALID add and failed at its
+  // VALIDATE -- on a violating row, which the dry run no longer looks for. The
+  // constraint is then there, and adding it again would fail on its name.
+  const auto have = detail::constraint_state(t, name);
+  if (have == detail::ConstraintState::kValid) {
+    Step s;
+    s.kind = in.kind_name;
+    s.action = Action::kSatisfied;
+    s.why = "constraint " + name + " already exists on " + qualified + " and is valid";
+    out.push_back(std::move(s));
+    return;
+  }
+
   Step add;
   add.kind = in.kind_name;
   add.txn_class = TxnClass::kRequired;
   add.own_transaction = true;
-  add.lock = "ShareRowExclusiveLock, briefly; NOT VALID means no scan";
+  // Measured on 18.6: ADD CONSTRAINT ... CHECK takes AccessExclusiveLock,
+  // NOT VALID or not. Only a foreign key gets the weaker ShareRowExclusiveLock.
+  // This said ShareRowExclusiveLock until a field report sampled pg_locks under
+  // load and found readers queued behind it.
+  add.lock = "AccessExclusiveLock, briefly: reads and writes wait while it is "
+             "requested and held; NOT VALID means no scan";
   add.sql.push_back("ALTER TABLE " + sql_rel + " ADD CONSTRAINT " + detail::quote_identifier(name) +
                     " CHECK (" + expression + ") NOT VALID;");
-  add.why = "step 1 of 2: NOT VALID costs no scan, so the strong lock is held "
-            "for the catalog change only";
+  add.why = "step 1 of 2: NOT VALID costs no scan, so the exclusive lock is held "
+            "for the catalog change only. It still has to be GRANTED: behind a "
+            "long transaction or an autovacuum on the table it waits, and every "
+            "reader and writer queues behind it until lock_timeout";
   add.detail["constraint"] = name;
-  out.push_back(std::move(add));
+  weaker_lock_first(add, {sql_rel});
+  const bool resuming = have == detail::ConstraintState::kNotValid;
+  if (!resuming) out.push_back(std::move(add));
 
   Step validate;
   validate.kind = in.kind_name;
@@ -1554,9 +2790,14 @@ inline void plan_add_check_constraint(const Intent& in, const Observations& obs,
   validate.own_transaction = true;
   validate.lock = "ShareUpdateExclusiveLock -- does NOT block reads or writes";
   validate.sql.push_back("ALTER TABLE " + sql_rel + " VALIDATE CONSTRAINT " + detail::quote_identifier(name) + ";");
-  validate.why = "step 2 of 2: the scan, under a lock the application can work "
-                 "through. Its own transaction, or step 1's lock would span it";
+  validate.why = resuming
+      ? "the constraint is already there, NOT VALID: an earlier attempt added it "
+        "and did not finish validating. This resumes at the scan, under a lock "
+        "the application can work through"
+      : "step 2 of 2: the scan, under a lock the application can work "
+        "through. Its own transaction, or step 1's lock would span it";
   validate.detail["constraint"] = name;
+  do_not_rehearse(validate, detail::kScanNotRehearsed, /*leaves_gap=*/false);
   out.push_back(std::move(validate));
 }
 
@@ -1935,7 +3176,8 @@ inline void plan_replication(const Intent& in, const Observations& obs,
 
     case IntentKind::kDropPublication:
       step.sql.push_back("DROP PUBLICATION " + name + ";");
-      step.lock = "ShareUpdateExclusiveLock on the published tables";
+      // Measured on 18.6: dropping a publication locks none of its tables.
+      step.lock = "none on the published tables";
       step.why = "the publication stops sending at commit";
       plan.warnings.push_back(
           "any subscriber to this publication stops receiving changes and does "
@@ -2200,7 +3442,10 @@ inline void plan_final_kinds(const Intent& in, const Observations& obs,
           detail::quote_literal(in.body.value("provider", "")) + " ON " + ot +
           " " + target + " IS " +
           (removing ? "NULL" : detail::quote_literal(in.body.value("label", ""))) + ";");
-      step.lock = "AccessShareLock";
+      // The same path as COMMENT, which was measured (see set_comment). Not
+      // measured itself: the lab has no label provider loaded.
+      step.lock = "ShareUpdateExclusiveLock on a relation; none that blocks "
+                  "on other objects";
       step.why = "a security label is metadata this server stores and does not "
                  "interpret";
       plan.warnings.push_back(
@@ -2482,7 +3727,8 @@ inline void plan_physical(const Intent& in, const Observations& obs, Plan& plan,
   const auto sql_rel = detail::quote_qualified(qualified);
   const auto& t = obs.table(qualified);
   const auto column = in.body.value("column", "");
-  const long long size = t.value("size_estimate", 0LL);
+  // What a rewrite copies and a move needs free: the data, wherever it is.
+  const long long size = detail::table_data(obs, qualified, in).bytes;
 
   auto emit = [&](std::vector<std::string> sql, const std::string& lock,
                   const std::string& why, bool own = false) {
@@ -2596,7 +3842,14 @@ inline void plan_physical(const Intent& in, const Observations& obs, Plan& plan,
       if (in.body.contains("compression")) {
         sql.push_back(head + "COMPRESSION " + in.body.value("compression", "") + ";");
       }
-      emit(std::move(sql), "AccessExclusiveLock on " + qualified + ", no rewrite",
+      // Measured on 18.6: SET STATISTICS takes ShareUpdateExclusiveLock, SET
+      // STORAGE AccessExclusiveLock.
+      const bool statistics_only =
+          !in.body.contains("storage") && !in.body.contains("compression");
+      emit(std::move(sql),
+           std::string(statistics_only ? "ShareUpdateExclusiveLock"
+                                       : "AccessExclusiveLock") +
+               " on " + qualified + ", no rewrite",
            "measured: all three are catalog-only");
       if (in.body.contains("storage") || in.body.contains("compression")) {
         plan.warnings.push_back(
@@ -2628,7 +3881,13 @@ inline void plan_physical(const Intent& in, const Observations& obs, Plan& plan,
         sql.push_back("ALTER TABLE " + sql_rel + " RESET (" +
                       detail::join(names, ", ") + ");");
       }
-      emit(std::move(sql), "AccessExclusiveLock on " + qualified + ", no rewrite",
+      // Measured on 18.6 for fillfactor and autovacuum_enabled. PostgreSQL
+      // takes the strongest lock any parameter named asks for, and a few ask
+      // for AccessExclusiveLock.
+      emit(std::move(sql),
+           "ShareUpdateExclusiveLock on " + qualified +
+               " for most parameters (PostgreSQL takes the strongest any named "
+               "parameter asks for), no rewrite",
            "measured: setting a storage parameter such as fillfactor is "
            "catalog-only; it changes how FUTURE writes lay out pages and "
            "reorganises nothing already there");
@@ -2646,6 +3905,7 @@ inline void plan_physical(const Intent& in, const Observations& obs, Plan& plan,
                (logged ? ", and every byte of it is written to WAL as it goes"
                        : ""),
            /*own=*/true);
+      do_not_rehearse(out.back(), detail::kHeavyNotRehearsed, /*leaves_gap=*/false);
       if (!logged) {
         plan.warnings.push_back(
             "UNLOGGED means " + qualified +
@@ -2671,6 +3931,7 @@ inline void plan_physical(const Intent& in, const Observations& obs, Plan& plan,
            "moving a table copies every page to the new location under an "
            "exclusive lock: " + detail::human_bytes(size) + " to write",
            /*own=*/true);
+      do_not_rehearse(out.back(), detail::kHeavyNotRehearsed, /*leaves_gap=*/false);
       plan.warnings.push_back(
           "the move needs " + detail::human_bytes(size) +
           " free in the destination tablespace WHILE the source still holds "
@@ -2695,6 +3956,7 @@ inline void plan_physical(const Intent& in, const Observations& obs, Plan& plan,
            "changing access method rewrites the table in the new method's "
            "format: " + detail::human_bytes(size) + " under an exclusive lock",
            /*own=*/true);
+      do_not_rehearse(out.back(), detail::kHeavyNotRehearsed, /*leaves_gap=*/false);
       plan.warnings.push_back(
           "measured only for a no-op change (heap to heap, which does not "
           "rewrite). A real change of access method does rewrite, and this plan "
@@ -2740,7 +4002,8 @@ inline void plan_physical(const Intent& in, const Observations& obs, Plan& plan,
             (setting ? " CLUSTER ON " +
                            detail::quote_identifier(in.body.value("index", "")) + ";"
                      : " SET WITHOUT CLUSTER;")},
-           "AccessExclusiveLock on " + qualified + ", no rewrite",
+           // Measured on 18.6, both forms.
+           "ShareUpdateExclusiveLock on " + qualified + ", no rewrite",
            "this only RECORDS which index a future CLUSTER would use; it does "
            "not reorder anything now");
       if (setting) {
@@ -2895,7 +4158,8 @@ inline void plan_alter_misc(const Intent& in, const Observations& obs,
       }
       if (!alter.empty()) sql.push_back("ALTER SEQUENCE " + qualified_obj + alter + ";");
       emit(TxnClass::kRequired, std::move(sql),
-           "AccessExclusiveLock on the sequence only",
+           // Measured on 18.6 (INCREMENT BY).
+           "ShareRowExclusiveLock on the sequence",
            "altering a sequence touches no table", /*own=*/false);
       if (in.body.contains("restart")) {
         plan.warnings.push_back(
@@ -2997,7 +4261,8 @@ inline void plan_alter_misc(const Intent& in, const Observations& obs,
              {"ALTER DOMAIN " + qualified_obj + " ADD CONSTRAINT " +
               detail::quote_identifier(cname) + " CHECK (" +
               in.body.value("add_check", "") + ") NOT VALID;"},
-             "AccessExclusiveLock on the domain, briefly; NOT VALID means no scan",
+             // Measured on 18.6: no lock on any table using the domain.
+             "no lock on any table; NOT VALID means no scan",
              "step 1 of 2: measured on 18.6, adding the constraint NOT VALID "
              "took 0.5ms against 37ms for the same constraint validated -- and "
              "that 37ms was 1.5M values across two tables, growing with every "
@@ -3006,11 +4271,13 @@ inline void plan_alter_misc(const Intent& in, const Observations& obs,
         emit(TxnClass::kRequired,
              {"ALTER DOMAIN " + qualified_obj + " VALIDATE CONSTRAINT " +
               detail::quote_identifier(cname) + ";"},
-             "AccessExclusiveLock on the domain while every column of this type "
-             "is scanned",
+             // Measured on 18.6.
+             "ShareLock on every table with a column of this type while it is "
+             "scanned: reads continue, writes to those tables wait",
              "step 2 of 2: the scan happens here, in its own transaction, so "
              "step 1's lock is not held across it",
              /*own=*/true);
+        do_not_rehearse(out.back(), detail::kScanNotRehearsed, /*leaves_gap=*/false);
         plan.warnings.push_back(
             "validating a domain constraint reads every column of type " +
             qualified_obj +
@@ -3034,8 +4301,16 @@ inline void plan_alter_misc(const Intent& in, const Observations& obs,
                       in.body.value("default", "") + ";");
       }
       emit(TxnClass::kRequired, std::move(sql),
-           "AccessExclusiveLock on the domain",
+           // Measured on 18.6 for SET NOT NULL.
+           in.body.value("not_null", false)
+               ? "ShareLock on every table with a column of this type while it "
+                 "is scanned: reads continue, writes to those tables wait"
+               : "none on the tables using the domain",
            "a domain change reaches every column of that type", /*own=*/false);
+      // SET NOT NULL scans every column of the type, writes waiting.
+      if (in.body.value("not_null", false)) {
+        do_not_rehearse(out.back(), detail::kHeavyNotRehearsed, /*leaves_gap=*/false);
+      }
       if (in.body.value("not_null", false)) {
         plan.warnings.push_back(
             "SET NOT NULL on a domain scans every column of type " + qualified_obj +
@@ -4170,8 +5445,9 @@ inline void plan_create_partition(const Intent& in, const Observations& obs,
                                 " estimated rows)"
                           : std::string()) +
         ", every row of it is read under lock to prove none belongs to the new "
-        "bound -- measured, 47 ms for 1M rows. One that does fails the step; "
-        "the dry run executes it, so that is found before anything commits.");
+        "bound -- measured, 47 ms for 1M rows. One that does fails the step, "
+        "in the job: the dry run does not read the default under that lock.");
+    do_not_rehearse(step, detail::kHeavyNotRehearsed, /*leaves_gap=*/true);
   }
   if (in.body.value("unlogged", false)) {
     plan.warnings.push_back(
@@ -4315,13 +5591,32 @@ inline void plan_drop_table(const Intent& in, const Observations& obs,
   step.txn_class = TxnClass::kRequired;
   step.sql.push_back("DROP TABLE " + sql_rel + ";");
   step.lock = "AccessExclusiveLock on " + qualified;
+  // Measured on 18.6: dropping a partition takes the same lock on its parent
+  // and on the parent's DEFAULT partition, and dropping a table with a foreign
+  // key takes it on the table the key references.
+  if (t.value("is_partition", false)) {
+    step.lock += ", on its parent table and on the parent's DEFAULT partition "
+                 "if there is one -- every query against every partition waits";
+  }
+  {
+    std::set<std::string> referenced;
+    const json constraints = t.value("constraints", json::object());
+    for (const auto& [cname, k] : constraints.items()) {
+      (void)cname;
+      const auto ref = k.value("references", json());
+      if (ref.is_string() && ref.get<std::string>() != qualified) {
+        referenced.insert(ref.get<std::string>());
+      }
+    }
+    for (const auto& r : referenced) step.lock += ", and on " + r + " (a foreign key references it)";
+  }
   step.why =
       "nothing depends on " + qualified +
       ", so the drop is a brief catalog change whatever the table's size";
   plan.warnings.push_back(
       "dropping " + qualified + " is irreversible. " +
-      detail::human_bytes(t.value("size_estimate", 0LL)) +
-      " and roughly " + std::to_string(t.value("reltuples", 0LL)) +
+      detail::human_bytes(detail::table_data(obs, qualified, in).bytes) +
+      " and roughly " + std::to_string(detail::table_data(obs, qualified, in).rows) +
       " rows go at commit, and no revert recovers them. If the data may be "
       "wanted, copy it out in an earlier intent.");
 }
@@ -4670,39 +5965,63 @@ inline void plan_attach_partition(const Intent& in, const Observations& obs,
         "deliberate: a CHECK over part of the key would not prove what ATTACH "
         "needs, and the scan would happen anyway without anyone being told.");
   } else if (!check_expr.empty()) {
-    emit(TxnClass::kRequired,
-         "ALTER TABLE " + child + " ADD CONSTRAINT " + detail::quote_identifier(check_name) + " CHECK (" +
-             check_expr + ") NOT VALID;",
-         "ShareRowExclusiveLock on " + child + ", briefly; NOT VALID means no scan",
-         "step 1 of 4: the CHECK is what lets ATTACH skip its scan, and adding "
-         "it NOT VALID costs nothing",
-         /*own=*/true);
-    emit(TxnClass::kRequired,
-         "ALTER TABLE " + child + " VALIDATE CONSTRAINT " + detail::quote_identifier(check_name) + ";",
-         "ShareUpdateExclusiveLock on " + child + " -- does NOT block reads or writes",
-         "step 2 of 4: the scan happens here instead, under a lock the "
-         "application survives. Measured: ATTACH without this took 98ms on 2M "
-         "rows against 0.9ms with it",
-         /*own=*/true);
+    // Resumed where an earlier attempt stopped: the bound check may be there
+    // already, valid or not.
+    const auto have = detail::constraint_state(c, check_name);
+    if (have == detail::ConstraintState::kAbsent) {
+      emit(TxnClass::kRequired,
+           "ALTER TABLE " + sql_child + " ADD CONSTRAINT " + detail::quote_identifier(check_name) + " CHECK (" +
+               check_expr + ") NOT VALID;",
+           "AccessExclusiveLock on " + child + ", briefly; NOT VALID means no scan",
+           "step 1 of 4: the CHECK is what lets ATTACH skip its scan, and adding "
+           "it NOT VALID costs nothing",
+           /*own=*/true);
+    }
+    if (have != detail::ConstraintState::kValid) {
+      emit(TxnClass::kRequired,
+           "ALTER TABLE " + sql_child + " VALIDATE CONSTRAINT " + detail::quote_identifier(check_name) + ";",
+           "ShareUpdateExclusiveLock on " + child + " -- does NOT block reads or writes",
+           "step 2 of 4: the scan happens here instead, under a lock the "
+           "application survives. Measured: ATTACH without this took 98ms on 2M "
+           "rows against 0.9ms with it",
+           /*own=*/true);
+      do_not_rehearse(out.back(), detail::kScanNotRehearsed, /*leaves_gap=*/false);
+    }
   }
 
   emit(TxnClass::kRequired,
        "ALTER TABLE " + sql_parent + " ATTACH PARTITION " + sql_child + " " +
            detail::bounds_as_for_values(in) + ";",
+       // Measured on 18.6: the DEFAULT partition is locked as the candidate is,
+       // for the scan that proves it holds no row of the new bounds.
        "ShareUpdateExclusiveLock on " + parent +
            " -- other partitions keep serving -- and AccessExclusiveLock on " +
-           child,
+           child +
+           (p.value("default_partition", json()).is_string()
+                ? " and on the DEFAULT partition " +
+                      p.value("default_partition", json()).get<std::string>() +
+                      ", whose readers and writers wait while it is scanned"
+                : ""),
        check_expr.empty()
            ? "step 3 of 4: attaching, with a full validation scan under the lock"
            : "step 3 of 4: attaching, now a catalog change because the "
              "validated CHECK already proves the bounds",
        /*own=*/true);
+  // Not rehearsed either. In the dry run the CHECK was never validated, so the
+  // ATTACH would scan the candidate itself -- and a DEFAULT partition is
+  // scanned whatever the CHECK says, under AccessExclusiveLock on it. An
+  // overlapping bound is found when the job reaches this step.
+  do_not_rehearse(out.back(),
+                  check_expr.empty() || p.value("default_partition", json()).is_string()
+                      ? detail::kHeavyNotRehearsed
+                      : detail::kNeedsTheScan,
+                  /*leaves_gap=*/true);
 
   // Step 4: the CHECK is redundant once the partition bound enforces the same
   // thing, and a redundant constraint costs time on every insert forever.
   if (!check_expr.empty()) {
     emit(TxnClass::kRequired,
-         "ALTER TABLE " + child + " DROP CONSTRAINT " + detail::quote_identifier(check_name) + ";",
+         "ALTER TABLE " + sql_child + " DROP CONSTRAINT " + detail::quote_identifier(check_name) + ";",
          "AccessExclusiveLock on " + child + ", briefly",
          "step 4 of 4: the partition bound now enforces what the CHECK did, "
          "and PostgreSQL evaluates both on every insert if it is left behind",
@@ -4772,9 +6091,13 @@ inline void plan_detach_partition(const Intent& in, const Observations& obs,
     return;
   }
 
-  const long long size = obs.table(child).value("size_estimate", 0LL);
+  const long long size = detail::table_data(obs, child, in).bytes;
   const int waiters = p.value("lock_waiters", 0);
-  const bool concurrent_available = obs.server_version >= 140000;
+  // Measured on 18.6: "cannot detach partitions concurrently when a default
+  // partition exists". With a default, the plain form is the only one.
+  const auto detach_default = p.value("default_partition", json());
+  const bool has_default = detach_default.is_string();
+  const bool concurrent_available = obs.server_version >= 140000 && !has_default;
   const bool small_and_quiet = size < (64LL << 20) && waiters == 0;
 
   if (concurrent_available && !small_and_quiet) {
@@ -4805,19 +6128,37 @@ inline void plan_detach_partition(const Intent& in, const Observations& obs,
   step.txn_class = TxnClass::kRequired;
   step.own_transaction = true;
   step.sql.push_back("ALTER TABLE " + sql_parent + " DETACH PARTITION " + sql_child + ";");
-  step.lock = "AccessExclusiveLock on " + parent + " AND on " + child;
+  // Measured on 18.6: the DEFAULT partition is locked the same way.
+  step.lock = "AccessExclusiveLock on " + parent + " AND on " + child +
+              (has_default && detach_default.get<std::string>() != child
+                   ? " AND on the DEFAULT partition " + detach_default.get<std::string>()
+                   : "");
   step.why =
       concurrent_available
           ? "size " + detail::human_bytes(size) +
                 " < 64 MiB and nothing queued: a plain detach is a brief "
                 "catalog change, and CONCURRENTLY costs an extra transaction "
                 "and a recoverable-but-awkward intermediate state for nothing"
+          : has_default
+                ? parent + " has a DEFAULT partition, and PostgreSQL refuses "
+                           "DETACH ... CONCURRENTLY beside one, so the exclusive "
+                           "lock on the parent is unavoidable -- it blocks every "
+                           "query against every partition while it is held"
           : "PostgreSQL " + std::to_string(obs.server_version) +
                 " has no DETACH ... CONCURRENTLY (it arrived in 14), so the "
                 "exclusive lock on the parent is unavoidable -- it blocks "
                 "every query against every partition while it is held";
   step.detail["method"] = "plain";
-  if (!concurrent_available) {
+  if (has_default && obs.server_version >= 140000 && !small_and_quiet) {
+    plan.warnings.push_back(
+        "detaching " + child + " (" + detail::human_bytes(size) +
+        (waiters > 0 ? ", " + std::to_string(waiters) + " lock waiter(s)" : "") +
+        ") takes AccessExclusiveLock on " + parent +
+        " and blocks queries against EVERY partition: the DEFAULT partition " +
+        detach_default.get<std::string>() +
+        " rules out DETACH ... CONCURRENTLY. Schedule it for a quiet window.");
+  }
+  if (obs.server_version < 140000) {
     plan.warnings.push_back(
         "this server is older than PostgreSQL 14, so detaching " + child +
         " takes AccessExclusiveLock on " + parent +
@@ -4844,6 +6185,216 @@ inline void plan_detach_partition(const Intent& in, const Observations& obs,
 // lock: 75ms on 2M rows nullable versus 0.6ms already NOT NULL. So a primary
 // key over a nullable column runs the set_not_null recipe first -- which exists
 // precisely to do that scan under a lock that does not block the application.
+// A unique constraint or primary key on a PARTITIONED table.
+//
+// The table holds no rows; its partitions do, and neither way core adds such a
+// constraint elsewhere works here. One ADD CONSTRAINT builds a unique index on
+// every partition under AccessExclusiveLock on the parent, which stops every
+// query on every partition for the whole of it. And the concurrent recipe
+// starts with CREATE UNIQUE INDEX CONCURRENTLY on the parent, which PostgreSQL
+// refuses ("cannot create index on partitioned table concurrently") -- in the
+// job, because the dry run cannot run it. Both were planned.
+//
+// Measured on 18.6, the recipe PostgreSQL's own documentation gives:
+//   1. ALTER TABLE ONLY <parent> ADD CONSTRAINT ...: AccessExclusiveLock on the
+//      parent for a catalog change. Its index is INVALID and holds nothing.
+//   2. per partition: CREATE UNIQUE INDEX CONCURRENTLY, then ADD CONSTRAINT ...
+//      USING INDEX on the partition (AccessExclusiveLock on that partition,
+//      briefly) -- required: an index that backs no constraint is refused at
+//      the next step ("belongs to a constraint in table ... but no constraint
+//      exists for index ...") -- then ALTER INDEX <parent's> ATTACH PARTITION.
+//   3. the parent's index is valid when the last partition's is attached, and
+//      a partition created meanwhile gets the constraint by itself.
+//
+// Every state on the way is in the reading (catalog.h, partition_parts), so a
+// recipe that stopped -- a duplicate found in the fifth partition -- resumes at
+// that partition when the specification is applied again.
+inline void plan_unique_on_partitions(const Intent& in, const json& t, bool primary,
+                                      const std::string& name,
+                                      const std::vector<std::string>& columns,
+                                      const std::vector<std::string>& quoted_columns,
+                                      Plan& plan, std::vector<Step>& out) {
+  const auto qualified = in.qualified_table();
+  const auto sql_rel = detail::quote_qualified(qualified);
+  const std::string kind_sql = primary ? "PRIMARY KEY" : "UNIQUE";
+  const std::string quoted_cols = detail::join(quoted_columns, ", ");
+  auto fail = [&](const std::string& why, const std::string& said) {
+    Step s;
+    s.kind = in.kind_name;
+    s.action = Action::kConflict;
+    s.why = why;
+    plan.conflicts.push_back(said);
+    out.push_back(std::move(s));
+  };
+  auto emit = [&](TxnClass klass, std::vector<std::string> sql, const std::string& lock,
+                  const std::string& why) -> Step& {
+    Step s;
+    s.kind = in.kind_name;
+    s.txn_class = klass;
+    s.own_transaction = true;
+    s.sql = std::move(sql);
+    s.lock = lock;
+    s.why = why;
+    s.detail["constraint"] = name;
+    out.push_back(std::move(s));
+    return out.back();
+  };
+
+  const auto partkey = t.value("partition_key", std::string());
+  const auto key = detail::partition_key_columns(partkey);
+  if (key.empty()) {
+    fail("the partition key of " + qualified + " is an expression",
+         qualified + " is partitioned by " + partkey + ", and PostgreSQL allows no " +
+             (primary ? "primary key" : "unique constraint") +
+             " on a table whose partition key includes an expression.");
+    return;
+  }
+  for (const auto& k : key) {
+    if (std::find(columns.begin(), columns.end(), k) != columns.end()) continue;
+    fail("the key does not contain the partition column " + k,
+         "\"" + name + "\" on " + qualified + ": the key (" + detail::join(columns, ", ") +
+             ") does not contain " + k + ", and " + qualified + " is partitioned by " +
+             partkey + ". PostgreSQL: \"unique constraint on partitioned table must "
+             "include all partitioning columns\". Add " + k + " to the key.");
+    return;
+  }
+
+  const json parts = t.value("partition_parts", json::array());
+  struct Part { std::string relation, index; json ix; };
+  std::vector<Part> todo;
+  for (const auto& p : parts) {
+    const auto relation = p.value("relation", "");
+    if (p.value("partitioned", false)) {
+      fail(relation + " is itself partitioned",
+           "\"" + name + "\" on " + qualified + ": its partition " + relation +
+               " is itself partitioned, so no index can be built on it "
+               "concurrently either. The recipe would have to descend into its "
+               "partitions, which pg_laswell does not plan yet; add the constraint "
+               "by hand, partition by partition, as PostgreSQL's documentation of "
+               "partitioned tables describes.");
+      return;
+    }
+    const auto bare = relation.substr(relation.find('.') + 1);
+    const auto child = bare + "_" + name;
+    if (child.size() > 63) {
+      fail("a per-partition constraint name would exceed 63 bytes",
+           "the constraint on " + relation + " would be named \"" + child +
+               "\", which PostgreSQL would truncate at 63 bytes -- and a truncated name "
+               "is not deterministic, so a resumed recipe could not find what it built. "
+               "Use a shorter constraint name.");
+      return;
+    }
+    const json ix = p.value("indexes", json::object()).value(child, json());
+    if (ix.is_object() && ix.value("valid", false) && !ix.value("unique", false)) {
+      fail("\"" + child + "\" exists and is not unique",
+           "an index named \"" + child + "\" already exists on " + relation +
+               " and is not unique, so it cannot back \"" + name +
+               "\". Drop or rename it in an earlier intent.");
+      return;
+    }
+    todo.push_back({relation, child, ix});
+  }
+
+  // No partitions: nothing to build on, and one statement on the parent is a
+  // catalog change that is valid at once.
+  if (todo.empty()) {
+    auto& s = emit(TxnClass::kRequired,
+                   {"ALTER TABLE " + sql_rel + " ADD CONSTRAINT " +
+                    detail::quote_identifier(name) + " " + kind_sql + " (" + quoted_cols + ");"},
+                   "AccessExclusiveLock on " + qualified + ", briefly: it has no partitions",
+                   qualified + " is partitioned and has no partitions yet, so the "
+                   "constraint is a catalog change; each partition created later gets it");
+    weaker_lock_first(s, {sql_rel});
+    return;
+  }
+
+  const bool parent_there = t.value("constraints", json::object()).contains(name);
+  if (!parent_there) {
+    auto& s = emit(TxnClass::kRequired,
+                   {"ALTER TABLE ONLY " + sql_rel + " ADD CONSTRAINT " +
+                    detail::quote_identifier(name) + " " + kind_sql + " (" + quoted_cols + ");"},
+                   "AccessExclusiveLock on " + qualified +
+                       " alone, briefly -- no partition is locked or read",
+                   "ON ONLY the parent the constraint is a catalog entry whose index holds "
+                   "nothing, so this scans nothing. It stays INVALID until every "
+                   "partition's index is attached, and a partition created meanwhile "
+                   "gets the constraint by itself");
+    // ONLY here too: without it LOCK TABLE takes every partition as well.
+    weaker_lock_first(s, {"ONLY " + sql_rel});
+  }
+
+  std::size_t n = 0;
+  for (const auto& p : todo) {
+    ++n;
+    const auto sql_part = detail::quote_qualified(p.relation);
+    const auto schema = p.relation.substr(0, p.relation.find('.'));
+    const auto sql_index = detail::quote_identifier(schema) + "." +
+                           detail::quote_identifier(p.index);
+    const std::string of = "partition " + std::to_string(n) + " of " +
+                           std::to_string(todo.size()) + " (" + p.relation + ")";
+    const bool built = p.ix.is_object() && p.ix.value("valid", false);
+    if (!built) {
+      std::vector<std::string> sql;
+      // An index left INVALID by a build that found a duplicate, or was
+      // interrupted: it is dropped and built again.
+      if (p.ix.is_object()) sql.push_back("DROP INDEX CONCURRENTLY " + sql_index + ";");
+      sql.push_back("CREATE UNIQUE INDEX CONCURRENTLY " + detail::quote_identifier(p.index) +
+                    " ON " + sql_part + " (" + quoted_cols + ");");
+      auto& s = emit(TxnClass::kForbidden, std::move(sql),
+                     "ShareUpdateExclusiveLock on " + p.relation + " -- reads and writes continue",
+                     of + ": the index is built concurrently on the partition itself, "
+                     "because CREATE INDEX CONCURRENTLY is refused on the parent");
+      s.detail["partition"] = p.relation;
+      s.detail["index"] = p.index;
+      s.detail["schema"] = schema;
+      if (p.ix.is_object()) s.detail["recovering_invalid_index"] = true;
+    }
+    const bool adopted = built && p.ix.value("constraint", json()).is_string();
+    if (!adopted) {
+      auto& s = emit(TxnClass::kRequired,
+                     {"ALTER TABLE " + sql_part + " ADD CONSTRAINT " +
+                      detail::quote_identifier(p.index) + " " + kind_sql + " USING INDEX " +
+                      detail::quote_identifier(p.index) + ";"},
+                     "AccessExclusiveLock on " + p.relation +
+                         ", briefly: no build and no scan under it",
+                     of + ": the index becomes the partition's own constraint, without "
+                     "which PostgreSQL will not attach it to the parent's");
+      weaker_lock_first(s, {sql_part});
+      s.detail["partition"] = p.relation;
+    }
+    const auto attached = p.ix.is_object() ? p.ix.value("attached_to", json()) : json();
+    if (!(built && attached.is_string() && attached.get<std::string>() == name)) {
+      const auto parent_schema = qualified.substr(0, qualified.find('.'));
+      auto& s = emit(TxnClass::kRequired,
+                     {"ALTER INDEX " + detail::quote_identifier(parent_schema) + "." +
+                      detail::quote_identifier(name) + " ATTACH PARTITION " + sql_index + ";"},
+                     "AccessExclusiveLock on the partition's index and "
+                     "ShareUpdateExclusiveLock on the parent's, briefly",
+                     of + ": attached; the constraint on " + qualified +
+                         " becomes valid when the last partition's is");
+      s.detail["partition"] = p.relation;
+    }
+  }
+
+  Step verify;
+  verify.kind = "verify_index_valid";
+  verify.txn_class = TxnClass::kOptional;
+  verify.lock = "none (catalog read)";
+  verify.why = "a partitioned constraint missing even one partition's index exists, is "
+               "INVALID, and enforces nothing across partitions -- and nothing else "
+               "would say so";
+  verify.detail = json{{"schema", qualified.substr(0, qualified.find('.'))}, {"index", name}};
+  out.push_back(std::move(verify));
+
+  plan.warnings.push_back(
+      "there is no NOT VALID form for a unique constraint, so each partition's index "
+      "build IS the validation. If (" + quoted_cols + ") holds duplicates in a partition "
+      "its build fails and leaves an INVALID index there, with the constraint on " +
+      qualified + " added and not yet valid. Remove the duplicates and apply the "
+      "specification again: it drops that index, builds it again, and carries on "
+      "from that partition.");
+}
+
 inline void plan_unique_like(const Intent& in, const Observations& obs,
                              Plan& plan, std::vector<Step>& out) {
   const bool primary = in.kind == IntentKind::kAddPrimaryKey;
@@ -4886,7 +6437,15 @@ inline void plan_unique_like(const Intent& in, const Observations& obs,
   }
 
   const json constraints = t.value("constraints", json::object());
-  if (constraints.contains(name)) {
+  // On a partitioned table the constraint can be there and unfinished: added
+  // on the parent alone, its index INVALID until every partition's is attached.
+  // That is a recipe to resume, not a constraint that is present.
+  const bool partitioned = t.value("kind", "") == "partitioned_table";
+  const bool unfinished =
+      partitioned && constraints.contains(name) &&
+      constraints[name].value("type", "") == (primary ? "p" : "u") &&
+      !t.value("indexes", json::object()).value(name, json::object()).value("is_valid", true);
+  if (constraints.contains(name) && !unfinished) {
     const auto type = constraints[name].value("type", "");
     if (type == (primary ? "p" : "u")) {
       Step s;
@@ -4902,7 +6461,7 @@ inline void plan_unique_like(const Intent& in, const Observations& obs,
              ". Drop it in an earlier intent if it is to be replaced.");
     return;
   }
-  if (primary) {
+  if (primary && !unfinished) {
     for (const auto& [cname, c] : constraints.items()) {
       if (c.value("type", "") == "p") {
         fail(qualified + " already has a primary key",
@@ -4918,9 +6477,11 @@ inline void plan_unique_like(const Intent& in, const Observations& obs,
   // AccessExclusiveLock. Run the recipe that does that scan under a lock the
   // application survives, rather than letting ADD PRIMARY KEY do it the
   // expensive way.
+  bool key_was_nullable = false;
   if (primary) {
     for (const auto& c : columns) {
       if (cols[c].value("not_null", false)) continue;
+      key_was_nullable = true;
       Intent nn;
       nn.kind = IntentKind::kSetNotNull;
       nn.kind_name = "set_not_null";
@@ -4937,6 +6498,11 @@ inline void plan_unique_like(const Intent& in, const Observations& obs,
           "AccessExclusiveLock -- measured at 75ms on 2M rows against 0.6ms "
           "when the column is already NOT NULL, and it grows with the table.");
     }
+  }
+
+  if (partitioned) {
+    plan_unique_on_partitions(in, t, primary, name, columns, quoted_columns, plan, out);
+    return;
   }
 
   // An existing valid unique index over exactly these columns is the whole
@@ -5009,6 +6575,11 @@ inline void plan_unique_like(const Intent& in, const Observations& obs,
              ") and is valid and unique, so the constraint is a catalog change "
              "over a build that is already paid for",
          /*own=*/true);
+    // The SET NOT NULL composed above is not rehearsed, so in the dry run the
+    // column is still nullable and the primary key would scan for it itself.
+    if (key_was_nullable) {
+      do_not_rehearse(out.back(), detail::kNeedsTheScan, /*leaves_gap=*/true);
+    }
     return;
   }
 
@@ -5022,6 +6593,11 @@ inline void plan_unique_like(const Intent& in, const Observations& obs,
              " < 64 MiB and no lock waiters, so one statement is briefer than "
              "a concurrent build plus a second exclusive lock",
          /*own=*/false);
+    // One statement of any size, because the module allows no concurrent
+    // build: the index builds under AccessExclusiveLock, in the dry run too.
+    if (no_concurrent && !(size < (64LL << 20) && waiters == 0)) {
+      do_not_rehearse(out.back(), detail::kHeavyNotRehearsed, /*leaves_gap=*/true);
+    }
     return;
   }
 
@@ -5157,6 +6733,8 @@ inline void plan_replace_view(const Intent& in, const Observations& obs,
   step.sql.push_back("DROP MATERIALIZED VIEW " + sql_rel + ";");
   step.sql.push_back("CREATE MATERIALIZED VIEW " + sql_rel + " AS " +
                      definition + ";");
+  // The query runs in full while the old view is locked against its readers.
+  do_not_rehearse(step, detail::kHeavyNotRehearsed, /*leaves_gap=*/true);
   const auto owner = v.value("owner", "");
   if (!owner.empty()) {
     step.sql.push_back("ALTER MATERIALIZED VIEW " + sql_rel + " OWNER TO " +
@@ -5295,6 +6873,9 @@ inline void plan_alter_column_type(const Intent& in, const Observations& obs,
                           : "") +
                      ";");
   detail::emit_view_recreates(views, rebuild, step);
+  // A rewrite, or at the least every index and dependent materialized view
+  // rebuilt, under AccessExclusiveLock.
+  do_not_rehearse(step, detail::kHeavyNotRehearsed, /*leaves_gap=*/true);
 
   step.lock = "AccessExclusiveLock on " + qualified +
               (rebuild.empty() ? "" : " and on every view rebuilt with it");
@@ -5305,7 +6886,8 @@ inline void plan_alter_column_type(const Intent& in, const Observations& obs,
   } else {
     step.why = current + " -> " + target +
                " is not a provable widening, so assume PostgreSQL rewrites the "
-               "whole table: " + detail::human_bytes(t.value("size_estimate", 0LL)) +
+               "whole table: " +
+               detail::human_bytes(detail::table_data(obs, qualified, in).bytes) +
                " under AccessExclusiveLock, during which every reader and "
                "writer queues";
     plan.warnings.push_back(
@@ -5551,8 +7133,8 @@ inline void plan_drop_index(const Intent& in, const Observations& obs, Plan& pla
     plan.conflicts.push_back(
         "\"" + name + "\" on " + qualified +
         " backs a constraint. PostgreSQL refuses to drop such an index "
-        "directly; drop the constraint instead, which pg_laswell does not yet "
-        "plan.");
+        "directly; drop the constraint instead, with a drop_constraint "
+        "intent.");
     return;
   }
   if (ex.value("is_unique", false)) {
@@ -5610,7 +7192,8 @@ inline void plan_drop_index(const Intent& in, const Observations& obs, Plan& pla
 // The safe form uses a CHECK constraint to do the scanning under a weaker lock:
 //
 //   1. ADD CONSTRAINT ... CHECK (col IS NOT NULL) NOT VALID
-//      ShareRowExclusiveLock, no scan, brief.
+//      AccessExclusiveLock (measured on 18.6; only a foreign key gets the
+//      weaker ShareRowExclusiveLock), no scan, brief.
 //   2. VALIDATE CONSTRAINT
 //      ShareUpdateExclusiveLock -- does NOT block reads or writes -- and this
 //      is where the scan happens.
@@ -5620,7 +7203,7 @@ inline void plan_drop_index(const Intent& in, const Observations& obs, Plan& pla
 //   4. DROP the CHECK, which is now redundant and costs time on every insert.
 //
 // Each of the first three MUST be in its own transaction. If 1 and 2 shared
-// one, the ShareRowExclusiveLock from 1 would be held across 2's scan and the
+// one, the AccessExclusiveLock from 1 would be held across 2's scan and the
 // recipe would buy nothing at all.
 inline void plan_set_not_null(const Intent& in, const Observations& obs, Plan& plan,
                               std::vector<Step>& out) {
@@ -5678,6 +7261,8 @@ inline void plan_set_not_null(const Intent& in, const Observations& obs, Plan& p
     s.sql.push_back(sql);
     s.detail["column"] = column;
     s.detail["qualified"] = qualified;
+    // Every step of this recipe but the VALIDATE asks for an exclusive lock.
+    if (sql.find("VALIDATE CONSTRAINT") == std::string::npos) weaker_lock_first(s, {sql_rel});
     out.push_back(std::move(s));
   };
 
@@ -5700,22 +7285,35 @@ inline void plan_set_not_null(const Intent& in, const Observations& obs, Plan& p
     return;
   }
 
-  make(TxnClass::kRequired,
-       "ALTER TABLE " + sql_rel + " ADD CONSTRAINT " +
-           detail::quote_identifier(check) + " CHECK (" +
-           detail::quote_identifier(column) + " IS NOT NULL) NOT VALID;",
-       "ShareRowExclusiveLock, briefly; NOT VALID means no scan",
-       "step 1 of 4: a NOT VALID check costs no scan, so the strong lock is "
-       "held only for the catalog change",
-       /*own=*/true);
+  // Resumed where an earlier attempt stopped. Its check may be there already:
+  // NOT VALID when the VALIDATE failed on a null -- which the dry run no
+  // longer looks for -- or valid when it stopped after that.
+  const auto have = detail::constraint_state(t, check);
 
-  make(TxnClass::kRequired,
-       "ALTER TABLE " + sql_rel + " VALIDATE CONSTRAINT " + detail::quote_identifier(check) + ";",
-       "ShareUpdateExclusiveLock -- does NOT block reads or writes",
-       "step 2 of 4: this is where the scan happens, and it happens under a "
-       "lock that lets the application keep working. It must be its own "
-       "transaction, or step 1's stronger lock would be held across it",
-       /*own=*/true);
+  if (have == detail::ConstraintState::kAbsent) {
+    make(TxnClass::kRequired,
+         "ALTER TABLE " + sql_rel + " ADD CONSTRAINT " +
+             detail::quote_identifier(check) + " CHECK (" +
+             detail::quote_identifier(column) + " IS NOT NULL) NOT VALID;",
+         "AccessExclusiveLock, briefly: reads and writes wait while it is "
+         "requested and held; NOT VALID means no scan",
+         "step 1 of 4: a NOT VALID check costs no scan, so the exclusive lock is "
+         "held only for the catalog change. It still has to be GRANTED: behind a "
+         "long transaction or an autovacuum on the table it waits, and every "
+         "reader and writer queues behind it until lock_timeout",
+         /*own=*/true);
+  }
+
+  if (have != detail::ConstraintState::kValid) {
+    make(TxnClass::kRequired,
+         "ALTER TABLE " + sql_rel + " VALIDATE CONSTRAINT " + detail::quote_identifier(check) + ";",
+         "ShareUpdateExclusiveLock -- does NOT block reads or writes",
+         "step 2 of 4: this is where the scan happens, and it happens under a "
+         "lock that lets the application keep working. It must be its own "
+         "transaction, or step 1's stronger lock would be held across it",
+         /*own=*/true);
+    do_not_rehearse(out.back(), detail::kScanNotRehearsed, /*leaves_gap=*/false);
+  }
 
   make(TxnClass::kRequired,
        "ALTER TABLE " + sql_rel + " ALTER COLUMN " + detail::quote_identifier(column) + " SET NOT NULL;",
@@ -5724,6 +7322,11 @@ inline void plan_set_not_null(const Intent& in, const Observations& obs, Plan& p
        "because the validated CHECK already proves the column has no nulls "
        "(measured: 24ms on 5000 rows)",
        /*own=*/true);
+  // Unless the check is valid ALREADY, the dry run has not validated it, and
+  // SET NOT NULL there would scan the table under AccessExclusiveLock.
+  if (have != detail::ConstraintState::kValid) {
+    do_not_rehearse(out.back(), detail::kNeedsTheScan, /*leaves_gap=*/true);
+  }
 
   if (!in.body.value("keep_check", false)) {
     make(TxnClass::kRequired,
@@ -5738,9 +7341,11 @@ inline void plan_set_not_null(const Intent& in, const Observations& obs, Plan& p
 
 // --- add_foreign_key -------------------------------------------------------
 //
-// Measured: adding a foreign key in one statement takes ShareRowExclusiveLock
-// on the child and RowShareLock on the parent, and HOLDS THEM FOR THE WHOLE
-// SCAN -- so writes to both tables are blocked for its duration. The two-step
+// Measured on 18.6: adding a foreign key takes ShareRowExclusiveLock on the
+// child AND on the parent -- NOT VALID or not -- and a validating add HOLDS
+// THEM FOR THE WHOLE SCAN, so writes to both tables are blocked for its
+// duration. (This said RowShareLock on the parent until pg_locks was read for
+// the NOT VALID form; RowShareLock is what VALIDATE takes there.) The two-step
 // form takes the same strong lock for a catalog change only, then does the scan
 // under ShareUpdateExclusiveLock, which does not block writes.
 //
@@ -5790,9 +7395,14 @@ inline void plan_add_foreign_key(const Intent& in, const Observations& obs,
         " to check this constraint. Add the index first, in an earlier intent.");
   }
 
+  // Quoted, every name: a table called "order" or a column called "end" is a
+  // reserved word, and unquoted this statement was a syntax error for it.
+  std::vector<std::string> quoted_cols, quoted_refs;
+  for (const auto& c : cols) quoted_cols.push_back(detail::quote_identifier(c));
+  for (const auto& c : refs) quoted_refs.push_back(detail::quote_identifier(c));
   std::string clause =
-      "FOREIGN KEY (" + detail::join(cols, ", ") + ") REFERENCES " + parent +
-      " (" + detail::join(refs, ", ") + ")";
+      "FOREIGN KEY (" + detail::join(quoted_cols, ", ") + ") REFERENCES " +
+      detail::quote_qualified(parent) + " (" + detail::join(quoted_refs, ", ") + ")";
   if (in.body.contains("on_delete")) {
     clause += " ON DELETE " + in.body.value("on_delete", "");
   }
@@ -5817,12 +7427,23 @@ inline void plan_add_foreign_key(const Intent& in, const Observations& obs,
     return;
   }
 
+  // As for a check: an earlier attempt may have left it NOT VALID.
+  const auto have = detail::constraint_state(t, name);
+  if (have == detail::ConstraintState::kValid) {
+    Step s;
+    s.kind = in.kind_name;
+    s.action = Action::kSatisfied;
+    s.why = "constraint " + name + " already exists on " + qualified + " and is valid";
+    out.push_back(std::move(s));
+    return;
+  }
+
   Step add;
   add.kind = in.kind_name;
   add.txn_class = TxnClass::kRequired;
   add.own_transaction = true;
-  add.lock = "ShareRowExclusiveLock on " + qualified + " and RowShareLock on " +
-             parent + "; NOT VALID means no scan";
+  add.lock = "ShareRowExclusiveLock on " + qualified + " and on " + parent +
+             ", briefly: writes to both wait, reads do not; NOT VALID means no scan";
   add.sql.push_back("ALTER TABLE " + sql_rel + " ADD CONSTRAINT " + detail::quote_identifier(name) + " " +
                     clause + " NOT VALID;");
   add.why =
@@ -5833,21 +7454,28 @@ inline void plan_add_foreign_key(const Intent& in, const Observations& obs,
       " may be the busier one";
   add.detail["constraint"] = name;
   add.detail["references"] = parent;
-  out.push_back(std::move(add));
+  // ShareRowExclusiveLock conflicts with autovacuum too, and on BOTH tables.
+  weaker_lock_first(add, {sql_rel, detail::quote_qualified(parent)});
+  const bool resuming = have == detail::ConstraintState::kNotValid;
+  if (!resuming) out.push_back(std::move(add));
 
   Step validate;
   validate.kind = in.kind_name;
   validate.txn_class = TxnClass::kRequired;
   validate.own_transaction = true;
-  validate.lock = "ShareUpdateExclusiveLock on " + qualified +
-                  " -- does NOT block reads or writes";
+  validate.lock = "ShareUpdateExclusiveLock on " + qualified + " and RowShareLock on " +
+                  parent + " -- neither blocks reads or writes";
   validate.sql.push_back("ALTER TABLE " + sql_rel + " VALIDATE CONSTRAINT " + detail::quote_identifier(name) + ";");
-  validate.why =
-      "step 2 of 2: the scan, under a lock that lets the application keep "
-      "working. It must be its own transaction, or step 1's "
-      "ShareRowExclusiveLock would be held across it and the two-step form "
-      "would buy nothing";
+  validate.why = resuming
+      ? "the constraint is already there, NOT VALID: an earlier attempt added it "
+        "and did not finish validating. This resumes at the scan, under a lock "
+        "that lets the application keep working"
+      : "step 2 of 2: the scan, under a lock that lets the application keep "
+        "working. It must be its own transaction, or step 1's "
+        "ShareRowExclusiveLock would be held across it and the two-step form "
+        "would buy nothing";
   validate.detail["constraint"] = name;
+  do_not_rehearse(validate, detail::kScanNotRehearsed, /*leaves_gap=*/false);
   out.push_back(std::move(validate));
 }
 
@@ -5963,6 +7591,21 @@ inline Plan plan_migration(const Spec& spec, const Observations& obs,
 #define PGLASWELL_PLAN_GUARD(guard_fn) guard_fn(spec, obs, budget, refuse, advise);
 #include "modules/enabled_guards.h"
 #undef PGLASWELL_PLAN_GUARD
+    // A module whose reading could not be taken. Its slot is absent, and to a
+    // module absent means "not installed": planned on, a hypertable would be
+    // treated as a plain table and a distributed one as local. So nothing is
+    // planned, and the refusal carries the server's own message.
+    for (const auto& [module, error] : obs.extension_errors.items()) {
+      refusals.push_back(
+          "the " + module + " module could not read this database, so nothing is "
+          "planned: without that reading a table the extension manages would be "
+          "planned as an ordinary one. The server said: " +
+          (error.is_string() ? error.get<std::string>() : error.dump()) +
+          ". This is about the role or the extension's state, not about the "
+          "specification -- a role lacking USAGE on one of the extension's schemas, "
+          "or an extension release older than the module supports, are the usual "
+          "causes.");
+    }
     if (!refusals.empty()) {
       plan.ok = false;
       for (auto& r : refusals) plan.conflicts.push_back(std::move(r));
@@ -5993,6 +7636,9 @@ inline Plan plan_migration(const Spec& spec, const Observations& obs,
     }
   }
 
+  // An add_column planned as part of an earlier one's recipe: its ordinal, and
+  // the ordinal of the intent that leads the group.
+  std::map<std::size_t, std::size_t> planned_with;
   for (const auto& in : spec.intents) {
     // An intent may need more than one step, and more importantly more than
     // one TRANSACTION. The safe way to add a foreign key is ADD ... NOT VALID
@@ -6008,7 +7654,48 @@ inline Plan plan_migration(const Spec& spec, const Observations& obs,
       case IntentKind::enum_id: plan_fn(in, projected, cfg, plan, emitted); break;
 #include "modules/enabled_kinds.inc"
 #undef PGLASWELL_KIND
-      case IntentKind::kAddColumn:   plan_add_column(in, projected, plan, emitted); break;
+      case IntentKind::kAddColumn: {
+        // Consecutive NOT NULL columns with "fill" on one table are ONE
+        // recipe (filled_column_group): planned at the first of them, and the
+        // others say so instead of walking the table again.
+        const auto led = planned_with.find(in.ordinal);
+        if (led != planned_with.end()) {
+          Step s;
+          s.kind = in.kind_name;
+          s.action = Action::kSatisfied;
+          s.why = "planned together with intent " + std::to_string(led->second) +
+                  ": " + in.body.value("column", "") + " is added and filled by that "
+                  "intent's steps, in one walk of the table for all of them";
+          emitted.push_back(std::move(s));
+          break;
+        }
+        const auto together = filled_column_group(spec, in.ordinal);
+        if (together.size() < 2) {
+          plan_add_column(in, projected, cfg, plan, emitted);
+          break;
+        }
+        if (together.front()->body.contains("default") &&
+            !together.front()->body["default"].is_null()) {
+          plan_add_columns_defaulted(together, projected, cfg, plan, emitted);
+        } else {
+          plan_add_columns_filled(together, projected, cfg, plan, emitted);
+        }
+        bool applies = false;
+        for (const auto& s : emitted) applies = applies || s.action == Action::kApply;
+        for (std::size_t g = 1; g < together.size(); ++g) {
+          planned_with[together[g]->ordinal] = in.ordinal;
+          // Later intents plan against every column of the together, not only
+          // the first, which is all the projection below would give them.
+          if (applies) {
+            json col = json::object();
+            col["type"] = together[g]->body.value("type", "");
+            col["not_null"] = true;
+            projected.tables[in.qualified_table()]["columns"]
+                            [together[g]->body.value("column", "")] = std::move(col);
+          }
+        }
+        break;
+      }
       case IntentKind::kCreateIndex: plan_create_index(in, projected, cfg, plan, emitted); break;
       case IntentKind::kBackfill:    plan_backfill(in, projected, cfg, plan, emitted); break;
       case IntentKind::kDropIndex:   plan_drop_index(in, projected, plan, emitted); break;
@@ -6116,6 +7803,7 @@ inline Plan plan_migration(const Spec& spec, const Observations& obs,
       case IntentKind::kRevoke:
         plan_security(in, projected, plan, emitted); break;
     }
+    detail::take_weaker_lock_first(in, projected, emitted);
     detail::append_creation_comment(in, emitted);
     if (!emitted.empty()) project(in, emitted.front(), projected);
 

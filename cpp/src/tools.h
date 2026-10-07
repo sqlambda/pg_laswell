@@ -16,6 +16,7 @@
 // startMigration, jobStatus and cancelJob arrive with the executor in phase 4.
 
 #include <memory>
+#include <chrono>
 #include <string>
 
 #include <nlohmann/json.hpp>
@@ -358,7 +359,44 @@ struct RehearsalInputs {
   // scheduled from the maintenance database runs somewhere else, and whether
   // its command can work is only answerable there.
   std::vector<json> elsewhere;
+  // Steps rehearsed as nothing, on purpose, that leave no gap behind them: a
+  // VALIDATE CONSTRAINT. Reported as unverified by note_not_run.
+  std::vector<int> not_run;
 };
+
+// Adds the steps that were deliberately not run to what the dry run reports as
+// unverified. They did not go through the loop as skipped steps, because a
+// skip there makes every later failure a gap, and these leave none.
+inline void note_not_run(const RehearsalInputs& inputs, Catalog::DryRun& dry) {
+  for (const int ordinal : inputs.not_run) {
+    if (std::find(dry.unverified_steps.begin(), dry.unverified_steps.end(), ordinal) ==
+        dry.unverified_steps.end()) {
+      dry.unverified_steps.push_back(ordinal);
+    }
+  }
+  std::sort(dry.unverified_steps.begin(), dry.unverified_steps.end());
+}
+
+// Why each unverified step was not checked, by ordinal: a reader deciding
+// whether to trust a plan is owed the reason, not a list of numbers.
+inline json unverified_reasons(const Plan& plan, const std::vector<int>& unverified) {
+  json why = json::object();
+  for (const auto& step : plan.steps) {
+    if (std::find(unverified.begin(), unverified.end(), step.ordinal) == unverified.end()) {
+      continue;
+    }
+    std::string reason;
+    if (step.detail.contains("not_rehearsed")) {
+      reason = step.detail.value("not_rehearsed", "");
+    } else if (step.txn_class == TxnClass::kForbidden) {
+      reason = "it cannot run inside a transaction block";
+    } else {
+      reason = "it was not reached, or could only be checked weakly; see the note";
+    }
+    why[std::to_string(step.ordinal)] = reason;
+  }
+  return why;
+}
 // One step's check in another database: connect there as the same role, run
 // the statements in a transaction, roll it back. A statement the server
 // refuses is a problem of that step; so is not being able to get there, said
@@ -389,10 +427,28 @@ inline void rehearse_elsewhere(const ConnConfig& cfg, const json& e, Catalog::Dr
   }
 }
 
-inline RehearsalInputs rehearsal_inputs(const Plan& plan) {
+// `run_scans` is for the chain rehearsal only: it is for an empty database or
+// a restored copy, holds every lock until its final rollback anyway, and is
+// asked precisely to find what an apply would -- a violating row included.
+inline RehearsalInputs rehearsal_inputs(const Plan& plan, bool run_scans = false) {
   RehearsalInputs r;
   for (const auto& step : plan.steps) {
     if (step.action != Action::kApply) continue;
+    // A step the planner says must not run here (planner.h, do_not_rehearse):
+    // the scan of a split recipe, which this one transaction would run under
+    // the lock the recipe exists to release first. Where skipping it leaves a
+    // gap later steps may trip on, it is treated exactly as a step that cannot
+    // run in a transaction is. Where it leaves none, it is rehearsed as
+    // nothing at all, and listed as not rehearsed.
+    if (!run_scans && step.detail.contains("not_rehearsed")) {
+      const bool gap = step.detail.value("not_rehearsed_leaves_gap", false);
+      r.steps.emplace_back(step.ordinal, std::vector<std::string>{});
+      r.forbidden.push_back(gap);
+      r.copy_payloads.push_back(json());
+      r.execute.push_back(false);
+      if (!gap) r.not_run.push_back(step.ordinal);
+      continue;
+    }
     // Rehearsed with the maintenance_work_mem it will run with, exactly as the
     // executor sets it on a transactional step -- a dry run that runs a step
     // with other settings than the real one is not rehearsing it.
@@ -465,8 +521,15 @@ inline json plan_migration_tool(ToolContext& ctx, const json& args) {
   // be tried before it is trusted.
   if (plan.ok && args.value("dryRun", true)) {
     const auto inputs = detail::rehearsal_inputs(plan);
+    // Timed, because it takes real locks on the live schema BEFORE any job
+    // exists: laswell.job.started_at is after it. The plan a job stores is
+    // this document, so the time spent here is kept with the job.
+    const auto rehearsal_began = std::chrono::steady_clock::now();
     auto dry = cat.dry_run(inputs.steps, inputs.forbidden, obs.server_version,
                            inputs.copy_payloads, inputs.execute);
+    const auto rehearsal_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - rehearsal_began).count();
+    detail::note_not_run(inputs, dry);
     // Checks in another database of the same server, each in its own
     // transaction there, rolled back. That database is read as it is NOW: this
     // dry run's own changes are in a transaction it cannot see.
@@ -476,12 +539,20 @@ inline json plan_migration_tool(ToolContext& ctx, const json& args) {
       }
     }
     json d{{"ran", dry.ran},
+           {"durationMs", rehearsal_ms},
            {"unverifiedSteps", dry.unverified_steps},
+           {"unverifiedWhy", detail::unverified_reasons(plan, dry.unverified_steps)},
            {"note",
             "the plan was applied in a transaction and rolled back; nothing "
-            "was committed. Steps listed as unverified cannot run inside a "
-            "transaction block (CREATE INDEX CONCURRENTLY) and were skipped "
-            "rather than silently passed."}};
+            "was committed. It took the locks its steps take, on the live "
+            "schema, for durationMs at most. Steps listed as unverified were "
+            "not run -- one that cannot run inside a transaction block (CREATE "
+            "INDEX CONCURRENTLY), or the scan of a split recipe (VALIDATE "
+            "CONSTRAINT), which in this one transaction would run under the "
+            "lock the recipe exists to release first, or a statement that "
+            "reads or rewrites a whole table under a lock that blocks writes "
+            "-- and unverifiedWhy says which. They were skipped rather than "
+            "silently passed."}};
     if (!dry.skipped_reason.empty()) d["skippedReason"] = dry.skipped_reason;
     // Named separately from the note, which a later branch may overwrite: a
     // reader deciding whether to trust this plan needs to see that some of it
@@ -505,6 +576,16 @@ inline json plan_migration_tool(ToolContext& ctx, const json& args) {
           "from that step on is unverified; raise "
           "dry_run_statement_timeout_ms if you want it checked, knowing what "
           "that costs.";
+    }
+    if (dry.lock_unavailable_at >= 0) {
+      d["lockUnavailableAtStep"] = dry.lock_unavailable_at;
+      d["note"] =
+          "the dry run stopped at a step whose exclusive lock was not available: "
+          "something else holds the table. It waited a fraction of a second and "
+          "no longer, because the application queues behind such a request and a "
+          "planning call must not make it wait. Everything from that step on is "
+          "unverified. The job asks again and again for the same lock, each time "
+          "as briefly; pg_licht currentLocks names the holder.";
     }
     if (!dry.problems.empty()) {
       // `problems` stays an array of strings, because callers read it as one.
@@ -646,7 +727,7 @@ class ChainRehearsal {
         undo();
         return out;
       }
-      const auto inputs = detail::rehearsal_inputs(plan);
+      const auto inputs = detail::rehearsal_inputs(plan, /*run_scans=*/true);
       Catalog::DryRun dry;
       dry.ran = true;
       const auto result = Catalog::rehearse_steps(

@@ -32,8 +32,13 @@ inline IndexTraits pgvector_index_traits(const Observations& obs, const std::str
   const auto& tab = obs.table(qualified);
   const long long rows = std::max(tab.value("reltuples", 0LL),
                                   tab.value("stats", json::object()).value("n_live_tup", 0LL));
-  if (per_row <= 0 || pt.dims <= 0 || rows <= 0) return t;
+  if (per_row <= 0 || pt.dims <= 0) return t;
+  // What a row costs is known from the column alone. How many there are is
+  // this relation's reading -- which is zero on a hypertable or a distributed
+  // table, where the rows are another module's to count: core multiplies by
+  // theirs (planner.h, index_traits).
   t.answered = true;
-  t.memory_wanted = rows * per_row;
+  t.memory_per_row = per_row;
+  if (rows > 0) t.memory_wanted = rows * per_row;
   return t;
 }

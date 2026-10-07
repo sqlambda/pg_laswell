@@ -104,11 +104,16 @@ for edition in tsl apache oldest; do
     "is not empty" \
     "SELECT create_hypertable('public.full_t', by_range('ts'))" \
     "table \"full_t\" is not empty"
-  clean "with migrate_data, its rows move (and roll back)" "$U" \
-    '{"kind":"timescaledb_create_hypertable","schema":"public","table":"full_t","time_column":"ts","migrate_data":true}'
+  # Moving rows into chunks holds AccessExclusiveLock for the whole copy, so the
+  # dry run plans it and leaves it to the job.
+  migrate='{"kind":"timescaledb_create_hypertable","schema":"public","table":"full_t","time_column":"ts","migrate_data":true}'
+  clean "with migrate_data, the plan is accepted" "$U" "$migrate"
+  plan "$U" "$migrate" | grep -q '"unverifiedSteps":\[0\]' \
+    && ok "the copy into chunks is left to the job, and listed as not rehearsed" \
+    || bad "the dry run should not move the rows of a populated table" "$(plan "$U" "$migrate")"
   [ "$(q "$U" "SELECT count(*) FROM ONLY public.full_t")" = 5000 ] \
-    && ok "the rehearsal left the rows where they were" \
-    || bad "the rehearsal should roll the migration back" "$(q "$U" "SELECT count(*) FROM ONLY public.full_t")"
+    && ok "the rows are where they were" \
+    || bad "the dry run should leave the table alone" "$(q "$U" "SELECT count(*) FROM ONLY public.full_t")"
 
   q "$U" "SELECT create_hypertable('public.m', by_range('ts', INTERVAL '1 day'))" >/dev/null
   q "$U" "INSERT INTO public.m SELECT g, now() - (g || ' seconds')::interval, g % 10, random()
@@ -122,13 +127,47 @@ for edition in tsl apache oldest; do
   # ceiling only by the hypertable's own size: the parent reads 0 pages. (At
   # 400 000 rows, 23 MiB, a plain build is the right plan, and is what came out.)
   sql=$(plan_sql "$U" "$(idx m_dev '["dev"]')")
-  if echo "$sql" | grep -q 'transaction_per_chunk' && ! echo "$sql" | grep -q CONCURRENTLY; then
-    ok "an index on a large hypertable is planned per chunk, not concurrently"
+  if [ "$edition" = oldest ]; then
+    # 2.28: the per-chunk option, one statement. The part-by-part concurrent
+    # build below has not been measured on it, so the module does not offer it.
+    if echo "$sql" | grep -q 'transaction_per_chunk' && ! echo "$sql" | grep -q CONCURRENTLY; then
+      ok "an index on a large hypertable is planned per chunk, not concurrently"
+    else
+      bad "a large hypertable's index should be per chunk" "$sql"
+    fi
   else
-    bad "a large hypertable's index should be per chunk" "$sql"
+    # 2.30: the index on the parent ONLY, then each chunk concurrently. The
+    # per-chunk option holds a write-blocking lock on chunk after chunk, and a
+    # write that does not name the time column waits behind all of them.
+    chunks=$(q "$U" "SELECT count(*) FROM timescaledb_information.chunks WHERE hypertable_name = 'm'")
+    if echo "$sql" | grep -q '^CREATE INDEX "m_dev" ON ONLY "public"."m"' \
+       && [ "$(echo "$sql" | grep -c '^CREATE INDEX CONCURRENTLY "_hyper_')" = "$chunks" ] \
+       && ! echo "$sql" | grep -q transaction_per_chunk; then
+      ok "an index on a large hypertable is planned on the parent only, then on each of its $chunks chunks concurrently"
+    else
+      bad "expected ON ONLY and one concurrent build per chunk ($chunks)" "$sql"
+    fi
   fi
   raw=$(echo "$sql" | grep '^CREATE INDEX' | psql -X -q "$U" 2>&1)
-  [ -z "$raw" ] && ok "and the server builds it as planned" || bad "the planned per-chunk build should run" "$raw"
+  [ -z "$raw" ] && ok "and the server builds it as planned" || bad "the planned build should run" "$raw"
+  if [ "$edition" != oldest ]; then
+    left=$(q "$U" "SELECT count(*) FROM timescaledb_information.chunks c WHERE c.hypertable_name = 'm'
+                    AND NOT EXISTS (SELECT 1 FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid
+                                     WHERE i.indrelid = format('%I.%I', c.chunk_schema, c.chunk_name)::regclass
+                                       AND i.indisvalid AND ic.relname = c.chunk_name || '_m_dev')")
+    [ "$left" = 0 ] && ok "every chunk has its index, valid" || bad "chunks without the index" "$left"
+    # Built by hand on each chunk, and TimescaleDB's all the same: planned
+    # again it is done, and a chunk made afterwards gets one by itself.
+    out=$(plan "$U" "$(idx m_dev '["dev"]')")
+    echo "$out" | grep -q '"action":"satisfied"' && ok "and planned again, it is satisfied" \
+      || bad "a finished part-by-part index should be satisfied" "$out"
+    q "$U" "INSERT INTO public.m VALUES (0, now() + interval '40 days', 1, 0)" >/dev/null
+    got=$(q "$U" "SELECT count(*) FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid
+                   WHERE ic.relname LIKE '%\_m\_dev' AND i.indrelid = (SELECT format('%I.%I', chunk_schema, chunk_name)::regclass
+                         FROM timescaledb_information.chunks WHERE hypertable_name = 'm' ORDER BY range_start DESC LIMIT 1)")
+    [ "$got" = 1 ] && ok "a chunk created afterwards gets the index by itself" || bad "the new chunk has no index" "$got"
+    q "$U" "DELETE FROM public.m WHERE id = 0" >/dev/null
+  fi
   raw=$(q "$U" "CREATE INDEX CONCURRENTLY m_cic ON public.m (v)")
   echo "$raw" | grep -qF "hypertables do not support concurrent index creation" \
     && ok "while the concurrent build it avoids is refused" \
@@ -208,25 +247,41 @@ for edition in tsl apache oldest; do
   ck='{"kind":"add_check_constraint","schema":"public","table":"m","name":"m_v_ck","expression":"v >= 0"}'
   fk='{"kind":"add_foreign_key","schema":"public","table":"m","name":"m_dev_fk","columns":["dev"],"references_schema":"public","references_table":"d","references_columns":["id"]}'
   clean "set_not_null, a check and a foreign key with the columnstore" "$U" "$nn,$ck,$fk"
+  # Each scans under its own lock, so the dry run leaves all three to the job.
+  plan "$U" "$nn,$ck,$fk" | grep -q '"unverifiedSteps":\[0,1,2\]' \
+    && ok "the three validating statements are planned and left to the job" \
+    || bad "a statement that validates under its lock should not be rehearsed" "$(plan "$U" "$nn,$ck,$fk")"
   sql=$(plan_sql "$U" "$nn,$ck,$fk")
-  if [ "$(echo "$sql" | grep -c .)" = 3 ] && ! echo "$sql" | grep -q "NOT VALID\|VALIDATE"; then
+  # So what the dry run no longer proves is proved here: the server accepts
+  # each statement as planned.
+  raw=$(q "$U" "BEGIN; $(echo "$sql" | tr '\n' ' ') ROLLBACK;")
+  echo "$raw" | grep -q "ERROR" \
+    && bad "the server refuses a one-step validating statement as planned" "$raw" \
+    || ok "the server accepts the three statements as planned"
+  # Each behind the weaker lock on the hypertable, which is not counted.
+  if [ "$(echo "$sql" | grep -v '^LOCK TABLE ' | grep -c .)" = 3 ] && ! echo "$sql" | grep -q "NOT VALID\|VALIDATE"; then
     ok "each is one validating statement"
   else
     bad "expected three statements and neither NOT VALID nor VALIDATE" "$sql"
   fi
   plan "$U" "$ck" | grep -q "validated in one statement" \
     && ok "and the plan says what the lock costs" || bad "the one-step warning is missing" "$(plan "$U" "$ck")"
-  # A violating row written into a converted chunk is found in the dry run.
+  # A violating row written into a converted chunk is found by the statement,
+  # which is where the job would meet it: the dry run plans and does not scan.
   q "$U" "INSERT INTO public.m VALUES (0, now() - INTERVAL '6 days', 99, -1)" >/dev/null
   q "$U" "SELECT compress_chunk(c, if_not_compressed => true) FROM show_chunks('public.m', older_than => INTERVAL '2 days') c" >/dev/null
   out=$(plan "$U" "$ck")
-  echo "$out" | grep -q "is violated by some row" \
-    && ok "a check violated in a converted chunk is caught in the dry run" \
-    || bad "the dry run should report the violated check" "$out"
-  out=$(plan "$U" "$fk")
-  echo "$out" | grep -q "violates foreign key constraint" \
-    && ok "a foreign key violated in a converted chunk is caught in the dry run" \
-    || bad "the dry run should report the violated foreign key" "$out"
+  echo "$out" | grep -q '"ok":true' && ! echo "$out" | grep -q "is violated by some row" \
+    && ok "the dry run does not scan for a violated check" \
+    || bad "the dry run should leave the validating scan to the job" "$out"
+  raw=$(q "$U" "BEGIN; $(plan_sql "$U" "$ck" | tr '\n' ' ') ROLLBACK;")
+  echo "$raw" | grep -q "is violated by some row" \
+    && ok "a check violated in a converted chunk is reported by the planned statement" \
+    || bad "the planned statement should report the violated check" "$raw"
+  raw=$(q "$U" "BEGIN; $(plan_sql "$U" "$fk" | tr '\n' ' ') ROLLBACK;")
+  echo "$raw" | grep -q "violates foreign key constraint" \
+    && ok "a foreign key violated in a converted chunk is reported by the planned statement" \
+    || bad "the planned statement should report the violated foreign key" "$raw"
   # The other direction: a plain table referencing a columnstore hypertable.
   # VALIDATE runs on the plain table, so the two-step recipe stands (measured).
   q "$U" "CREATE TABLE public.h2 (ts timestamptz NOT NULL, dev int NOT NULL, PRIMARY KEY (dev, ts));

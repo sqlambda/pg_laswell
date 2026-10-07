@@ -380,10 +380,18 @@ inline void pgvector_advise(const Intent& in, const std::string& qualified,
   const auto& t = obs.table(qualified);
   // reltuples is 0 until the first ANALYZE; n_live_tup counts from the first
   // insert. The larger of the two is the best this reading has.
-  const long long rows =
+  long long rows =
       created_here ? 0
                    : std::max(t.value("reltuples", 0LL),
                               t.value("stats", json::object()).value("n_live_tup", 0LL));
+  // A hypertable or a distributed table reads empty here and is not: its rows
+  // are another module's to count, and core has merged that count in. Without
+  // it a full table was advised to wait "until the data is loaded".
+  if (!created_here) {
+    std::string by;
+    const auto traits = index_traits(obs, qualified, in, by);
+    if (traits.answered && traits.rows > rows) rows = traits.rows;
+  }
   const bool known = created_here || t.value("exists", false);
 
   if (method == "ivfflat" && known) {

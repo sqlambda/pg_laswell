@@ -195,6 +195,18 @@ inline void citus_note_reference_copy(const json& citus, Step& step, Plan& plan,
       "the next step needing them everywhere pays for it, and this is that step.");
 }
 
+// The rows of a table Citus holds in shards, from the module's own reading of
+// them; the relation's reltuples where there is none (a plain table).
+inline long long citus_table_rows(const json& citus, const std::string& qualified,
+                                  const json& table) {
+  if (citus.is_object() && citus.contains("sizes") && citus["sizes"].is_object() &&
+      citus["sizes"].contains(qualified)) {
+    const auto rows = citus["sizes"][qualified].value("rows", -1LL);
+    if (rows >= 0) return rows;
+  }
+  return table.value("reltuples", 0LL);
+}
+
 inline void plan_citus_distribute_table(const Intent& in, const Observations& obs,
                                   const ExecutorConfig& cfg, Plan& plan,
                                   std::vector<Step>& out) {
@@ -456,6 +468,13 @@ inline void plan_citus_distribute_table(const Intent& in, const Observations& ob
   // dry run now proves the call succeeds; on a large table it is bounded by
   // dry_run_statement_timeout_ms like any other DDL that does real work.
   step.detail["rehearse_by"] = "execution";
+  // But not where it copies rows: the blocking form holds writes for the whole
+  // copy, and the dry run would do that to the live table.
+  // Pages as well as rows: a table never analysed reads no rows and is not
+  // empty.
+  if (!concurrent && (rows > 0 || t.value("size_estimate", 0LL) > 0)) {
+    do_not_rehearse(step, detail::kHeavyNotRehearsed, /*leaves_gap=*/true);
+  }
   step.action = Action::kApply;
   step.lock = concurrent
                   ? "ShareUpdateExclusiveLock on " + qualified +
@@ -571,8 +590,13 @@ inline void plan_citus_create_reference_table(const Intent& in, const Observatio
 
   step.action = Action::kApply;
   step.txn_class = TxnClass::kRequired;
-  // Rehearsed by execution: see plan_citus_distribute_table.
+  // Rehearsed by execution: see plan_citus_distribute_table. But not where
+  // there are rows to copy to every node under that lock.
   step.detail["rehearse_by"] = "execution";
+  if (obs.table(qualified).value("reltuples", 0LL) > 0 ||
+      obs.table(qualified).value("size_estimate", 0LL) > 0) {
+    do_not_rehearse(step, detail::kHeavyNotRehearsed, /*leaves_gap=*/true);
+  }
   step.lock = "AccessExclusiveLock on " + qualified +
               " (the whole table is copied to every node)";
   step.why = "a reference table is replicated in full to every node, so reads "
@@ -1069,11 +1093,15 @@ inline void plan_citus_alter_distributed_table(const Intent& in,
   }
   step.sql.push_back("SELECT alter_distributed_table(" + args + ");");
 
-  const long long rows = t.value("reltuples", 0LL);
+  // The coordinator's relation is a shell that reads 0: the rows are the
+  // shards', which the reading sums.
+  const long long rows = citus_table_rows(citus, qualified, t);
   step.action = Action::kApply;
   step.txn_class = TxnClass::kRequired;
   // Rehearsed by execution: see plan_citus_distribute_table.
   step.detail["rehearse_by"] = "execution";
+  // Except that it rewrites a distributed table in full, under its lock.
+  do_not_rehearse(step, detail::kHeavyNotRehearsed, /*leaves_gap=*/true);
   step.detail["changes"] = changes;
   step.detail["rows_estimated"] = rows;
   step.why = detail::join(changes, "; ");
@@ -1141,11 +1169,15 @@ inline void plan_citus_undistribute_table(const Intent& in, const Observations& 
   }
 
   const auto kind = citus_kind_of(citus, qualified);
-  const long long rows = t.value("reltuples", 0LL);
+  // The coordinator's relation is a shell that reads 0: the rows are the
+  // shards', which the reading sums.
+  const long long rows = citus_table_rows(citus, qualified, t);
   step.action = Action::kApply;
   step.txn_class = TxnClass::kRequired;
   // Rehearsed by execution: see plan_citus_distribute_table.
   step.detail["rehearse_by"] = "execution";
+  // Except that it copies every row back to the coordinator, under its lock.
+  do_not_rehearse(step, detail::kHeavyNotRehearsed, /*leaves_gap=*/true);
   step.detail["was"] = kind;
   step.detail["rows_estimated"] = rows;
   std::vector<std::string> rewritten{qualified};

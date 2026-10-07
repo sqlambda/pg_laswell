@@ -90,6 +90,10 @@ struct BatchOutcome {
   // success having merged nothing.
   long long considered = 0;
   std::string cursor;
+  // A grouped walk has reached the end of a group while this transaction still
+  // holds the row locks of earlier batches. Nothing was done; the caller
+  // commits and comes back, and the next group is looked for with no lock held.
+  bool commit_first = false;
 };
 
 // WHERE a grouped walk has got to: which value of the group column, and how far
@@ -143,7 +147,8 @@ inline BatchOutcome run_paced_batch(pqxx::work& txn,
                                     const std::string& select_sql,
                                     const std::string& apply_sql,
                                     const std::string& cursor, int batch,
-                                    long long batch_bytes) {
+                                    long long batch_bytes,
+                                    const std::vector<std::optional<std::string>>& upto = {}) {
   BatchOutcome out;
   out.cursor = cursor;
   if (apply_sql.empty()) {
@@ -156,7 +161,11 @@ inline BatchOutcome run_paced_batch(pqxx::work& txn,
   // The lock taken here is what makes the two statements safe as one: nothing
   // can change these rows before the apply below, because both run in this
   // transaction.
-  const auto sel = txn.exec(select_sql, pqxx::params{cursor, batch});
+  // `upto`, where the plan gave the walk an upper bound: the parameters after
+  // the cursor and the limit. See read_upper_bound.
+  pqxx::params select_params{cursor, batch};
+  for (const auto& v : upto) select_params.append(v);
+  const auto sel = txn.exec(select_sql, select_params);
   std::vector<std::string> keys;
   keys.reserve(static_cast<std::size_t>(sel.size()));
   long long bytes = 0;
@@ -205,6 +214,110 @@ inline std::optional<std::string> maybe(const std::string& v) {
   return v;
 }
 
+// ONE BATCH of a composite walk: a keyset walk along ALL the key columns of a
+// unique index at once, in index order.
+//
+// For a table whose key is unique only together with other columns -- a
+// tenant column first, or a time column on a partitioned table -- when nothing
+// requires a batch to stay inside one value of anything. The walk by group
+// (run_grouped_batch) handles such a table one group at a time, and where the
+// leading column is nearly unique that is one ROW at a time: found in the
+// field on a hypertable keyed (time, id), 550 rows a second. Measured there for
+// this walk, 1 000 rows a batch along the whole key: 0.44 ms a batch whichever
+// column leads, and a million rows in 13 s.
+//
+// Two statements, as the plain walk has: select the next rows after the cursor
+// FOR UPDATE, then change exactly those. The cursor is the last row's key, all
+// columns of it, as a JSON array of strings; "" or "0" is "not started".
+inline BatchOutcome run_composite_batch(pqxx::work& txn,
+                                        const std::string& select_sql,
+                                        const std::string& apply_sql,
+                                        const std::string& cursor, int batch,
+                                        long long batch_bytes,
+                                        std::size_t columns,
+                                        const std::vector<std::optional<std::string>>& upto = {}) {
+  BatchOutcome out;
+  out.cursor = cursor;
+  std::vector<std::string> at;
+  if (!cursor.empty() && cursor != "0") {
+    json j;
+    try {
+      j = json::parse(cursor);
+    } catch (const std::exception&) {
+      j = json();
+    }
+    if (!j.is_array() || j.size() != columns) {
+      throw std::runtime_error("a composite walk could not read its own cursor: \"" +
+                               cursor + "\"");
+    }
+    for (const auto& v : j) at.push_back(v.get<std::string>());
+  }
+
+  pqxx::params where;
+  for (std::size_t c = 0; c < columns; ++c) {
+    if (at.empty()) {
+      where.append(std::optional<std::string>());  // NULL: before the first row
+    } else {
+      where.append(at[c]);
+    }
+  }
+  where.append(batch);
+  for (const auto& v : upto) where.append(v);
+  const auto sel = txn.exec(select_sql, where);
+
+  // The one-statement form: the mutation rode in the statement, which returns
+  // the batch's keys in order. The cursor is the last of them.
+  if (apply_sql.empty()) {
+    std::vector<std::string> end;
+    for (const auto& row : sel) {
+      end.clear();
+      for (std::size_t c = 0; c < columns; ++c) {
+        end.push_back(row[static_cast<pqxx::row::size_type>(c)].as<std::string>());
+      }
+    }
+    out.considered = static_cast<long long>(sel.size());
+    if (!end.empty()) out.cursor = json(end).dump();
+    return out;
+  }
+
+  // One array per key column, element i of each being row i's value.
+  std::vector<std::string> literals(columns, "{");
+  std::vector<std::string> last;
+  long long bytes = 0;
+  std::size_t taken = 0;
+  for (const auto& row : sel) {
+    std::vector<std::string> values;
+    long long row_bytes = 0;
+    for (std::size_t c = 0; c < columns; ++c) {
+      values.push_back(row[static_cast<pqxx::row::size_type>(c)].as<std::string>());
+      row_bytes += static_cast<long long>(values.back().size());
+    }
+    // Between rows, never mid-row, and never zero rows: see run_paced_batch.
+    if (taken != 0 && bytes + row_bytes > batch_bytes) break;
+    bytes += row_bytes;
+    for (std::size_t c = 0; c < columns; ++c) {
+      if (taken != 0) literals[c] += ',';
+      literals[c] += '"';
+      for (const char ch : values[c]) {
+        if (ch == '"' || ch == '\\') literals[c] += '\\';
+        literals[c] += ch;
+      }
+      literals[c] += '"';
+    }
+    last = std::move(values);
+    ++taken;
+  }
+  if (taken == 0) return out;
+
+  pqxx::params keys;
+  for (auto& l : literals) keys.append(l + "}");
+  const auto r = txn.exec(apply_sql, keys);
+  out.cursor = json(last).dump();
+  out.considered = static_cast<long long>(r.size());
+  if (out.considered == 0) out.considered = static_cast<long long>(taken);
+  return out;
+}
+
 // ONE BATCH of a grouped walk, and the only implementation of it.
 //
 // A grouped walk iterates the values of one column and keyset-walks the key
@@ -231,7 +344,8 @@ inline BatchOutcome run_grouped_batch(pqxx::work& txn,
                                              const std::string& select_sql,
                                              const std::string& apply_sql,
                                              const GroupCursor& from, int batch,
-                                             long long batch_bytes) {
+                                             long long batch_bytes,
+                                             bool holds_locks = false) {
   BatchOutcome out;
   GroupCursor at = from;
   out.cursor = at.encode();
@@ -259,10 +373,24 @@ inline BatchOutcome run_grouped_batch(pqxx::work& txn,
     const auto sel = txn.exec(select_sql,
                                pqxx::params{at.group, maybe(at.key), batch});
     if (sel.empty()) {
-      // This group is done. Advance past it and look at the next one: `groups_sql`
-      // is keyset-walked on the group, so an empty key with a group set means
-      // "everything in this group is done", and the next iteration asks for the
-      // next group after it.
+      // This group is done. The question that comes next -- which group
+      // follows -- needs none of the row locks this transaction holds, and
+      // must not be asked while it holds any. Found in the field, under load
+      // on Citus: the question took 0.6 to 1.5 s on a shard, the batches before
+      // it stayed locked for all of that, and updates to rows the walk had just
+      // touched waited up to 1.8 s -- the walk's commit on a lock waiter can
+      // only happen once the statement in flight returns. So the caller
+      // commits first. (The question itself was made cheap as well; see where
+      // the planner writes it.)
+      if (holds_locks) {
+        out.cursor = at.encode();
+        out.commit_first = true;
+        return out;
+      }
+      // Advance past it and look at the next one: `groups_sql` is keyset-walked
+      // on the group, so an empty key with a group set means "everything in
+      // this group is done", and the next iteration asks for the next group
+      // after it.
       const auto g = txn.exec(groups_sql,
                                pqxx::params{maybe(at.group), 1});
       if (g.empty()) {
@@ -365,7 +493,15 @@ class Executor {
     // opens. Declared out here so committing the group releases it.
     OperationGate::Slot group_slot;
 
-    for (const auto& step : steps) {
+    // Where the open group began, and how often and since when it has been
+    // tried: an exclusive step whose lock does not come rolls the WHOLE group
+    // back and the group is run again from its first step.
+    std::size_t group_first = 0;
+    int group_attempt = 1;
+    long long group_began = 0;
+
+    for (std::size_t at = 0; at < steps.size(); ++at) {
+      const auto& step = steps[at];
       if (job_->pacing.cancel_stop.load()) {
         if (group_open) worker.rollback();
         cancelled();
@@ -414,21 +550,76 @@ class Executor {
       // COPY carries a payload after its statement, so it cannot go through
       // exec() with the rest. It still belongs to the current transaction
       // group -- COPY is transactional, and rolls back with everything else.
+      // Opens the group's transaction at this step, if it is not open. A
+      // group being tried again keeps its count and its clock.
+      const auto open_group = [&]() {
+        if (group_open) return;
+        group_slot = operation_slot();
+        worker.begin(app_name(ordinal));
+        group_open = true;
+        if (group_first != at || group_began == 0) {
+          group_first = at;
+          group_attempt = 1;
+          group_began = detail::steady_ms();
+        }
+      };
       if (kind == "copy_rows" && step.value("detail", json::object())
                                      .contains("copy_rows")) {
-        if (!group_open) {
-          group_slot = operation_slot();
-          worker.begin(app_name(ordinal));
-          group_open = true;
-        }
+        open_group();
         run_copy(worker, ordinal, step);
         continue;
       }
 
-      if (!group_open) {
-        group_slot = operation_slot();
-        worker.begin(app_name(ordinal));
-        group_open = true;
+      open_group();
+
+      // A step that asks for an exclusive lock is run so that the application
+      // does not queue behind the request for long: the weaker lock first,
+      // then the exclusive one with a short timeout (run_in_transaction). When
+      // it does not come, the transaction is rolled back -- which releases the
+      // pending request the application was queued behind, and everything the
+      // steps before it in this group had done and locked -- and the group is
+      // run again from its first step after a pause. Whole, so that intents
+      // that commit together still do: a retry never leaves half a group
+      // applied.
+      if (step.value("detail", json::object()).value("exclusive_retry", false)) {
+        bool timed_out = false;
+        run_in_transaction(worker, ordinal, step, &timed_out, group_attempt);
+        if (!timed_out) continue;
+        worker.rollback();
+        group_open = false;
+        group_slot = OperationGate::Slot();
+        if (job_->pacing.cancel_stop.load()) {
+          cancelled();
+          return;
+        }
+        const long long patience = static_cast<long long>(cfg_.executor.lock_timeout_ms) *
+                                   kExclusivePatienceFactor;
+        const long long waited = detail::steady_ms() - group_began;
+        if (waited >= patience) {
+          record_step(ordinal, step, "lock_not_acquired", 0,
+                      json{{"sqlstate", "55P03"},
+                           {"lockAttempts", group_attempt},
+                           {"note",
+                            "the exclusive lock was not available in " +
+                                std::to_string(group_attempt) + " attempts over " +
+                                std::to_string(waited) +
+                                " ms; nothing was applied. Each attempt waited at most " +
+                                std::to_string(kExclusiveTryMs) +
+                                " ms, so the application was never queued for longer. "
+                                "Something holds a lock on the table for a long time -- "
+                                "pg_licht currentLocks names the holder."}});
+          throw std::runtime_error("step " + std::to_string(ordinal) +
+                                   " could not acquire its exclusive lock in " +
+                                   std::to_string(group_attempt) + " attempts");
+        }
+        // What the steps before it in this group reported is no longer true.
+        forget_steps_from(steps[group_first].value("ordinal", 0));
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(std::min(100 * group_attempt, 1000)));
+        ++group_attempt;
+        // Back to the group's first step: the loop's ++at lands on it.
+        at = group_first - 1;
+        continue;
       }
       run_in_transaction(worker, ordinal, step);
     }
@@ -482,7 +673,32 @@ class Executor {
     }
   }
 
-  void run_in_transaction(WriteSession& w, int ordinal, const json& step) {
+  // How long one attempt at an exclusive lock may wait, and how long the step
+  // goes on trying. The first bounds how long the application can queue behind
+  // a single request; the second is this step's patience, and since nothing
+  // queues while it sleeps between attempts it can be far longer than
+  // lock_timeout, which bounds a wait the application DOES queue behind.
+  static constexpr int kExclusiveTryMs = 200;
+  static constexpr int kExclusivePatienceFactor = 20;  // x lock_timeout_ms
+
+  // The steps of a group that is being run again, out of the job's in-memory
+  // record: they were rolled back. The ledger's rows are replaced when the
+  // steps run again (it keeps one row a step).
+  void forget_steps_from(int first_ordinal) {
+    std::lock_guard<std::mutex> lock(job_->m);
+    auto& done = job_->steps;
+    done.erase(std::remove_if(done.begin(), done.end(),
+                              [first_ordinal](const json& s) {
+                                return s.value("ordinal", -1) >= first_ordinal;
+                              }),
+               done.end());
+  }
+
+  // `lock_timed_out`, when given, makes a lock timeout the CALLER's to handle:
+  // it is set, nothing is recorded, and the transaction is left aborted for
+  // the caller to roll back. `attempt` is recorded with the step.
+  void run_in_transaction(WriteSession& w, int ordinal, const json& step,
+                          bool* lock_timed_out = nullptr, int attempt = 1) {
     const auto started = detail::steady_ms();
     long long rows = 0;
     // maintenance_work_mem, when the planner decided this step uses it. The
@@ -496,16 +712,31 @@ class Executor {
     if (mwm > 0) {
       w.txn().exec("SET LOCAL maintenance_work_mem = '" + std::to_string(mwm) + "MB'");
     }
+    bool gated = false;
+    long long gates_taken = 0;
     for (const auto& raw : step.value("sql", json::array())) {
       const auto stmt = detail::strip_semicolon(raw.get<std::string>());
       if (stmt.empty()) continue;
       try {
         const auto r = w.txn().exec(stmt);
         rows += r.affected_rows();
+        // After the weaker lock, the exclusive one: a short wait per attempt.
+        if (lock_timed_out != nullptr && stmt.rfind("LOCK TABLE ", 0) == 0 &&
+            !gated) {
+          const auto more = step.value("detail", json::object()).value("weaker_lock_first", 1LL);
+          if (++gates_taken >= more) {
+            w.txn().exec("SET LOCAL lock_timeout = " + std::to_string(kExclusiveTryMs));
+            gated = true;
+          }
+        }
       } catch (const pqxx::sql_error& e) {
         // A lock timeout is a retryable OUTCOME, not a broken migration: "we
         // did not get the lock this second" and "this migration is wrong" are
         // different facts and must not share a state.
+        if (detail::is_lock_timeout(e) && lock_timed_out != nullptr) {
+          *lock_timed_out = true;
+          return;
+        }
         if (detail::is_lock_timeout(e)) {
           record_step(ordinal, step, "lock_not_acquired", 0,
                       json{{"sqlstate", "55P03"},
@@ -523,8 +754,16 @@ class Executor {
       }
     }
     if (mwm > 0) w.txn().exec("SET LOCAL maintenance_work_mem TO DEFAULT");
-    record_step(ordinal, step, "succeeded", rows,
-                json{{"elapsedMs", detail::steady_ms() - started}});
+    // The short timeout was this step's. The steps after it share the
+    // transaction, and one that is not marked for a retry would fail outright
+    // on a wait this short.
+    if (gated) {
+      w.txn().exec("SET LOCAL lock_timeout = " +
+                   std::to_string(cfg_.executor.lock_timeout_ms));
+    }
+    json result{{"elapsedMs", detail::steady_ms() - started}};
+    if (lock_timed_out != nullptr) result["lockAttempts"] = attempt;
+    record_step(ordinal, step, "succeeded", rows, result);
   }
 
   // COPY ... FROM STDIN.
@@ -701,8 +940,19 @@ class Executor {
     // the mode, it does not bring its own executor.
     const bool grouped =
         batch_mode == "grouped" && step["sql"].size() > 2;
+    // A composite walk: two statements, like the plain one, over all the key
+    // columns of a unique index together. See run_composite_batch.
+    // Or ONE statement over them, for the kinds whose rows come from the
+    // specification: the mutation rides in the statement that names the batch.
+    const bool composite_statement = batch_mode == "composite_statement";
+    const bool composite =
+        (batch_mode == "composite" && step["sql"].size() > 1) || composite_statement;
+    std::vector<std::string> composite_columns;
+    for (const auto& c : detail_json.value("key_columns", json::array())) {
+      composite_columns.push_back(c.get<std::string>());
+    }
     const auto apply_sql =
-        (two_statement || grouped)
+        (two_statement || grouped || (composite && !composite_statement))
             ? detail::strip_semicolon(
                   step["sql"][grouped ? 2 : 1].get<std::string>())
             : std::string();
@@ -717,6 +967,7 @@ class Executor {
     // Non-empty only for a grouped walk, whose cursor is a pair and whose
     // staleness check therefore has a different shape. See cursor_is_stale.
     resume_group_ = detail_json.value("group_column", "");
+    resume_columns_ = composite ? composite_columns : std::vector<std::string>{};
     std::string cursor = resume_cursor(ordinal);
     // Recorded so a resume is VISIBLE. Without it a retry that resumed and one
     // that silently started over were indistinguishable -- the predicate hides
@@ -728,7 +979,8 @@ class Executor {
     long long rows_committed = 0; // survives a crash
     int commits = 0;
     std::map<std::string, int> reasons{
-        {"interval", 0}, {"lock_waiter", 0}, {"batch_cap", 0}, {"final", 0}};
+        {"interval", 0}, {"lock_waiter", 0}, {"batch_cap", 0}, {"final", 0},
+        {"group_end", 0}};
 
     // Invariants are evaluated BEFORE the first batch and again after the
     // last, on the worker connection. Both readings are stored, so a failure
@@ -745,6 +997,31 @@ class Executor {
       for (const auto& inv : invariants) {
         invariants_before[inv.value("name", "")] =
             scalar(w, inv.value("query", ""));
+      }
+      w.commit();
+    }
+
+    // The walk's upper bound, where the plan gives it one: the highest key
+    // there is as the walk starts, read once. A walk whose new rows are filled
+    // by a trigger never needs to go past it -- and without it, on a table
+    // partitioned by time, every batch read in full each partition made since
+    // the walk began, finding nothing left to do in any (found in the field:
+    // a batch select at 135 ms where it had been 1.7, and a 35-minute walk).
+    // Read again when a job resumes, which only moves it up: still correct.
+    // An empty table has no highest key, and the bound is then NULL, which the
+    // statement reads as no bound.
+    std::vector<std::optional<std::string>> upto;
+    if (detail_json.contains("upper_bound_sql")) {
+      const auto columns = static_cast<std::size_t>(
+          detail_json.value("upper_bound_columns", 1));
+      w.begin(app_name(ordinal));
+      const auto r = w.txn().exec(detail_json.value("upper_bound_sql", ""));
+      for (std::size_t c = 0; c < columns; ++c) {
+        if (r.empty() || r[0][static_cast<pqxx::row::size_type>(c)].is_null()) {
+          upto.emplace_back(std::nullopt);
+        } else {
+          upto.emplace_back(r[0][static_cast<pqxx::row::size_type>(c)].as<std::string>());
+        }
       }
       w.commit();
     }
@@ -784,6 +1061,7 @@ class Executor {
                               ? std::max(1, e.batch_rows / 2)
                               : e.batch_rows;
         long long affected = 0;
+        bool outcome_commit_first = false;
         try {
           BatchOutcome outcome;
           if (grouped) {
@@ -808,13 +1086,28 @@ class Executor {
             }
             outcome = run_grouped_batch(w.txn(), sql, confined_select_sql,
                                                apply_sql, at, batch,
-                                               e.batch_bytes);
+                                               e.batch_bytes,
+                                               // Only once the transaction holds a
+                                               // batch's worth of rows. A group can be
+                                               // one row -- any key whose leading
+                                               // column is nearly unique -- and a
+                                               // commit at the end of each was a
+                                               // commit per row (found in the field,
+                                               // after this commit was introduced).
+                                               // Below that the next-group question,
+                                               // now an index probe, runs with those
+                                               // few rows locked.
+                                               /*holds_locks=*/rows_this_txn >= batch);
+          } else if (composite) {
+            outcome = run_composite_batch(w.txn(), sql, apply_sql, cursor, batch,
+                                          e.batch_bytes, composite_columns.size(), upto);
           } else {
             outcome = run_paced_batch(w.txn(), sql, apply_sql, cursor, batch,
-                                      e.batch_bytes);
+                                      e.batch_bytes, upto);
           }
           affected = outcome.considered;
           cursor = outcome.cursor;
+          outcome_commit_first = outcome.commit_first;
           // A batch that only advanced past finished groups did no work and is
           // not the end of the walk. Treated as progress so the loop continues,
           // and not counted as rows.
@@ -848,6 +1141,12 @@ class Executor {
         // throughout -- indistinguishable from a stuck job.
         publish_backfill(ordinal, rows_done, rows_committed, commits, cursor,
                          reasons, detail_json, "in_flight");
+        if (outcome_commit_first) {
+          // A group ended with batches uncommitted: commit them, then ask
+          // which group is next with nothing locked.
+          reason = CommitReason::kGroupEnd;
+          break;
+        }
         if (affected == 0 && !skipped_groups_only) {
           done = true;
           reason = CommitReason::kFinal;
@@ -1029,10 +1328,32 @@ class Executor {
   std::string resume_key_;
   std::string resume_where_;
   std::string resume_group_;
+  std::vector<std::string> resume_columns_;  // a composite walk's key, in order
 
   bool cursor_is_stale(ReadSession& r, const std::string& from) {
     if (resume_qualified_.empty() || resume_where_.empty()) return false;
     try {
+      // A composite cursor is one row's whole key. "Everything at or below it
+      // is done" is the same question as for a single key, asked with a row
+      // comparison over the same columns the walk orders by.
+      if (!resume_columns_.empty()) {
+        if (from.empty() || from == "0") return false;  // nothing claimed yet
+        const json at = json::parse(from);
+        if (!at.is_array() || at.size() != resume_columns_.size()) return true;
+        std::vector<std::string> cols, marks;
+        pqxx::params values;
+        for (std::size_t c = 0; c < resume_columns_.size(); ++c) {
+          cols.push_back(detail::quote_identifier(resume_columns_[c]));
+          marks.push_back("$" + std::to_string(c + 1));
+          values.append(at[c].get<std::string>());
+        }
+        const auto res = r.txn().exec(
+            "SELECT EXISTS (SELECT 1 FROM " + resume_qualified_ + " WHERE (" +
+                detail::join(cols, ", ") + ") <= (" + detail::join(marks, ", ") +
+                ") AND (" + resume_where_ + "))",
+            values);
+        return !res.empty() && res[0][0].as<bool>();
+      }
       // A grouped cursor is a pair, so "everything at or below it is
       // done" means: every earlier distribution value, and within the current
       // one every key up to the recorded one. The check asks whether any row in

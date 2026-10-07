@@ -1,5 +1,388 @@
 # Changes
 
+## Unreleased
+
+Findings from a field report -- a 10-million-row table under 1,000 inserts
+a second, where `set_not_null` stopped every insert for three seconds before its
+job had started -- and the recipe that report was writing by hand.
+
+### A NOT NULL column without a default, as one intent
+
+`ADD COLUMN ... NOT NULL` without a default fails on the first existing row, so
+`add_column` refused it and told the author to add the column nullable,
+backfill it and set NOT NULL later. Written as separate intents, nothing covers
+the rows inserted while the backfill runs unless the author also thinks of a
+trigger.
+
+`add_column` now takes `fill`, one SQL expression over the row's own columns,
+and `after`, which says what becomes of the trigger:
+
+```json
+{"kind": "add_column", "schema": "public", "table": "messages",
+ "column": "customer_id", "type": "bigint", "nullable": false,
+ "fill": "(payload->>'customer')::bigint", "after": "drop_trigger",
+ "comment": "The customer the message was sent to."}
+```
+
+The plan is the whole recipe: the column nullable and, in the same transaction,
+a trigger that fills it on insert and update; a paced backfill of the rows
+already there; the `set_not_null` recipe; and the trigger dropped or kept. One
+expression serves the trigger and the backfill -- measured, the trigger
+evaluates it as `SELECT (fill) INTO NEW.col FROM (SELECT NEW.*) AS table` -- so
+they cannot disagree. `after` has no default: whether the application writes the
+column itself is known only to the author.
+
+Several such columns on one table, written as consecutive intents, are planned
+as one recipe: one trigger, one backfill that sets them all, one validation
+scan. One after the other they would rewrite every row once per column.
+Measured on 6 million rows: one check over all the columns, validated once, is
+enough for PostgreSQL to skip the scan for each, and both `SET NOT NULL` ran in
+one statement in 4 ms against 344 ms for a bare one. They are not merged where
+one expression names another column of the group, since the trigger fills in
+order and a single `UPDATE` does not.
+
+`fill` may be a list of sources, the first that gives a value winning: an
+expression over the row, or `{"from", "on", "value"}` naming another table, how
+its row is found and what is taken from it. A row found with a NULL falls
+through to the next. The trigger evaluates the list as one `COALESCE`, which
+stops at the first value (measured: the second table was probed for half the
+rows, those the first had no value for). The backfill makes one joined pass per
+source over the rows still null -- 17.5 ms a batch of 5,000 against 30 ms for
+the per-row form, with one source -- and each pass is a step, so the ledger says
+how many rows each source filled.
+
+With a `default` as well, the recipe is shorter: the column is added NOT NULL
+with its default, catalog-only, and the backfill writes only the rows whose
+value differs from it. No trigger, no check, no validation scan, and the one
+exclusive lock comes before the walk. A row is written only while it still
+holds the default, so a value the application wrote is kept.
+
+Consecutive columns with a default and a fill share one walk too: a row is
+selected when any still holds its default and has another value to take, and
+each column is written only where that is so for it. Found in the field as two
+walks, every row rewritten twice.
+
+Every part resumes from the catalog. A row the expression cannot fill stops the
+job at the validation scan with the column nullable and the trigger in place,
+and the same specification finishes once the row is repaired; the live test
+does exactly that.
+
+### A grouped walk no longer looks for the next group while holding row locks
+
+A seventh finding, from running the change under load on Citus. A walk that
+goes one group at a time -- a Citus distributed table, or any table whose key
+is unique only within a tenant -- asks, at the end of a group, which group
+comes next. It asked inside the transaction that still held the row locks of
+the batches before. On a shard of 5 million rows that question took 0.6 to
+1.5 s, and updates to rows the walk had just touched waited for it: single-row
+updates went from 1.5 ms to 11.9 ms mean and 313 ms worst, with waits of up to
+1.8 s seen on the workers. The walk commits when another session waits, but
+only once the statement in flight returns.
+
+Two changes. The walk now commits at the end of a group before it asks, as a
+commit reason of its own, `group_end`. And the question is the next value after
+this one and nothing more -- no predicate, no `DISTINCT` -- which is a probe of
+the unique index the walk already requires: measured at 0.017 ms, against
+359 ms for the earlier form to pass six finished groups. A group with nothing
+left now costs one empty batch, taken with no lock held. The live test makes
+every other commit trigger unreachable and counts the commits that remain.
+
+### A key that is unique only with other columns is walked along the whole index
+
+An eighth finding, from a probe on a TimescaleDB hypertable, whose primary key
+must contain the time column. With the key as `(message_id, created_at)` a
+backfill was refused, with advice no hypertable can follow (a unique index on
+`message_id` alone, built concurrently). With it as `(created_at, message_id)`
+it was accepted as a walk by group in which every timestamp was a group of one
+row: 550 rows a second, about five hours for 10 million rows, with nothing in
+the plan to say so -- and, since the end-of-group commit above, a commit per
+row.
+
+A backfill now walks such a key as what it is. Where the unique index that
+contains `key` holds other columns too, and no module requires a batch to stay
+inside one value of any of them, the walk follows all the index's columns
+together in index order (`batch_mode: composite`), a full batch at a time
+whatever the size of a "group". Measured on a hypertable of a million rows in
+nine chunks: 0.44 ms for a batch of 1,000 whichever column leads, and the whole
+table in 13 s. Every column of the index must be NOT NULL. The cursor is the
+last row's whole key, and a pre-image is captured by it.
+
+This applies to every table that was walked by group without being required
+to, a plain tenant table keyed `(tenant_id, id)` included; the walk by group
+remains for a Citus distributed table, where it is required. The end-of-group
+commit now fires only once the transaction holds a batch of rows, and the
+refusal no longer suggests an index: it says what the walk needs.
+
+### TimescaleDB: an index built on each chunk concurrently
+
+A ninth finding, from the change under load on a hypertable. The per-chunk
+index build (`WITH (timescaledb.transaction_per_chunk)`) holds a write-blocking
+lock on one chunk after another, and a write that does not name the time column
+has to lock every chunk: updates by id were at zero for four seconds while a
+7.8 GiB index was built, with inserts unaffected.
+
+Measured on 2.30.2: an index can be created `ON ONLY` the hypertable, which
+reads no chunk; `CREATE INDEX CONCURRENTLY` then works on each chunk directly; a
+chunk created afterwards gets the index by itself; and TimescaleDB counts the
+ones built by hand as the hypertable index's own. On a 1.2 GB hypertable of 19
+chunks the per-chunk option took 4.6 s with an update by id waiting up to
+3,491 ms; this took 2.5 s with the worst update at 43 ms.
+
+The module now tells core the chunks and the indexes each carries, and core
+plans the index on the parent only, then one concurrent build per chunk, each
+with its own validity check. It resumes from the reading: a chunk that has its
+index is left alone, and one whose build failed is dropped and built again.
+Offered where it was measured -- 2.30 and later, without the columnstore -- and
+not for a UNIQUE index; elsewhere the per-chunk option stands.
+
+### The composite walk finds its partition
+
+A tenth finding: on a hypertable the composite walk ran at about 40,000 rows a
+second, a third of a plain table's rate. The batch's update named its rows by a
+tuple, from which a partitioned table cannot tell which partitions they are in,
+so it was planned against every chunk and probed them row by row.
+
+The first answer made it worse. Each key column was also tested against its own
+array, beside the tuple; the chunk was then found -- and the planner, no longer
+needing the tuple to find the rows, ran it as a nested loop over a materialised
+list with a join filter, 499,500 comparisons discarded for a batch of 1,000. In
+the field under load the batch update went from 20 ms to 65 ms. Which join the
+planner picks depends on its estimates: on the project's own hypertable it
+hashed, and measured faster.
+
+The array tests now find the rows, and the tuple is tested beside them as a
+filter that cannot become a join (`(...) IN (SELECT * FROM unnest(...)) IS
+TRUE`, a hashed subplan: one probe per row the index returned). Measured on one
+of 20 chunks, a batch of 1,000: 12.2 ms with the tuple alone, 27.8 ms in the
+nested loop the field saw, 5.6 to 8 ms in this form.
+
+### The trigger recipe's walk stops at the highest key there was when it started
+
+An eleventh finding, on a hypertable under 1,000 inserts a second. With `fill`
+and a trigger, every row inserted after the walk starts is filled as it
+arrives. A chunk created during the walk holds only such rows, all ahead of the
+cursor: none passes "still to fill", and each batch read the whole chunk to
+find that out, for every chunk made since the walk began. The batch select went
+from 1.7 ms to 135.6 ms and the walk from 267 s to 2,080 s.
+
+The walk now reads the highest key once as it starts, and every batch carries
+`key <= that`; rows above it are the trigger's. Measured on 20 chunks with
+nothing ahead of the cursor left to do: 132 buffers a batch against 191,870,
+and 11.5 ms to read the bound. The statement that reads it is in the step's
+detail as `upper_bound_sql`. On a resumed job it is read again, which only
+moves it up.
+
+Only where the key grows -- an integer, a timestamp or a date leading the walk.
+With a random key such as a uuid, new rows land everywhere below the bound and
+it would exclude nothing, so the walk is left as it was. Not for a `backfill`
+the author wrote, nor for `fill` with a `default`, where nothing fills the new
+rows but the walk.
+
+### Citus: a distributed table is sized by its shards
+
+From a probe of the same change on Citus 14: the coordinator's relation for a
+distributed table is a shell -- 8192 bytes and 0 rows beside whatever its
+shards hold -- and core decides how to build an index from the table's size.
+So every index on a distributed table was built plainly, 346 MB as "size 0 B <
+64 MiB ceiling", blocking writes on every shard for the length of the build and
+presenting that as the safe choice. A backfill said "0 rows estimated" for a
+million.
+
+The Citus module now reads what the shards hold and answers core's question
+about the index build, as TimescaleDB does for a hypertable. The sum is taken
+from each node's own catalog over `run_command_on_workers`, not from
+`citus_table_size`, which Citus refuses inside a transaction that has made
+multi-shard modifications -- every chained dry run after its first write. It
+matched `citus_table_size` to the byte. On the probe's table the plan now reads
+"size 346.0 MiB >= 64 MiB ceiling -> concurrent build" and "1000000 rows
+estimated".
+
+### Citus: core DDL a distributed table refuses is refused at planning
+
+The module spoke for its own kinds and for `add_column` with `fill`; for the
+rest of core's DDL on a distributed or reference table it said nothing, and
+Citus's refusal arrived from the dry run or, where the dry run cannot go, from
+the job. Each of these is measured on Citus 14.0 and now refused at planning in
+Citus's words:
+
+- `create_index` with `unique`, `add_unique_constraint` and `add_primary_key`
+  whose columns lack the distribution column. A unique index is built
+  `CONCURRENTLY`, which no dry run rehearses, so this one failed in the job.
+- `create_trigger` and `set_trigger_state` on a distributed or reference table.
+- `drop_column` and `alter_column_type` of the distribution column.
+
+The pass follows the specification in order: a table distributed by an earlier
+intent is distributed for the intents after it, though no reading says so yet.
+
+A reference table's size was the sum over every node, and each node holds the
+whole table: 1,056 kB for a table of 352 kB on three nodes. It is now one copy's
+size, which is what decides a plain build against a concurrent one and what a
+backfill's estimate is made from.
+
+### Citus: the trigger recipe is refused, and says what works instead
+
+`add_column` with `fill` and no `default` creates a trigger, and Citus allows
+none on a distributed or reference table unless `citus.enable_unsafe_triggers`
+is on. The recipe failed in the dry run at `CREATE FUNCTION` with a Citus hint
+about a setting, and the manual said it would fail somewhere else. It is now
+refused at planning, quoting the measured errors, and names the form with a
+`default`, which needs no trigger and works there.
+
+### An exclusive step no longer queues the application behind its request
+
+A third finding from the same report, still there once the rehearsal was fixed:
+straight after a backfill autovacuum is on the table, and the next exclusive
+step waited a second behind it with every session queued behind that request.
+
+Reproduced on a 1.5 GB table with autovacuum running: asking for the exclusive
+lock directly waited 1.05 s, and an insert arriving meanwhile took 1,027 ms.
+Taking `LOCK TABLE ... IN SHARE UPDATE EXCLUSIVE MODE` first, in the same
+transaction, waited the same second with the worst insert at 30 ms: that lock
+conflicts with autovacuum and not with inserts and updates, and once it is held
+the exclusive lock is granted almost at once. The exclusive steps of
+`set_not_null`, `add_check_constraint`, `add_foreign_key` and the `fill` recipe
+now begin with that statement, and the plan shows it.
+
+The other cause of the same stall is a long application transaction, which the
+weaker lock does not help with. There the exclusive statement runs with a 200 ms
+lock timeout; when it gives up the transaction is rolled back and tried again,
+for up to twenty times `lock_timeout_ms`. The application waits a fraction of a
+second at a time, where it used to wait all of `lock_timeout_ms` before the step
+failed anyway. A step records `lockAttempts`.
+
+### The dry run no longer runs the scan of a split recipe
+
+`set_not_null`, `add_check_constraint`, `add_foreign_key`, `attach_partition`
+and a domain's check add a constraint `NOT VALID` and validate it in a
+transaction of its own, so the lock of the first step is not held across the
+scan of the second. The dry run applies every step in one rolled-back
+transaction, so it held that lock across exactly that scan -- on the live
+table, before every apply. The job honoured the recipe; the rehearsal in front
+of it undid it.
+
+The planner now marks those steps and the dry run leaves them out:
+`VALIDATE CONSTRAINT`, and the `SET NOT NULL` of `set_not_null`, which is cheap
+only once the scan has proved the rows. They are listed in `unverifiedSteps`,
+and a new `unverifiedWhy` gives the reason for each. `--dry-run=chain`, which is
+for an empty database or a restored copy, still runs them.
+
+What this gives up, and what makes it acceptable: a violating row is found by
+the job at its `VALIDATE`, with the `NOT VALID` constraint already committed,
+instead of before anything ran. So the same specification applied again now
+resumes there -- a constraint that exists and is not valid is validated, not
+added a second time, and one that is valid is satisfied. Before, the second
+attempt failed on the constraint's own name.
+
+### The rehearsal's time is recorded
+
+The dry run takes real locks before any job exists, and `laswell.job.started_at`
+is after it, so three seconds of stall left no trace in the ledger. Its duration
+is now in the result (`dryRun.durationMs`), which is the plan the job stores,
+and `pg_laswell` prints it when the job starts, with the steps it did not run.
+
+### Three locks the plan named wrongly
+
+Read from `pg_locks` on PostgreSQL 18.6:
+
+- Adding a `CHECK` constraint takes `AccessExclusiveLock`, `NOT VALID` or not.
+  The plan said `ShareRowExclusiveLock` for `set_not_null`, `add_check_constraint`
+  and `attach_partition`, under which a reader would not wait. It does.
+- A `NOT VALID` foreign key takes `ShareRowExclusiveLock` on the referenced
+  table as well as the referencing one. The plan said `RowShareLock` there,
+  which is what the `VALIDATE` takes.
+
+The steps now also say that the lock must be granted before it is brief: behind
+a long transaction or an autovacuum it waits, and every session queues behind
+it until `lock_timeout`.
+
+### A paced `select` no longer skips rows that share a key
+
+`insert_rows`, `update_rows`, `delete_rows` and `merge_rows` with a `select`
+walk their source by `key`, a batch at a time, and remember the last key of each
+batch. Nothing makes that key unique in the source -- a load into a
+`(tenant, id)` table keyed by `id` repeats every id -- and a batch was cut at its
+row limit alone. The rows that shared the batch's last key but fell past the
+limit were below the next batch's starting point and were never considered.
+Measured: a source of 6,000 rows, each id three times, in batches of 100, had
+5,884 considered and 116 skipped, with no error.
+
+A batch now ends on a whole key: the limit finds the last key, and the batch is
+every row up to and including it. It is therefore larger than `batch_rows` by
+the rows that share its last key.
+
+### The dry run no longer rewrites or reads a whole table under a write-blocking lock
+
+The scan of a split recipe was left to the job; the statements that are a scan
+or a rewrite in themselves were still executed by the dry run, on the live
+table, for as long as `dry_run_statement_timeout_ms` allowed and holding their
+lock until the final rollback. They are now planned, listed under
+`unverifiedSteps` with the reason, and left to the job, whatever the table's
+size:
+
+- `alter_column_type`;
+- `ATTACH PARTITION` -- in the dry run its check was never validated, so it
+  scanned the candidate itself, and a DEFAULT partition is scanned whatever the
+  check says;
+- `create_table` with `partition_of` beside a DEFAULT partition;
+- `set_logged`, `set_tablespace`, `set_access_method`;
+- `SET NOT NULL` on a domain;
+- `replace_view` on a materialized view;
+- a constraint a module makes validate in the statement that adds it, and an
+  index or unique constraint a module makes build without `CONCURRENTLY` on a
+  table too large or too busy for a plain build;
+- a primary key over a column that is still nullable in the dry run;
+- the module kinds that copy a populated table: `citus_distribute_table` in its
+  blocking form, `citus_create_reference_table`, `citus_alter_distributed_table`,
+  `citus_undistribute_table`, and `timescaledb_create_hypertable` with
+  `migrate_data`.
+
+A later step that needs what one of them would have made is reported as
+depending on a step that was not rehearsed, not as a failure of its own. What
+this gives up: a `using` expression that fails on a row, or a partition bound
+that overlaps, is found by the job. The chain rehearsal still runs them all.
+
+### Plans that could not run
+
+- `detach_partition` chose `DETACH ... CONCURRENTLY` for a large or busy
+  partition without looking for a DEFAULT partition, and PostgreSQL refuses that
+  (measured: "cannot detach partitions concurrently when a default partition
+  exists") -- in the job, since the dry run executes nothing that cannot be
+  rolled back. Beside a DEFAULT partition the plain form is planned, and a
+  warning says that it blocks every partition.
+- `create_index` over an INVALID index of the same name, on a table small and
+  quiet enough for a plain build, put `DROP INDEX CONCURRENTLY` into the plain
+  build's transaction, where it cannot run. The invalid index is now dropped
+  plainly in that transaction: dropped and rebuilt together, the table is never
+  without it.
+- `add_column` with `fill` and no `key` refused a table whose primary key has
+  more than one column, although the backfill it hands to walks such a key
+  whole. The walk now defaults to a column of the primary key, whatever its
+  width.
+- `drop_index` on an index that backs a constraint said that dropping the
+  constraint "is not yet planned". `drop_constraint` plans it.
+
+### More locks the plan named wrongly
+
+Each read from `pg_locks` on 18.6, as the three above were.
+
+| Statement | The plan said | PostgreSQL takes |
+| --- | --- | --- |
+| `ALTER TABLE ... SET (fillfactor ...)` | AccessExclusiveLock | ShareUpdateExclusiveLock |
+| `ALTER TABLE ... CLUSTER ON`, `SET WITHOUT CLUSTER` | AccessExclusiveLock | ShareUpdateExclusiveLock |
+| `ALTER COLUMN ... SET STATISTICS` | AccessExclusiveLock | ShareUpdateExclusiveLock |
+| `ALTER SEQUENCE` | AccessExclusiveLock | ShareRowExclusiveLock on the sequence |
+| `ALTER INDEX ... ATTACH PARTITION` | AccessExclusiveLock on both indexes | that on the partition's index, ShareUpdateExclusiveLock on the parent's |
+| `DROP PUBLICATION` | ShareUpdateExclusiveLock on the published tables | no lock on them |
+| `ALTER DOMAIN ... VALIDATE CONSTRAINT`, `SET NOT NULL` | AccessExclusiveLock on the domain | ShareLock on every table with a column of the type, for the scan |
+| `ATTACH PARTITION` | nothing about a DEFAULT partition | AccessExclusiveLock on it, for its scan |
+| plain `DETACH PARTITION` | parent and partition | and the DEFAULT partition |
+| `DROP TABLE` of a partition | the table | and its parent and the parent's DEFAULT partition |
+| `DROP TABLE` with a foreign key | the table | and the table the key references |
+
+`SECURITY LABEL` was described as AccessShareLock; it goes the way of `COMMENT`,
+ShareUpdateExclusiveLock on a relation. That one is not measured: the lab has no
+label provider.
+
 ## 0.1.3
 
 Two gaps reported from pgshard while writing specifications for an audit
@@ -189,6 +572,162 @@ as a warning, that the last one could not connect.
 Found while measuring, and now in the man page: dropping a role that still has
 a job makes the pg_cron launcher exit and restart every second, and no job runs
 until the row is removed.
+
+### A module reading that raises is contained, and named
+
+A module's reading is one statement over a vendor's catalogs and functions, and
+one that raised failed the whole observation -- every plan on that server --
+with the vendor's raw error. Measured: as a role without USAGE on a schema that
+holds a hypertable, the TimescaleDB reading raises "permission denied for
+schema". Each module's reading now runs in a savepoint. One that raises fails
+alone; the plan is refused -- without the reading a hypertable would be planned
+as a plain table and a distributed one as local -- and the refusal names the
+module and carries the server's message.
+
+### A default that calls a function is not claimed to be catalog-only
+
+`add_column` with a `default` said "non-volatile default is catalog-only" of
+every default and checked none. Measured: a constant and `now()` did not
+rewrite the table; `gen_random_uuid()` did, under `AccessExclusiveLock`. What a
+function is, is in `pg_proc` and not in the default's text, so for a default
+that calls one the step now says it is catalog-only only if the function is not
+volatile, and a warning gives the query that tells and the alternative for a
+volatile value: the column without the default, and `fill`.
+
+### Names quoted where they were not, and one more TimescaleDB refusal
+
+- `attach_partition` wrote the partition's name unquoted in the three
+  statements that add, validate and drop its bound check, and `add_foreign_key`
+  wrote the referenced table and both column lists unquoted. A partition or a
+  table named with a reserved word -- `order`, a column `end` -- was a syntax
+  error in those statements and nowhere else in the plan.
+- `add_primary_key` and `add_unique_constraint` adopt a matching unique index
+  where there is one. On a hypertable that is refused (measured on 2.30.2:
+  "hypertables do not support adding a constraint using an existing index"),
+  and it was the only statement planned. Refused at planning now, saying what
+  works: drop the index, and the constraint builds its own.
+
+### A list of columns as the key of a row-level kind
+
+`update_rows` and `merge_rows` required a unique index on their key column
+alone and were refused on any table keyed by two columns -- `(tenant_id, id)`,
+or `(id, created_at)` where it is partitioned by time. The refusal said to
+`CREATE UNIQUE INDEX CONCURRENTLY ... (key)`, which a hypertable, a Citus
+distributed table and a partitioned table all refuse. `delete_rows` by `values`
+matched on one column, so on such a table a listed id deleted that id for every
+tenant. `insert_rows` refused two tenants with the same id as "the key more
+than once".
+
+`key` now takes a list as well as a name:
+
+```json
+{"kind": "update_rows", "schema": "public", "table": "lines",
+ "key": ["tenant_id", "id"], "columns": ["tenant_id", "id", "status"],
+ "select": "SELECT tenant_id, id, status FROM staging.lines"}
+```
+
+The match, the pre-image and the duplicate check are on the whole key. Paced,
+the walk goes along the whole key and its cursor is the whole key. What proves
+the key names one row is a valid unique index, not partial, whose columns are
+all among the key's. The refusal without one no longer names an index that
+cannot be built; it names the list form. `delete_rows` by `where` keeps one
+column, which it walks by and which need not be unique.
+
+### Every exclusive step takes the weaker lock first, and a group retries whole
+
+The weaker-lock-first retry was on the recipes where a field report found the
+queue. The same request for `AccessExclusiveLock` is made by a plain
+`add_column`, `drop_column`, `alter_column_type`, the renames, triggers,
+policies, `drop_constraint`, a plain index build, the steps of
+`attach_partition` and `detach_partition`, and some twenty more kinds; behind
+an autovacuum or one long transaction each stopped the application for all of
+`lock_timeout_ms`. Every such step on a table that is already there now begins
+with `LOCK TABLE ... IN SHARE UPDATE EXCLUSIVE MODE` and is retried on a short
+timeout. It is applied in one place, after a kind's planner has run, to
+whatever it emitted.
+
+Most of those steps share their transaction with their neighbours, where the
+retry did not apply: it rolled back only a step that opened its transaction.
+The retry is now the group's. When a step does not get its lock, the
+transaction is rolled back -- releasing the pending request, and every lock the
+steps before it had taken -- and the group is run again from its first step.
+Intents that commit together still do. The short timeout is put back after the
+step that set it, so a step after it in the same transaction is not failed by a
+wait of 200 ms.
+
+The dry run asks for the same locks and waited 2 s for each, with the
+application queued, and reported a lock it did not get as a problem with the
+plan. After the weaker lock it now waits 200 ms, once; when the lock does not
+come it stops, reports `lockUnavailableAtStep`, and lists the rest as
+unverified.
+
+Not done for the module kinds, whose locks are taken inside the vendor's
+functions and have not been measured behind a weaker lock.
+
+### Unique constraints on a partitioned table, a partition at a time
+
+`add_unique_constraint` and `add_primary_key` did not know a partitioned table
+from a plain one. Quiet, they planned one `ADD CONSTRAINT`, which builds a
+unique index on every partition under `AccessExclusiveLock` on the parent --
+"size 0 B < 64 MiB". Busy, they planned `CREATE UNIQUE INDEX CONCURRENTLY` on
+the parent, which PostgreSQL refuses ("cannot create index on partitioned
+table concurrently"), in the job. `create_index` with `unique` was refused for
+a reason that was no longer true.
+
+All three are now the recipe PostgreSQL's documentation gives, measured on
+18.6: the constraint (or index) on `ONLY` the parent, a catalog change; then,
+for each partition, a unique index built `CONCURRENTLY`, adopted as that
+partition's constraint with `USING INDEX`, and attached. The parent's is valid
+when the last one lands.
+
+The constraint recipe resumes. A duplicate in one partition fails that
+partition's build, with the partitions before it done; applied again, the
+plan is only what is missing -- the invalid index dropped and rebuilt, adopted,
+attached. The parent's reading now carries each partition's indexes for this.
+
+Refused at planning, in PostgreSQL's words: a key that lacks a partition
+column, and a partition key that is an expression. Refused for now: a
+partition that is itself partitioned, where the recipe would have to descend --
+which the non-unique `create_index` recipe used to plan and fail on.
+
+### A table whose parent holds no rows is sized by where the rows are
+
+`create_index` and `backfill` asked the module how much data a hypertable or a
+distributed table holds; the other kinds that decide or speak by size still
+read the parent, which reads empty. They ask too now:
+
+- `delete_rows` by predicate planned "deleting 0 estimated rows" and published
+  no progress;
+- `alter_column_type` said it would rewrite "the whole table: 0 B";
+- `drop_table` warned that "0 B and roughly 0 rows go at commit";
+- `set_logged`, `set_tablespace` and `set_access_method` stated a rewrite of
+  0 B, and `set_tablespace` asked for 0 B free at the destination;
+- `detach_partition` chose the plain form, which locks every partition, for a
+  partition that is itself partitioned -- "size 0 B < 64 MiB";
+- `citus_alter_distributed_table` and `citus_undistribute_table` warned of a
+  full rewrite of "0 estimated rows".
+
+A native partitioned table has no module to ask. Its own reading is now the
+total of its leaf partitions, at any depth: `relpages` is always 0 on the
+parent, and `reltuples` is 0 until someone analyses the parent by hand, which
+autovacuum never does.
+
+### Two modules on one table: their index answers are merged
+
+Core asked each module how an index may be built on a table and took the first
+answer. On a hypertable with a vector column that was whichever the build
+listed first: pgvector's memory request hid TimescaleDB's "no concurrent
+build" -- so `CREATE INDEX CONCURRENTLY` was planned, which a hypertable
+refuses, in the job -- or TimescaleDB's answer hid the memory request. On a
+Citus table pgvector was never asked, and would have read the coordinator's
+empty relation if it had been.
+
+Every module is now asked and the answers merged: "no concurrent build" from
+any module stands, the size and row count are the largest reported, and the
+memory is the largest asked for. pgvector says what a row of the graph costs,
+and on a table whose rows another module counts, core multiplies by that count;
+the raise applies to each chunk's build as well. The same count keeps
+pgvector's advisories from calling a full hypertable empty.
 
 ### pgvector: an HNSW build gets the memory it needs, within a deduced limit
 

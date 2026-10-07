@@ -380,6 +380,71 @@ inline bool unique_group_key_index(const json& t, const std::string& key,
   return false;
 }
 
+// The composite counterpart: a unique index that CONTAINS `key`, whatever else
+// it holds and wherever in it `key` sits. Its key columns together identify a
+// row, so a walk along all of them, in index order, neither skips nor repeats
+// one -- which a walk along `key` alone could.
+//
+// Held to the same standard: unique, valid, not partial, no expressions, a
+// reading that says which columns it covers. And every column NOT NULL: a
+// unique index admits any number of rows with a NULL in it, and a row
+// comparison passes over them. The primary key is preferred; among others the
+// narrowest, then by name, so the choice is the same on every reading.
+// A type whose values, as keys, are handed out in increasing order often
+// enough to bound a walk by: the integers of a sequence or identity, and time.
+// Not a uuid, which may be random, and not text.
+inline bool type_grows(const std::string& type) {
+  return type == "bigint" || type == "integer" || type == "smallint" ||
+         type == "timestamp with time zone" || type == "timestamp without time zone" ||
+         type == "date";
+}
+
+inline bool unique_index_containing(const json& t, const std::string& key,
+                                    std::vector<std::string>& columns,
+                                    std::string& index_name) {
+  const json indexes = t.value("indexes", json::object());
+  const json table_columns = t.value("columns", json::object());
+  bool found = false, found_primary = false;
+  for (auto it = indexes.begin(); it != indexes.end(); ++it) {
+    const auto& ix = it.value();
+    if (!ix.value("is_unique", false) || !ix.value("is_valid", false)) continue;
+    if (ix.value("has_expressions", false)) continue;
+    if (!ix.contains("columns") || !ix["columns"].is_array() ||
+        !ix.contains("predicate")) {
+      continue;
+    }
+    if (!ix.value("predicate", "").empty()) continue;
+    const auto& all = ix["columns"];
+    const auto key_count = static_cast<std::size_t>(
+        ix.value("key_column_count", static_cast<int>(all.size())));
+    if (key_count < 2 || all.size() < key_count) continue;
+    std::vector<std::string> cols;
+    bool usable = true, has_key = false;
+    for (std::size_t c = 0; c < key_count; ++c) {
+      if (!all[c].is_string()) { usable = false; break; }
+      const auto name = all[c].get<std::string>();
+      if (!table_columns.contains(name) ||
+          !table_columns[name].value("not_null", false)) {
+        usable = false;
+        break;
+      }
+      if (name == key) has_key = true;
+      cols.push_back(name);
+    }
+    if (!usable || !has_key) continue;
+    const bool primary = ix.value("is_primary", false);
+    const bool better = !found || (primary && !found_primary) ||
+                        (primary == found_primary && cols.size() < columns.size());
+    if (better) {
+      columns = cols;
+      index_name = it.key();
+      found = true;
+      found_primary = primary;
+    }
+  }
+  return found;
+}
+
 inline bool unique_key_index(const json& t, const std::string& key,
                              std::string& index_name,
                              std::string* reason = nullptr) {
@@ -513,9 +578,12 @@ inline bool plan_preserve(const Intent& in, const json& columns,
 inline std::string preserve_cte(const Preserved& pv,
                                 const std::string& target_sql_rel,
                                 const std::string& target_ref,
-                                const std::string& key,
+                                const std::vector<std::string>& key,
                                 const std::string& source_alias) {
-  const auto k = quote_identifier(key);
+  std::vector<std::string> on;
+  for (const auto& c : key) {
+    on.push_back(target_ref + "." + quote_identifier(c) + " = pb." + quote_identifier(c));
+  }
   std::vector<std::string> quoted, selected;
   for (const auto& c : pv.cols) {
     quoted.push_back(quote_identifier(c));
@@ -525,7 +593,7 @@ inline std::string preserve_cte(const Preserved& pv,
          "  INSERT INTO " + pv.sql_rel + " (" + join(quoted, ", ") + ")\n"
          "  SELECT " + join(selected, ", ") + "\n"
          "    FROM " + target_sql_rel + ", " + source_alias + " AS pb\n"
-         "   WHERE " + target_ref + "." + k + " = pb." + k + "\n"
+         "   WHERE " + join(on, " AND ") + "\n"
          ")";
 }
 
@@ -590,6 +658,34 @@ inline void warn_about_row_security(const json& t, const std::string& qualified,
              "of surprise."));
 }
 
+}  // namespace detail
+
+// index_traits: defined in planner.h, with the dispatcher over the enabled
+// modules. Declared here because a backfill asks it how many rows a table
+// really holds.
+inline IndexTraits index_traits(const Observations& obs, const std::string& qualified,
+                                const Intent& in, std::string& decided_by);
+
+namespace detail {
+// How much data a table holds, for a decision or a sentence about its size:
+// the module's figure where the relation's own does not hold the rows (a
+// hypertable, a distributed table -- both read 0 from the parent), else the
+// reading's, which for a partitioned table is already its leaves' total.
+struct TableData {
+  long long bytes = 0;
+  long long rows = 0;
+};
+inline TableData table_data(const Observations& obs, const std::string& qualified,
+                            const Intent& in) {
+  const auto& t = obs.table(qualified);
+  std::string by;
+  const auto traits = index_traits(obs, qualified, in, by);
+  TableData d;
+  d.bytes = traits.answered && traits.size_bytes >= 0 ? traits.size_bytes
+                                                      : t.value("size_estimate", 0LL);
+  d.rows = traits.answered && traits.rows >= 0 ? traits.rows : t.value("reltuples", 0LL);
+  return d;
+}
 }  // namespace detail
 
 // --- backfill --------------------------------------------------------------
@@ -663,9 +759,31 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
   const auto required_group = required_confinement(obs, qualified, confined_by);
   std::string supporting_index, unproven, group_column;
   bool grouped = false;
+  // The key is unique only together with other columns, and nothing requires a
+  // batch to stay inside one value of any of them: the walk follows the whole
+  // unique index (executor.h, run_composite_batch).
+  //
+  // REVIEW LATER IF THIS CAUSES TROUBLE (decided 2026-10-06): this is taken for
+  // EVERY such table, including a plain tenant table keyed (tenant_id, id) that
+  // was walked one tenant at a time until now and worked. The reason to switch
+  // them all is that the walk by group degenerates to a row per batch wherever
+  // the leading column is nearly unique -- (time, id) on a hypertable or a
+  // partitioned table, measured at 550 rows a second -- and the planner has no
+  // reading of how many values a column holds to tell the two cases apart. The
+  // alternative considered was to keep the walk by group where groups are
+  // large and decide by a distinct-value estimate, which can be stale. If a
+  // tenant table turns out to need the per-tenant walk (its commits at tenant
+  // boundaries, or batches that never span two tenants), that is where to look.
+  bool composite = false;
+  std::vector<std::string> composite_columns;
+  std::string composite_index;
   if (required_group.empty() &&
       detail::unique_key_index(t, key, supporting_index, &unproven)) {
     grouped = false;
+  } else if (required_group.empty() &&
+             detail::unique_index_containing(t, key, composite_columns, composite_index)) {
+    composite = true;
+    supporting_index = composite_index;
   } else if (!required_group.empty() && required_group == key) {
     // Confinement is an equality on the group column, so when that column IS
     // the key every group holds exactly one row: technically a walk, and one row
@@ -699,20 +817,32 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
             "), in that order, proves. Create it, or walk a key that such an "
             "index already covers.");
       } else {
+        // No recipe for the index is offered. It used to say CREATE UNIQUE
+        // INDEX CONCURRENTLY ... (key), which a hypertable refuses twice over
+        // -- found in the field -- and what index a table can have is its
+        // owner's to know.
         step.why = "no unique index proves " + key + " unique";
         plan.conflicts.push_back(
             qualified + " has no valid unique index on (" + key + ") alone" +
             (unproven.empty() ? "" : " (" + unproven + ")") +
-            ", nor on (<group>, " + key + ") with " + key + " second, so a "
-            "keyset walk could skip or repeat rows. Create one first: "
-            "CREATE UNIQUE INDEX CONCURRENTLY ... ON " + qualified + " (" + key +
-            ");");
+            ", nor one that contains " + key + " over NOT NULL columns only, so a "
+            "keyset walk could skip or repeat rows. The walk needs a unique index "
+            "that contains " + key + ": on it alone, or with other columns, which "
+            "it then follows together. Name as \"key\" a column of such an "
+            "index, or create one.");
       }
       return;
     }
   }
 
-  const long long rows = t.value("reltuples", 0LL);
+  // The table's own estimate, unless a module knows the relation does not
+  // hold the rows: a Citus distributed table and a TimescaleDB hypertable both
+  // read 0 from the parent (measured), and "0 rows estimated" for a table of a
+  // million was what the plan said.
+  std::string rows_by;
+  const auto traits = index_traits(obs, qualified, in, rows_by);
+  const long long rows = traits.answered && traits.rows >= 0 ? traits.rows
+                                                              : t.value("reltuples", 0LL);
   const auto where = in.body.value("where", "");
   const auto from = in.body.value("from", "");
 
@@ -782,7 +912,15 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
       changed.push_back(it.key());
     }
     detail::Preserved pv;
-    if (detail::plan_preserve(in, columns, sql_rel, key, changed, out, pv)) {
+    // For a composite walk the side table carries the WHOLE key, since that is
+    // what identifies the row a pre-image belongs to.
+    std::vector<std::string> saved = changed;
+    if (composite) {
+      saved.assign(composite_columns.begin() + 1, composite_columns.end());
+      saved.insert(saved.end(), changed.begin(), changed.end());
+    }
+    if (detail::plan_preserve(in, columns, sql_rel,
+                              composite ? composite_columns[0] : key, saved, out, pv)) {
       preserve_cte =
           "WITH " + detail::preserve_cte_by_keys(pv, sql_rel, rel, key, key_array) +
           "\n";
@@ -790,10 +928,53 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
     }
   }
 
+  // An upper bound for the walk, where something else fills every row made
+  // after it starts (the trigger of add_column's fill recipe) and the key
+  // grows: the highest key there is at the start, read once by the executor
+  // and carried by every batch.
+  //
+  // Found in the field on a hypertable under 1 000 inserts a second. A new
+  // chunk's rows are all ahead of the cursor and all already filled, so none
+  // passes "still to fill" -- and the batch read the whole chunk to learn
+  // that, every batch, for every chunk made since the walk began: a select at
+  // 135 ms where it had been 1.7, and a walk of 35 minutes for one of 4.
+  // Measured with the bound on 20 chunks: 132 buffers a batch against 191 870.
+  //
+  // Only for a key that grows. With a random key (a uuid) new rows land
+  // everywhere below the bound and it excludes nothing. Not for a walk by
+  // group, which the trigger recipe never is.
+  const std::vector<std::string> bound_columns =
+      !composite_columns.empty() ? composite_columns : std::vector<std::string>{key};
+  const bool bounded =
+      in.body.value("new_rows_are_filled", false) && !grouped &&
+      detail::type_grows(
+          columns.value(bound_columns[0], json::object()).value("type", ""));
+  const auto bound_mark = [&](std::size_t i) {
+    // After the cursor's parameters and the limit.
+    return "$" + std::to_string(bound_columns.size() + 2 + i);
+  };
+  std::string bound_sql;
+  if (bounded) {
+    std::vector<std::string> cs, ms, desc;
+    for (std::size_t i = 0; i < bound_columns.size(); ++i) {
+      cs.push_back(rel + "." + detail::quote_identifier(bound_columns[i]));
+      ms.push_back(bound_mark(i));
+      desc.push_back(cs.back() + " DESC");
+    }
+    bound_sql = bound_columns.size() == 1
+                    ? " AND (" + cs[0] + " <= " + ms[0] + " OR " + ms[0] + " IS NULL)"
+                    : " AND ((" + detail::join(cs, ", ") + ") <= (" + detail::join(ms, ", ") +
+                          ") OR " + ms[0] + " IS NULL)";
+    step.detail["upper_bound_sql"] =
+        "SELECT " + detail::join(cs, ", ") + " FROM " + sql_rel + " ORDER BY " +
+        detail::join(desc, ", ") + " LIMIT 1;";
+    step.detail["upper_bound_columns"] = static_cast<long long>(bound_columns.size());
+  }
+
   const std::string select_sql =
       "SELECT " + rel + "." + k + "\n"
       "  FROM " + sql_rel + (from.empty() ? "" : ", " + from) + "\n"
-      " WHERE " + rel + "." + k + " > $1 AND (" + where + ")\n"
+      " WHERE " + rel + "." + k + " > $1" + bound_sql + " AND (" + where + ")\n"
       " ORDER BY " + rel + "." + k + "\n"
       " LIMIT $2\n"
       " FOR UPDATE OF " + rel + ";";
@@ -810,7 +991,93 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
       " WHERE " + rel + "." + k + " = " + key_array + " AND (" + where + ")\n"
       "RETURNING " + rel + "." + k + ";";
 
-  if (!grouped) {
+  if (composite) {
+    // Two statements, as the plain walk has, over the index's columns
+    // together. The row comparison is what an index on those columns serves in
+    // order without a sort (measured on a hypertable, either column leading:
+    // an index scan per chunk, 0.44 ms for 1 000 rows).
+    //
+    // `$1 IS NULL` means "before the first row", and comes AFTER the
+    // comparison for the reason given below for the walk by group.
+    std::vector<std::string> cols, marks, arrays;
+    for (std::size_t c = 0; c < composite_columns.size(); ++c) {
+      cols.push_back(rel + "." + detail::quote_identifier(composite_columns[c]));
+      marks.push_back("$" + std::to_string(c + 1));
+      arrays.push_back("$" + std::to_string(c + 1) + "::" +
+                       columns.value(composite_columns[c], json::object()).value("type", "text") +
+                       "[]");
+    }
+    const std::string tuple = "(" + detail::join(cols, ", ") + ")";
+    // Each column is tested against its own array, which is what finds the
+    // rows: an index condition, and on a partitioned table the partitions the
+    // batch is in. The arrays alone would also name a row made of one row's
+    // first column and another's second, so the tuple is tested as well -- as
+    // a FILTER, not as a join.
+    //
+    // Found in the field on a hypertable, twice. With the tuple alone, as a
+    // semi-join, the update was planned against every chunk and probed them
+    // row by row: a third of a plain table's speed. With the array tests added
+    // BESIDE that semi-join, the chunk was found -- and the planner, no longer
+    // needing the join to find the rows, ran it as a nested loop over a
+    // materialised list with a join filter: 499 500 comparisons discarded for
+    // a batch of 1 000, three times slower under load than before. Which join
+    // it picks depends on its estimates, so on another table of the same
+    // shape it hashed instead and looked fine.
+    //
+    // `(...) IS TRUE` keeps the IN from being turned into a join at all: it is
+    // a hashed subplan, one probe per row the index returned, whatever the
+    // estimates say. Measured on one of 20 chunks, 3.4 million rows, a batch
+    // of 1 000: 12.2 ms with the tuple alone, 27.8 ms in the nested loop the
+    // field saw, 5.6 to 8 ms in this form.
+    std::vector<std::string> each;
+    for (std::size_t c = 0; c < cols.size(); ++c) {
+      each.push_back(cols[c] + " = ANY(" + arrays[c] + ")");
+    }
+    const std::string in_batch =
+        detail::join(each, " AND ") + " AND (" + tuple +
+        " IN (SELECT * FROM unnest(" + detail::join(arrays, ", ") + "))) IS TRUE";
+    step.sql.push_back(
+        "SELECT " + detail::join(cols, ", ") + "\n"
+        "  FROM " + sql_rel + (from.empty() ? "" : ", " + from) + "\n"
+        " WHERE (" + tuple + " > (" + detail::join(marks, ", ") + ") OR $1 IS NULL)" +
+            bound_sql + " AND (" + where + ")\n"
+        " ORDER BY " + detail::join(cols, ", ") + "\n"
+        " LIMIT $" + std::to_string(composite_columns.size() + 1) + "\n"
+        " FOR UPDATE OF " + rel + ";");
+    std::string composite_preserve;
+    if (step.detail.contains("preserve")) {
+      // The pre-image is identified by the whole key, so every key column is
+      // saved, and the capture selects the batch by all of them.
+      detail::Preserved pv;
+      std::vector<std::string> saved(composite_columns.begin() + 1, composite_columns.end());
+      for (auto it = in.body["set"].begin(); it != in.body["set"].end(); ++it) {
+        saved.push_back(it.key());
+      }
+      std::vector<Step> discard;  // the side table step was already emitted above
+      detail::plan_preserve(in, columns, sql_rel, composite_columns[0], saved, discard, pv);
+      std::vector<std::string> quoted, selected;
+      for (const auto& c : pv.cols) {
+        quoted.push_back(detail::quote_identifier(c));
+        selected.push_back(rel + "." + detail::quote_identifier(c));
+      }
+      composite_preserve =
+          "WITH preserved AS (\n"
+          "  INSERT INTO " + pv.sql_rel + " (" + detail::join(quoted, ", ") + ")\n"
+          "  SELECT " + detail::join(selected, ", ") + "\n"
+          "    FROM " + sql_rel + "\n"
+          "   WHERE " + in_batch + "\n"
+          ")\n";
+    }
+    step.sql.push_back(
+        composite_preserve +
+        "UPDATE " + sql_rel + "\n"
+        "   SET " + detail::join(assignments, ", ") + "\n" +
+        (from.empty() ? "" : "  FROM " + from + "\n") +
+        " WHERE " + in_batch + " AND (" + where + ")\n"
+        "RETURNING " + detail::join(cols, ", ") + ";");
+    step.detail["batch_mode"] = "composite";
+    step.detail["key_columns"] = composite_columns;
+  } else if (!grouped) {
     step.sql.push_back(select_sql);
     step.sql.push_back(apply_sql);
     // Which loop the executor runs. Named rather than inferred from the number
@@ -830,10 +1097,21 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
     // instead, so the order is what satisfies both.
     const auto g = detail::quote_identifier(group_column);
     const std::string from_list = from.empty() ? "" : ", " + from;
+    // WHICH GROUP IS NEXT: the next value after this one, and nothing more.
+    //
+    // It used to carry the backfill's predicate (and DISTINCT), so that a group
+    // with nothing left never became a group at all. That made it the slowest
+    // statement of the walk exactly when it mattered: to pass a group that is
+    // done it reads all of that group's rows to prove it. Measured on 4
+    // million rows, 20 groups: 359 ms to pass six finished groups, against
+    // 0.017 ms for this form, an index-only probe of the unique index the walk
+    // already requires -- and in the field, on a Citus shard, 0.6 to 1.5 s each
+    // time. A group with nothing left now costs one empty batch instead
+    // (15.8 ms for 200 000 rows), taken with no lock held.
     step.sql.push_back(
-        "SELECT DISTINCT " + rel + "." + g + "\n"
-        "  FROM " + sql_rel + from_list + "\n"
-        " WHERE (" + rel + "." + g + " > $1 OR $1 IS NULL) AND (" + where + ")\n"
+        "SELECT " + rel + "." + g + "\n"
+        "  FROM " + sql_rel + "\n"
+        " WHERE (" + rel + "." + g + " > $1 OR $1 IS NULL)\n"
         " ORDER BY " + rel + "." + g + "\n"
         " LIMIT $2;");
     step.sql.push_back(
@@ -905,7 +1183,9 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
         "does not: a backfill can complete every row and still halve a total.";
   }
 
-  step.why = std::to_string(rows) + " rows estimated; keyset walk on " + key +
+  step.why = std::to_string(rows) + " rows estimated; keyset walk on " +
+             (composite ? "(" + detail::join(composite_columns, ", ") + ") together"
+                        : key) +
              (grouped ? " within each " + group_column : std::string()) +
              " via " + supporting_index + ", " + std::to_string(cfg.batch_rows) +
              " rows per batch, committing on a lock waiter or " +
@@ -939,6 +1219,127 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
         "a partial index before running this against a live system.");
   }
 }
+
+namespace detail {
+// The key a row-level kind matches rows by: one column, or several that are
+// unique together -- (tenant_id, id), or (id, created_at) on a table
+// partitioned by time, where no single column is unique or can be made so.
+struct RowKey {
+  std::vector<std::string> columns;
+  bool empty() const { return columns.empty(); }
+  bool composite() const { return columns.size() > 1; }
+  bool has(const std::string& c) const {
+    return std::find(columns.begin(), columns.end(), c) != columns.end();
+  }
+  // "id", or "(tenant_id, id)": for prose.
+  std::string label() const {
+    return composite() ? "(" + join(columns, ", ") + ")" : (empty() ? "" : columns[0]);
+  }
+  // left."a" = right."a" AND left."b" = right."b"
+  std::string equals(const std::string& left, const std::string& right) const {
+    std::vector<std::string> terms;
+    for (const auto& c : columns) {
+      terms.push_back(left + "." + quote_identifier(c) + " = " + right + "." +
+                      quote_identifier(c));
+    }
+    return join(terms, " AND ");
+  }
+  // alias."a", alias."b"
+  std::string list(const std::string& alias) const {
+    std::vector<std::string> cols;
+    for (const auto& c : columns) cols.push_back(alias + "." + quote_identifier(c));
+    return join(cols, ", ");
+  }
+};
+
+inline RowKey row_key(const Intent& in) {
+  RowKey k;
+  if (!in.body.contains("key")) return k;
+  const auto& v = in.body["key"];
+  if (v.is_string()) {
+    if (!v.get<std::string>().empty()) k.columns.push_back(v.get<std::string>());
+  } else if (v.is_array()) {
+    for (const auto& c : v) {
+      if (c.is_string()) k.columns.push_back(c.get<std::string>());
+    }
+  }
+  return k;
+}
+
+// Does a valid unique index prove that the key names at most one row? For one
+// column, an index on it alone (unique_key_index). For several, any unique
+// index whose columns are all among them: what is unique on (a) is unique on
+// (a, b). Not a partial index, which proves it only for the rows it covers,
+// and not one over an expression.
+inline bool row_key_is_unique(const json& t, const RowKey& key, std::string& index_name,
+                              std::string* unproven) {
+  if (!key.composite()) {
+    return unique_key_index(t, key.empty() ? std::string() : key.columns[0], index_name,
+                            unproven);
+  }
+  const json indexes = t.value("indexes", json::object());
+  for (auto it = indexes.begin(); it != indexes.end(); ++it) {
+    const auto& ix = it.value();
+    if (!ix.value("is_unique", false) || !ix.value("is_valid", false)) continue;
+    if (ix.value("has_expressions", false)) continue;
+    if (!ix.contains("columns") || !ix["columns"].is_array() || !ix.contains("predicate")) {
+      continue;
+    }
+    if (!ix.value("predicate", "").empty()) continue;
+    const auto& all = ix["columns"];
+    const auto key_count = static_cast<std::size_t>(
+        ix.value("key_column_count", static_cast<int>(all.size())));
+    if (key_count == 0 || all.size() < key_count) continue;
+    bool within = true;
+    for (std::size_t c = 0; c < key_count; ++c) {
+      if (!all[c].is_string() || !key.has(all[c].get<std::string>())) {
+        within = false;
+        break;
+      }
+    }
+    if (!within) continue;
+    index_name = it.key();
+    if (unproven) unproven->clear();
+    return true;
+  }
+  if (unproven) {
+    *unproven = "no valid, complete unique index has all its columns among " + key.label();
+  }
+  return false;
+}
+
+// What a pre-image saves beside the first key column: the rest of the key, so
+// a saved row can be matched back to the one it was, and then what changed.
+inline std::vector<std::string> with_rest_of_key(const RowKey& key,
+                                                 const std::vector<std::string>& changed) {
+  std::vector<std::string> all(key.columns.begin() + (key.empty() ? 0 : 1), key.columns.end());
+  all.insert(all.end(), changed.begin(), changed.end());
+  return all;
+}
+
+// The refusal every kind that matches rows by key makes when nothing proves
+// the key unique. It does not tell the author to create a unique index on the
+// key: on a hypertable, a distributed table or a partitioned one that index
+// cannot exist without the time, distribution or partition column -- which is
+// what a list of columns as "key" is for.
+inline std::string no_unique_key_advice(const json& t, const std::string& qualified,
+                                        const RowKey& key) {
+  std::string said = " Name as \"key\" the columns of a unique index on " + qualified;
+  if (key.composite() || key.empty()) return said + ".";
+  // The index that would do, where there is one: unique, valid, whole, and
+  // holding the column that was named.
+  std::vector<std::string> columns;
+  std::string index;
+  if (unique_index_containing(t, key.columns[0], columns, index)) {
+    std::vector<std::string> quoted;
+    for (const auto& c : columns) quoted.push_back("\"" + c + "\"");
+    return said + ": a list is accepted, and " + index + " makes [" + join(quoted, ", ") +
+           "] one.";
+  }
+  return said + ": a list is accepted, for a table where " + key.columns[0] +
+         " is unique only together with other columns.";
+}
+}  // namespace detail
 
 // --- the shape every paced row-level statement takes ------------------------
 //
@@ -979,13 +1380,52 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
 // Data-modifying CTEs run whether or not the outer query reads them (measured:
 // the unreferenced INSERT ... ON CONFLICT still wrote its rows), so the
 // mutation happening in a CTE nobody selects from is deliberate and safe.
+//
+// A batch ends on a whole key, never part-way through one. The cursor is a key
+// VALUE, and nothing makes the key unique in the source -- a load into a
+// (tenant, id) table keyed by id repeats every id. Cut at LIMIT alone, the rows
+// that shared the batch's last key but fell past the limit were below the next
+// batch's cursor and were never considered: skipped, with no error. So LIMIT
+// finds the last key, and the batch is every row up to and including it. A
+// batch is therefore larger than its limit by the rows that share its last key.
+//
+// With a key of several columns the cursor is the whole key, compared as a row
+// and passed as one parameter a column, the limit after them (the executor's
+// composite cursor: executor.h, run_composite_batch).
 inline std::string paced_statement(const std::string& source_relation,
-                                   const std::string& key,
+                                   const detail::RowKey& key,
                                    const std::string& mutation_cte) {
-  const auto k = detail::quote_identifier(key);
+  if (key.composite()) {
+    std::vector<std::string> marks, desc;
+    for (std::size_t c = 0; c < key.columns.size(); ++c) {
+      marks.push_back("$" + std::to_string(c + 1));
+      desc.push_back("upto." + detail::quote_identifier(key.columns[c]) + " DESC");
+    }
+    const auto limit = "$" + std::to_string(key.columns.size() + 1);
+    const auto after = "((" + key.list("src") + ") > (" + detail::join(marks, ", ") +
+                       ") OR $1 IS NULL)";
+    return "WITH src AS (\n" + source_relation + "\n"
+           "), batch AS (\n"
+           "  SELECT * FROM src\n"
+           "   WHERE " + after + "\n"
+           "     AND (" + key.list("src") + ") <= (SELECT " + key.list("upto") + " FROM (\n"
+           "           SELECT " + key.list("src") + " FROM src WHERE " + after + "\n"
+           "            ORDER BY " + key.list("src") + " LIMIT " + limit + ") AS upto\n"
+           "          ORDER BY " + detail::join(desc, ", ") + " LIMIT 1)\n"
+           "), " + mutation_cte + "\n"
+           "SELECT " + key.list("batch") + " FROM batch ORDER BY " + key.list("batch") + ";";
+  }
+  const auto k = detail::quote_identifier(key.columns.at(0));
   return "WITH src AS (\n" + source_relation + "\n"
          "), batch AS (\n"
-         "  SELECT * FROM src WHERE src." + k + " > $1 ORDER BY src." + k + " LIMIT $2\n"
+         "  SELECT * FROM src\n"
+         "   WHERE src." + k + " > $1\n"
+         // The last key by ORDER BY, not by MAX: not every type that sorts has
+         // a max() aggregate.
+         "     AND src." + k + " <= (SELECT upto." + k + " FROM (\n"
+         "           SELECT src." + k + " FROM src WHERE src." + k + " > $1\n"
+         "            ORDER BY src." + k + " LIMIT $2) AS upto\n"
+         "          ORDER BY upto." + k + " DESC LIMIT 1)\n"
          "), " + mutation_cte + "\n"
          "SELECT batch." + k + " FROM batch ORDER BY batch." + k + ";";
 }
@@ -1014,11 +1454,17 @@ inline void attach_pacing_detail(Step& step, const Intent& in,
                                  const ExecutorConfig& cfg,
                                  const RowSource& src,
                                  const std::string& qualified,
-                                 const std::string& key,
+                                 const RowKey& key,
                                  const std::string& resume_where) {
   step.txn_class = TxnClass::kOwnTxnPerBatch;
   step.detail["qualified"] = qualified;
-  step.detail["key"] = key;
+  step.detail["key"] = key.empty() ? std::string() : key.columns[0];
+  // A key of several columns: the cursor is the whole key, and the executor
+  // runs the one statement with a parameter for each (executor.h).
+  if (key.composite()) {
+    step.detail["key_columns"] = key.columns;
+    step.detail["batch_mode"] = "composite_statement";
+  }
   step.detail["where"] = resume_where;
   step.detail["batch_rows"] = cfg.batch_rows;
   step.detail["commit_interval_ms"] = cfg.commit_interval_ms;
@@ -1043,7 +1489,7 @@ inline void attach_pacing_detail(Step& step, const Intent& in,
 // The common opening every row-level planner needs: the table exists, it is a
 // table, and the key is real. Returns false when the step has been refused.
 inline bool row_target_ok(const json& t, const std::string& qualified,
-                          const std::string& key, Plan& plan, Step& step) {
+                          const RowKey& keys, Plan& plan, Step& step) {
   if (!t.value("exists", false)) {
     step.action = Action::kConflict;
     step.why = qualified + " does not exist";
@@ -1062,7 +1508,8 @@ inline bool row_target_ok(const json& t, const std::string& qualified,
         "effect it cannot predict.");
     return false;
   }
-  if (!key.empty() && !t.value("columns", json::object()).contains(key)) {
+  for (const auto& key : keys.columns) {
+    if (t.value("columns", json::object()).contains(key)) continue;
     step.action = Action::kConflict;
     step.why = qualified + "." + key + " does not exist";
     plan.conflicts.push_back(step.why + ", so there is nothing to match rows by.");
@@ -1078,19 +1525,27 @@ inline bool row_target_ok(const json& t, const std::string& qualified,
 // here, beats three different failures at three different times.
 inline bool refuse_duplicate_keys(const Intent& in,
                                   const std::vector<std::string>& names,
-                                  const std::string& key, Plan& plan,
+                                  const RowKey& key, Plan& plan,
                                   Step& step) {
   if (!in.body.contains("values") || key.empty()) return false;
-  std::size_t idx = 0;
-  bool found = false;
-  for (std::size_t i = 0; i < names.size(); ++i) {
-    if (names[i] == key) { idx = i; found = true; break; }
+  // The WHOLE key: on a table keyed (tenant, id), two tenants with the same id
+  // are two rows, and refusing them as one key was refusing a correct list.
+  std::vector<std::size_t> idx;
+  for (const auto& k : key.columns) {
+    bool found = false;
+    for (std::size_t i = 0; i < names.size(); ++i) {
+      if (names[i] == k) { idx.push_back(i); found = true; break; }
+    }
+    if (!found) return false;
   }
-  if (!found) return false;
 
   std::set<std::string> seen;
   for (const auto& row : in.body["values"]) {
-    const auto rendered = render_cell(row[idx]);
+    std::string rendered;
+    for (const auto i : idx) {
+      rendered += (rendered.empty() ? "" : ", ") + render_cell(row[i]);
+    }
+    if (idx.size() > 1) rendered = "(" + rendered + ")";
     if (!seen.insert(rendered).second) {
       step.action = Action::kConflict;
       step.why = "\"values\" gives key " + rendered + " twice";
@@ -1128,7 +1583,8 @@ inline void plan_insert_rows(const Intent& in, const Observations& obs,
   const auto qualified = in.qualified_table();
   const auto sql_rel = detail::quote_qualified(qualified);
   const auto& t = obs.table(qualified);
-  const auto key = in.body.value("key", "");
+  const auto rk = detail::row_key(in);
+  const std::string key = rk.empty() ? std::string() : rk.columns[0];
   const auto names = detail::column_names(in);
 
   // Emitted through a guard so every early return still records the step, and
@@ -1139,10 +1595,10 @@ inline void plan_insert_rows(const Intent& in, const Observations& obs,
     ~Emit() { if (!done) o.push_back(s); }
   } emit{out, step, emitted};
 
-  if (!detail::row_target_ok(t, qualified, key, plan, step)) return;
+  if (!detail::row_target_ok(t, qualified, rk, plan, step)) return;
   const json columns = t.value("columns", json::object());
   if (detail::refuse_unwritable_columns(in, columns, qualified, names, plan, step)) return;
-  if (detail::refuse_duplicate_keys(in, names, key, plan, step)) return;
+  if (detail::refuse_duplicate_keys(in, names, rk, plan, step)) return;
 
   // ON CONFLICT's arbiter is not optional and has no default. Measured on 18.6:
   // with no matching unique index the statement is refused outright rather than
@@ -1277,12 +1733,12 @@ inline void plan_insert_rows(const Intent& in, const Observations& obs,
         "  RETURNING 1\n"
         ")";
     step.sql.push_back(paced_statement(
-        detail::source_relation(in, names, columns), key, mutation));
+        detail::source_relation(in, names, columns), rk, mutation));
     // No resume predicate: the rows come from the spec or from a query, not
     // from the target, so there is nothing on the target to re-check a
     // recorded cursor against. Left empty deliberately -- executor.h skips the
     // staleness check rather than running it against the wrong relation.
-    detail::attach_pacing_detail(step, in, cfg, src, qualified, key, "");
+    detail::attach_pacing_detail(step, in, cfg, src, qualified, rk, "");
     step.lock = "RowExclusiveLock on " + qualified +
                 " plus row locks, released at every commit";
   } else {
@@ -1393,35 +1849,36 @@ inline void plan_update_rows(const Intent& in, const Observations& obs,
   const auto qualified = in.qualified_table();
   const auto sql_rel = detail::quote_qualified(qualified);
   const auto& t = obs.table(qualified);
-  const auto key = in.body.value("key", "");
+  const auto rk = detail::row_key(in);
+  const std::string key = rk.empty() ? std::string() : rk.columns[0];
   const auto names = detail::column_names(in);
 
-  if (!detail::row_target_ok(t, qualified, key, plan, step)) return;
+  if (!detail::row_target_ok(t, qualified, rk, plan, step)) return;
   const json columns = t.value("columns", json::object());
   if (detail::refuse_unwritable_columns(in, columns, qualified, names, plan, step)) return;
-  if (detail::refuse_duplicate_keys(in, names, key, plan, step)) return;
+  if (detail::refuse_duplicate_keys(in, names, rk, plan, step)) return;
 
   // Without a unique index on the key, one spec row can match several table
   // rows, and every one of them silently takes the value meant for one. Same
   // refusal backfill makes, for a reason that is worse here: backfill's
   // expression would at least be correct for each row it hit.
   std::string supporting_index, unproven;
-  if (!detail::unique_key_index(t, key, supporting_index, &unproven)) {
+  if (!detail::row_key_is_unique(t, rk, supporting_index, &unproven)) {
     step.action = Action::kConflict;
-    step.why = "no unique index proves " + key + " unique";
+    step.why = "no unique index proves " + rk.label() + " unique";
     plan.conflicts.push_back(
-        qualified + " has no valid unique index on (" + key + ") alone" +
+        qualified + " has no valid unique index on " +
+        (rk.composite() ? rk.label() + " or columns among them" : "(" + key + ") alone") +
         (unproven.empty() ? "" : " (" + unproven + ")") +
         ", so one row of \"values\" could match several rows of the "
         "table and every one of them would take a value meant for a single "
-        "row -- with no error anywhere. Create one first: CREATE UNIQUE INDEX "
-        "CONCURRENTLY ... ON " + qualified + " (" + key + ");");
+        "row -- with no error anywhere." + detail::no_unique_key_advice(t, qualified, rk));
     return;
   }
 
   std::vector<std::string> set_columns;
   for (const auto& n : names) {
-    if (n != key) set_columns.push_back(n);
+    if (!rk.has(n)) set_columns.push_back(n);
   }
   const auto src = detail::decide_pacing(in, cfg, true);
   const auto k = detail::quote_identifier(key);
@@ -1442,23 +1899,24 @@ inline void plan_update_rows(const Intent& in, const Observations& obs,
   // After every refusal above, so a refused plan carries no side-table step.
   detail::Preserved pv;
   const bool preserved =
-      detail::plan_preserve(in, columns, sql_rel, key, set_columns, out, pv);
+      detail::plan_preserve(in, columns, sql_rel, key, detail::with_rest_of_key(rk, set_columns),
+                            out, pv);
   if (preserved) step.detail["preserve"] = pv.qualified;
 
   if (src.paced) {
     const auto mutation =
-        (preserved ? detail::preserve_cte(pv, sql_rel, sql_rel, key, "batch") + ",\n"
+        (preserved ? detail::preserve_cte(pv, sql_rel, sql_rel, rk.columns, "batch") + ",\n"
                    : std::string()) +
         "upd AS (\n"
         "  UPDATE " + sql_rel + "\n"
         "     SET " + assignments("batch") + "\n"
         "    FROM batch\n"
-        "   WHERE " + sql_rel + "." + k + " = batch." + k + "\n"
+        "   WHERE " + rk.equals(sql_rel, "batch") + "\n"
         "  RETURNING 1\n"
         ")";
     step.sql.push_back(paced_statement(
-        detail::source_relation(in, names, columns), key, mutation));
-    detail::attach_pacing_detail(step, in, cfg, src, qualified, key, "");
+        detail::source_relation(in, names, columns), rk, mutation));
+    detail::attach_pacing_detail(step, in, cfg, src, qualified, rk, "");
     step.lock = "RowExclusiveLock on " + qualified +
                 " plus row locks, released at every commit";
   } else {
@@ -1470,11 +1928,11 @@ inline void plan_update_rows(const Intent& in, const Observations& obs,
       // statement; the plain form below stays as it was for everyone else.
       step.sql.push_back(
           "WITH src AS (\n" + detail::source_relation(in, names, columns) + "\n"
-          "), " + detail::preserve_cte(pv, sql_rel, sql_rel, key, "src") + "\n"
+          "), " + detail::preserve_cte(pv, sql_rel, sql_rel, rk.columns, "src") + "\n"
           "UPDATE " + sql_rel + "\n"
           "   SET " + assignments("src") + "\n"
           "  FROM src\n"
-          " WHERE " + sql_rel + "." + k + " = src." + k + ";");
+          " WHERE " + rk.equals(sql_rel, "src") + ";");
     } else {
       const auto relation =
           in.body.contains("select")
@@ -1485,7 +1943,7 @@ inline void plan_update_rows(const Intent& in, const Observations& obs,
           "UPDATE " + sql_rel + "\n"
           "   SET " + assignments("v") + "\n"
           "  FROM " + relation + "\n"
-          " WHERE " + sql_rel + "." + k + " = v." + k + ";");
+          " WHERE " + rk.equals(sql_rel, "v") + ";");
     }
     step.detail["rows"] = src.row_count;
   }
@@ -1538,12 +1996,13 @@ inline void plan_delete_rows(const Intent& in, const Observations& obs,
   const auto qualified = in.qualified_table();
   const auto sql_rel = detail::quote_qualified(qualified);
   const auto& t = obs.table(qualified);
-  const auto key = in.body.value("key", "");
+  const auto rk = detail::row_key(in);
+  const std::string key = rk.empty() ? std::string() : rk.columns[0];
   const auto where = in.body.value("where", "");
   const auto names = detail::column_names(in);
 
-  if (!detail::row_target_ok(t, qualified, key, plan, step)) return;
-  if (detail::refuse_duplicate_keys(in, names, key, plan, step)) return;
+  if (!detail::row_target_ok(t, qualified, rk, plan, step)) return;
+  if (detail::refuse_duplicate_keys(in, names, rk, plan, step)) return;
 
   // A delete that removes a parent row a foreign key points at fails per row,
   // mid-batch, after some batches have already committed. Saying so first is
@@ -1561,7 +2020,10 @@ inline void plan_delete_rows(const Intent& in, const Observations& obs,
         "in an earlier intent, or confirm the constraint cascades.");
   }
 
-  const auto rows = t.value("reltuples", 0LL);
+  // Not the relation's own count where it does not hold the rows: "deleting 0
+  // estimated rows" was what the plan said of a hypertable or a distributed
+  // table.
+  const auto rows = detail::table_data(obs, qualified, in).rows;
   const auto src = detail::decide_pacing(in, cfg, true);
   const auto k = detail::quote_identifier(key);
   const bool by_predicate = !in.body.contains("values") && !in.body.contains("select");
@@ -1630,10 +2092,11 @@ inline void plan_delete_rows(const Intent& in, const Observations& obs,
       // guard reads `x > $n OR $n IS NULL`, comparison first.
       const auto g = detail::quote_identifier(group_column);
       const std::string in_batch = "ANY($2::" + del_key_type + "[])";
+      // As for a backfill: the next value, without the predicate.
       step.sql.push_back(
-          "SELECT DISTINCT " + sql_rel + "." + g + "\n"
+          "SELECT " + sql_rel + "." + g + "\n"
           "  FROM " + sql_rel + "\n"
-          " WHERE (" + sql_rel + "." + g + " > $1 OR $1 IS NULL) AND (" + where + ")\n"
+          " WHERE (" + sql_rel + "." + g + " > $1 OR $1 IS NULL)\n"
           " ORDER BY " + sql_rel + "." + g + "\n"
           " LIMIT $2;");
       step.sql.push_back(
@@ -1661,7 +2124,7 @@ inline void plan_delete_rows(const Intent& in, const Observations& obs,
       step.detail["confined_by"] = confined_by;
     }
     step.detail["key_type"] = del_key_type;
-    detail::attach_pacing_detail(step, in, cfg, src, qualified, key, where);
+    detail::attach_pacing_detail(step, in, cfg, src, qualified, rk, where);
     step.detail["rows_estimated"] = rows;
     step.lock = "RowExclusiveLock on " + qualified +
                 " -- no table-level exclusive lock at any point";
@@ -1674,21 +2137,21 @@ inline void plan_delete_rows(const Intent& in, const Observations& obs,
         "would hold its locks for the whole of it";
   } else if (src.paced) {
     const auto mutation =
-        (preserved ? detail::preserve_cte(pv, sql_rel, sql_rel, key, "batch") + ",\n"
+        (preserved ? detail::preserve_cte(pv, sql_rel, sql_rel, rk.columns, "batch") + ",\n"
                    : std::string()) +
         "del AS (\n"
         "  DELETE FROM " + sql_rel + "\n"
         "   USING batch\n"
-        "   WHERE " + sql_rel + "." + k + " = batch." + k + "\n"
+        "   WHERE " + rk.equals(sql_rel, "batch") + "\n"
         "  RETURNING 1\n"
         ")";
     step.sql.push_back(paced_statement(
-        detail::source_relation(in, names, columns), key, mutation));
+        detail::source_relation(in, names, columns), rk, mutation));
     // Empty for the same reason insert_rows leaves it empty: the keys come from
     // the spec, so a recorded cursor cannot be re-checked against the target.
     // A key that is already gone must still advance the cursor -- which is
     // exactly what naming it from the batch achieves.
-    detail::attach_pacing_detail(step, in, cfg, src, qualified, key, "");
+    detail::attach_pacing_detail(step, in, cfg, src, qualified, rk, "");
     step.lock = "RowExclusiveLock on " + qualified +
                 " plus row locks, released at every commit";
     step.why = src.why;
@@ -1699,10 +2162,10 @@ inline void plan_delete_rows(const Intent& in, const Observations& obs,
     if (preserved) {
       step.sql.push_back(
           "WITH src AS (\n" + detail::source_relation(in, names, columns) + "\n"
-          "), " + detail::preserve_cte(pv, sql_rel, sql_rel, key, "src") + "\n"
+          "), " + detail::preserve_cte(pv, sql_rel, sql_rel, rk.columns, "src") + "\n"
           "DELETE FROM " + sql_rel + "\n"
           " USING src\n"
-          " WHERE " + sql_rel + "." + k + " = src." + k + ";");
+          " WHERE " + rk.equals(sql_rel, "src") + ";");
     } else {
       const auto relation =
           in.body.contains("select")
@@ -1712,7 +2175,7 @@ inline void plan_delete_rows(const Intent& in, const Observations& obs,
       step.sql.push_back(
           "DELETE FROM " + sql_rel + "\n"
           " USING " + relation + "\n"
-          " WHERE " + sql_rel + "." + k + " = v." + k + ";");
+          " WHERE " + rk.equals(sql_rel, "v") + ";");
     }
     step.detail["rows"] = src.row_count;
     step.why = src.why;
@@ -1775,12 +2238,13 @@ inline void plan_merge_rows(const Intent& in, const Observations& obs,
   const auto qualified = in.qualified_table();
   const auto sql_rel = detail::quote_qualified(qualified);
   const auto& t = obs.table(qualified);
-  const auto key = in.body.value("key", "");
+  const auto rk = detail::row_key(in);
+  const std::string key = rk.empty() ? std::string() : rk.columns[0];
   const auto names = detail::column_names(in);
 
-  if (!detail::row_target_ok(t, qualified, key, plan, step)) return;
+  if (!detail::row_target_ok(t, qualified, rk, plan, step)) return;
   const json columns = t.value("columns", json::object());
-  if (detail::refuse_duplicate_keys(in, names, key, plan, step)) return;
+  if (detail::refuse_duplicate_keys(in, names, rk, plan, step)) return;
 
   const auto matched = in.body.value("when_matched", "update");
   const auto not_matched = in.body.value("when_not_matched", "insert");
@@ -1795,18 +2259,18 @@ inline void plan_merge_rows(const Intent& in, const Observations& obs,
   }
 
   std::string supporting_index, unproven;
-  if (!detail::unique_key_index(t, key, supporting_index, &unproven)) {
+  if (!detail::row_key_is_unique(t, rk, supporting_index, &unproven)) {
     step.action = Action::kConflict;
-    step.why = "no unique index proves " + key + " unique";
+    step.why = "no unique index proves " + rk.label() + " unique";
     plan.conflicts.push_back(
-        qualified + " has no valid unique index on (" + key + ") alone" +
+        qualified + " has no valid unique index on " +
+        (rk.composite() ? rk.label() + " or columns among them" : "(" + key + ") alone") +
         (unproven.empty() ? "" : " (" + unproven + ")") +
         ", and MERGE's ON clause is not a key constraint. Measured on "
         "18.6: with duplicate target rows, one source row updated BOTH of them "
         "-- no error, nothing in the row count to notice, and the extra row "
-        "silently carrying values meant for another. Create the index first: "
-        "CREATE UNIQUE INDEX CONCURRENTLY ... ON " + qualified + " (" + key +
-        ");");
+        "silently carrying values meant for another." +
+        detail::no_unique_key_advice(t, qualified, rk));
     return;
   }
 
@@ -1887,7 +2351,7 @@ inline void plan_merge_rows(const Intent& in, const Observations& obs,
     for (const auto& c : in.body["update_columns"]) update_cols.push_back(c.get<std::string>());
   } else {
     for (const auto& n : names) {
-      if (n != key) update_cols.push_back(n);
+      if (!rk.has(n)) update_cols.push_back(n);
     }
   }
   if (matched == "update" && update_cols.empty()) {
@@ -1945,22 +2409,24 @@ inline void plan_merge_rows(const Intent& in, const Observations& obs,
   detail::Preserved pv;
   const bool preserved = detail::plan_preserve(
       in, columns, sql_rel, key,
-      matched == "delete" ? detail::all_columns(columns) : update_cols, out, pv);
+      matched == "delete" ? detail::all_columns(columns)
+                          : detail::with_rest_of_key(rk, update_cols),
+      out, pv);
   if (preserved) step.detail["preserve"] = pv.qualified;
 
   if (src.paced) {
     const auto mutation =
-        (preserved ? detail::preserve_cte(pv, sql_rel, sql_rel, key, "batch") + ",\n"
+        (preserved ? detail::preserve_cte(pv, sql_rel, sql_rel, rk.columns, "batch") + ",\n"
                    : std::string()) +
         "m AS (\n"
         "  MERGE INTO " + sql_rel + " USING batch\n"
-        "     ON " + sql_rel + "." + k + " = batch." + k + "\n" +
+        "     ON " + rk.equals(sql_rel, "batch") + "\n" +
         branches("batch") +
         "  RETURNING 1\n"
         ")";
     step.sql.push_back(paced_statement(
-        detail::source_relation(in, names, columns), key, mutation));
-    detail::attach_pacing_detail(step, in, cfg, src, qualified, key, "");
+        detail::source_relation(in, names, columns), rk, mutation));
+    detail::attach_pacing_detail(step, in, cfg, src, qualified, rk, "");
     step.lock = "RowExclusiveLock on " + qualified +
                 " plus row locks, released at every commit";
   } else {
@@ -1974,9 +2440,9 @@ inline void plan_merge_rows(const Intent& in, const Observations& obs,
     if (preserved) {
       step.sql.push_back(
           "WITH src AS (\n" + detail::source_relation(in, names, columns) + "\n"
-          "), " + detail::preserve_cte(pv, sql_rel, sql_rel, key, "src") + "\n"
+          "), " + detail::preserve_cte(pv, sql_rel, sql_rel, rk.columns, "src") + "\n"
           "MERGE INTO " + sql_rel + " USING src\n"
-          "   ON " + sql_rel + "." + k + " = src." + k + "\n" +
+          "   ON " + rk.equals(sql_rel, "src") + "\n" +
           branches("src") + ";");
     } else {
       const auto relation =
@@ -1986,7 +2452,7 @@ inline void plan_merge_rows(const Intent& in, const Observations& obs,
                                         names, "s", columns);
       step.sql.push_back(
           "MERGE INTO " + sql_rel + " USING " + relation + "\n"
-          "   ON " + sql_rel + "." + k + " = s." + k + "\n" +
+          "   ON " + rk.equals(sql_rel, "s") + "\n" +
           branches("s") + ";");
     }
     step.detail["rows"] = src.row_count;
@@ -2054,7 +2520,7 @@ inline void plan_copy_rows(const Intent& in, const Observations& obs,
   const auto& t = obs.table(qualified);
   const auto names = detail::column_names(in);
 
-  if (!detail::row_target_ok(t, qualified, "", plan, step)) return;
+  if (!detail::row_target_ok(t, qualified, detail::RowKey{}, plan, step)) return;
   const json columns = t.value("columns", json::object());
   if (detail::refuse_unwritable_columns(in, columns, qualified, names, plan, step)) return;
 

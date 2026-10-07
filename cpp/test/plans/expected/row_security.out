@@ -2,10 +2,11 @@ Plan for 0002-row-security  (digest aa7831188178…)
 
 -- transaction group 1 ---------------- atomic --
  0. set_row_security
+    LOCK TABLE "shop"."orders" IN SHARE UPDATE EXCLUSIVE MODE;
     ALTER TABLE "shop"."orders" ENABLE ROW LEVEL SECURITY;
     ALTER TABLE "shop"."orders" NO FORCE ROW LEVEL SECURITY;
     lock: AccessExclusiveLock on shop.orders
-    why:  enabling row-level security is a catalog change, and its effect is immediate for every session already connected
+    why:  enabling row-level security is a catalog change, and its effect is immediate for every session already connected. SHARE UPDATE EXCLUSIVE is taken first: it waits out an autovacuum without queueing reads or writes, and the exclusive lock after it is asked for with a short timeout and retried
 
  warn: enabling row-level security on shop.orders with NO POLICY hides every row from every non-owner. Measured on 18.6: an application role reading the table went from 1000 rows to 0, with no error -- the query succeeds and returns nothing. Create the policies in EARLIER intents than this one.
 

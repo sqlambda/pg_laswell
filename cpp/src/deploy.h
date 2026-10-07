@@ -432,6 +432,10 @@ class Deployment {
           return DeployResult::kRefused;
         }
         out << "  " << id << ": started (" << started.value("jobId", "") << ")\n";
+        // The rehearsal ran BEFORE the job exists, with real locks on the live
+        // schema, and laswell.job.started_at is after it. Said here so the time
+        // is somewhere a reader of the deployment looks.
+        report_rehearsal(out, started);
         running.emplace_back(id, started.value("jobId", ""));
       }
 
@@ -627,7 +631,23 @@ class Deployment {
     return v.dump();
   }
 
+  static void report_rehearsal(std::ostream& out, const json& started) {
+    const json dry = started.value("dryRun", json::object());
+    if (!dry.value("ran", false)) return;
+    out << "      rehearsed first, in a transaction rolled back: "
+        << dry.value("durationMs", 0LL) << " ms";
+    const json why = dry.value("unverifiedWhy", json::object());
+    if (!why.empty()) {
+      out << "; " << why.size() << " step(s) not run there";
+    }
+    out << "\n";
+    for (const auto& [ordinal, reason] : why.items()) {
+      out << "        step " << ordinal << ": " << reason.get<std::string>() << "\n";
+    }
+  }
+
   static void report_failure(std::ostream& out, const json& st) {
+
     // The ledger has the statement; this says where to look rather than
     // reprinting it, because a deployment log is not the place a failure is
     // diagnosed and pretending otherwise encourages reading the wrong thing.

@@ -61,8 +61,23 @@ SELECT COALESCE(
      'reloptions', COALESCE(TO_JSONB(t.reloptions), '[]'::jsonb),
      'owner', PG_GET_USERBYID(t.relowner),
      'is_partition', t.relispartition,
-     'reltuples', GREATEST(t.reltuples, 0)::bigint,
-     'size_estimate', (t.relpages::bigint * 8192),
+     -- A partitioned table holds nothing itself: relpages is always 0 and
+     -- reltuples is 0 until someone analyses the parent by hand. Its data is
+     -- its leaves', and every decision made by size or rows -- plain against
+     -- concurrent, an estimate, a warning about what a rewrite costs -- was
+     -- being made about an empty table.
+     'reltuples', CASE WHEN t.relkind = 'p'
+                       THEN (SELECT COALESCE(SUM(GREATEST(lc.reltuples, 0)), 0)::bigint
+                               FROM pg_partition_tree(t.oid) lt
+                               JOIN pg_class lc ON lc.oid = lt.relid
+                              WHERE lt.isleaf)
+                       ELSE GREATEST(t.reltuples, 0)::bigint END,
+     'size_estimate', CASE WHEN t.relkind = 'p'
+                           THEN (SELECT COALESCE(SUM(lc.relpages::bigint), 0) * 8192
+                                   FROM pg_partition_tree(t.oid) lt
+                                   JOIN pg_class lc ON lc.oid = lt.relid
+                                  WHERE lt.isleaf)
+                           ELSE t.relpages::bigint * 8192 END,
      'estimated_from', (SELECT GREATEST(s.last_vacuum, s.last_autovacuum,
                                         s.last_analyze, s.last_autoanalyze)
                           FROM pg_stat_all_tables s WHERE s.relid = t.oid),
@@ -314,6 +329,9 @@ SELECT COALESCE(
      -- the planner beats failing at execution.
      'constraints', COALESCE((SELECT JSONB_OBJECT_AGG(k.conname, JSONB_BUILD_OBJECT(
                        'type', k.contype::text,
+                       -- A NOT VALID constraint left by an attempt that failed
+                       -- at its VALIDATE is resumed there, not added again.
+                       'validated', k.convalidated,
                        'has_index', k.conindid <> 0,
                        'index', CASE WHEN k.conindid <> 0
                                      THEN k.conindid::regclass::text END,
@@ -352,6 +370,35 @@ SELECT COALESCE(
                                JOIN pg_class pc ON pc.oid = pi.inhrelid
                                JOIN pg_namespace pn ON pn.oid = pc.relnamespace
                               WHERE pi.inhparent = t.oid), '[]'::jsonb),
+     -- Each direct partition, with what a per-partition recipe has to know
+     -- before it builds on one: whether it is itself partitioned (no
+     -- CREATE INDEX CONCURRENTLY there either), and its indexes -- valid or
+     -- not, which constraint each backs, and whether it is already attached to
+     -- an index of the parent. That is what lets an interrupted recipe resume
+     -- at the partition it stopped on.
+     'partition_parts', COALESCE((
+        SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
+                 'relation', pn.nspname || '.' || pc.relname,
+                 'partitioned', pc.relkind = 'p',
+                 'indexes', COALESCE((
+                    SELECT JSONB_OBJECT_AGG(ic.relname, JSONB_BUILD_OBJECT(
+                             'valid', ix.indisvalid,
+                             'unique', ix.indisunique,
+                             'constraint', (SELECT k.conname FROM pg_constraint k
+                                             WHERE k.conindid = ix.indexrelid
+                                               AND k.conrelid = pc.oid
+                                               AND k.contype IN ('p', 'u') LIMIT 1),
+                             'attached_to', (SELECT pic.relname
+                                               FROM pg_inherits ii
+                                               JOIN pg_class pic ON pic.oid = ii.inhparent
+                                              WHERE ii.inhrelid = ix.indexrelid LIMIT 1)))
+                      FROM pg_index ix JOIN pg_class ic ON ic.oid = ix.indexrelid
+                     WHERE ix.indrelid = pc.oid), '{}'::jsonb))
+                 ORDER BY pn.nspname, pc.relname)
+          FROM pg_inherits pi
+          JOIN pg_class pc ON pc.oid = pi.inhrelid
+          JOIN pg_namespace pn ON pn.oid = pc.relnamespace
+         WHERE pi.inhparent = t.oid AND t.relkind = 'p'), '[]'::jsonb),
      -- Partition-key text, e.g. "RANGE (at)". The planner needs the key COLUMN
      -- to render the CHECK constraint that turns an ATTACH from a full scan
      -- into a catalog change (measured: 98ms vs 0.9ms on 2M rows).
@@ -601,6 +648,9 @@ inline constexpr int kEstimateStalenessSeconds = 3600;
 // of the ALTER -- the planner's own measurement blocking on the thing it is
 // planning around, which is the exact hazard documented for pg_table_size().
 inline constexpr int kObservationLockTimeoutMs = 2000;
+// How long a rehearsal waits for an exclusive lock after it holds the weaker
+// one: what one attempt of the job waits (executor.h, kExclusiveTryMs).
+inline constexpr int kRehearsalExclusiveTryMs = 200;
 
 // SQLSTATE 55P03, lock_not_available. Matched by code because libpqxx declares
 // no exception class for it -- the same rule the rest of this codebase follows:
@@ -714,16 +764,32 @@ class Catalog {
 #define PGLASWELL_OBSERVE(module_name, present_sql, observation_sql, absent_sql, \
                           reads_applied_steps)                                 \
     do {                                                                      \
-      const auto probe = txn.exec(present_sql);                               \
-      const bool present = !probe.empty() && probe[0][0].as<bool>();          \
-      const char* const sql = present ? (observation_sql) : (absent_sql);     \
-      if (sql == nullptr) break;                                              \
-      const auto r = txn.exec(sql);                                           \
-      if (!r.empty() && !r[0][0].is_null()) {                                 \
-        obs.extensions[module_name] = json::parse(r[0][0].as<std::string>()); \
-        if (reads_applied_steps) {                                            \
-          observe_applied_steps(txn, obs.extensions[module_name], module_name); \
+      /* In a savepoint: a module's reading is one statement over a vendor's   \
+         catalogs and functions, and one that raises -- a role without USAGE   \
+         on a schema, a chunk dropped as it was read, an older release of the  \
+         extension -- used to fail the whole observation, and with it every    \
+         plan on that server, with the vendor's raw error. It now fails that   \
+         module's reading alone, and the planner says which and why. */        \
+      txn.exec("SAVEPOINT laswell_module_reading");                           \
+      try {                                                                   \
+        const auto probe = txn.exec(present_sql);                             \
+        const bool present = !probe.empty() && probe[0][0].as<bool>();        \
+        const char* const sql = present ? (observation_sql) : (absent_sql);   \
+        if (sql != nullptr) {                                                 \
+          const auto r = txn.exec(sql);                                       \
+          if (!r.empty() && !r[0][0].is_null()) {                             \
+            obs.extensions[module_name] = json::parse(r[0][0].as<std::string>()); \
+            if (reads_applied_steps) {                                        \
+              observe_applied_steps(txn, obs.extensions[module_name], module_name); \
+            }                                                                 \
+          }                                                                   \
         }                                                                     \
+        txn.exec("RELEASE SAVEPOINT laswell_module_reading");                 \
+      } catch (const pqxx::sql_error& e) {                                    \
+        txn.exec("ROLLBACK TO SAVEPOINT laswell_module_reading");             \
+        obs.extensions.erase(module_name);                                    \
+        obs.extension_errors[module_name] =                                   \
+            std::string(e.sqlstate()) + ": " + server_message(e.what());      \
       }                                                                       \
     } while (false);
 #include "modules/enabled_observers.h"
@@ -913,6 +979,9 @@ class Catalog {
     std::vector<int> unverified_steps;  // could not be included, or not reached
     std::string skipped_reason;
     int timed_out_at = -1;
+    // The step at which an exclusive lock was not available within the short
+    // wait a rehearsal allows itself; -1 when every lock was had.
+    int lock_unavailable_at = -1;
     bool depends_on_skipped = false;
   };
 
@@ -1043,7 +1112,14 @@ class Catalog {
         }
         continue;
       }
-      for (const auto& raw : steps[i].second) {
+      // A step that takes the weaker lock first asks for the exclusive one
+      // with a short timeout, as the job does (executor.h): the application
+      // queues behind that request, and a planning call may not make it wait
+      // for seconds. Put back after the step.
+      bool short_wait = false;
+      const auto& statements = steps[i].second;
+      for (std::size_t q = 0; q < statements.size(); ++q) {
+        const auto& raw = statements[q];
         const auto stmt = detail::strip_trailing_semicolon(raw);
         if (stmt.empty()) continue;
         try {
@@ -1060,7 +1136,27 @@ class Catalog {
                   "as unverified rather than claimed as checked.";
             }
           }
+          if (!short_wait && stmt.rfind("LOCK TABLE ", 0) == 0 &&
+              stmt.find("SHARE UPDATE EXCLUSIVE") != std::string::npos) {
+            // After the LAST of the weaker locks, where a step takes several.
+            const bool more_locks = q + 1 < statements.size() &&
+                                    statements[q + 1].rfind("LOCK TABLE ", 0) == 0;
+            if (!more_locks) {
+              txn.exec("SET LOCAL lock_timeout = " + std::to_string(kRehearsalExclusiveTryMs));
+              short_wait = true;
+            }
+          }
         } catch (const pqxx::sql_error& e) {
+          // The exclusive lock did not come in the short wait: something else
+          // holds the table. Not a defect in the plan -- the job tries again
+          // and again for it -- so everything from here on is unverified.
+          if (short_wait && is_lock_not_available(e)) {
+            out.lock_unavailable_at = steps[i].first;
+            for (std::size_t k = i; k < steps.size(); ++k) {
+              note_unverified(steps[k].first);
+            }
+            return Rehearsal::kTimedOut;
+          }
           // A statement timeout is not a defect in the plan: the step does real
           // work that a rehearsal declines to finish. Everything from here on
           // is unverified, and saying so beats reporting a problem that is not.
@@ -1092,6 +1188,9 @@ class Catalog {
                                         server_message(e.what()), stmt});
           return Rehearsal::kFailed;
         }
+      }
+      if (short_wait) {
+        txn.exec("SET LOCAL lock_timeout = " + std::to_string(kObservationLockTimeoutMs));
       }
     }
     return Rehearsal::kOk;

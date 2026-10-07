@@ -77,7 +77,7 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
   &quot;kind&quot;: &quot;delete_rows&quot;,
   &quot;schema&quot;: &lt;required&gt;,
   &quot;table&quot;: &lt;required&gt;,
-  &quot;key&quot;: &lt;required&gt;,
+  &quot;key&quot;: &lt;optional&gt;,
   &quot;where&quot;: &lt;optional&gt;,
   &quot;columns&quot;: &lt;optional&gt;,
   &quot;values&quot;: &lt;optional&gt;,
@@ -97,8 +97,8 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
 <dd>&nbsp;</dd>
 <dt>table<span class="tag req">required</span></dt>
 <dd>&nbsp;</dd>
-<dt>key<span class="tag req">required</span></dt>
-<dd>The key has to be one of the values each row supplies, so every row must carry it.</dd>
+<dt>key<span class="tag opt">optional</span></dt>
+<dd>With &quot;where&quot; the key is the one column the purge walks the table by; it need not be unique. A list of columns is for &quot;values&quot; and &quot;select&quot;, where it says which row each entry names.</dd>
 <dt>where<span class="tag opt">optional</span></dt>
 <dd>&nbsp;</dd>
 <dt>columns<span class="tag opt">optional</span></dt>

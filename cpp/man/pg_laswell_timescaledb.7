@@ -234,12 +234,38 @@ The size and row count come from
 .Fn hypertable_size
 and
 .Fn approximate_row_count .
+.It
+On 2.30 and later, for a hypertable without the columnstore: an index can be
+created
+.Ic ON ONLY
+the hypertable, which reads no chunk, and
+.Ic CREATE INDEX CONCURRENTLY
+then works on each chunk directly.
+A chunk created afterwards gets the index by itself, and TimescaleDB counts the
+ones built by hand as the hypertable index's own: the planner uses them, and
+dropping the hypertable's index removes them.
+That last point is what was measured, not something its documentation
+promises.
 .El
 .Pp
+The per-chunk option is not as gentle as it reads.
+It holds a write-blocking lock on one chunk after another, and a write that
+does not name the time column has to lock every chunk, so it waits behind each
+in turn: found in the field, updates by id stopped for the whole build.
+Measured on a 1.2 GB hypertable of 19 chunks, the per-chunk option took 4.6 s
+and an update by id waited up to 3 491 ms; the index on the parent only and then
+each chunk concurrently took 2.5 s, with the worst update by id at 43 ms and
+the worst insert at 42 ms.
+.Pp
 So core plans, for an index on a hypertable:
-a plain build when the data is small and nothing waits, as for any table; a
-per-chunk build otherwise; and, for a UNIQUE index or constraint that is not
-small, the plain build anyway \(em the only one that exists \(em with a warning
+a plain build when the data is small and nothing waits, as for any table;
+otherwise, where the module offers it, the index on the parent only and then a
+concurrent build of each chunk, a step and a validity check apiece, resumable
+\(em a chunk that has its index is left alone, one whose build failed is
+dropped and built again; where it does not \(em the columnstore, or a release
+before 2.30, neither of which has been measured \(em the per-chunk option; and,
+for a UNIQUE index or constraint that is not small, the plain build anyway
+\(em the only one that exists \(em with a warning
 that writes to the hypertable and every chunk wait for the whole build.
 A drop is always a plain
 .Ic DROP INDEX .

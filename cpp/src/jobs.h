@@ -65,7 +65,7 @@ inline bool is_terminal(JobState s) {
 
 // Why a paced backfill committed. The histogram of these is the observable
 // proof that pacing works, and it is what the deterministic test asserts on.
-enum class CommitReason { kInterval, kLockWaiter, kBatchCap, kFinal };
+enum class CommitReason { kInterval, kLockWaiter, kBatchCap, kFinal, kGroupEnd };
 
 inline const char* to_string(CommitReason r) {
   switch (r) {
@@ -73,6 +73,7 @@ inline const char* to_string(CommitReason r) {
     case CommitReason::kLockWaiter: return "lock_waiter";
     case CommitReason::kBatchCap: return "batch_cap";
     case CommitReason::kFinal: return "final";
+    case CommitReason::kGroupEnd: return "group_end";
   }
   return "unknown";
 }

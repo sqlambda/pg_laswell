@@ -298,16 +298,95 @@ Almost all PostgreSQL DDL is transactional, which is what makes this possible,
 and nothing weaker works: a backfill referencing a column that step 0 adds does
 not parse until step 0 has run, and that is the ordinary case.
 .Pp
-Three costs, all bounded and all reported:
+Five costs, all bounded and all reported:
 .Bl -bullet -compact
 .It
-It takes the real locks, briefly, and rolls them back.
+It takes the real locks, on the live schema, and holds each until the rollback
+at the end.
 .Va lock_timeout
-bounds the attempt, so planning can never queue behind anything.
+bounds each request, and
+.Va durationMs
+in the result says how long the whole of it took.
+That time is before any job exists \(em
+.Li laswell.job.started_at
+is after it \(em so it is kept in the plan the job stores and printed by
+.Xr pg_laswell 1
+when the job starts.
 .It
 .Ic CREATE INDEX CONCURRENTLY
 cannot run inside a transaction block, so it is listed as unverified rather
 than silently passed.
+.It
+The scan of a split recipe is not run.
+.Cm set_not_null ,
+.Cm add_check_constraint ,
+.Cm add_foreign_key ,
+.Cm attach_partition
+and a domain's check add a constraint
+.Ic NOT VALID
+and validate it in a transaction of its own, so that the lock of the first is
+not held across the scan of the second.
+One transaction would hold it across exactly that: measured in the field on a
+3 GB table under load, three seconds without a single insert, all of them
+before the job began.
+So
+.Ic VALIDATE CONSTRAINT
+is listed as unverified, and so is the
+.Ic SET NOT NULL
+of
+.Cm set_not_null ,
+which is cheap only once the scan has proved the rows;
+.Va unverifiedWhy
+gives the reason for each.
+What this gives up: a row that violates the constraint is found by the job, at
+its
+.Ic VALIDATE ,
+with the
+.Ic NOT VALID
+constraint already committed \(em not before anything ran.
+Applying the specification again resumes at the scan: a constraint that is
+there and not valid is validated, not added a second time.
+The chain rehearsal below runs the scans, since it is not for a live database.
+.It
+A statement that reads or rewrites a whole table under a lock that blocks
+writes is not run either, whatever the table's size: the dry run would do it to
+the live table and hold the lock until its rollback.
+That is
+.Cm alter_column_type ;
+.Ic ATTACH PARTITION ,
+which scans the candidate where its check was not validated and scans a
+.Li DEFAULT
+partition always;
+.Cm create_table
+with
+.Va partition_of
+beside a
+.Li DEFAULT
+partition;
+.Cm set_logged ,
+.Cm set_tablespace
+and
+.Cm set_access_method ;
+.Ic SET NOT NULL
+on a domain;
+.Cm replace_view
+on a materialized view; a constraint a module makes validate in the statement
+that adds it, and an index or unique constraint a module makes build without
+.Ic CONCURRENTLY
+on a table too large or too busy for a plain build; a primary key over a
+column that is still nullable in the dry run; and the module kinds that copy a
+populated table \(em distributing it with the blocking form, making it a
+reference table, altering or undistributing a distributed table,
+.Cm timescaledb_create_hypertable
+with
+.Va migrate_data .
+Each is listed as unverified with its reason, and a later step that needs what
+one of them would have made is reported as depending on a step that was not
+rehearsed, not as a failure of its own.
+What this gives up: a
+.Va using
+expression that fails on a row, or a partition bound that overlaps, is found by
+the job.
 .It
 Queries are planned with
 .Ic EXPLAIN Pq Cm GENERIC_PLAN ,
@@ -356,6 +435,83 @@ Against production it would block the application for the length of the run,
 which is why it is a separate mode and not what
 .Fl -dry-run
 does.
+.Sh EXCLUSIVE LOCKS
+A pending
+.Va AccessExclusiveLock
+blocks every reader and writer that arrives after it, for as long as it waits,
+so what a brief exclusive step costs the application is not how long it holds
+its lock but how long it waits for it.
+Two things make it wait, and each is handled where it was measured.
+.Pp
+.Em \&An autovacuum on the table ,
+which is close to certain straight after a backfill.
+PostgreSQL cancels it once a session has waited
+.Va deadlock_timeout
+behind it.
+Measured on a 1.5 GB table: asking for the exclusive lock directly waited
+1.05 s and an insert arriving meanwhile took 1 027 ms; taking
+.Bd -literal -offset indent
+LOCK TABLE t IN SHARE UPDATE EXCLUSIVE MODE;
+.Ed
+.Pp
+first, in the same transaction, waited the same second while the worst insert
+stayed at 30 ms, because that lock conflicts with autovacuum and not with
+inserts and updates.
+Once it is held autovacuum cannot start again, and the exclusive lock is then
+granted almost at once.
+Every step that asks, on a table already there, for a lock readers or writers
+wait behind begins with that statement, and the plan shows it: the recipes of
+.Cm set_not_null ,
+.Cm add_check_constraint
+and
+.Cm add_foreign_key
+(for both tables), and equally a plain
+.Cm add_column ,
+.Cm drop_column ,
+.Cm alter_column_type ,
+a rename, a trigger, a policy,
+.Cm drop_constraint ,
+a plain index build, each step of
+.Cm attach_partition
+and
+.Cm detach_partition ,
+and the rest of the kinds that alter a table.
+Not a
+.Ic VALIDATE ,
+which takes only that weaker lock itself, and not a module's own kinds, whose
+locks are taken inside the vendor's functions.
+.Pp
+.Em A long application transaction ,
+which the weaker lock passes straight through.
+There the exclusive statement itself is run with a lock timeout of 200 ms.
+When it gives up, the transaction is rolled back \(em releasing the request
+the application was queued behind \(em and it is tried again after a pause.
+The application waits a fraction of a second at a time where it used to wait
+all of
+.Va lock_timeout_ms ,
+after which the step failed anyway.
+The step goes on trying for twenty times
+.Va lock_timeout_ms
+(one minute by default), since nothing queues while it sleeps, and then ends
+as
+.Li lock_not_acquired
+with the number of attempts.
+A step that succeeds records
+.Va lockAttempts .
+.Pp
+The retry is the transaction group's.
+Intents that share a transaction are rolled back together when one of them does
+not get its lock \(em which also releases every lock the steps before it had
+taken \(em and the group is run again from its first step.
+So what commits together still does, and a retry never leaves half a group
+applied.
+.Pp
+The dry run asks for the same locks, and is as brief about it: after the weaker
+lock it waits 200 ms for the exclusive one, once.
+When it does not come the dry run stops there, reports
+.Va lockUnavailableAtStep ,
+and lists that step and those after it as unverified \(em a table held by
+something else is not a defect in the plan.
 .Sh PACING
 A backfill walks the table by keyset and commits on whichever comes first:
 .Bl -tag -width Ds -compact
@@ -367,7 +523,25 @@ has elapsed
 .It Cm batch_cap
 .Va batch_cap_rows
 rows since the last commit, a backstop against pathological row widths
+.It Cm group_end
+in a walk that goes one group at a time \(em a Citus distributed table
+\(em the end of a group, once the transaction holds at least a batch of rows
 .El
+.Pp
+The last is there because of what comes next.
+After a group, the walk asks which group follows, and that question must not
+run while the transaction holds the row locks of the batches before it: a
+commit on a lock waiter can only happen once the statement in flight returns.
+Found under load on a Citus cluster, where the question took 0.6 to 1.5 s on a
+shard and updates to rows the walk had just touched waited up to 1.8 s.
+So the walk commits first.
+The question itself is the next value after this one and nothing more, a probe
+of the unique index the walk already requires (measured: 0.017 ms, against
+359 ms for the earlier form to pass six finished groups of 200 000 rows).
+A group with nothing left to do therefore costs one empty batch, taken with no
+lock held.
+Below a batch of rows the walk does not commit at the end of a group: groups
+can be a row each, and a commit for every one of them was a commit per row.
 .Pp
 Two knobs that are easy to conflate and must not be.
 .Va batch_rows
@@ -736,10 +910,219 @@ There is no default, because
 .Ic NOT NULL
 on an existing table is a different risk class from a nullable add.
 .Pp
+A
+.Ic NOT NULL
+column with a
+.Va default
+that is not volatile is one catalog-only statement.
+Measured on 18.6: a constant, and
+.Fn now ,
+did not rewrite the table;
+.Fn gen_random_uuid ,
+which is volatile, rewrote it under
+.Va AccessExclusiveLock .
+Which a function is cannot be read from the text of a default, and pg_laswell
+does not guess from a name: for a default that calls a function the step says
+it is catalog-only only if the function is not volatile, and a warning names the
+query that tells
+.Pq Li provolatile No in Li pg_proc .
+Without a default,
+.Ic ADD COLUMN ... NOT NULL
+fails on the first existing row, and the column is refused unless the
+specification says where its value comes from:
+.Bd -literal -offset indent
+{"kind": "add_column", "schema": "public", "table": "messages",
+ "column": "customer_id", "type": "bigint", "nullable": false,
+ "fill": "(payload->>'customer')::bigint",
+ "after": "drop_trigger",
+ "comment": "The customer the message was sent to."}
+.Ed
+.Pp
+.Va fill
+is one SQL expression over the row's own columns, written bare or as
+.Ql table.column .
+The plan is then the whole recipe, in this order:
+.Bl -enum -compact
+.It
+The column, nullable \(em catalog-only \(em and in the same transaction a
+.Ic BEFORE INSERT OR UPDATE
+trigger that sets it from the expression when it is null.
+From that commit on no new row lacks a value, and an existing row the
+application updates gets one.
+.Va AccessExclusiveLock ,
+briefly.
+.It
+A paced
+.Cm backfill
+of the rows already there, walking
+.Va key ,
+which defaults to a column of the table's primary key;
+a composite key is walked whole, in its order.
+Where that key grows \(em an integer, a timestamp or a date \(em the walk
+reads the highest key once as it starts and goes no further: the trigger fills
+every row made after that.
+On a table partitioned by time this is what keeps each batch from reading every
+partition created since the walk began.
+.It
+The
+.Cm set_not_null
+recipe, whose scan runs under a lock the application works through.
+.It
+What
+.Va after
+says:
+.Ql drop_trigger
+drops the trigger and its function;
+.Ql keep_trigger
+leaves them.
+.El
+.Pp
+The same expression is used by the trigger and by the backfill, so the two
+cannot disagree: inside the trigger it is evaluated as
+.Ql SELECT (fill) INTO NEW.column FROM (SELECT NEW.*) AS table
+(measured on 18.6).
+The trigger and its function are named
+.Ql <table>_<column>_laswell_fill
+and created in the table's schema.
+They run as the role writing the row, so names inside the expression resolve
+through that role's
+.Va search_path ;
+qualify what it calls.
+.Pp
+.Va after
+has no default, for the reason
+.Va nullable
+has none.
+Whether the application writes the column itself is known only to the author:
+dropping the trigger when it does not makes its next insert fail, and keeping
+it when it does leaves a trigger on every write for nothing.
+.Pp
+A row for which the expression is NULL stays null, and the
+.Ic VALIDATE
+of step 3 fails on it.
+The job stops there with the column nullable and the trigger in place, so the
+application is unaffected, and applying the same specification again resumes:
+each part reads what is already there \(em the column, the trigger, the rows
+still null, the temporary check \(em and does only what is left.
+The dry run does not look for such a row; see
+.Sx DRY RUN .
+.Pp
+Several such columns on one table are written as consecutive
+.Cm add_column
+intents, and planned as one recipe: one trigger that fills them all, one
+backfill that sets them all, and one validation scan.
+Planned one after the other they would rewrite every row once per column.
+The scan is shared because one check over all the columns is enough
+(measured on 18.6, 6 million rows: after
+.Ql CHECK (a IS NOT NULL AND b IS NOT NULL)
+is validated once, PostgreSQL skips the scan for each column, and both
+.Ic SET NOT NULL
+ran in one statement in 4 ms against 344 ms for a bare one).
+The trigger is named after the first column, and each later intent's step says
+which intent it was planned with.
+Intents are merged only when they are consecutive, on the same table, with the
+same
+.Va after
+and
+.Va key ,
+and when no expression names another column of the group \(em the trigger
+fills in order and one
+.Ic UPDATE
+does not, so those are planned in order instead.
+.Pp
+.Va fill
+may be a list of sources, tried in order; the first that gives a value wins:
+.Bd -literal -offset indent
+"fill": [
+  {"from": "public.crm AS c", "on": "c.msg_id = messages.id",
+   "value": "c.customer"},
+  {"from": "public.legacy AS l", "on": "l.msg_id = messages.id",
+   "value": "l.customer"},
+  "(payload->>'customer')::bigint",
+  "0"
+]
+.Ed
+.Pp
+A source is an expression over the row, or another table:
+.Va from
+names it with an alias,
+.Va on
+says how its row is found from this table's row, and
+.Va value
+is what is taken from it.
+.Dq Found
+means a value: a row that is there with a NULL falls through to the next
+source, since NULL can never be the answer for a
+.Ic NOT NULL
+column.
+The trigger evaluates the list as one
+.Ic COALESCE
+over scalar subqueries, which stops at the first that is not null (measured:
+of 100 000 rows the second table was probed for the 50 000 the first had no
+value for).
+The backfill does not probe row by row: it makes one joined pass per source,
+in order, each over the rows still null, and the ledger's step for each pass
+says how many rows that source filled.
+Columns of one recipe whose source at the same position is the same table
+found the same way share that pass.
+.Pp
+.Va on
+must match at most one row.
+The trigger fails the write when two match
+.Pq Qq more than one row returned by a subquery ,
+while the join takes one of them without saying which, so a unique key on what
+.Va on
+compares is what makes the two agree; the plan says so.
+The value is copied when the row is written, and a later change in the other
+table does not follow.
+.Pp
+With a
+.Va default
+as well as a
+.Va fill ,
+the recipe is a different and shorter one, for a column most of whose rows keep
+one value.
+The column is added
+.Ic NOT NULL
+with its default, which is catalog-only: every existing row reads the default
+without being rewritten.
+The backfill then writes only the rows whose value differs from it, so the walk
+reads the table once and writes, logs and leaves dead rows for the exceptions
+alone.
+There is no check, no validation scan and no
+.Ic SET NOT NULL ,
+and the one exclusive lock is taken before the walk and not after it.
+No trigger is created and
+.Va after
+is not given: a row written from then on gets the default unless the
+application supplies a value.
+The walk touches a row only while it still holds the default, so a value the
+application wrote is kept; a row it deliberately set to the default cannot be
+told from one it never set, and is given the computed value.
+A row no source has a value for keeps the default.
+A list of sources is here one pass over the same
+.Ic COALESCE ,
+since with a default in the column
+.Dq still to do
+cannot be told from
+.Dq already given .
+.Pp
+Several columns with a default and a fill, written as consecutive intents on
+one table, share one walk as well: a row is selected when any of them still
+holds its default and has another value to take, and each column is written
+only where that is so for it.
+.Pp
+Where a vendor allows no row trigger on the table, the recipe that needs one is
+refused at planning and the form with a
+.Va default
+is named instead; see
+.Xr pg_laswell_citus 7
+for a distributed or reference table.
+.Pp
 .Cm backfill
 takes a single-column
 .Va key
-that must lead a unique index, a
+that a unique index must contain, a
 .Va set
 of column-to-expression mappings, an optional
 .Va from ,
@@ -751,6 +1134,34 @@ predicate that must select zero rows when the backfill is complete.
 An unfiltered backfill is refused; write
 .Ql true
 to mean it.
+.Pp
+How the table is walked follows from the unique index that contains
+.Va key ,
+and the step records it as
+.Va batch_mode :
+.Bl -tag -width Ds -compact
+.It Cm two_statement
+the index is on
+.Va key
+alone: a keyset walk on it.
+.It Cm composite
+the index holds other columns too \(em a tenant column first, or the time
+column of a partitioned table or hypertable, in either order.
+The walk follows all its columns together, in index order, a full batch at a
+time; every one of them must be
+.Ic NOT NULL .
+.It Cm grouped
+a module requires each batch to stay inside one value of a column, as Citus
+does for a distributed table: one group at a time.
+.El
+.Pp
+The composite walk exists because going group by group is a row at a time
+wherever the leading column is nearly unique.
+Found on a hypertable keyed by time and id: 550 rows a second, with a commit
+for each.
+Measured there for the composite walk, 1 000 rows a batch: 0.44 ms a batch
+whichever column leads, and a million rows in 13 s.
+Its cursor is the last row's whole key.
 .Pp
 .Va assert_invariants
 is a list of named scalar queries, evaluated on the worker connection before
@@ -921,7 +1332,9 @@ which takes
 and scans the whole table.
 It emits four steps in four separate transactions: a
 .Ic NOT VALID
-check, a
+check
+.Pq Va AccessExclusiveLock , No held for the catalog change only ,
+a
 .Ic VALIDATE
 that does the scanning under
 .Va ShareUpdateExclusiveLock
@@ -955,14 +1368,19 @@ Note what the first step locks: adding a foreign key takes
 .Va ShareRowExclusiveLock
 on the child
 .Em and
-.Va RowShareLock
-on the parent, so a statement naming one table locks two, and the table nobody
-mentioned is often the busier one.
+on the parent (measured; writes to both wait, reads do not), so a statement
+naming one table locks two, and the table nobody mentioned is often the busier
+one.
 It warns when no index leads with the referencing column, because without one
 every parent update or delete scans the child.
 .Pp
 .Cm add_check_constraint
 takes the same two-step shape as a foreign key, for the same measured reason.
+Its first step is not the same lock, though: adding a check takes
+.Va AccessExclusiveLock ,
+.Ic NOT VALID
+or not, so reads wait too, while it is requested and while it is held.
+Only a foreign key gets the weaker lock.
 .Pp
 .Cm create_index
 on a
@@ -977,11 +1395,37 @@ attaches each child, and then checks validity: the parent index stays
 .Va indisvalid
 false until the last attachment lands, and an index that exists, is invalid and
 is never used would otherwise pass silently.
-A unique index there is refused rather than planned, because PostgreSQL
-requires it to include the partition key and this planner does not read the
-partition key -- emitting a recipe whose final
-.Ic ATTACH
-would fail is worse than declining.
+A unique index there is built the same way when its columns include every
+partition column, and refused in PostgreSQL's words when they do not
+.Pq Qq unique constraint on partitioned table must include all partitioning columns
+or when the partition key is an expression.
+.Pp
+.Cm add_unique_constraint
+and
+.Cm add_primary_key
+on a partitioned table are a recipe too.
+One
+.Ic ADD CONSTRAINT
+would build a unique index on every partition under
+.Va AccessExclusiveLock
+on the parent, and the concurrent recipe begins with
+.Ic CREATE UNIQUE INDEX CONCURRENTLY
+on the parent, which PostgreSQL refuses.
+So the constraint is added on
+.Ic ONLY
+the parent \(em a catalog change, its index invalid and empty \(em and then,
+partition by partition, a unique index is built concurrently, adopted as that
+partition's own constraint with
+.Ic USING INDEX
+.Pq without which PostgreSQL will not attach it ,
+and attached.
+The parent's constraint is valid when the last partition's is attached; a
+partition created meanwhile gets it by itself.
+A recipe that stops \(em a duplicate in the fifth partition \(em resumes there
+when the specification is applied again: what each partition already has is
+read, and an index left invalid is dropped and built again.
+A partition that is itself partitioned is refused for now, for an index and for
+a constraint: the recipe would have to descend into it.
 .Pp
 A dry run cannot cover such a recipe: the concurrent builds cannot run inside a
 transaction block, so the attaches that follow have nothing to attach.
@@ -1107,6 +1551,51 @@ nothing.
 The same trap waits for an update whose rows have gone and an insert whose
 every row hits
 .Ic ON CONFLICT DO NOTHING .
+.Pp
+A batch ends on a whole key.
+The cursor is a key value, and
+.Va key
+need not be unique in the source: the batch is every source row up to and
+including the key its row limit reaches, so it exceeds
+.Va batch_rows
+by the rows that share its last key.
+Cut at the limit alone, those rows would be below the next batch's cursor and
+never considered.
+.Pp
+.Va key
+is one column, or a list of columns that are unique together:
+.Bd -literal -offset indent
+"key": ["tenant_id", "id"]
+.Ed
+.Pp
+A table keyed by tenant and id, or by id and time where it is partitioned by
+time, has no single column that names a row, and where the table is a
+hypertable, distributed or partitioned no unique index on one column can be
+made.
+With a list,
+.Cm update_rows ,
+.Cm merge_rows
+and
+.Cm delete_rows
+(by
+.Va values
+or
+.Va select )
+match on every column of it, the pre-image saves every column of it, the walk
+goes along the whole key with a cursor that is the whole key, and two rows of
+.Va values
+are the same key only when they agree on all of it.
+What proves the key names one row is a valid unique index, not partial and not
+over an expression, whose columns are all among the key's.
+Without one,
+.Cm update_rows
+and
+.Cm merge_rows
+are refused: one source row could change several.
+.Cm delete_rows
+by
+.Va where
+keeps a single column, which it walks by and which need not be unique.
 .Pp
 .Cm insert_rows
 takes

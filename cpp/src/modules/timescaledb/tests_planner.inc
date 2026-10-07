@@ -97,6 +97,43 @@ json ts_index(json columns, bool unique = false) {
 
 // --- core kinds on a hypertable: the hazard this module exists for ----------
 
+// The parent of a hypertable holds no rows, and the kinds that state a size or
+// a row count read it there: "deleting 0 estimated rows", "rewrites the whole
+// table: 0 B". They take the module's figure, as create_index and backfill do.
+// Measured on 2.30.2: "hypertables do not support adding a constraint using an
+// existing index". Core adopts a matching unique index wherever it finds one.
+TEST(TimescaledbPlanner, AConstraintCannotAdoptAnIndexOnAHypertable) {
+  auto obs = ts_hypertable_obs();
+  obs.tables["public.m"]["indexes"]["m_id_ts_u"] =
+      json{{"is_valid", true}, {"is_unique", true}, {"is_primary", false},
+           {"leading_column", "id"}, {"columns", json::array({"id", "ts"})},
+           {"predicate", ""}, {"has_expressions", false}};
+  const json pk = {{"kind", "add_primary_key"}, {"schema", "public"}, {"table", "m"},
+                   {"name", "m_pk"}, {"columns", json::array({"id", "ts"})}};
+  const auto refused = ts_plan(pk, obs);
+  EXPECT_TRUE(ts_conflict(refused, "do not support adding a constraint using an existing index"))
+      << refused.render();
+  EXPECT_TRUE(ts_conflict(refused, "Drop m_id_ts_u")) << refused.render();
+  // Without such an index there is nothing to adopt, and nothing to refuse.
+  EXPECT_FALSE(ts_conflict(ts_plan(pk, ts_hypertable_obs()), "using an existing index"));
+}
+
+TEST(TimescaledbPlanner, TheKindsThatStateASizeReadTheChunksNotTheEmptyParent) {
+  const auto del = ts_plan(json{{"kind", "delete_rows"}, {"schema", "public"}, {"table", "m"},
+                                {"key", "id"}, {"where", "v < 0"}},
+                           ts_hypertable_obs());
+  ASSERT_FALSE(del.steps.empty()) << del.render();
+  EXPECT_EQ(del.steps.back().detail.value("rows_estimated", 0LL), 4000000)
+      << del.render();
+  const auto drop = ts_plan(json{{"kind", "drop_table"}, {"schema", "public"}, {"table", "m"}},
+                            ts_hypertable_obs());
+  bool said = false;
+  for (const auto& w : drop.warnings) {
+    if (w.find("512.0 MiB and roughly 4000000 rows") != std::string::npos) said = true;
+  }
+  EXPECT_TRUE(said) << drop.render();
+}
+
 TEST(TimescaledbPlanner, AnIndexOnALargeHypertableIsBuiltOneChunkAtATimeNeverConcurrently) {
   const auto p = ts_plan(ts_index(json::array({"dev"})), ts_hypertable_obs());
   ASSERT_TRUE(p.ok) << p.render();
@@ -210,15 +247,16 @@ TEST(TimescaledbPlanner, WithTheColumnstoreAConstraintIsValidatedByTheStatementT
             {"name", "m_dev_fk"}, {"columns", json::array({"dev"})},
             {"references_schema", "public"}, {"references_table", "d"},
             {"references_columns", json::array({"id"})}},
-       "ALTER TABLE \"public\".\"m\" ADD CONSTRAINT \"m_dev_fk\" FOREIGN KEY (dev) "
-       "REFERENCES public.d (id);",
+       "ALTER TABLE \"public\".\"m\" ADD CONSTRAINT \"m_dev_fk\" FOREIGN KEY (\"dev\") "
+       "REFERENCES \"public\".\"d\" (\"id\");",
        "ShareRowExclusiveLock on public.m and each of its 15 chunks, held for the whole scan; "
        "ShareRowExclusiveLock on public.d for as long"}};
   for (const auto& c : cases) {
     const auto p = ts_plan(c.intent, cs);
     ASSERT_TRUE(p.ok) << c.intent.dump();
     ASSERT_EQ(p.steps.size(), 1u) << ts_sql(p);
-    EXPECT_EQ(p.steps[0].sql.at(0), c.sql);
+    EXPECT_EQ(p.steps[0].sql.at(0), "LOCK TABLE \"public\".\"m\" IN SHARE UPDATE EXCLUSIVE MODE;");
+    EXPECT_EQ(p.steps[0].sql.at(1), c.sql);
     EXPECT_EQ(p.steps[0].lock, c.lock);
     EXPECT_TRUE(p.steps[0].own_transaction);
     EXPECT_EQ(p.steps[0].detail.value("validated_in_one_step_by", ""), "timescaledb");
@@ -260,8 +298,8 @@ TEST(TimescaledbPlanner, WithoutTheColumnstoreTheTwoStepRecipeIsUnchanged) {
   const auto plain = ts_plan(in, obs);
   EXPECT_EQ(hyper.digest(), plain.digest());
   ASSERT_EQ(hyper.steps.size(), 2u);
-  EXPECT_NE(hyper.steps[0].sql.at(0).find("NOT VALID;"), std::string::npos);
-  EXPECT_NE(hyper.steps[1].sql.at(0).find("VALIDATE CONSTRAINT"), std::string::npos);
+  EXPECT_NE(hyper.steps[0].sql.back().find("NOT VALID;"), std::string::npos);
+  EXPECT_NE(hyper.steps[1].sql.back().find("VALIDATE CONSTRAINT"), std::string::npos);
 }
 
 // A policy step records what it declared -- applied or already satisfied -- so
@@ -495,4 +533,87 @@ TEST(TimescaledbPlanner, ATableCreatedInTheSameSpecificationIsMadeAHypertable) {
   EXPECT_TRUE(pglaswell::ts_is_time_type("Timestamp  With Time Zone"));
   EXPECT_FALSE(pglaswell::ts_is_time_type("timestamptzz"));
   EXPECT_FALSE(pglaswell::ts_is_time_type("bigint"));
+}
+
+// A hypertable's index, built one chunk at a time CONCURRENTLY. The per-chunk
+// option holds a write-blocking lock on chunk after chunk, and a write that
+// does not name the time column waits behind all of them -- found in the field,
+// updates by id stopped for the whole build. Measured on 2.30.2: the index ON
+// ONLY the parent, then CREATE INDEX CONCURRENTLY on each chunk, which
+// TimescaleDB counts as the hypertable index's (worst update 43 ms against
+// 3 491 ms). Offered only where that was measured.
+TEST(TimescaledbPlanner, AnIndexIsBuiltOnTheParentOnlyThenOnEachChunkConcurrently) {
+  const auto with_chunks = [](json h, json indexes_on_first = json::object()) {
+    h["chunks"] = json::array(
+        {json{{"relation", "_timescaledb_internal._hyper_1_1_chunk"},
+              {"indexes", std::move(indexes_on_first)}},
+         json{{"relation", "_timescaledb_internal._hyper_1_2_chunk"}, {"indexes", json::object()}},
+         json{{"relation", "_timescaledb_internal._hyper_1_3_chunk"}, {"indexes", json::object()}}});
+    return h;
+  };
+  const json index = ts_index(json::array({"dev"}));
+  const auto name = index.value("name", "");
+
+  auto p = ts_plan(index, ts_hypertable_obs(with_chunks(ts_hyper())));
+  ASSERT_TRUE(p.ok) << p.render();
+  std::vector<const pglaswell::Step*> builds;
+  for (const auto& s : p.steps) {
+    if (s.kind == "create_index" && s.txn_class == pglaswell::TxnClass::kForbidden) builds.push_back(&s);
+  }
+  ASSERT_EQ(builds.size(), 3u) << p.render();
+  // The parent first, in a transaction, behind the weaker lock.
+  EXPECT_EQ(p.steps[0].sql.at(0), "LOCK TABLE \"public\".\"m\" IN SHARE UPDATE EXCLUSIVE MODE;");
+  EXPECT_NE(p.steps[0].sql.at(1).find("CREATE INDEX \"" + name + "\" ON ONLY \"public\".\"m\" USING btree (\"dev\")"),
+            std::string::npos) << p.steps[0].sql.at(1);
+  EXPECT_EQ(ts_sql(p).find("transaction_per_chunk"), std::string::npos) << ts_sql(p);
+  // Each chunk by its own name, named as TimescaleDB names its own.
+  EXPECT_EQ(builds[0]->sql.at(0),
+            "CREATE INDEX CONCURRENTLY \"_hyper_1_1_chunk_" + name +
+                "\" ON \"_timescaledb_internal\".\"_hyper_1_1_chunk\" USING btree (\"dev\");");
+  EXPECT_EQ(builds[0]->detail.value("schema", ""), "_timescaledb_internal");
+  // And each is checked: a concurrent build can return and leave it invalid.
+  int checks = 0;
+  for (const auto& s : p.steps) if (s.kind == "verify_index_valid") ++checks;
+  EXPECT_EQ(checks, 3) << p.render();
+
+  // RESUMED. The parent's index is there; chunk 1 has its own, valid; chunk 2's
+  // concurrent build failed and left it invalid.
+  auto h = with_chunks(ts_hyper(), json{{"_hyper_1_1_chunk_" + name, true}});
+  h["chunks"][1]["indexes"] = json{{"_hyper_1_2_chunk_" + name, false}};
+  auto obs = ts_hypertable_obs(h);
+  obs.tables["public.m"]["indexes"][name] =
+      json{{"is_valid", true}, {"is_unique", false}, {"leading_column", "dev"},
+           {"columns", json::array({"dev"})}, {"predicate", ""}};
+  p = ts_plan(index, obs);
+  ASSERT_TRUE(p.ok) << p.render();
+  const auto sql = ts_sql(p);
+  EXPECT_EQ(sql.find("ON ONLY"), std::string::npos) << "the parent is not created twice: " << sql;
+  EXPECT_EQ(sql.find("_hyper_1_1_chunk"), std::string::npos) << "a finished chunk is left alone: " << sql;
+  EXPECT_NE(sql.find("DROP INDEX CONCURRENTLY \"_timescaledb_internal\".\"_hyper_1_2_chunk_" + name + "\";"),
+            std::string::npos) << sql;
+  EXPECT_NE(sql.find("CREATE INDEX CONCURRENTLY \"_hyper_1_3_chunk_" + name + "\""), std::string::npos);
+  // Every chunk done: satisfied.
+  for (auto& c : h["chunks"]) {
+    const auto rel = c.value("relation", "");
+    c["indexes"] = json{{rel.substr(rel.find('.') + 1) + "_" + name, true}};
+  }
+  obs = ts_hypertable_obs(h);
+  obs.tables["public.m"]["indexes"][name] =
+      json{{"is_valid", true}, {"is_unique", false}, {"leading_column", "dev"},
+           {"columns", json::array({"dev"})}, {"predicate", ""}};
+  p = ts_plan(index, obs);
+  ASSERT_EQ(p.steps.size(), 1u) << p.render();
+  EXPECT_EQ(p.steps[0].action, pglaswell::Action::kSatisfied);
+
+  // NOT offered where it was not measured: the columnstore, and 2.28. There
+  // the per-chunk option stands.
+  auto columnstore = ts_hypertable_obs(with_chunks(ts_hyper(512LL << 20, 4000000, true, 2)));
+  EXPECT_NE(ts_sql(ts_plan(index, columnstore)).find("transaction_per_chunk"), std::string::npos);
+  auto old = ts_hypertable_obs(with_chunks(ts_hyper()));
+  old.extensions["timescaledb"]["version"] = "2.28.3";
+  EXPECT_NE(ts_sql(ts_plan(index, old)).find("transaction_per_chunk"), std::string::npos);
+  // A UNIQUE index keeps the plain build: per-part uniqueness was not measured.
+  const auto uniq = ts_plan(ts_index(json::array({"id", "ts"}), true),
+                            ts_hypertable_obs(with_chunks(ts_hyper())));
+  EXPECT_EQ(ts_sql(uniq).find("ON ONLY"), std::string::npos) << ts_sql(uniq);
 }

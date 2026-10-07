@@ -491,6 +491,47 @@ inline std::string require_string(const json& obj, const std::string& key,
   return obj[key].get<std::string>();
 }
 
+// The key of a row-level kind: one column, or a list of columns that are unique
+// together -- a table keyed (tenant_id, id), or (id, created_at) where it is
+// partitioned by time, has no single column to match a row by.
+inline std::vector<std::string> row_key_columns(const json& body, const std::string& at,
+                                                std::size_t ordinal, bool required) {
+  std::vector<std::string> keys;
+  if (!body.contains("key")) {
+    if (required) {
+      fail(at + " is missing a non-empty \"key\"",
+           "Add \"key\": the column, or the list of columns, that identifies a row.");
+    }
+    return keys;
+  }
+  const auto& v = body["key"];
+  if (v.is_string()) {
+    keys.push_back(v.get<std::string>());
+  } else if (v.is_array() && !v.empty()) {
+    for (const auto& c : v) {
+      if (!c.is_string()) {
+        fail(at + ".key must be a column name or a list of column names",
+             "A string naming one column, or a list of strings naming the columns "
+             "that are unique together.");
+      }
+      keys.push_back(c.get<std::string>());
+    }
+  } else {
+    fail(at + ".key must be a column name or a non-empty list of column names",
+         "A string naming one column, or a list of strings naming the columns that "
+         "are unique together.");
+  }
+  for (std::size_t k = 0; k < keys.size(); ++k) {
+    require_identifier(keys[k], "key", ordinal);
+    for (std::size_t o = 0; o < k; ++o) {
+      if (keys[o] == keys[k]) {
+        fail(at + ".key names \"" + keys[k] + "\" twice", "Each column once.");
+      }
+    }
+  }
+  return keys;
+}
+
 inline void reject_unknown_keys(const json& obj, const std::set<std::string>& allowed,
                                 const std::string& at) {
   for (auto it = obj.begin(); it != obj.end(); ++it) {
@@ -539,7 +580,7 @@ inline void parse_add_column(Intent& in) {
   detail::reject_unknown_keys(
       in.body,
       {"kind", "schema", "table", "column", "type", "nullable", "default",
-       "comment"},
+       "comment", "fill", "key", "after"},
       at);
   detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
   detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
@@ -553,6 +594,136 @@ inline void parse_add_column(Intent& in) {
                  "meant must be written down rather than inferred.");
   }
   (void)detail::require_string(in.body, "comment", at);
+
+  // "fill": the value for a NOT NULL column that has no default, as one SQL
+  // expression over the row's own columns. It selects the recipe that adds the
+  // column nullable, fills new rows by trigger and old ones by a paced
+  // backfill, and only then sets NOT NULL (planner.h, plan_add_columns_filled).
+  //
+  // The hints below are also the reference page's text for each key
+  // (tools/manual_extract.py takes the first one that names it), so each is
+  // written to describe the key and not only the mistake.
+  if (in.body.contains("fill")) {
+    const auto& fill = in.body["fill"];
+    const bool one = fill.is_string() && !fill.get<std::string>().empty();
+    if (!one && !(fill.is_array() && !fill.empty())) {
+      detail::fail(at + ".fill must be a non-empty SQL expression, or a list of sources",
+                   "The value for a NOT NULL column that has no default: one "
+                   "SQL expression over the row's own columns, for example "
+                   "(payload->>'customer')::bigint -- or a list of sources "
+                   "tried in order, the first that gives a value winning. A "
+                   "source is such an expression, or {\"from\", \"on\", "
+                   "\"value\"} naming another table, how its row is found, and "
+                   "what is taken from it. The plan adds the column nullable "
+                   "with a trigger that fills it on insert and update, backfills "
+                   "the existing rows from the same sources, and sets NOT NULL "
+                   "last. Requires nullable false, no default, and \"after\".");
+    }
+    if (fill.is_array()) {
+      std::size_t n = 0;
+      for (const auto& src : fill) {
+        const std::string here = at + ".fill[" + std::to_string(n++) + "]";
+        if (src.is_string()) {
+          if (src.get<std::string>().empty()) {
+            detail::fail(here + " is an empty expression",
+                         "A source written as a string is one SQL expression "
+                         "over the row's own columns.");
+          }
+          continue;
+        }
+        if (!src.is_object()) {
+          detail::fail(here + " is neither an expression nor a source object",
+                       "Write a string, or {\"from\": \"schema.table AS s\", "
+                       "\"on\": \"s.id = <table>.some_id\", \"value\": \"s.column\"}.");
+        }
+        for (auto it = src.begin(); it != src.end(); ++it) {
+          if (it.key() != "from" && it.key() != "on" && it.key() != "value") {
+            detail::fail(here + " has an unknown key \"" + it.key() + "\"",
+                         "A source object has exactly \"from\", \"on\" and \"value\".");
+          }
+        }
+        for (const char* k : {"from", "on", "value"}) {
+          if (!src.contains(k) || !src[k].is_string() || src[k].get<std::string>().empty()) {
+            detail::fail(here + " needs a non-empty \"" + std::string(k) + "\"",
+                         "\"from\" is the other table, with an alias; \"on\" is "
+                         "how its row is found from this table's row, and must "
+                         "match at most one; \"value\" is the expression taken "
+                         "from it. A row with no match, or whose value is NULL, "
+                         "falls through to the next source.");
+          }
+        }
+      }
+    }
+    if (in.body["nullable"].get<bool>()) {
+      detail::fail(at + ".fill is for a column declared with nullable false",
+                   "A nullable column needs no recipe: add it, and use a "
+                   "backfill intent if existing rows should carry a value.");
+    }
+  }
+  // "default" WITH "fill" is its own recipe: the column is added NOT NULL with
+  // its default -- catalog-only, every row reads the default at once -- and the
+  // backfill then writes only the rows whose value differs from it. There is
+  // no trigger in it, so nothing for "after" to decide.
+  const bool defaulted_fill = in.body.contains("fill") && in.body.contains("default") &&
+                              !in.body["default"].is_null();
+  if (defaulted_fill && in.body.contains("after")) {
+    detail::fail(at + ".after does not apply when the column has a default",
+                 "With a default and a fill, no trigger is created: the column "
+                 "is NOT NULL from the start, rows written from then on get the "
+                 "default unless the application supplies a value, and the "
+                 "backfill writes the existing rows whose value differs from "
+                 "the default. Remove \"after\", or remove the default to have "
+                 "new rows filled by trigger.");
+  }
+  // No default for what happens to the trigger afterwards, for the reason
+  // "nullable" has none: whether the application writes the column itself is
+  // known to the author and to nobody else, and guessing wrong either breaks
+  // its inserts or leaves a trigger on every write for good.
+  if (!defaulted_fill && (in.body.contains("fill") || in.body.contains("after"))) {
+    if (!in.body.contains("fill")) {
+      detail::fail(at + ".after is only meaningful together with a fill expression",
+                   "With fill, required: what becomes of the trigger that fills "
+                   "the column once it is NOT NULL. drop_trigger if the "
+                   "application writes the column itself by then -- its inserts "
+                   "fail otherwise. keep_trigger if it does not: the trigger then "
+                   "stays on every insert and update until a later specification "
+                   "drops it.");
+    }
+    if (!in.body.contains("after") || !in.body["after"].is_string() ||
+        (in.body["after"] != "drop_trigger" && in.body["after"] != "keep_trigger")) {
+      detail::fail(at + ".after must be \"drop_trigger\" or \"keep_trigger\"",
+                   "Say what becomes of the trigger that fills the column once "
+                   "it is NOT NULL. There is no default: whether the application "
+                   "writes the column itself is known only to the author.");
+    }
+  }
+  if (in.body.contains("key")) {
+    if (!in.body.contains("fill")) {
+      detail::fail(at + ".key is only meaningful together with a fill expression",
+                   "With fill, optional: the column the backfill walks -- unique, or "
+                   "contained in a unique index over NOT NULL columns. It "
+                   "defaults to a column of the table's primary key.");
+    }
+    if (!in.body["key"].is_string()) {
+      detail::fail(at + ".key must be a column name", "A string naming one column.");
+    }
+    detail::require_identifier(in.body["key"].get<std::string>(), "key", in.ordinal);
+  }
+  if (!in.body.contains("fill")) return;
+  // The trigger, its function and the temporary check are named from the
+  // table and the column. PostgreSQL truncates an identifier at 63 bytes
+  // without saying so, and a truncated name is then not found under the name
+  // the plan uses.
+  const auto generated = in.body.value("table", "") + "_" + in.body.value("column", "") +
+                         "_laswell_fill";
+  if (generated.size() > 63) {
+    detail::fail(at + ": the generated name \"" + generated + "\" is " +
+                     std::to_string(generated.size()) + " bytes",
+                 "PostgreSQL truncates identifiers at 63 bytes. Write this "
+                 "column's recipe as separate intents (add_column nullable, "
+                 "create_function, create_trigger, backfill, set_not_null), "
+                 "where every name is yours to choose.");
+  }
 }
 
 inline void parse_backfill(Intent& in) {
@@ -2014,8 +2185,7 @@ inline void parse_row_source(Intent& in, const std::string& at,
 
     // The key must be a column the rows actually carry, or neither the keyset
     // walk nor the per-row match has anything to join on.
-    if (in.body.contains("key")) {
-      const auto key = in.body.value("key", "");
+    for (const auto& key : row_key_columns(in.body, at, in.ordinal, false)) {
       bool found = false;
       for (const auto& c : in.body["columns"]) {
         if (c.get<std::string>() == key) found = true;
@@ -2119,7 +2289,7 @@ inline void parse_delete_rows(Intent& in) {
                 "assert_invariants"}, at);
   detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
   detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
-  detail::require_identifier(detail::require_string(in.body, "key", at), "key", in.ordinal);
+  const auto delete_keys = detail::row_key_columns(in.body, at, in.ordinal, true);
 
   // The three forms are alternatives. `where` is the one this kind had first,
   // and its refusal is kept verbatim because it is the mistake people actually
@@ -2127,6 +2297,13 @@ inline void parse_delete_rows(Intent& in) {
   // deleting an explicit list of keys no longer has to invent a predicate.
   const bool has_values = in.body.contains("values");
   const bool has_select = in.body.contains("select");
+  if (!has_values && !has_select && delete_keys.size() > 1) {
+    detail::fail(at + ".key is a list, which the \"where\" form does not take",
+                 "With \"where\" the key is the one column the purge walks the "
+                 "table by; it need not be unique. A list of columns is for "
+                 "\"values\" and \"select\", where it says which row each entry "
+                 "names.");
+  }
   if (!has_values && !has_select) {
     const auto where = in.body.value("where", "");
     if (!in.body.contains("where") || !in.body["where"].is_string() || where.empty()) {
@@ -2153,9 +2330,7 @@ inline void parse_insert_rows(Intent& in) {
                 "assert_invariants"}, at);
   detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
   detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
-  if (in.body.contains("key")) {
-    detail::require_identifier(in.body.value("key", ""), "key", in.ordinal);
-  }
+  detail::row_key_columns(in.body, at, in.ordinal, false);
   detail::parse_row_source(in, at, "", false);
 
   // The select form has to say which columns it is filling, because
@@ -2257,7 +2432,7 @@ inline void parse_update_rows(Intent& in) {
       at);
   detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
   detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
-  detail::require_identifier(detail::require_string(in.body, "key", at), "key", in.ordinal);
+  const auto update_keys = detail::row_key_columns(in.body, at, in.ordinal, true);
   detail::parse_row_source(in, at, "identifies the row each set of values "
                                    "belongs to", false);
 
@@ -2269,17 +2444,18 @@ inline void parse_update_rows(Intent& in) {
                  "reason as the values form: to know which returned column is "
                  "which.");
   }
-  const auto key = in.body.value("key", "");
-  bool key_in_columns = false;
-  for (const auto& c : in.body["columns"]) {
-    if (c.is_string() && c.get<std::string>() == key) key_in_columns = true;
+  for (const auto& key : update_keys) {
+    bool key_in_columns = false;
+    for (const auto& c : in.body["columns"]) {
+      if (c.is_string() && c.get<std::string>() == key) key_in_columns = true;
+    }
+    if (!key_in_columns) {
+      detail::fail(at + ".columns does not include the key \"" + key + "\"",
+                   "The key identifies which row each set of values belongs to, "
+                   "so it has to be one of the columns supplied.");
+    }
   }
-  if (!key_in_columns) {
-    detail::fail(at + ".columns does not include the key \"" + key + "\"",
-                 "The key identifies which row each set of values belongs to, "
-                 "so it has to be one of the columns supplied.");
-  }
-  if (in.body["columns"].size() < 2) {
+  if (in.body["columns"].size() < update_keys.size() + 1) {
     detail::fail(at + " sets no columns",
                  "\"columns\" holds the key plus at least one column to change. "
                  "With only the key there is nothing to update, and if the "
@@ -2299,7 +2475,7 @@ inline void parse_merge_rows(Intent& in) {
                 "preserve", "assert_invariants"}, at);
   detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
   detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
-  detail::require_identifier(detail::require_string(in.body, "key", at), "key", in.ordinal);
+  const auto merge_keys = detail::row_key_columns(in.body, at, in.ordinal, true);
   detail::parse_row_source(in, at, "matches a source row to a target row", false);
 
   if (!in.body.contains("columns") || !in.body["columns"].is_array() ||
@@ -2308,16 +2484,19 @@ inline void parse_merge_rows(Intent& in) {
                  "Name the key and the columns the source carries, in order. "
                  "MERGE needs them to build both the INSERT and the UPDATE.");
   }
-  const auto key = in.body.value("key", "");
-  bool key_in_columns = false;
   for (const auto& c : in.body["columns"]) {
     if (!c.is_string()) detail::fail(at + ".columns entries must be strings", "");
-    if (c.get<std::string>() == key) key_in_columns = true;
   }
-  if (!key_in_columns) {
-    detail::fail(at + ".columns does not include the key \"" + key + "\"",
-                 "The key is what ON matches source rows to target rows by, so "
-                 "the source has to carry it.");
+  for (const auto& key : merge_keys) {
+    bool key_in_columns = false;
+    for (const auto& c : in.body["columns"]) {
+      if (c.get<std::string>() == key) key_in_columns = true;
+    }
+    if (!key_in_columns) {
+      detail::fail(at + ".columns does not include the key \"" + key + "\"",
+                   "The key is what ON matches source rows to target rows by, so "
+                   "the source has to carry it.");
+    }
   }
 
   const auto matched = in.body.value("when_matched", "update");
