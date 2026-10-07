@@ -1172,13 +1172,25 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
 // Data-modifying CTEs run whether or not the outer query reads them (measured:
 // the unreferenced INSERT ... ON CONFLICT still wrote its rows), so the
 // mutation happening in a CTE nobody selects from is deliberate and safe.
+//
+// A batch ends on a whole key, never part-way through one. The cursor is a key
+// VALUE, and nothing makes the key unique in the source -- a load into a
+// (tenant, id) table keyed by id repeats every id. Cut at LIMIT alone, the rows
+// that shared the batch's last key but fell past the limit were below the next
+// batch's cursor and were never considered: skipped, with no error. So LIMIT
+// finds the last key, and the batch is every row up to and including it. A
+// batch is therefore larger than its limit by the rows that share its last key.
 inline std::string paced_statement(const std::string& source_relation,
                                    const std::string& key,
                                    const std::string& mutation_cte) {
   const auto k = detail::quote_identifier(key);
   return "WITH src AS (\n" + source_relation + "\n"
          "), batch AS (\n"
-         "  SELECT * FROM src WHERE src." + k + " > $1 ORDER BY src." + k + " LIMIT $2\n"
+         "  SELECT * FROM src\n"
+         "   WHERE src." + k + " > $1\n"
+         "     AND src." + k + " <= (SELECT MAX(upto." + k + ") FROM (\n"
+         "           SELECT src." + k + " FROM src WHERE src." + k + " > $1\n"
+         "            ORDER BY src." + k + " LIMIT $2) AS upto)\n"
          "), " + mutation_cte + "\n"
          "SELECT batch." + k + " FROM batch ORDER BY batch." + k + ";";
 }

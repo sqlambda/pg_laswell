@@ -5027,6 +5027,51 @@ TEST_F(ToolTest, ACompositeWalkFillsATableKeyedByTimeAndIdInFullBatches) {
                 [0][0].as<int>(), 5000);
 }
 
+// A paced select names its cursor by a key VALUE, and nothing makes that key
+// unique in the source. Cut at LIMIT alone, the rows sharing a batch's last key
+// but past its limit were below the next cursor and never considered -- 6 000
+// source rows loaded as fewer, with no error. A batch ends on a whole key.
+TEST_F(ToolTest, APacedSelectLoadsEveryRowWhenTheKeyRepeatsInTheSource) {
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/ties");
+    w.txn().exec("DROP SCHEMA IF EXISTS shop CASCADE");
+    w.txn().exec("CREATE SCHEMA shop");
+    w.txn().exec("CREATE TABLE shop.staged(tenant int NOT NULL, id bigint NOT NULL, v text)");
+    // Every id three times, once a tenant: no batch of 100 ends between ids.
+    w.txn().exec("INSERT INTO shop.staged SELECT t, g, 'v' FROM generate_series(1, 2000) g,"
+                 " generate_series(1, 3) t");
+    w.txn().exec("CREATE TABLE shop.lines(tenant int NOT NULL, id bigint NOT NULL, v text,"
+                 " PRIMARY KEY (tenant, id))");
+    w.commit();
+  }
+  auto e = cfg().executor;
+  e.batch_rows = 100;
+  set_executor(e);
+
+  json doc = minimal_spec();
+  doc["id"] = "0012-lines-load";
+  doc["description"] = "Every staged line, for every tenant.";
+  doc["intents"] = json::array(
+      {json{{"kind", "insert_rows"}, {"schema", "shop"}, {"table", "lines"}, {"key", "id"},
+            {"columns", json::array({"tenant", "id", "v"})},
+            {"select", "SELECT tenant, id, v FROM shop.staged"}}});
+  {
+    const auto parsed = pglaswell::parse_spec(doc);
+    doc["signatures"] = json::array({{{"key_id", test_key().key_id},
+                                      {"algorithm", "ed25519"},
+                                      {"signature", base64(sign(parsed.canonical_bytes))}}});
+  }
+  const auto started = payload(call("startMigration", json{{"spec", doc}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, started["jobId"], [](const json& s) {
+    return s.value("state", "") == "succeeded";
+  })) << status_of(started["jobId"]).dump(2);
+
+  pglaswell::ReadSession r(cfg());
+  EXPECT_EQ(r.txn().exec("SELECT count(*) FROM shop.lines")[0][0].as<int>(), 6000);
+}
+
 TEST_F(ToolTest, AFailedStepFailsTheJobAndTheLedgerSaysWhich) {
   make_shop(cfg());
   // A backfill expression that parses and plans but fails at runtime: a cast

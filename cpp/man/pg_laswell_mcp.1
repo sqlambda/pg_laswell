@@ -880,7 +880,8 @@ A paced
 .Cm backfill
 of the rows already there, walking
 .Va key ,
-which defaults to the table's single-column primary key.
+which defaults to a column of the table's primary key;
+a composite key is walked whole, in its order.
 .It
 The
 .Cm set_not_null
@@ -1443,6 +1444,16 @@ nothing.
 The same trap waits for an update whose rows have gone and an insert whose
 every row hits
 .Ic ON CONFLICT DO NOTHING .
+.Pp
+A batch ends on a whole key.
+The cursor is a key value, and
+.Va key
+need not be unique in the source: the batch is every source row up to and
+including the key its row limit reaches, so it exceeds
+.Va batch_rows
+by the rows that share its last key.
+Cut at the limit alone, those rows would be below the next batch's cursor and
+never considered.
 .Pp
 .Cm insert_rows
 takes

@@ -240,6 +240,21 @@ The steps now also say that the lock must be granted before it is brief: behind
 a long transaction or an autovacuum it waits, and every session queues behind
 it until `lock_timeout`.
 
+### A paced `select` no longer skips rows that share a key
+
+`insert_rows`, `update_rows`, `delete_rows` and `merge_rows` with a `select`
+walk their source by `key`, a batch at a time, and remember the last key of each
+batch. Nothing makes that key unique in the source -- a load into a
+`(tenant, id)` table keyed by `id` repeats every id -- and a batch was cut at its
+row limit alone. The rows that shared the batch's last key but fell past the
+limit were below the next batch's starting point and were never considered.
+Measured: a source of 6,000 rows, each id three times, in batches of 100, had
+5,884 considered and 116 skipped, with no error.
+
+A batch now ends on a whole key: the limit finds the last key, and the batch is
+every row up to and including it. It is therefore larger than `batch_rows` by
+the rows that share its last key.
+
 ### Plans that could not run
 
 - `detach_partition` chose `DETACH ... CONCURRENTLY` for a large or busy
