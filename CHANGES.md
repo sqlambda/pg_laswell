@@ -1,6 +1,6 @@
 # Changes
 
-## Unreleased
+## 0.1.4
 
 Findings from a field report -- a 10-million-row table under 1,000 inserts
 a second, where `set_not_null` stopped every insert for three seconds before its
