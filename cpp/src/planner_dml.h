@@ -1250,9 +1250,12 @@ inline std::string paced_statement(const std::string& source_relation,
          "), batch AS (\n"
          "  SELECT * FROM src\n"
          "   WHERE src." + k + " > $1\n"
-         "     AND src." + k + " <= (SELECT MAX(upto." + k + ") FROM (\n"
+         // The last key by ORDER BY, not by MAX: not every type that sorts has
+         // a max() aggregate.
+         "     AND src." + k + " <= (SELECT upto." + k + " FROM (\n"
          "           SELECT src." + k + " FROM src WHERE src." + k + " > $1\n"
-         "            ORDER BY src." + k + " LIMIT $2) AS upto)\n"
+         "            ORDER BY src." + k + " LIMIT $2) AS upto\n"
+         "          ORDER BY upto." + k + " DESC LIMIT 1)\n"
          "), " + mutation_cte + "\n"
          "SELECT batch." + k + " FROM batch ORDER BY batch." + k + ";";
 }

@@ -33,7 +33,12 @@ RETURNING "order"."end";
   SELECT * FROM (VALUES (1::bigint, 'a'::text),
         (2, 'b')) AS v ("end", "desc")
 ), batch AS (
-  SELECT * FROM src WHERE src."end" > $1 ORDER BY src."end" LIMIT $2
+  SELECT * FROM src
+   WHERE src."end" > $1
+     AND src."end" <= (SELECT upto."end" FROM (
+           SELECT src."end" FROM src WHERE src."end" > $1
+            ORDER BY src."end" LIMIT $2) AS upto
+          ORDER BY upto."end" DESC LIMIT 1)
 ), ins AS (
   INSERT INTO "user"."order" ("end", "desc")
   SELECT batch."end", batch."desc" FROM batch
@@ -49,7 +54,12 @@ SELECT batch."end" FROM batch ORDER BY batch."end";
   SELECT * FROM (VALUES (1::bigint, 'c'::text),
         (2, 'd')) AS v ("end", "desc")
 ), batch AS (
-  SELECT * FROM src WHERE src."end" > $1 ORDER BY src."end" LIMIT $2
+  SELECT * FROM src
+   WHERE src."end" > $1
+     AND src."end" <= (SELECT upto."end" FROM (
+           SELECT src."end" FROM src WHERE src."end" > $1
+            ORDER BY src."end" LIMIT $2) AS upto
+          ORDER BY upto."end" DESC LIMIT 1)
 ), upd AS (
   UPDATE "user"."order"
      SET "desc" = batch."desc"
@@ -67,7 +77,12 @@ SELECT batch."end" FROM batch ORDER BY batch."end";
   SELECT * FROM (VALUES (1::bigint),
         (2)) AS v ("end")
 ), batch AS (
-  SELECT * FROM src WHERE src."end" > $1 ORDER BY src."end" LIMIT $2
+  SELECT * FROM src
+   WHERE src."end" > $1
+     AND src."end" <= (SELECT upto."end" FROM (
+           SELECT src."end" FROM src WHERE src."end" > $1
+            ORDER BY src."end" LIMIT $2) AS upto
+          ORDER BY upto."end" DESC LIMIT 1)
 ), del AS (
   DELETE FROM "user"."order"
    USING batch
@@ -83,7 +98,12 @@ SELECT batch."end" FROM batch ORDER BY batch."end";
     WITH src AS (
   SELECT * FROM (VALUES (3::bigint, 'e'::text)) AS v ("end", "desc")
 ), batch AS (
-  SELECT * FROM src WHERE src."end" > $1 ORDER BY src."end" LIMIT $2
+  SELECT * FROM src
+   WHERE src."end" > $1
+     AND src."end" <= (SELECT upto."end" FROM (
+           SELECT src."end" FROM src WHERE src."end" > $1
+            ORDER BY src."end" LIMIT $2) AS upto
+          ORDER BY upto."end" DESC LIMIT 1)
 ), m AS (
   MERGE INTO "user"."order" USING batch
      ON "user"."order"."end" = batch."end"

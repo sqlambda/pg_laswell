@@ -247,7 +247,17 @@ for edition in tsl apache oldest; do
   ck='{"kind":"add_check_constraint","schema":"public","table":"m","name":"m_v_ck","expression":"v >= 0"}'
   fk='{"kind":"add_foreign_key","schema":"public","table":"m","name":"m_dev_fk","columns":["dev"],"references_schema":"public","references_table":"d","references_columns":["id"]}'
   clean "set_not_null, a check and a foreign key with the columnstore" "$U" "$nn,$ck,$fk"
+  # Each scans under its own lock, so the dry run leaves all three to the job.
+  plan "$U" "$nn,$ck,$fk" | grep -q '"unverifiedSteps":\[0,1,2\]' \
+    && ok "the three validating statements are planned and left to the job" \
+    || bad "a statement that validates under its lock should not be rehearsed" "$(plan "$U" "$nn,$ck,$fk")"
   sql=$(plan_sql "$U" "$nn,$ck,$fk")
+  # So what the dry run no longer proves is proved here: the server accepts
+  # each statement as planned.
+  raw=$(q "$U" "BEGIN; $(echo "$sql" | tr '\n' ' ') ROLLBACK;")
+  echo "$raw" | grep -q "ERROR" \
+    && bad "the server refuses a one-step validating statement as planned" "$raw" \
+    || ok "the server accepts the three statements as planned"
   if [ "$(echo "$sql" | grep -c .)" = 3 ] && ! echo "$sql" | grep -q "NOT VALID\|VALIDATE"; then
     ok "each is one validating statement"
   else
@@ -255,17 +265,22 @@ for edition in tsl apache oldest; do
   fi
   plan "$U" "$ck" | grep -q "validated in one statement" \
     && ok "and the plan says what the lock costs" || bad "the one-step warning is missing" "$(plan "$U" "$ck")"
-  # A violating row written into a converted chunk is found in the dry run.
+  # A violating row written into a converted chunk is found by the statement,
+  # which is where the job would meet it: the dry run plans and does not scan.
   q "$U" "INSERT INTO public.m VALUES (0, now() - INTERVAL '6 days', 99, -1)" >/dev/null
   q "$U" "SELECT compress_chunk(c, if_not_compressed => true) FROM show_chunks('public.m', older_than => INTERVAL '2 days') c" >/dev/null
   out=$(plan "$U" "$ck")
-  echo "$out" | grep -q "is violated by some row" \
-    && ok "a check violated in a converted chunk is caught in the dry run" \
-    || bad "the dry run should report the violated check" "$out"
-  out=$(plan "$U" "$fk")
-  echo "$out" | grep -q "violates foreign key constraint" \
-    && ok "a foreign key violated in a converted chunk is caught in the dry run" \
-    || bad "the dry run should report the violated foreign key" "$out"
+  echo "$out" | grep -q '"ok":true' && ! echo "$out" | grep -q "is violated by some row" \
+    && ok "the dry run does not scan for a violated check" \
+    || bad "the dry run should leave the validating scan to the job" "$out"
+  raw=$(q "$U" "BEGIN; $(plan_sql "$U" "$ck" | tr '\n' ' ') ROLLBACK;")
+  echo "$raw" | grep -q "is violated by some row" \
+    && ok "a check violated in a converted chunk is reported by the planned statement" \
+    || bad "the planned statement should report the violated check" "$raw"
+  raw=$(q "$U" "BEGIN; $(plan_sql "$U" "$fk" | tr '\n' ' ') ROLLBACK;")
+  echo "$raw" | grep -q "violates foreign key constraint" \
+    && ok "a foreign key violated in a converted chunk is reported by the planned statement" \
+    || bad "the planned statement should report the violated foreign key" "$raw"
   # The other direction: a plain table referencing a columnstore hypertable.
   # VALIDATE runs on the plain table, so the two-step recipe stands (measured).
   q "$U" "CREATE TABLE public.h2 (ts timestamptz NOT NULL, dev int NOT NULL, PRIMARY KEY (dev, ts));
