@@ -258,7 +258,8 @@ for edition in tsl apache oldest; do
   echo "$raw" | grep -q "ERROR" \
     && bad "the server refuses a one-step validating statement as planned" "$raw" \
     || ok "the server accepts the three statements as planned"
-  if [ "$(echo "$sql" | grep -c .)" = 3 ] && ! echo "$sql" | grep -q "NOT VALID\|VALIDATE"; then
+  # Each behind the weaker lock on the hypertable, which is not counted.
+  if [ "$(echo "$sql" | grep -v '^LOCK TABLE ' | grep -c .)" = 3 ] && ! echo "$sql" | grep -q "NOT VALID\|VALIDATE"; then
     ok "each is one validating statement"
   else
     bad "expected three statements and neither NOT VALID nor VALIDATE" "$sql"

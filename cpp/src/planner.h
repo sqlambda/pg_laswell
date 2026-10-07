@@ -1459,6 +1459,107 @@ inline void project(const Intent& in, const Step& step, Observations& projected)
   }
 }
 
+namespace detail {
+// EVERY step that asks for a lock the application queues behind, on a table
+// that is already there, takes the weaker lock first and is marked for the
+// executor's short-timeout retry (weaker_lock_first, above).
+//
+// The recipes had it where a field report found the queue: set_not_null, the
+// NOT VALID adds, the fill recipe. The same request is made by a plain ADD
+// COLUMN, a DROP COLUMN, a rename, a trigger, a policy -- an audit counted
+// some thirty kinds -- and behind an autovacuum or one long transaction each
+// of them stops the application for all of lock_timeout in the same way. So
+// it is done here, once, for whatever a kind's planner emitted, rather than
+// remembered at thirty sites.
+//
+// Not a scan (VALIDATE takes only the weaker lock anyway), not a step outside
+// a transaction, not one that already has it, and not a statement on an index
+// alone. Only an ordinary or partitioned table can be named in LOCK TABLE.
+inline void take_weaker_lock_first(const Intent& in, const Observations& obs,
+                                   std::vector<Step>& steps) {
+  std::vector<std::string> tables;
+  switch (in.kind) {
+    case IntentKind::kAddColumn:
+    case IntentKind::kDropColumn:
+    case IntentKind::kAlterColumnType:
+    case IntentKind::kDropConstraint:
+    case IntentKind::kRenameTable:
+    case IntentKind::kRenameColumn:
+    case IntentKind::kRenameConstraint:
+    case IntentKind::kDropTable:
+    case IntentKind::kCreateTrigger:
+    case IntentKind::kDropTrigger:
+    case IntentKind::kSetTriggerState:
+    case IntentKind::kSetRowSecurity:
+    case IntentKind::kCreatePolicy:
+    case IntentKind::kAlterPolicy:
+    case IntentKind::kDropPolicy:
+    case IntentKind::kAlterColumnDefault:
+    case IntentKind::kDropNotNull:
+    case IntentKind::kSetIdentity:
+    case IntentKind::kDropExpression:
+    case IntentKind::kSetColumnOptions:
+    case IntentKind::kSetLogged:
+    case IntentKind::kSetTablespace:
+    case IntentKind::kSetAccessMethod:
+    case IntentKind::kSetReplicaIdentity:
+    case IntentKind::kCreateRule:
+    case IntentKind::kDropRule:
+    case IntentKind::kSetOwner:
+    case IntentKind::kAddPrimaryKey:
+    case IntentKind::kAddUniqueConstraint:
+    case IntentKind::kAddCheckConstraint:
+    case IntentKind::kAddForeignKey:
+    case IntentKind::kSetNotNull:
+    case IntentKind::kCreateIndex:
+    case IntentKind::kDropIndex:
+      tables.push_back(in.qualified_table());
+      break;
+    case IntentKind::kAttachPartition:
+      tables.push_back(in.body.value("schema", "") + "." + in.body.value("partition", ""));
+      break;
+    case IntentKind::kDetachPartition:
+      tables.push_back(in.qualified_table());
+      tables.push_back(in.body.value("schema", "") + "." + in.body.value("partition", ""));
+      break;
+    case IntentKind::kCreateTable:
+      if (in.body.contains("partition_of") && in.body["partition_of"].is_string()) {
+        tables.push_back(in.body["partition_of"].get<std::string>());
+      }
+      break;
+    default:
+      return;
+  }
+  std::vector<std::string> lockable;
+  for (const auto& q : tables) {
+    const auto& t = obs.table(q);
+    const auto kind = t.value("kind", "");
+    if (t.value("exists", false) && (kind == "table" || kind == "partitioned_table")) {
+      lockable.push_back(quote_qualified(q));
+    }
+  }
+  if (lockable.empty()) return;
+  for (auto& step : steps) {
+    if (step.action != Action::kApply || step.sql.empty()) continue;
+    if (step.txn_class != TxnClass::kRequired && step.txn_class != TxnClass::kOptional) continue;
+    if (step.detail.value("exclusive_retry", false)) continue;
+    // Only a lock that readers or writers wait behind.
+    if (step.lock.find("AccessExclusiveLock") == std::string::npos &&
+        step.lock.find("ShareRowExclusiveLock") == std::string::npos &&
+        step.lock.find("ShareLock") == std::string::npos) {
+      continue;
+    }
+    bool skip = false;
+    for (const auto& q : step.sql) {
+      if (q.find("VALIDATE CONSTRAINT") != std::string::npos) skip = true;
+    }
+    if (step.sql.front().rfind("ALTER INDEX ", 0) == 0) skip = true;
+    if (skip) continue;
+    weaker_lock_first(step, lockable);
+  }
+}
+}  // namespace detail
+
 // Every enabled module's answer to: how may an index be built and dropped on
 // this table? (planner_base.h, IndexTraits). EVERY module is asked and the
 // answers are merged, because they answer different questions: how to build,
@@ -6181,7 +6282,8 @@ inline void plan_unique_on_partitions(const Intent& in, const json& t, bool prim
                    "nothing, so this scans nothing. It stays INVALID until every "
                    "partition's index is attached, and a partition created meanwhile "
                    "gets the constraint by itself");
-    weaker_lock_first(s, {sql_rel});
+    // ONLY here too: without it LOCK TABLE takes every partition as well.
+    weaker_lock_first(s, {"ONLY " + sql_rel});
   }
 
   std::size_t n = 0;
@@ -7644,6 +7746,7 @@ inline Plan plan_migration(const Spec& spec, const Observations& obs,
       case IntentKind::kRevoke:
         plan_security(in, projected, plan, emitted); break;
     }
+    detail::take_weaker_lock_first(in, projected, emitted);
     detail::append_creation_comment(in, emitted);
     if (!emitted.empty()) project(in, emitted.front(), projected);
 

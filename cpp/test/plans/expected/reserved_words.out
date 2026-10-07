@@ -2,15 +2,17 @@ Plan for 0009-reserved-words  (digest 13523d18c4aa…)
 
 -- transaction group 1 ---------------- atomic --
  0. add_column
+    LOCK TABLE "user"."order" IN SHARE UPDATE EXCLUSIVE MODE;
     ALTER TABLE "user"."order" ADD COLUMN "table" text;
     COMMENT ON COLUMN "user"."order"."table" IS 'Reserved.';
     lock: AccessExclusiveLock
-    why:  column absent; nullable with no default is catalog-only
+    why:  column absent; nullable with no default is catalog-only. SHARE UPDATE EXCLUSIVE is taken first: it waits out an autovacuum without queueing reads or writes, and the exclusive lock after it is asked for with a short timeout and retried
  1. create_index
+    LOCK TABLE "user"."order" IN SHARE UPDATE EXCLUSIVE MODE;
     CREATE INDEX "limit" ON "user"."order" USING btree ("desc");
     COMMENT ON INDEX "user"."limit" IS 'Reserved.';
     lock: ShareLock (blocks writes for the whole build)
-    why:  size 8.0 KiB < 64 MiB ceiling, 0 lock waiters -> plain build (transactional, cannot leave an invalid index)
+    why:  size 8.0 KiB < 64 MiB ceiling, 0 lock waiters -> plain build (transactional, cannot leave an invalid index). SHARE UPDATE EXCLUSIVE is taken first: it waits out an autovacuum without queueing reads or writes, and the exclusive lock after it is asked for with a short timeout and retried
 
 -- transaction group 2 ---------------- NOT atomic: paced, many commits --
  2. backfill

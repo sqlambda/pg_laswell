@@ -573,6 +573,37 @@ Found while measuring, and now in the man page: dropping a role that still has
 a job makes the pg_cron launcher exit and restart every second, and no job runs
 until the row is removed.
 
+### Every exclusive step takes the weaker lock first, and a group retries whole
+
+The weaker-lock-first retry was on the recipes where a field report found the
+queue. The same request for `AccessExclusiveLock` is made by a plain
+`add_column`, `drop_column`, `alter_column_type`, the renames, triggers,
+policies, `drop_constraint`, a plain index build, the steps of
+`attach_partition` and `detach_partition`, and some twenty more kinds; behind
+an autovacuum or one long transaction each stopped the application for all of
+`lock_timeout_ms`. Every such step on a table that is already there now begins
+with `LOCK TABLE ... IN SHARE UPDATE EXCLUSIVE MODE` and is retried on a short
+timeout. It is applied in one place, after a kind's planner has run, to
+whatever it emitted.
+
+Most of those steps share their transaction with their neighbours, where the
+retry did not apply: it rolled back only a step that opened its transaction.
+The retry is now the group's. When a step does not get its lock, the
+transaction is rolled back -- releasing the pending request, and every lock the
+steps before it had taken -- and the group is run again from its first step.
+Intents that commit together still do. The short timeout is put back after the
+step that set it, so a step after it in the same transaction is not failed by a
+wait of 200 ms.
+
+The dry run asks for the same locks and waited 2 s for each, with the
+application queued, and reported a lock it did not get as a problem with the
+plan. After the weaker lock it now waits 200 ms, once; when the lock does not
+come it stops, reports `lockUnavailableAtStep`, and lists the rest as
+unverified.
+
+Not done for the module kinds, whose locks are taken inside the vendor's
+functions and have not been measured behind a weaker lock.
+
 ### Unique constraints on a partitioned table, a partition at a time
 
 `add_unique_constraint` and `add_primary_key` did not know a partitioned table

@@ -237,7 +237,8 @@ TEST(TimescaledbPlanner, WithTheColumnstoreAConstraintIsValidatedByTheStatementT
     const auto p = ts_plan(c.intent, cs);
     ASSERT_TRUE(p.ok) << c.intent.dump();
     ASSERT_EQ(p.steps.size(), 1u) << ts_sql(p);
-    EXPECT_EQ(p.steps[0].sql.at(0), c.sql);
+    EXPECT_EQ(p.steps[0].sql.at(0), "LOCK TABLE \"public\".\"m\" IN SHARE UPDATE EXCLUSIVE MODE;");
+    EXPECT_EQ(p.steps[0].sql.at(1), c.sql);
     EXPECT_EQ(p.steps[0].lock, c.lock);
     EXPECT_TRUE(p.steps[0].own_transaction);
     EXPECT_EQ(p.steps[0].detail.value("validated_in_one_step_by", ""), "timescaledb");

@@ -478,7 +478,15 @@ class Executor {
     // opens. Declared out here so committing the group releases it.
     OperationGate::Slot group_slot;
 
-    for (const auto& step : steps) {
+    // Where the open group began, and how often and since when it has been
+    // tried: an exclusive step whose lock does not come rolls the WHOLE group
+    // back and the group is run again from its first step.
+    std::size_t group_first = 0;
+    int group_attempt = 1;
+    long long group_began = 0;
+
+    for (std::size_t at = 0; at < steps.size(); ++at) {
+      const auto& step = steps[at];
       if (job_->pacing.cancel_stop.load()) {
         if (group_open) worker.rollback();
         cancelled();
@@ -527,36 +535,76 @@ class Executor {
       // COPY carries a payload after its statement, so it cannot go through
       // exec() with the rest. It still belongs to the current transaction
       // group -- COPY is transactional, and rolls back with everything else.
+      // Opens the group's transaction at this step, if it is not open. A
+      // group being tried again keeps its count and its clock.
+      const auto open_group = [&]() {
+        if (group_open) return;
+        group_slot = operation_slot();
+        worker.begin(app_name(ordinal));
+        group_open = true;
+        if (group_first != at || group_began == 0) {
+          group_first = at;
+          group_attempt = 1;
+          group_began = detail::steady_ms();
+        }
+      };
       if (kind == "copy_rows" && step.value("detail", json::object())
                                      .contains("copy_rows")) {
-        if (!group_open) {
-          group_slot = operation_slot();
-          worker.begin(app_name(ordinal));
-          group_open = true;
-        }
+        open_group();
         run_copy(worker, ordinal, step);
         continue;
       }
 
-      // A step that asks for an exclusive lock and stands alone in its
-      // transaction is run so that the application does not queue behind the
-      // request; see run_exclusive. Alone, because a retry rolls back, and
-      // only a step that opens its transaction has nothing of an earlier
-      // step's to lose.
-      if (!group_open &&
-          step.value("detail", json::object()).value("exclusive_retry", false)) {
-        if (!run_exclusive(worker, ordinal, step, group_slot)) {
+      open_group();
+
+      // A step that asks for an exclusive lock is run so that the application
+      // does not queue behind the request for long: the weaker lock first,
+      // then the exclusive one with a short timeout (run_in_transaction). When
+      // it does not come, the transaction is rolled back -- which releases the
+      // pending request the application was queued behind, and everything the
+      // steps before it in this group had done and locked -- and the group is
+      // run again from its first step after a pause. Whole, so that intents
+      // that commit together still do: a retry never leaves half a group
+      // applied.
+      if (step.value("detail", json::object()).value("exclusive_retry", false)) {
+        bool timed_out = false;
+        run_in_transaction(worker, ordinal, step, &timed_out, group_attempt);
+        if (!timed_out) continue;
+        worker.rollback();
+        group_open = false;
+        group_slot = OperationGate::Slot();
+        if (job_->pacing.cancel_stop.load()) {
           cancelled();
           return;
         }
-        group_open = true;
+        const long long patience = static_cast<long long>(cfg_.executor.lock_timeout_ms) *
+                                   kExclusivePatienceFactor;
+        const long long waited = detail::steady_ms() - group_began;
+        if (waited >= patience) {
+          record_step(ordinal, step, "lock_not_acquired", 0,
+                      json{{"sqlstate", "55P03"},
+                           {"lockAttempts", group_attempt},
+                           {"note",
+                            "the exclusive lock was not available in " +
+                                std::to_string(group_attempt) + " attempts over " +
+                                std::to_string(waited) +
+                                " ms; nothing was applied. Each attempt waited at most " +
+                                std::to_string(kExclusiveTryMs) +
+                                " ms, so the application was never queued for longer. "
+                                "Something holds a lock on the table for a long time -- "
+                                "pg_licht currentLocks names the holder."}});
+          throw std::runtime_error("step " + std::to_string(ordinal) +
+                                   " could not acquire its exclusive lock in " +
+                                   std::to_string(group_attempt) + " attempts");
+        }
+        // What the steps before it in this group reported is no longer true.
+        forget_steps_from(steps[group_first].value("ordinal", 0));
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(std::min(100 * group_attempt, 1000)));
+        ++group_attempt;
+        // Back to the group's first step: the loop's ++at lands on it.
+        at = group_first - 1;
         continue;
-      }
-
-      if (!group_open) {
-        group_slot = operation_slot();
-        worker.begin(app_name(ordinal));
-        group_open = true;
       }
       run_in_transaction(worker, ordinal, step);
     }
@@ -618,54 +666,17 @@ class Executor {
   static constexpr int kExclusiveTryMs = 200;
   static constexpr int kExclusivePatienceFactor = 20;  // x lock_timeout_ms
 
-  // A step that needs an exclusive lock, in a transaction of its own.
-  //
-  // The plan put LOCK TABLE ... IN SHARE UPDATE EXCLUSIVE MODE first
-  // (planner.h, weaker_lock_first): that waits with the ordinary lock_timeout,
-  // behind an autovacuum or other DDL, and nothing the application does queues
-  // behind it. What follows asks for the exclusive lock with a SHORT timeout.
-  // If a long application transaction is in the way the attempt gives up after
-  // kExclusiveTryMs, the transaction is rolled back -- releasing the pending
-  // request the application was queued behind -- and it is tried again after a
-  // pause. So the application waits a fraction of a second at a time, where it
-  // used to wait all of lock_timeout and the step then failed anyway.
-  //
-  // Returns false when the job was cancelled between attempts. Leaves the
-  // transaction OPEN on success, as the caller's group.
-  bool run_exclusive(WriteSession& w, int ordinal, const json& step,
-                     OperationGate::Slot& slot) {
-    const auto began = detail::steady_ms();
-    const long long patience =
-        static_cast<long long>(cfg_.executor.lock_timeout_ms) * kExclusivePatienceFactor;
-    for (int attempt = 1;; ++attempt) {
-      slot = operation_slot();
-      w.begin(app_name(ordinal));
-      bool timed_out = false;
-      run_in_transaction(w, ordinal, step, &timed_out, attempt);
-      if (!timed_out) return true;
-      w.rollback();
-      slot = OperationGate::Slot();
-      if (job_->pacing.cancel_stop.load()) return false;
-      if (detail::steady_ms() - began >= patience) {
-        record_step(ordinal, step, "lock_not_acquired", 0,
-                    json{{"sqlstate", "55P03"},
-                         {"lockAttempts", attempt},
-                         {"note",
-                          "the exclusive lock was not available in " +
-                              std::to_string(attempt) + " attempts over " +
-                              std::to_string(detail::steady_ms() - began) +
-                              " ms; nothing was applied. Each attempt waited at most " +
-                              std::to_string(kExclusiveTryMs) +
-                              " ms, so the application was never queued for longer. "
-                              "Something holds a lock on the table for a long time -- "
-                              "pg_licht currentLocks names the holder."}});
-        throw std::runtime_error("step " + std::to_string(ordinal) +
-                                 " could not acquire its exclusive lock in " +
-                                 std::to_string(attempt) + " attempts");
-      }
-      std::this_thread::sleep_for(
-          std::chrono::milliseconds(std::min(100 * attempt, 1000)));
-    }
+  // The steps of a group that is being run again, out of the job's in-memory
+  // record: they were rolled back. The ledger's rows are replaced when the
+  // steps run again (it keeps one row a step).
+  void forget_steps_from(int first_ordinal) {
+    std::lock_guard<std::mutex> lock(job_->m);
+    auto& done = job_->steps;
+    done.erase(std::remove_if(done.begin(), done.end(),
+                              [first_ordinal](const json& s) {
+                                return s.value("ordinal", -1) >= first_ordinal;
+                              }),
+               done.end());
   }
 
   // `lock_timed_out`, when given, makes a lock timeout the CALLER's to handle:
@@ -728,6 +739,13 @@ class Executor {
       }
     }
     if (mwm > 0) w.txn().exec("SET LOCAL maintenance_work_mem TO DEFAULT");
+    // The short timeout was this step's. The steps after it share the
+    // transaction, and one that is not marked for a retry would fail outright
+    // on a wait this short.
+    if (gated) {
+      w.txn().exec("SET LOCAL lock_timeout = " +
+                   std::to_string(cfg_.executor.lock_timeout_ms));
+    }
     json result{{"elapsedMs", detail::steady_ms() - started}};
     if (lock_timed_out != nullptr) result["lockAttempts"] = attempt;
     record_step(ordinal, step, "succeeded", rows, result);

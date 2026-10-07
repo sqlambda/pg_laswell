@@ -1920,8 +1920,10 @@ TEST(Planner, AnInvalidIndexOnASmallQuietTableIsDroppedInTheTransactionThatRebui
   const auto* s = find_step(plan, "create_index");
   ASSERT_NE(s, nullptr);
   EXPECT_EQ(s->txn_class, pglaswell::TxnClass::kOptional) << plan.render();
-  ASSERT_GE(s->sql.size(), 2u) << all_sql(*s);
-  EXPECT_EQ(s->sql[0].rfind("DROP INDEX \"shop\".", 0), 0u) << s->sql[0];
+  ASSERT_GE(s->sql.size(), 3u) << all_sql(*s);
+  // The weaker lock first, as every step that blocks writes on a table has.
+  EXPECT_EQ(s->sql[0], "LOCK TABLE \"shop\".\"orders\" IN SHARE UPDATE EXCLUSIVE MODE;");
+  EXPECT_EQ(s->sql[1].rfind("DROP INDEX \"shop\".", 0), 0u) << s->sql[1];
   EXPECT_EQ(all_sql(*s).find("CONCURRENTLY"), std::string::npos) << all_sql(*s);
 }
 
@@ -2059,7 +2061,7 @@ TEST(Planner, AUniqueConstraintOnAPartitionedTableIsARecipeOverItsPartitions) {
   // Parent alone; 2024 built, adopted, attached; 2025 -- already built and
   // adopted by an earlier attempt -- only attached; then the check.
   ASSERT_EQ(sql.size(), 6u) << plan.render();
-  EXPECT_NE(sql[0].find("LOCK TABLE \"shop\".\"orders\" IN SHARE UPDATE EXCLUSIVE MODE;"),
+  EXPECT_NE(sql[0].find("LOCK TABLE ONLY \"shop\".\"orders\" IN SHARE UPDATE EXCLUSIVE MODE;"),
             std::string::npos) << sql[0];
   EXPECT_NE(sql[0].find("ALTER TABLE ONLY \"shop\".\"orders\" ADD CONSTRAINT \"orders_key\" "
                         "UNIQUE (\"created_at\", \"id\");"),
@@ -4959,6 +4961,122 @@ TEST_F(ToolTest, AnExclusiveStepBehindALongTransactionRetriesAndLetsTheApplicati
   EXPECT_GT(attempts[0][0].as<int>(), 1) << "the first step should have needed more than one try";
   EXPECT_TRUE(r.txn().exec("SELECT attnotnull FROM pg_attribute WHERE attrelid ="
                            " 'shop.orders'::regclass AND attname = 'warehouse_id'")[0][0].as<bool>());
+}
+
+// The dry run asks for the same exclusive lock the job will, and the
+// application queues behind that request in a planning call as it does in a
+// job. So it waits as briefly as one attempt of the job, and a lock that does
+// not come is not a defect in the plan: the rest is unverified, and said so.
+TEST_F(ToolTest, TheDryRunDoesNotQueueTheApplicationForAnExclusiveLock) {
+  make_shop(cfg());
+  json doc = minimal_spec();
+  doc["id"] = "0010-orders-note";
+  doc["description"] = "A note on each order.";
+  doc["intents"] = json::array(
+      {json{{"kind", "add_column"}, {"schema", "shop"}, {"table", "orders"},
+            {"column", "note"}, {"type", "text"}, {"nullable", true},
+            {"comment", "Free text."}}});
+  {
+    const auto parsed = pglaswell::parse_spec(doc);
+    doc["signatures"] = json::array({{{"key_id", test_key().key_id},
+                                      {"algorithm", "ed25519"},
+                                      {"signature", base64(sign(parsed.canonical_bytes))}}});
+  }
+  pqxx::connection app_conn(cfg().conninfo);
+  pqxx::work app(app_conn);
+  app.exec("UPDATE shop.orders SET status = status WHERE id = 1");
+
+  const auto t0 = std::chrono::steady_clock::now();
+  const auto plan = payload(call("planMigration", json{{"spec", doc}}));
+  const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0).count();
+  app.commit();
+
+  EXPECT_TRUE(plan.value("ok", false)) << plan.dump(2);
+  const auto& dry = plan["dryRun"];
+  EXPECT_FALSE(dry.contains("problems")) << dry.dump(2);
+  EXPECT_EQ(dry.value("lockUnavailableAtStep", -1), 0) << dry.dump(2);
+  EXPECT_EQ(dry["unverifiedSteps"], json::array({0})) << dry.dump(2);
+  // Two seconds was what it waited, with every writer of the table behind it.
+  EXPECT_LT(took, 1500) << "the dry run waited " << took << " ms for the lock";
+}
+
+// The retry is the GROUP's. Two intents that commit together still do when the
+// second cannot get its lock: the transaction is rolled back -- the first
+// intent's work with it -- and the group is run again from its first step.
+// Nothing of it is ever visible half-applied.
+TEST_F(ToolTest, AGroupWhoseExclusiveStepCannotGetItsLockIsRolledBackAndRunAgainWhole) {
+  make_shop(cfg());
+  json doc = minimal_spec();
+  doc["id"] = "0009-orders-note-and-log";
+  doc["description"] = "A note on each order, and a log of who changed it.";
+  doc["intents"] = json::array(
+      {json{{"kind", "create_table"}, {"schema", "shop"}, {"table", "order_log"},
+            {"comment", "Who changed an order."},
+            {"columns", json::array({json{{"name", "id"}, {"type", "bigint"},
+                                          {"nullable", false}, {"comment", "The order."}}})}},
+       json{{"kind", "add_column"}, {"schema", "shop"}, {"table", "orders"},
+            {"column", "note"}, {"type", "text"}, {"nullable", true},
+            {"comment", "Free text."}}});
+  {
+    const auto parsed = pglaswell::parse_spec(doc);
+    doc["signatures"] = json::array({{{"key_id", test_key().key_id},
+                                      {"algorithm", "ed25519"},
+                                      {"signature", base64(sign(parsed.canonical_bytes))}}});
+  }
+  const auto plan = payload(call("planMigration", json{{"spec", doc}}));
+  ASSERT_TRUE(plan.value("ok", false)) << plan.dump(2);
+  ASSERT_EQ(plan["steps"].size(), 2u) << plan.dump(2);
+  ASSERT_EQ(plan["steps"][0]["txnGroup"], plan["steps"][1]["txnGroup"])
+      << "the two intents must share a transaction for this test to mean anything";
+
+  // An application transaction holding a row of the table the SECOND step alters.
+  pqxx::connection app_conn(cfg().conninfo);
+  pqxx::work app(app_conn);
+  app.exec("UPDATE shop.orders SET status = status WHERE id = 1");
+
+  const auto started = payload(call("startMigration", json{{"spec", doc}, {"dryRun", false}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  const auto job_id = started["jobId"].get<std::string>();
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(cfg().executor.lock_timeout_ms + 500));
+  EXPECT_EQ(status_of(job_id).value("state", ""), "running") << status_of(job_id).dump(2);
+  {
+    // The first intent's table is not there: its transaction was rolled back
+    // with the attempt, or has not committed. Never half a group.
+    pglaswell::ReadSession r(cfg());
+    EXPECT_TRUE(r.txn().exec("SELECT to_regclass('shop.order_log')")[0][0].is_null());
+  }
+  // And the application is not queued behind the pending request.
+  const auto t0 = std::chrono::steady_clock::now();
+  {
+    pglaswell::WriteSession other(cfg());
+    other.begin("pg_laswell/test/another-writer");
+    other.txn().exec("INSERT INTO shop.orders(warehouse_id) VALUES (2)");
+    other.commit();
+  }
+  EXPECT_LT(std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count(),
+            cfg().executor.lock_timeout_ms / 2);
+
+  app.commit();
+  ASSERT_TRUE(wait_for_status(*this, job_id, [](const json& st) {
+    return st.value("state", "") == "succeeded";
+  })) << status_of(job_id).dump(2);
+
+  pglaswell::ReadSession r(cfg());
+  EXPECT_FALSE(r.txn().exec("SELECT to_regclass('shop.order_log')")[0][0].is_null());
+  EXPECT_EQ(r.txn().exec("SELECT count(*) FROM pg_attribute WHERE attrelid ="
+                         " 'shop.orders'::regclass AND attname = 'note'")[0][0].as<int>(), 1);
+  const auto rows = r.txn().exec(
+      "SELECT ordinal, state, (detail->>'lockAttempts')::int FROM laswell.step"
+      " WHERE job_id = $1::uuid ORDER BY ordinal", pqxx::params{job_id});
+  ASSERT_EQ(rows.size(), 2u);
+  EXPECT_EQ(rows[0][1].as<std::string>(), "succeeded");
+  EXPECT_EQ(rows[1][1].as<std::string>(), "succeeded");
+  EXPECT_GT(rows[1][2].as<int>(), 1) << "the second step should have needed more than one try";
+  // The job's own record holds each step once, not once an attempt.
+  EXPECT_EQ(status_of(job_id)["steps"].size(), 2u) << status_of(job_id).dump(2);
 }
 
 // THE COMPOSITE WALK. A key unique only together with other columns -- a tenant
@@ -8106,10 +8224,14 @@ TEST(Planner, AddColumnIsNotBlockedByViewsButWarnsTheColumnIsInvisible) {
   // statement list rather than on one forbidden keyword, so a future change
   // that starts emitting view DDL here fails loudly.
   const auto* step = steps_of(plan, "add_column")[0];
-  ASSERT_EQ(step->sql.size(), 2u) << all_sql(*step);
-  EXPECT_NE(step->sql[0].find("ALTER TABLE \"shop\".\"orders\" ADD COLUMN \"region\""),
-            std::string::npos) << step->sql[0];
-  EXPECT_NE(step->sql[1].find("COMMENT ON COLUMN"), std::string::npos)
+  ASSERT_EQ(step->sql.size(), 3u) << all_sql(*step);
+  // A plain ADD COLUMN asks for AccessExclusiveLock like any other: the
+  // weaker lock first, and the short-timeout retry.
+  EXPECT_EQ(step->sql[0], "LOCK TABLE \"shop\".\"orders\" IN SHARE UPDATE EXCLUSIVE MODE;");
+  EXPECT_TRUE(step->detail.value("exclusive_retry", false));
+  EXPECT_NE(step->sql[1].find("ALTER TABLE \"shop\".\"orders\" ADD COLUMN \"region\""),
+            std::string::npos) << step->sql[1];
+  EXPECT_NE(step->sql[2].find("COMMENT ON COLUMN"), std::string::npos)
       << step->sql[1];
   const auto sql = all_sql(*step);
   for (const char* forbidden : {"DROP VIEW", "CREATE VIEW", "CREATE OR REPLACE",
@@ -11864,8 +11986,8 @@ TEST_F(DatabaseTest, ConstraintObservationsMatchWhatPostgresqlActuallyRefuses) {
   {
     pglaswell::WriteSession w(cfg);
     w.begin("pg_laswell/test/constraints-apply");
-    const std::string stmt = steps[0]->sql[0];
-    w.txn().exec(stmt.substr(0, stmt.size() - 1));
+    // Every statement of the step: the weaker lock, then the drop.
+    for (const auto& stmt : steps[0]->sql) w.txn().exec(stmt.substr(0, stmt.size() - 1));
     w.commit();
   }
   const auto after = cat.observe({"public"}, {"laswell_c"});
@@ -12883,7 +13005,9 @@ TEST(Planner, APartitionTakesItsColumnsFromItsParentAndSaysWhatItLocks) {
       spec_of(json::array({partition_intent(range_2027())})), partitioned_orders(), {});
   ASSERT_TRUE(plan.ok) << plan.render();
   const auto* step = only_step(plan, "create_table");
-  EXPECT_EQ(step->sql.front(),
+  // The parent is what the application queues on: the weaker lock on it first.
+  EXPECT_EQ(step->sql.front(), "LOCK TABLE \"shop\".\"orders\" IN SHARE UPDATE EXCLUSIVE MODE;");
+  EXPECT_EQ(step->sql.at(1),
             "CREATE TABLE \"shop\".\"orders_2027\" PARTITION OF \"shop\".\"orders\" "
             "FOR VALUES FROM ('2027-01-01') TO ('2028-01-01');");
   // Measured: AccessExclusiveLock on the parent; a SELECT on it waited.

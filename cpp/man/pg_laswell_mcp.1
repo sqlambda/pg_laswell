@@ -459,14 +459,27 @@ stayed at 30 ms, because that lock conflicts with autovacuum and not with
 inserts and updates.
 Once it is held autovacuum cannot start again, and the exclusive lock is then
 granted almost at once.
-The steps of
+Every step that asks, on a table already there, for a lock readers or writers
+wait behind begins with that statement, and the plan shows it: the recipes of
 .Cm set_not_null ,
-.Cm add_check_constraint ,
+.Cm add_check_constraint
+and
 .Cm add_foreign_key
-(for both tables) and the
-.Va fill
-recipe that ask for an exclusive lock begin with that statement, and the plan
-shows it.
+(for both tables), and equally a plain
+.Cm add_column ,
+.Cm drop_column ,
+.Cm alter_column_type ,
+a rename, a trigger, a policy,
+.Cm drop_constraint ,
+a plain index build, each step of
+.Cm attach_partition
+and
+.Cm detach_partition ,
+and the rest of the kinds that alter a table.
+Not a
+.Ic VALIDATE ,
+which takes only that weaker lock itself, and not a module's own kinds, whose
+locks are taken inside the vendor's functions.
 .Pp
 .Em A long application transaction ,
 which the weaker lock passes straight through.
@@ -485,8 +498,20 @@ as
 with the number of attempts.
 A step that succeeds records
 .Va lockAttempts .
-This applies to a step that stands alone in its transaction, which those above
-do.
+.Pp
+The retry is the transaction group's.
+Intents that share a transaction are rolled back together when one of them does
+not get its lock \(em which also releases every lock the steps before it had
+taken \(em and the group is run again from its first step.
+So what commits together still does, and a retry never leaves half a group
+applied.
+.Pp
+The dry run asks for the same locks, and is as brief about it: after the weaker
+lock it waits 200 ms for the exclusive one, once.
+When it does not come the dry run stops there, reports
+.Va lockUnavailableAtStep ,
+and lists that step and those after it as unverified \(em a table held by
+something else is not a defect in the plan.
 .Sh PACING
 A backfill walks the table by keyset and commits on whichever comes first:
 .Bl -tag -width Ds -compact

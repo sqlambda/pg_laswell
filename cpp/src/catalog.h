@@ -648,6 +648,9 @@ inline constexpr int kEstimateStalenessSeconds = 3600;
 // of the ALTER -- the planner's own measurement blocking on the thing it is
 // planning around, which is the exact hazard documented for pg_table_size().
 inline constexpr int kObservationLockTimeoutMs = 2000;
+// How long a rehearsal waits for an exclusive lock after it holds the weaker
+// one: what one attempt of the job waits (executor.h, kExclusiveTryMs).
+inline constexpr int kRehearsalExclusiveTryMs = 200;
 
 // SQLSTATE 55P03, lock_not_available. Matched by code because libpqxx declares
 // no exception class for it -- the same rule the rest of this codebase follows:
@@ -960,6 +963,9 @@ class Catalog {
     std::vector<int> unverified_steps;  // could not be included, or not reached
     std::string skipped_reason;
     int timed_out_at = -1;
+    // The step at which an exclusive lock was not available within the short
+    // wait a rehearsal allows itself; -1 when every lock was had.
+    int lock_unavailable_at = -1;
     bool depends_on_skipped = false;
   };
 
@@ -1090,7 +1096,14 @@ class Catalog {
         }
         continue;
       }
-      for (const auto& raw : steps[i].second) {
+      // A step that takes the weaker lock first asks for the exclusive one
+      // with a short timeout, as the job does (executor.h): the application
+      // queues behind that request, and a planning call may not make it wait
+      // for seconds. Put back after the step.
+      bool short_wait = false;
+      const auto& statements = steps[i].second;
+      for (std::size_t q = 0; q < statements.size(); ++q) {
+        const auto& raw = statements[q];
         const auto stmt = detail::strip_trailing_semicolon(raw);
         if (stmt.empty()) continue;
         try {
@@ -1107,7 +1120,27 @@ class Catalog {
                   "as unverified rather than claimed as checked.";
             }
           }
+          if (!short_wait && stmt.rfind("LOCK TABLE ", 0) == 0 &&
+              stmt.find("SHARE UPDATE EXCLUSIVE") != std::string::npos) {
+            // After the LAST of the weaker locks, where a step takes several.
+            const bool more_locks = q + 1 < statements.size() &&
+                                    statements[q + 1].rfind("LOCK TABLE ", 0) == 0;
+            if (!more_locks) {
+              txn.exec("SET LOCAL lock_timeout = " + std::to_string(kRehearsalExclusiveTryMs));
+              short_wait = true;
+            }
+          }
         } catch (const pqxx::sql_error& e) {
+          // The exclusive lock did not come in the short wait: something else
+          // holds the table. Not a defect in the plan -- the job tries again
+          // and again for it -- so everything from here on is unverified.
+          if (short_wait && is_lock_not_available(e)) {
+            out.lock_unavailable_at = steps[i].first;
+            for (std::size_t k = i; k < steps.size(); ++k) {
+              note_unverified(steps[k].first);
+            }
+            return Rehearsal::kTimedOut;
+          }
           // A statement timeout is not a defect in the plan: the step does real
           // work that a rehearsal declines to finish. Everything from here on
           // is unverified, and saying so beats reporting a problem that is not.
@@ -1139,6 +1172,9 @@ class Catalog {
                                         server_message(e.what()), stmt});
           return Rehearsal::kFailed;
         }
+      }
+      if (short_wait) {
+        txn.exec("SET LOCAL lock_timeout = " + std::to_string(kObservationLockTimeoutMs));
       }
     }
     return Rehearsal::kOk;

@@ -577,6 +577,16 @@ inline json plan_migration_tool(ToolContext& ctx, const json& args) {
           "dry_run_statement_timeout_ms if you want it checked, knowing what "
           "that costs.";
     }
+    if (dry.lock_unavailable_at >= 0) {
+      d["lockUnavailableAtStep"] = dry.lock_unavailable_at;
+      d["note"] =
+          "the dry run stopped at a step whose exclusive lock was not available: "
+          "something else holds the table. It waited a fraction of a second and "
+          "no longer, because the application queues behind such a request and a "
+          "planning call must not make it wait. Everything from that step on is "
+          "unverified. The job asks again and again for the same lock, each time "
+          "as briefly; pg_licht currentLocks names the holder.";
+    }
     if (!dry.problems.empty()) {
       // `problems` stays an array of strings, because callers read it as one.
       // The SQLSTATE now leads each line, since that is the part a reader can
