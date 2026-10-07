@@ -140,10 +140,43 @@ not for a UNIQUE index; elsewhere the per-chunk option stands.
 A tenth finding: on a hypertable the composite walk ran at about 40,000 rows a
 second, a third of a plain table's rate. The batch's update named its rows by a
 tuple, from which a partitioned table cannot tell which partitions they are in,
-so it was planned against every chunk and probed them row by row. Each key
-column is now also tested against its own array, which names no new row and
-tells the planner where to look: 74,000 rows a second became 151,000 on a
-hypertable of 18 chunks, and a plain table keyed `(tenant, id)` is unaffected.
+so it was planned against every chunk and probed them row by row.
+
+The first answer made it worse. Each key column was also tested against its own
+array, beside the tuple; the chunk was then found -- and the planner, no longer
+needing the tuple to find the rows, ran it as a nested loop over a materialised
+list with a join filter, 499,500 comparisons discarded for a batch of 1,000. In
+the field under load the batch update went from 20 ms to 65 ms. Which join the
+planner picks depends on its estimates: on the project's own hypertable it
+hashed, and measured faster.
+
+The array tests now find the rows, and the tuple is tested beside them as a
+filter that cannot become a join (`(...) IN (SELECT * FROM unnest(...)) IS
+TRUE`, a hashed subplan: one probe per row the index returned). Measured on one
+of 20 chunks, a batch of 1,000: 12.2 ms with the tuple alone, 27.8 ms in the
+nested loop the field saw, 5.6 to 8 ms in this form.
+
+### The trigger recipe's walk stops at the highest key there was when it started
+
+An eleventh finding, on a hypertable under 1,000 inserts a second. With `fill`
+and a trigger, every row inserted after the walk starts is filled as it
+arrives. A chunk created during the walk holds only such rows, all ahead of the
+cursor: none passes "still to fill", and each batch read the whole chunk to
+find that out, for every chunk made since the walk began. The batch select went
+from 1.7 ms to 135.6 ms and the walk from 267 s to 2,080 s.
+
+The walk now reads the highest key once as it starts, and every batch carries
+`key <= that`; rows above it are the trigger's. Measured on 20 chunks with
+nothing ahead of the cursor left to do: 132 buffers a batch against 191,870,
+and 11.5 ms to read the bound. The statement that reads it is in the step's
+detail as `upper_bound_sql`. On a resumed job it is read again, which only
+moves it up.
+
+Only where the key grows -- an integer, a timestamp or a date leading the walk.
+With a random key such as a uuid, new rows land everywhere below the bound and
+it would exclude nothing, so the walk is left as it was. Not for a `backfill`
+the author wrote, nor for `fill` with a `default`, where nothing fills the new
+rows but the walk.
 
 ### Citus: a distributed table is sized by its shards
 

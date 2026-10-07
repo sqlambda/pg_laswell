@@ -1752,6 +1752,23 @@ inline long long drive_paced_step(const pglaswell::ConnConfig& cfg,
   const bool composite = mode == "composite" && step.sql.size() > 1;
   const auto key_columns = step.detail.value("key_columns", json::array()).size();
 
+  // The walk's upper bound, read once, as the executor reads it.
+  std::vector<std::optional<std::string>> upto;
+  if (step.detail.contains("upper_bound_sql")) {
+    pglaswell::WriteSession b(cfg);
+    b.begin(app_name);
+    const auto r = b.txn().exec(step.detail.value("upper_bound_sql", ""));
+    const auto n = static_cast<std::size_t>(step.detail.value("upper_bound_columns", 1));
+    for (std::size_t c = 0; c < n; ++c) {
+      if (r.empty() || r[0][static_cast<pqxx::row::size_type>(c)].is_null()) {
+        upto.emplace_back(std::nullopt);
+      } else {
+        upto.emplace_back(r[0][static_cast<pqxx::row::size_type>(c)].as<std::string>());
+      }
+    }
+    b.commit();
+  }
+
   std::string cursor = "0";
   long long considered = 0;
   for (int pass = 0; pass < 1000; ++pass) {
@@ -1770,11 +1787,11 @@ inline long long drive_paced_step(const pglaswell::ConnConfig& cfg,
     } else if (composite) {
       out = pglaswell::run_composite_batch(b.txn(), strip(step.sql[0]),
                                            strip(step.sql[1]), cursor, 1000, 1 << 20,
-                                           key_columns);
+                                           key_columns, upto);
     } else {
       out = pglaswell::run_paced_batch(b.txn(), strip(step.sql[0]),
                                        two ? strip(step.sql[1]) : std::string(),
-                                       cursor, 1000, 1 << 20);
+                                       cursor, 1000, 1 << 20, upto);
     }
     b.commit();
     cursor = out.cursor;
@@ -4812,6 +4829,54 @@ TEST_F(ToolTest, AnExclusiveStepBehindALongTransactionRetriesAndLetsTheApplicati
 // whole unique index, a full batch at a time, whatever the size of a "group".
 // Found in the field on a hypertable keyed (time, id): the walk by group made
 // every timestamp a group of one row, 550 rows a second.
+// The trigger fills every row made after the walk starts, so the walk stops at
+// the highest key there was. Without the bound, on a table partitioned by time,
+// each batch read in full every partition made since it began.
+TEST(Planner, TheTriggerRecipesWalkStopsAtTheHighestKeyThereWasWhenItStarted) {
+  auto obs = observations(2LL << 30, 8000000);
+  auto plan = pglaswell::plan_migration(spec_with(json::array({filled_column()})), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto* s = find_step(plan, "backfill");
+  ASSERT_NE(s, nullptr);
+  EXPECT_EQ(s->detail.value("upper_bound_sql", ""),
+            "SELECT \"orders\".\"id\" FROM \"shop\".\"orders\" ORDER BY \"orders\".\"id\" "
+            "DESC LIMIT 1;");
+  EXPECT_EQ(s->detail.value("upper_bound_columns", 0), 1);
+  // After the cursor and the limit; NULL -- an empty table -- is no bound.
+  EXPECT_NE(s->sql[0].find("\"orders\".\"id\" > $1 AND (\"orders\".\"id\" <= $3 OR $3 IS NULL)"),
+            std::string::npos) << s->sql[0];
+
+  // A composite key: the bound is the whole key, after its two cursor marks
+  // and the limit.
+  auto& t = obs.tables["shop.orders"];
+  t["columns"]["created_at"] = json{{"type", "timestamp with time zone"}, {"not_null", true}};
+  t["columns"]["id"] = json{{"type", "bigint"}, {"not_null", true}};
+  t["indexes"] = json{{"orders_pkey",
+                       {{"is_valid", true}, {"is_unique", true}, {"is_primary", true},
+                        {"leading_column", "id"},
+                        {"columns", json::array({"id", "created_at"})}, {"predicate", ""},
+                        {"has_expressions", false}}}};
+  plan = pglaswell::plan_migration(spec_with(json::array({filled_column()})), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  s = find_step(plan, "backfill");
+  EXPECT_NE(s->sql[0].find("AND ((\"orders\".\"id\", \"orders\".\"created_at\") <= ($4, $5) "
+                           "OR $4 IS NULL)"),
+            std::string::npos) << s->sql[0];
+  EXPECT_EQ(s->detail.value("upper_bound_columns", 0), 2);
+
+  // A key that does not grow bounds nothing: new rows land everywhere below it.
+  t["columns"]["id"]["type"] = "uuid";
+  plan = pglaswell::plan_migration(spec_with(json::array({filled_column()})), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  EXPECT_FALSE(find_step(plan, "backfill")->detail.contains("upper_bound_sql"));
+
+  // And a backfill the author wrote has no trigger behind it: no bound.
+  json doc = minimal_spec();
+  plan = pglaswell::plan_migration(pglaswell::parse_spec(doc), observations(2LL << 30, 8000000), {});
+  ASSERT_NE(find_step(plan, "backfill"), nullptr);
+  EXPECT_FALSE(find_step(plan, "backfill")->detail.contains("upper_bound_sql"));
+}
+
 // A table keyed (time, id) has no single-column primary key, and the fill
 // refused it -- while the walk it hands to takes such a key whole.
 TEST(Planner, AFillWithNoKeyWalksACompositePrimaryKey) {
@@ -4864,14 +4929,15 @@ TEST(Planner, AKeyUniqueOnlyWithOtherColumnsIsWalkedAlongTheWholeIndex) {
   EXPECT_NE(s->sql[0].find("ORDER BY \"orders\".\"created_at\", \"orders\".\"id\"\n LIMIT $3"),
             std::string::npos) << s->sql[0];
   EXPECT_NE(s->sql[0].find("FOR UPDATE OF \"orders\""), std::string::npos);
-  EXPECT_NE(s->sql[1].find("WHERE (\"orders\".\"created_at\", \"orders\".\"id\") IN (SELECT * FROM "
-                           "unnest($1::timestamp with time zone[], $2::bigint[]))"),
-            std::string::npos) << s->sql[1];
-  // Each column also against its own array: it names no new row, and it is
-  // what lets a partitioned table find the partitions the batch is in
-  // (measured on a hypertable: 74 000 -> 151 000 rows a second).
-  EXPECT_NE(s->sql[1].find(")) AND \"orders\".\"created_at\" = ANY($1::timestamp with time zone[]) "
-                           "AND \"orders\".\"id\" = ANY($2::bigint[]) AND (orders.fulfilment_region IS NULL)"),
+  // Each column against its own array finds the rows, and on a partitioned
+  // table the partitions. The tuple is a FILTER beside them, not a join: as a
+  // join the planner ran it as a nested loop with 499 500 comparisons discarded
+  // for a batch of 1 000 (found in the field on a hypertable under load).
+  EXPECT_NE(s->sql[1].find(
+                " WHERE \"orders\".\"created_at\" = ANY($1::timestamp with time zone[]) AND "
+                "\"orders\".\"id\" = ANY($2::bigint[]) AND ((\"orders\".\"created_at\", "
+                "\"orders\".\"id\") IN (SELECT * FROM unnest($1::timestamp with time zone[], "
+                "$2::bigint[]))) IS TRUE AND (orders.fulfilment_region IS NULL)"),
             std::string::npos) << s->sql[1];
   EXPECT_NE(s->why.find("keyset walk on (created_at, id) together"), std::string::npos) << s->why;
 
@@ -5025,6 +5091,74 @@ TEST_F(ToolTest, ACompositeWalkFillsATableKeyedByTimeAndIdInFullBatches) {
   EXPECT_EQ(r.txn().exec("SELECT count(*) FROM shop.events_before b JOIN shop.events e"
                          " ON e.stamp = b.stamp AND e.id = b.id WHERE b.customer IS NULL")
                 [0][0].as<int>(), 5000);
+}
+
+// The whole trigger recipe on a hypertable keyed (id, time), where TimescaleDB
+// is installed: the composite walk, its upper bound, and the batch update whose
+// tuple test is a filter -- under TimescaleDB's own update path, which a plain
+// table does not exercise.
+TEST_F(ToolTest, TheTriggerRecipeFillsAHypertableAndStopsAtTheKeyItStartedBelow) {
+  {
+    pglaswell::ReadSession r(cfg());
+    if (r.txn().exec("SELECT 1 FROM pg_available_extensions WHERE name = 'timescaledb'").empty()) {
+      GTEST_SKIP() << "TimescaleDB is not installed on this server";
+    }
+  }
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/hyper");
+    w.txn().exec("CREATE EXTENSION IF NOT EXISTS timescaledb");
+    w.txn().exec("DROP SCHEMA IF EXISTS shop CASCADE");
+    w.txn().exec("CREATE SCHEMA shop");
+    w.txn().exec("CREATE TABLE shop.msg(id bigint NOT NULL, stamp timestamptz NOT NULL,"
+                 " payload jsonb NOT NULL, PRIMARY KEY (id, stamp))");
+    w.txn().exec("SELECT create_hypertable('shop.msg', by_range('stamp', interval '10 minutes'))");
+    // Six chunks of a thousand rows.
+    w.txn().exec("INSERT INTO shop.msg SELECT g, '2026-01-01'::timestamptz + g * interval"
+                 " '0.6 second', jsonb_build_object('customer', g * 7)"
+                 " FROM generate_series(1, 6000) g");
+    w.commit();
+    w.exec_nontransactional("ANALYZE shop.msg");
+  }
+  auto e = cfg().executor;
+  e.batch_rows = 500;
+  set_executor(e);
+
+  json doc = minimal_spec();
+  doc["id"] = "0013-msg-customer";
+  doc["description"] = "The customer, out of the payload.";
+  doc["intents"] = json::array(
+      {json{{"kind", "add_column"}, {"schema", "shop"}, {"table", "msg"},
+            {"column", "customer"}, {"type", "bigint"}, {"nullable", false},
+            {"fill", "(payload->>'customer')::bigint"}, {"after", "drop_trigger"},
+            {"comment", "The customer the message was sent to."}}});
+  {
+    const auto parsed = pglaswell::parse_spec(doc);
+    doc["signatures"] = json::array({{{"key_id", test_key().key_id},
+                                      {"algorithm", "ed25519"},
+                                      {"signature", base64(sign(parsed.canonical_bytes))}}});
+  }
+  const auto plan = payload(call("planMigration", json{{"spec", doc}}));
+  ASSERT_TRUE(plan.value("ok", false)) << plan.dump(2);
+  EXPECT_FALSE(plan["dryRun"].contains("problems")) << plan["dryRun"].dump(2);
+
+  const auto started = payload(call("startMigration", json{{"spec", doc}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, started["jobId"], [](const json& s) {
+    return s.value("state", "") == "succeeded";
+  })) << status_of(started["jobId"]).dump(2);
+
+  pglaswell::ReadSession r(cfg());
+  EXPECT_EQ(r.txn().exec("SELECT count(*) FROM shop.msg WHERE customer IS DISTINCT FROM id * 7")
+                [0][0].as<int>(), 0);
+  EXPECT_EQ(r.txn().exec("SELECT attnotnull FROM pg_attribute WHERE attrelid ="
+                         " 'shop.msg'::regclass AND attname = 'customer'")[0][0].as<bool>(),
+            true);
+  const auto cur = r.txn().exec(
+      "SELECT rows_done FROM laswell.backfill_cursor WHERE job_id = $1::uuid",
+      pqxx::params{started["jobId"].get<std::string>()});
+  ASSERT_EQ(cur.size(), 1u);
+  EXPECT_EQ(cur[0][0].as<int>(), 6000);
 }
 
 // A paced select names its cursor by a key VALUE, and nothing makes that key

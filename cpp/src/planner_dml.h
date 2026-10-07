@@ -390,6 +390,15 @@ inline bool unique_group_key_index(const json& t, const std::string& key,
 // unique index admits any number of rows with a NULL in it, and a row
 // comparison passes over them. The primary key is preferred; among others the
 // narrowest, then by name, so the choice is the same on every reading.
+// A type whose values, as keys, are handed out in increasing order often
+// enough to bound a walk by: the integers of a sequence or identity, and time.
+// Not a uuid, which may be random, and not text.
+inline bool type_grows(const std::string& type) {
+  return type == "bigint" || type == "integer" || type == "smallint" ||
+         type == "timestamp with time zone" || type == "timestamp without time zone" ||
+         type == "date";
+}
+
 inline bool unique_index_containing(const json& t, const std::string& key,
                                     std::vector<std::string>& columns,
                                     std::string& index_name) {
@@ -894,10 +903,53 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
     }
   }
 
+  // An upper bound for the walk, where something else fills every row made
+  // after it starts (the trigger of add_column's fill recipe) and the key
+  // grows: the highest key there is at the start, read once by the executor
+  // and carried by every batch.
+  //
+  // Found in the field on a hypertable under 1 000 inserts a second. A new
+  // chunk's rows are all ahead of the cursor and all already filled, so none
+  // passes "still to fill" -- and the batch read the whole chunk to learn
+  // that, every batch, for every chunk made since the walk began: a select at
+  // 135 ms where it had been 1.7, and a walk of 35 minutes for one of 4.
+  // Measured with the bound on 20 chunks: 132 buffers a batch against 191 870.
+  //
+  // Only for a key that grows. With a random key (a uuid) new rows land
+  // everywhere below the bound and it excludes nothing. Not for a walk by
+  // group, which the trigger recipe never is.
+  const std::vector<std::string> bound_columns =
+      !composite_columns.empty() ? composite_columns : std::vector<std::string>{key};
+  const bool bounded =
+      in.body.value("new_rows_are_filled", false) && !grouped &&
+      detail::type_grows(
+          columns.value(bound_columns[0], json::object()).value("type", ""));
+  const auto bound_mark = [&](std::size_t i) {
+    // After the cursor's parameters and the limit.
+    return "$" + std::to_string(bound_columns.size() + 2 + i);
+  };
+  std::string bound_sql;
+  if (bounded) {
+    std::vector<std::string> cs, ms, desc;
+    for (std::size_t i = 0; i < bound_columns.size(); ++i) {
+      cs.push_back(rel + "." + detail::quote_identifier(bound_columns[i]));
+      ms.push_back(bound_mark(i));
+      desc.push_back(cs.back() + " DESC");
+    }
+    bound_sql = bound_columns.size() == 1
+                    ? " AND (" + cs[0] + " <= " + ms[0] + " OR " + ms[0] + " IS NULL)"
+                    : " AND ((" + detail::join(cs, ", ") + ") <= (" + detail::join(ms, ", ") +
+                          ") OR " + ms[0] + " IS NULL)";
+    step.detail["upper_bound_sql"] =
+        "SELECT " + detail::join(cs, ", ") + " FROM " + sql_rel + " ORDER BY " +
+        detail::join(desc, ", ") + " LIMIT 1;";
+    step.detail["upper_bound_columns"] = static_cast<long long>(bound_columns.size());
+  }
+
   const std::string select_sql =
       "SELECT " + rel + "." + k + "\n"
       "  FROM " + sql_rel + (from.empty() ? "" : ", " + from) + "\n"
-      " WHERE " + rel + "." + k + " > $1 AND (" + where + ")\n"
+      " WHERE " + rel + "." + k + " > $1" + bound_sql + " AND (" + where + ")\n"
       " ORDER BY " + rel + "." + k + "\n"
       " LIMIT $2\n"
       " FOR UPDATE OF " + rel + ";";
@@ -931,29 +983,39 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
                        "[]");
     }
     const std::string tuple = "(" + detail::join(cols, ", ") + ")";
-    // The rows are named by the tuple. Each column is ALSO tested against its
-    // own array, which names nothing new and tells the planner something the
-    // tuple cannot: on a partitioned table, which partitions the batch is in.
+    // Each column is tested against its own array, which is what finds the
+    // rows: an index condition, and on a partitioned table the partitions the
+    // batch is in. The arrays alone would also name a row made of one row's
+    // first column and another's second, so the tuple is tested as well -- as
+    // a FILTER, not as a join.
     //
-    // Found in the field on a hypertable, where the walk ran at a third of a
-    // plain table's speed. Measured on one of 18 chunks, 3.4 million rows:
-    // with the tuple alone the update is planned against every chunk and
-    // probes them row by row, 74 000 rows a second; with `col = ANY(array)`
-    // beside it, 151 000, a plain table's rate. On a plain table keyed
-    // (tenant, id) the extra tests cost nothing (190 000 against 195 000 rows a
-    // second, and 169 000 against 175 000, in alternating runs).
+    // Found in the field on a hypertable, twice. With the tuple alone, as a
+    // semi-join, the update was planned against every chunk and probed them
+    // row by row: a third of a plain table's speed. With the array tests added
+    // BESIDE that semi-join, the chunk was found -- and the planner, no longer
+    // needing the join to find the rows, ran it as a nested loop over a
+    // materialised list with a join filter: 499 500 comparisons discarded for
+    // a batch of 1 000, three times slower under load than before. Which join
+    // it picks depends on its estimates, so on another table of the same
+    // shape it hashed instead and looked fine.
+    //
+    // `(...) IS TRUE` keeps the IN from being turned into a join at all: it is
+    // a hashed subplan, one probe per row the index returned, whatever the
+    // estimates say. Measured on one of 20 chunks, 3.4 million rows, a batch
+    // of 1 000: 12.2 ms with the tuple alone, 27.8 ms in the nested loop the
+    // field saw, 5.6 to 8 ms in this form.
     std::vector<std::string> each;
     for (std::size_t c = 0; c < cols.size(); ++c) {
       each.push_back(cols[c] + " = ANY(" + arrays[c] + ")");
     }
     const std::string in_batch =
-        tuple + " IN (SELECT * FROM unnest(" + detail::join(arrays, ", ") + ")) AND " +
-        detail::join(each, " AND ");
+        detail::join(each, " AND ") + " AND (" + tuple +
+        " IN (SELECT * FROM unnest(" + detail::join(arrays, ", ") + "))) IS TRUE";
     step.sql.push_back(
         "SELECT " + detail::join(cols, ", ") + "\n"
         "  FROM " + sql_rel + (from.empty() ? "" : ", " + from) + "\n"
-        " WHERE (" + tuple + " > (" + detail::join(marks, ", ") + ") OR $1 IS NULL) AND (" +
-            where + ")\n"
+        " WHERE (" + tuple + " > (" + detail::join(marks, ", ") + ") OR $1 IS NULL)" +
+            bound_sql + " AND (" + where + ")\n"
         " ORDER BY " + detail::join(cols, ", ") + "\n"
         " LIMIT $" + std::to_string(composite_columns.size() + 1) + "\n"
         " FOR UPDATE OF " + rel + ";");

@@ -922,6 +922,11 @@ of the rows already there, walking
 .Va key ,
 which defaults to a column of the table's primary key;
 a composite key is walked whole, in its order.
+Where that key grows \(em an integer, a timestamp or a date \(em the walk
+reads the highest key once as it starts and goes no further: the trigger fills
+every row made after that.
+On a table partitioned by time this is what keeps each batch from reading every
+partition created since the walk began.
 .It
 The
 .Cm set_not_null

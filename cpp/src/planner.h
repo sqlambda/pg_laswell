@@ -617,6 +617,10 @@ inline void plan_add_columns_filled(const std::vector<const Intent*>& group,
       bf.kind_name = "backfill";
       bf.ordinal = in.ordinal;
       bf.body = json{{"schema", in.schema()}, {"table", in.table()}, {"key", key}, {"set", set}};
+      // The trigger made in step 1 fills every row inserted from here on, so
+      // this walk need not go past the highest key there is when it starts.
+      // Not part of the specification's language: plan_backfill reads it.
+      bf.body["new_rows_are_filled"] = true;
       if (where.joined()) {
         bf.body["from"] = where.from;
         bf.body["where"] = "(" + where.on + ") AND (" + detail::join(terms, " OR ") + ")";

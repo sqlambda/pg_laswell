@@ -147,7 +147,8 @@ inline BatchOutcome run_paced_batch(pqxx::work& txn,
                                     const std::string& select_sql,
                                     const std::string& apply_sql,
                                     const std::string& cursor, int batch,
-                                    long long batch_bytes) {
+                                    long long batch_bytes,
+                                    const std::vector<std::optional<std::string>>& upto = {}) {
   BatchOutcome out;
   out.cursor = cursor;
   if (apply_sql.empty()) {
@@ -160,7 +161,11 @@ inline BatchOutcome run_paced_batch(pqxx::work& txn,
   // The lock taken here is what makes the two statements safe as one: nothing
   // can change these rows before the apply below, because both run in this
   // transaction.
-  const auto sel = txn.exec(select_sql, pqxx::params{cursor, batch});
+  // `upto`, where the plan gave the walk an upper bound: the parameters after
+  // the cursor and the limit. See read_upper_bound.
+  pqxx::params select_params{cursor, batch};
+  for (const auto& v : upto) select_params.append(v);
+  const auto sel = txn.exec(select_sql, select_params);
   std::vector<std::string> keys;
   keys.reserve(static_cast<std::size_t>(sel.size()));
   long long bytes = 0;
@@ -229,7 +234,8 @@ inline BatchOutcome run_composite_batch(pqxx::work& txn,
                                         const std::string& apply_sql,
                                         const std::string& cursor, int batch,
                                         long long batch_bytes,
-                                        std::size_t columns) {
+                                        std::size_t columns,
+                                        const std::vector<std::optional<std::string>>& upto = {}) {
   BatchOutcome out;
   out.cursor = cursor;
   std::vector<std::string> at;
@@ -256,6 +262,7 @@ inline BatchOutcome run_composite_batch(pqxx::work& txn,
     }
   }
   where.append(batch);
+  for (const auto& v : upto) where.append(v);
   const auto sel = txn.exec(select_sql, where);
 
   // One array per key column, element i of each being row i's value.
@@ -958,6 +965,31 @@ class Executor {
       w.commit();
     }
 
+    // The walk's upper bound, where the plan gives it one: the highest key
+    // there is as the walk starts, read once. A walk whose new rows are filled
+    // by a trigger never needs to go past it -- and without it, on a table
+    // partitioned by time, every batch read in full each partition made since
+    // the walk began, finding nothing left to do in any (found in the field:
+    // a batch select at 135 ms where it had been 1.7, and a 35-minute walk).
+    // Read again when a job resumes, which only moves it up: still correct.
+    // An empty table has no highest key, and the bound is then NULL, which the
+    // statement reads as no bound.
+    std::vector<std::optional<std::string>> upto;
+    if (detail_json.contains("upper_bound_sql")) {
+      const auto columns = static_cast<std::size_t>(
+          detail_json.value("upper_bound_columns", 1));
+      w.begin(app_name(ordinal));
+      const auto r = w.txn().exec(detail_json.value("upper_bound_sql", ""));
+      for (std::size_t c = 0; c < columns; ++c) {
+        if (r.empty() || r[0][static_cast<pqxx::row::size_type>(c)].is_null()) {
+          upto.emplace_back(std::nullopt);
+        } else {
+          upto.emplace_back(r[0][static_cast<pqxx::row::size_type>(c)].as<std::string>());
+        }
+      }
+      w.commit();
+    }
+
     const auto started = detail::steady_ms();
     bool done = false;
 
@@ -1032,10 +1064,10 @@ class Executor {
                                                /*holds_locks=*/rows_this_txn >= batch);
           } else if (composite) {
             outcome = run_composite_batch(w.txn(), sql, apply_sql, cursor, batch,
-                                          e.batch_bytes, composite_columns.size());
+                                          e.batch_bytes, composite_columns.size(), upto);
           } else {
             outcome = run_paced_batch(w.txn(), sql, apply_sql, cursor, batch,
-                                      e.batch_bytes);
+                                      e.batch_bytes, upto);
           }
           affected = outcome.considered;
           cursor = outcome.cursor;
