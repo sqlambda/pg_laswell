@@ -195,6 +195,18 @@ inline void citus_note_reference_copy(const json& citus, Step& step, Plan& plan,
       "the next step needing them everywhere pays for it, and this is that step.");
 }
 
+// The rows of a table Citus holds in shards, from the module's own reading of
+// them; the relation's reltuples where there is none (a plain table).
+inline long long citus_table_rows(const json& citus, const std::string& qualified,
+                                  const json& table) {
+  if (citus.is_object() && citus.contains("sizes") && citus["sizes"].is_object() &&
+      citus["sizes"].contains(qualified)) {
+    const auto rows = citus["sizes"][qualified].value("rows", -1LL);
+    if (rows >= 0) return rows;
+  }
+  return table.value("reltuples", 0LL);
+}
+
 inline void plan_citus_distribute_table(const Intent& in, const Observations& obs,
                                   const ExecutorConfig& cfg, Plan& plan,
                                   std::vector<Step>& out) {
@@ -1081,7 +1093,9 @@ inline void plan_citus_alter_distributed_table(const Intent& in,
   }
   step.sql.push_back("SELECT alter_distributed_table(" + args + ");");
 
-  const long long rows = t.value("reltuples", 0LL);
+  // The coordinator's relation is a shell that reads 0: the rows are the
+  // shards', which the reading sums.
+  const long long rows = citus_table_rows(citus, qualified, t);
   step.action = Action::kApply;
   step.txn_class = TxnClass::kRequired;
   // Rehearsed by execution: see plan_citus_distribute_table.
@@ -1155,7 +1169,9 @@ inline void plan_citus_undistribute_table(const Intent& in, const Observations& 
   }
 
   const auto kind = citus_kind_of(citus, qualified);
-  const long long rows = t.value("reltuples", 0LL);
+  // The coordinator's relation is a shell that reads 0: the rows are the
+  // shards', which the reading sums.
+  const long long rows = citus_table_rows(citus, qualified, t);
   step.action = Action::kApply;
   step.txn_class = TxnClass::kRequired;
   // Rehearsed by execution: see plan_citus_distribute_table.

@@ -3521,7 +3521,8 @@ inline void plan_physical(const Intent& in, const Observations& obs, Plan& plan,
   const auto sql_rel = detail::quote_qualified(qualified);
   const auto& t = obs.table(qualified);
   const auto column = in.body.value("column", "");
-  const long long size = t.value("size_estimate", 0LL);
+  // What a rewrite copies and a move needs free: the data, wherever it is.
+  const long long size = detail::table_data(obs, qualified, in).bytes;
 
   auto emit = [&](std::vector<std::string> sql, const std::string& lock,
                   const std::string& why, bool own = false) {
@@ -5408,8 +5409,8 @@ inline void plan_drop_table(const Intent& in, const Observations& obs,
       ", so the drop is a brief catalog change whatever the table's size";
   plan.warnings.push_back(
       "dropping " + qualified + " is irreversible. " +
-      detail::human_bytes(t.value("size_estimate", 0LL)) +
-      " and roughly " + std::to_string(t.value("reltuples", 0LL)) +
+      detail::human_bytes(detail::table_data(obs, qualified, in).bytes) +
+      " and roughly " + std::to_string(detail::table_data(obs, qualified, in).rows) +
       " rows go at commit, and no revert recovers them. If the data may be "
       "wanted, copy it out in an earlier intent.");
 }
@@ -5884,7 +5885,7 @@ inline void plan_detach_partition(const Intent& in, const Observations& obs,
     return;
   }
 
-  const long long size = obs.table(child).value("size_estimate", 0LL);
+  const long long size = detail::table_data(obs, child, in).bytes;
   const int waiters = p.value("lock_waiters", 0);
   // Measured on 18.6: "cannot detach partitions concurrently when a default
   // partition exists". With a default, the plain form is the only one.
@@ -6456,7 +6457,8 @@ inline void plan_alter_column_type(const Intent& in, const Observations& obs,
   } else {
     step.why = current + " -> " + target +
                " is not a provable widening, so assume PostgreSQL rewrites the "
-               "whole table: " + detail::human_bytes(t.value("size_estimate", 0LL)) +
+               "whole table: " +
+               detail::human_bytes(detail::table_data(obs, qualified, in).bytes) +
                " under AccessExclusiveLock, during which every reader and "
                "writer queues";
     plan.warnings.push_back(

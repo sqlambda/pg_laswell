@@ -2788,6 +2788,47 @@ TEST_F(DatabaseTest, ObservesStructureSizeAndLockStateOfARealTable) {
   w.commit();
 }
 
+// A partitioned table holds nothing itself: relpages 0 always, reltuples 0
+// until someone analyses the parent. Every decision by size or rows was being
+// made about an empty table. The reading is its leaves' total.
+TEST_F(DatabaseTest, APartitionedTableIsSizedByItsPartitions) {
+  pglaswell::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = url_;
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/part-size");
+    w.txn().exec("DROP TABLE IF EXISTS laswell_parts");
+    w.txn().exec("CREATE TABLE laswell_parts(id int, at int, pad text) PARTITION BY RANGE (at)");
+    w.txn().exec("CREATE TABLE laswell_parts_1 PARTITION OF laswell_parts"
+                 " FOR VALUES FROM (0) TO (10) PARTITION BY RANGE (id)");
+    w.txn().exec("CREATE TABLE laswell_parts_1a PARTITION OF laswell_parts_1"
+                 " FOR VALUES FROM (0) TO (100000)");
+    w.txn().exec("CREATE TABLE laswell_parts_2 PARTITION OF laswell_parts"
+                 " FOR VALUES FROM (10) TO (20)");
+    w.txn().exec("INSERT INTO laswell_parts SELECT g, g % 20, repeat('x', 200)"
+                 " FROM generate_series(1, 4000) g");
+    // The leaves, as autovacuum would: the parent is never analysed by it.
+    w.txn().exec("ANALYZE laswell_parts_1a");
+    w.txn().exec("ANALYZE laswell_parts_2");
+    w.commit();
+  }
+  pglaswell::Catalog cat(cfg);
+  const auto obs = cat.observe({"public", "public"}, {"laswell_parts", "laswell_parts_2"});
+  const auto& parent = obs.table("public.laswell_parts");
+  EXPECT_EQ(parent.value("kind", ""), "partitioned_table");
+  // Both leaves, the one two levels down included.
+  EXPECT_EQ(parent.value("reltuples", 0LL), 4000) << parent.dump(2);
+  EXPECT_GT(parent.value("size_estimate", 0LL), 800000) << parent.dump(2);
+  // A leaf is still its own.
+  EXPECT_EQ(obs.table("public.laswell_parts_2").value("reltuples", 0LL), 2000);
+
+  pglaswell::WriteSession w(cfg);
+  w.begin("pg_laswell/test/cleanup");
+  w.txn().exec("DROP TABLE laswell_parts");
+  w.commit();
+}
+
 TEST_F(DatabaseTest, SizeEscalationIsSeparateFromObservationBecauseItTakesALock) {
   pglaswell::ConnConfig cfg;
   cfg.name = "t";

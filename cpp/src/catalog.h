@@ -61,8 +61,23 @@ SELECT COALESCE(
      'reloptions', COALESCE(TO_JSONB(t.reloptions), '[]'::jsonb),
      'owner', PG_GET_USERBYID(t.relowner),
      'is_partition', t.relispartition,
-     'reltuples', GREATEST(t.reltuples, 0)::bigint,
-     'size_estimate', (t.relpages::bigint * 8192),
+     -- A partitioned table holds nothing itself: relpages is always 0 and
+     -- reltuples is 0 until someone analyses the parent by hand. Its data is
+     -- its leaves', and every decision made by size or rows -- plain against
+     -- concurrent, an estimate, a warning about what a rewrite costs -- was
+     -- being made about an empty table.
+     'reltuples', CASE WHEN t.relkind = 'p'
+                       THEN (SELECT COALESCE(SUM(GREATEST(lc.reltuples, 0)), 0)::bigint
+                               FROM pg_partition_tree(t.oid) lt
+                               JOIN pg_class lc ON lc.oid = lt.relid
+                              WHERE lt.isleaf)
+                       ELSE GREATEST(t.reltuples, 0)::bigint END,
+     'size_estimate', CASE WHEN t.relkind = 'p'
+                           THEN (SELECT COALESCE(SUM(lc.relpages::bigint), 0) * 8192
+                                   FROM pg_partition_tree(t.oid) lt
+                                   JOIN pg_class lc ON lc.oid = lt.relid
+                                  WHERE lt.isleaf)
+                           ELSE t.relpages::bigint * 8192 END,
      'estimated_from', (SELECT GREATEST(s.last_vacuum, s.last_autovacuum,
                                         s.last_analyze, s.last_autoanalyze)
                           FROM pg_stat_all_tables s WHERE s.relid = t.oid),

@@ -97,6 +97,25 @@ json ts_index(json columns, bool unique = false) {
 
 // --- core kinds on a hypertable: the hazard this module exists for ----------
 
+// The parent of a hypertable holds no rows, and the kinds that state a size or
+// a row count read it there: "deleting 0 estimated rows", "rewrites the whole
+// table: 0 B". They take the module's figure, as create_index and backfill do.
+TEST(TimescaledbPlanner, TheKindsThatStateASizeReadTheChunksNotTheEmptyParent) {
+  const auto del = ts_plan(json{{"kind", "delete_rows"}, {"schema", "public"}, {"table", "m"},
+                                {"key", "id"}, {"where", "v < 0"}},
+                           ts_hypertable_obs());
+  ASSERT_FALSE(del.steps.empty()) << del.render();
+  EXPECT_EQ(del.steps.back().detail.value("rows_estimated", 0LL), 4000000)
+      << del.render();
+  const auto drop = ts_plan(json{{"kind", "drop_table"}, {"schema", "public"}, {"table", "m"}},
+                            ts_hypertable_obs());
+  bool said = false;
+  for (const auto& w : drop.warnings) {
+    if (w.find("512.0 MiB and roughly 4000000 rows") != std::string::npos) said = true;
+  }
+  EXPECT_TRUE(said) << drop.render();
+}
+
 TEST(TimescaledbPlanner, AnIndexOnALargeHypertableIsBuiltOneChunkAtATimeNeverConcurrently) {
   const auto p = ts_plan(ts_index(json::array({"dev"})), ts_hypertable_obs());
   ASSERT_TRUE(p.ok) << p.render();

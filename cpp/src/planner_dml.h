@@ -663,6 +663,28 @@ inline void warn_about_row_security(const json& t, const std::string& qualified,
 inline IndexTraits index_traits(const Observations& obs, const std::string& qualified,
                                 const Intent& in, std::string& decided_by);
 
+namespace detail {
+// How much data a table holds, for a decision or a sentence about its size:
+// the module's figure where the relation's own does not hold the rows (a
+// hypertable, a distributed table -- both read 0 from the parent), else the
+// reading's, which for a partitioned table is already its leaves' total.
+struct TableData {
+  long long bytes = 0;
+  long long rows = 0;
+};
+inline TableData table_data(const Observations& obs, const std::string& qualified,
+                            const Intent& in) {
+  const auto& t = obs.table(qualified);
+  std::string by;
+  const auto traits = index_traits(obs, qualified, in, by);
+  TableData d;
+  d.bytes = traits.answered && traits.size_bytes >= 0 ? traits.size_bytes
+                                                      : t.value("size_estimate", 0LL);
+  d.rows = traits.answered && traits.rows >= 0 ? traits.rows : t.value("reltuples", 0LL);
+  return d;
+}
+}  // namespace detail
+
 // --- backfill --------------------------------------------------------------
 //
 // One expression applied to many rows. The oldest kind in this family and the
@@ -1831,7 +1853,10 @@ inline void plan_delete_rows(const Intent& in, const Observations& obs,
         "in an earlier intent, or confirm the constraint cascades.");
   }
 
-  const auto rows = t.value("reltuples", 0LL);
+  // Not the relation's own count where it does not hold the rows: "deleting 0
+  // estimated rows" was what the plan said of a hypertable or a distributed
+  // table.
+  const auto rows = detail::table_data(obs, qualified, in).rows;
   const auto src = detail::decide_pacing(in, cfg, true);
   const auto k = detail::quote_identifier(key);
   const bool by_predicate = !in.body.contains("values") && !in.body.contains("select");

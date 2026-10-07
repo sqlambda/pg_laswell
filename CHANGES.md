@@ -573,6 +573,28 @@ Found while measuring, and now in the man page: dropping a role that still has
 a job makes the pg_cron launcher exit and restart every second, and no job runs
 until the row is removed.
 
+### A table whose parent holds no rows is sized by where the rows are
+
+`create_index` and `backfill` asked the module how much data a hypertable or a
+distributed table holds; the other kinds that decide or speak by size still
+read the parent, which reads empty. They ask too now:
+
+- `delete_rows` by predicate planned "deleting 0 estimated rows" and published
+  no progress;
+- `alter_column_type` said it would rewrite "the whole table: 0 B";
+- `drop_table` warned that "0 B and roughly 0 rows go at commit";
+- `set_logged`, `set_tablespace` and `set_access_method` stated a rewrite of
+  0 B, and `set_tablespace` asked for 0 B free at the destination;
+- `detach_partition` chose the plain form, which locks every partition, for a
+  partition that is itself partitioned -- "size 0 B < 64 MiB";
+- `citus_alter_distributed_table` and `citus_undistribute_table` warned of a
+  full rewrite of "0 estimated rows".
+
+A native partitioned table has no module to ask. Its own reading is now the
+total of its leaf partitions, at any depth: `relpages` is always 0 on the
+parent, and `reltuples` is 0 until someone analyses the parent by hand, which
+autovacuum never does.
+
 ### Two modules on one table: their index answers are merged
 
 Core asked each module how an index may be built on a table and took the first
