@@ -265,6 +265,21 @@ inline BatchOutcome run_composite_batch(pqxx::work& txn,
   for (const auto& v : upto) where.append(v);
   const auto sel = txn.exec(select_sql, where);
 
+  // The one-statement form: the mutation rode in the statement, which returns
+  // the batch's keys in order. The cursor is the last of them.
+  if (apply_sql.empty()) {
+    std::vector<std::string> end;
+    for (const auto& row : sel) {
+      end.clear();
+      for (std::size_t c = 0; c < columns; ++c) {
+        end.push_back(row[static_cast<pqxx::row::size_type>(c)].as<std::string>());
+      }
+    }
+    out.considered = static_cast<long long>(sel.size());
+    if (!end.empty()) out.cursor = json(end).dump();
+    return out;
+  }
+
   // One array per key column, element i of each being row i's value.
   std::vector<std::string> literals(columns, "{");
   std::vector<std::string> last;
@@ -927,14 +942,17 @@ class Executor {
         batch_mode == "grouped" && step["sql"].size() > 2;
     // A composite walk: two statements, like the plain one, over all the key
     // columns of a unique index together. See run_composite_batch.
+    // Or ONE statement over them, for the kinds whose rows come from the
+    // specification: the mutation rides in the statement that names the batch.
+    const bool composite_statement = batch_mode == "composite_statement";
     const bool composite =
-        batch_mode == "composite" && step["sql"].size() > 1;
+        (batch_mode == "composite" && step["sql"].size() > 1) || composite_statement;
     std::vector<std::string> composite_columns;
     for (const auto& c : detail_json.value("key_columns", json::array())) {
       composite_columns.push_back(c.get<std::string>());
     }
     const auto apply_sql =
-        (two_statement || grouped || composite)
+        (two_statement || grouped || (composite && !composite_statement))
             ? detail::strip_semicolon(
                   step["sql"][grouped ? 2 : 1].get<std::string>())
             : std::string();

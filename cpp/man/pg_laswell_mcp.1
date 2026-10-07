@@ -1551,6 +1551,41 @@ by the rows that share its last key.
 Cut at the limit alone, those rows would be below the next batch's cursor and
 never considered.
 .Pp
+.Va key
+is one column, or a list of columns that are unique together:
+.Bd -literal -offset indent
+"key": ["tenant_id", "id"]
+.Ed
+.Pp
+A table keyed by tenant and id, or by id and time where it is partitioned by
+time, has no single column that names a row, and where the table is a
+hypertable, distributed or partitioned no unique index on one column can be
+made.
+With a list,
+.Cm update_rows ,
+.Cm merge_rows
+and
+.Cm delete_rows
+(by
+.Va values
+or
+.Va select )
+match on every column of it, the pre-image saves every column of it, the walk
+goes along the whole key with a cursor that is the whole key, and two rows of
+.Va values
+are the same key only when they agree on all of it.
+What proves the key names one row is a valid unique index, not partial and not
+over an expression, whose columns are all among the key's.
+Without one,
+.Cm update_rows
+and
+.Cm merge_rows
+are refused: one source row could change several.
+.Cm delete_rows
+by
+.Va where
+keeps a single column, which it walks by and which need not be unique.
+.Pp
 .Cm insert_rows
 takes
 .Va on_conflict :

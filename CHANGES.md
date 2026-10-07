@@ -573,6 +573,32 @@ Found while measuring, and now in the man page: dropping a role that still has
 a job makes the pg_cron launcher exit and restart every second, and no job runs
 until the row is removed.
 
+### A list of columns as the key of a row-level kind
+
+`update_rows` and `merge_rows` required a unique index on their key column
+alone and were refused on any table keyed by two columns -- `(tenant_id, id)`,
+or `(id, created_at)` where it is partitioned by time. The refusal said to
+`CREATE UNIQUE INDEX CONCURRENTLY ... (key)`, which a hypertable, a Citus
+distributed table and a partitioned table all refuse. `delete_rows` by `values`
+matched on one column, so on such a table a listed id deleted that id for every
+tenant. `insert_rows` refused two tenants with the same id as "the key more
+than once".
+
+`key` now takes a list as well as a name:
+
+```json
+{"kind": "update_rows", "schema": "public", "table": "lines",
+ "key": ["tenant_id", "id"], "columns": ["tenant_id", "id", "status"],
+ "select": "SELECT tenant_id, id, status FROM staging.lines"}
+```
+
+The match, the pre-image and the duplicate check are on the whole key. Paced,
+the walk goes along the whole key and its cursor is the whole key. What proves
+the key names one row is a valid unique index, not partial, whose columns are
+all among the key's. The refusal without one no longer names an index that
+cannot be built; it names the list form. `delete_rows` by `where` keeps one
+column, which it walks by and which need not be unique.
+
 ### Every exclusive step takes the weaker lock first, and a group retries whole
 
 The weaker-lock-first retry was on the recipes where a field report found the

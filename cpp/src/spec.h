@@ -491,6 +491,47 @@ inline std::string require_string(const json& obj, const std::string& key,
   return obj[key].get<std::string>();
 }
 
+// The key of a row-level kind: one column, or a list of columns that are unique
+// together -- a table keyed (tenant_id, id), or (id, created_at) where it is
+// partitioned by time, has no single column to match a row by.
+inline std::vector<std::string> row_key_columns(const json& body, const std::string& at,
+                                                std::size_t ordinal, bool required) {
+  std::vector<std::string> keys;
+  if (!body.contains("key")) {
+    if (required) {
+      fail(at + " is missing a non-empty \"key\"",
+           "Add \"key\": the column, or the list of columns, that identifies a row.");
+    }
+    return keys;
+  }
+  const auto& v = body["key"];
+  if (v.is_string()) {
+    keys.push_back(v.get<std::string>());
+  } else if (v.is_array() && !v.empty()) {
+    for (const auto& c : v) {
+      if (!c.is_string()) {
+        fail(at + ".key must be a column name or a list of column names",
+             "A string naming one column, or a list of strings naming the columns "
+             "that are unique together.");
+      }
+      keys.push_back(c.get<std::string>());
+    }
+  } else {
+    fail(at + ".key must be a column name or a non-empty list of column names",
+         "A string naming one column, or a list of strings naming the columns that "
+         "are unique together.");
+  }
+  for (std::size_t k = 0; k < keys.size(); ++k) {
+    require_identifier(keys[k], "key", ordinal);
+    for (std::size_t o = 0; o < k; ++o) {
+      if (keys[o] == keys[k]) {
+        fail(at + ".key names \"" + keys[k] + "\" twice", "Each column once.");
+      }
+    }
+  }
+  return keys;
+}
+
 inline void reject_unknown_keys(const json& obj, const std::set<std::string>& allowed,
                                 const std::string& at) {
   for (auto it = obj.begin(); it != obj.end(); ++it) {
@@ -2144,8 +2185,7 @@ inline void parse_row_source(Intent& in, const std::string& at,
 
     // The key must be a column the rows actually carry, or neither the keyset
     // walk nor the per-row match has anything to join on.
-    if (in.body.contains("key")) {
-      const auto key = in.body.value("key", "");
+    for (const auto& key : row_key_columns(in.body, at, in.ordinal, false)) {
       bool found = false;
       for (const auto& c : in.body["columns"]) {
         if (c.get<std::string>() == key) found = true;
@@ -2249,7 +2289,7 @@ inline void parse_delete_rows(Intent& in) {
                 "assert_invariants"}, at);
   detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
   detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
-  detail::require_identifier(detail::require_string(in.body, "key", at), "key", in.ordinal);
+  const auto delete_keys = detail::row_key_columns(in.body, at, in.ordinal, true);
 
   // The three forms are alternatives. `where` is the one this kind had first,
   // and its refusal is kept verbatim because it is the mistake people actually
@@ -2257,6 +2297,13 @@ inline void parse_delete_rows(Intent& in) {
   // deleting an explicit list of keys no longer has to invent a predicate.
   const bool has_values = in.body.contains("values");
   const bool has_select = in.body.contains("select");
+  if (!has_values && !has_select && delete_keys.size() > 1) {
+    detail::fail(at + ".key is a list, which the \"where\" form does not take",
+                 "With \"where\" the key is the one column the purge walks the "
+                 "table by; it need not be unique. A list of columns is for "
+                 "\"values\" and \"select\", where it says which row each entry "
+                 "names.");
+  }
   if (!has_values && !has_select) {
     const auto where = in.body.value("where", "");
     if (!in.body.contains("where") || !in.body["where"].is_string() || where.empty()) {
@@ -2283,9 +2330,7 @@ inline void parse_insert_rows(Intent& in) {
                 "assert_invariants"}, at);
   detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
   detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
-  if (in.body.contains("key")) {
-    detail::require_identifier(in.body.value("key", ""), "key", in.ordinal);
-  }
+  detail::row_key_columns(in.body, at, in.ordinal, false);
   detail::parse_row_source(in, at, "", false);
 
   // The select form has to say which columns it is filling, because
@@ -2387,7 +2432,7 @@ inline void parse_update_rows(Intent& in) {
       at);
   detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
   detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
-  detail::require_identifier(detail::require_string(in.body, "key", at), "key", in.ordinal);
+  const auto update_keys = detail::row_key_columns(in.body, at, in.ordinal, true);
   detail::parse_row_source(in, at, "identifies the row each set of values "
                                    "belongs to", false);
 
@@ -2399,17 +2444,18 @@ inline void parse_update_rows(Intent& in) {
                  "reason as the values form: to know which returned column is "
                  "which.");
   }
-  const auto key = in.body.value("key", "");
-  bool key_in_columns = false;
-  for (const auto& c : in.body["columns"]) {
-    if (c.is_string() && c.get<std::string>() == key) key_in_columns = true;
+  for (const auto& key : update_keys) {
+    bool key_in_columns = false;
+    for (const auto& c : in.body["columns"]) {
+      if (c.is_string() && c.get<std::string>() == key) key_in_columns = true;
+    }
+    if (!key_in_columns) {
+      detail::fail(at + ".columns does not include the key \"" + key + "\"",
+                   "The key identifies which row each set of values belongs to, "
+                   "so it has to be one of the columns supplied.");
+    }
   }
-  if (!key_in_columns) {
-    detail::fail(at + ".columns does not include the key \"" + key + "\"",
-                 "The key identifies which row each set of values belongs to, "
-                 "so it has to be one of the columns supplied.");
-  }
-  if (in.body["columns"].size() < 2) {
+  if (in.body["columns"].size() < update_keys.size() + 1) {
     detail::fail(at + " sets no columns",
                  "\"columns\" holds the key plus at least one column to change. "
                  "With only the key there is nothing to update, and if the "
@@ -2429,7 +2475,7 @@ inline void parse_merge_rows(Intent& in) {
                 "preserve", "assert_invariants"}, at);
   detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
   detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
-  detail::require_identifier(detail::require_string(in.body, "key", at), "key", in.ordinal);
+  const auto merge_keys = detail::row_key_columns(in.body, at, in.ordinal, true);
   detail::parse_row_source(in, at, "matches a source row to a target row", false);
 
   if (!in.body.contains("columns") || !in.body["columns"].is_array() ||
@@ -2438,16 +2484,19 @@ inline void parse_merge_rows(Intent& in) {
                  "Name the key and the columns the source carries, in order. "
                  "MERGE needs them to build both the INSERT and the UPDATE.");
   }
-  const auto key = in.body.value("key", "");
-  bool key_in_columns = false;
   for (const auto& c : in.body["columns"]) {
     if (!c.is_string()) detail::fail(at + ".columns entries must be strings", "");
-    if (c.get<std::string>() == key) key_in_columns = true;
   }
-  if (!key_in_columns) {
-    detail::fail(at + ".columns does not include the key \"" + key + "\"",
-                 "The key is what ON matches source rows to target rows by, so "
-                 "the source has to carry it.");
+  for (const auto& key : merge_keys) {
+    bool key_in_columns = false;
+    for (const auto& c : in.body["columns"]) {
+      if (c.get<std::string>() == key) key_in_columns = true;
+    }
+    if (!key_in_columns) {
+      detail::fail(at + ".columns does not include the key \"" + key + "\"",
+                   "The key is what ON matches source rows to target rows by, so "
+                   "the source has to carry it.");
+    }
   }
 
   const auto matched = in.body.value("when_matched", "update");
