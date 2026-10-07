@@ -573,6 +573,27 @@ Found while measuring, and now in the man page: dropping a role that still has
 a job makes the pg_cron launcher exit and restart every second, and no job runs
 until the row is removed.
 
+### A module reading that raises is contained, and named
+
+A module's reading is one statement over a vendor's catalogs and functions, and
+one that raised failed the whole observation -- every plan on that server --
+with the vendor's raw error. Measured: as a role without USAGE on a schema that
+holds a hypertable, the TimescaleDB reading raises "permission denied for
+schema". Each module's reading now runs in a savepoint. One that raises fails
+alone; the plan is refused -- without the reading a hypertable would be planned
+as a plain table and a distributed one as local -- and the refusal names the
+module and carries the server's message.
+
+### A default that calls a function is not claimed to be catalog-only
+
+`add_column` with a `default` said "non-volatile default is catalog-only" of
+every default and checked none. Measured: a constant and `now()` did not
+rewrite the table; `gen_random_uuid()` did, under `AccessExclusiveLock`. What a
+function is, is in `pg_proc` and not in the default's text, so for a default
+that calls one the step now says it is catalog-only only if the function is not
+volatile, and a warning gives the query that tells and the alternative for a
+volatile value: the column without the default, and `fill`.
+
 ### Names quoted where they were not, and one more TimescaleDB refusal
 
 - `attach_partition` wrote the partition's name unquoted in the three

@@ -764,16 +764,32 @@ class Catalog {
 #define PGLASWELL_OBSERVE(module_name, present_sql, observation_sql, absent_sql, \
                           reads_applied_steps)                                 \
     do {                                                                      \
-      const auto probe = txn.exec(present_sql);                               \
-      const bool present = !probe.empty() && probe[0][0].as<bool>();          \
-      const char* const sql = present ? (observation_sql) : (absent_sql);     \
-      if (sql == nullptr) break;                                              \
-      const auto r = txn.exec(sql);                                           \
-      if (!r.empty() && !r[0][0].is_null()) {                                 \
-        obs.extensions[module_name] = json::parse(r[0][0].as<std::string>()); \
-        if (reads_applied_steps) {                                            \
-          observe_applied_steps(txn, obs.extensions[module_name], module_name); \
+      /* In a savepoint: a module's reading is one statement over a vendor's   \
+         catalogs and functions, and one that raises -- a role without USAGE   \
+         on a schema, a chunk dropped as it was read, an older release of the  \
+         extension -- used to fail the whole observation, and with it every    \
+         plan on that server, with the vendor's raw error. It now fails that   \
+         module's reading alone, and the planner says which and why. */        \
+      txn.exec("SAVEPOINT laswell_module_reading");                           \
+      try {                                                                   \
+        const auto probe = txn.exec(present_sql);                             \
+        const bool present = !probe.empty() && probe[0][0].as<bool>();        \
+        const char* const sql = present ? (observation_sql) : (absent_sql);   \
+        if (sql != nullptr) {                                                 \
+          const auto r = txn.exec(sql);                                       \
+          if (!r.empty() && !r[0][0].is_null()) {                             \
+            obs.extensions[module_name] = json::parse(r[0][0].as<std::string>()); \
+            if (reads_applied_steps) {                                        \
+              observe_applied_steps(txn, obs.extensions[module_name], module_name); \
+            }                                                                 \
+          }                                                                   \
         }                                                                     \
+        txn.exec("RELEASE SAVEPOINT laswell_module_reading");                 \
+      } catch (const pqxx::sql_error& e) {                                    \
+        txn.exec("ROLLBACK TO SAVEPOINT laswell_module_reading");             \
+        obs.extensions.erase(module_name);                                    \
+        obs.extension_errors[module_name] =                                   \
+            std::string(e.sqlstate()) + ": " + server_message(e.what());      \
       }                                                                       \
     } while (false);
 #include "modules/enabled_observers.h"

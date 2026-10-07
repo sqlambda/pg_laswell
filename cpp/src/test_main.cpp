@@ -3215,6 +3215,78 @@ TEST_F(BootstrappedTest, StatusReportsAUsableLedgerAndItsTrustedKeys) {
   EXPECT_EQ(st.trusted_key_ids[0], test_key().key_id);
 }
 
+// A module's reading is one statement over a vendor's catalogs, and one that
+// raises used to fail the whole observation -- every plan on that server --
+// with the vendor's raw error. Measured: as a role without USAGE on a schema
+// that holds a hypertable, the TimescaleDB reading raises "permission denied
+// for schema". It now fails that module's reading alone; the planner refuses,
+// because without the reading a hypertable would be planned as a plain table,
+// and says which module and what the server said.
+TEST_F(DatabaseTest, AModuleReadingThatRaisesIsContainedAndNamed) {
+  pglaswell::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = url_;
+  if (std::string(PGLASWELL_MODULE_SET).find("timescaledb") == std::string::npos) {
+    GTEST_SKIP() << "built without the timescaledb module";
+  }
+  {
+    pglaswell::ReadSession r(cfg);
+    if (r.txn().exec("SELECT 1 FROM pg_available_extensions WHERE name = 'timescaledb'").empty()) {
+      GTEST_SKIP() << "TimescaleDB is not installed on this server";
+    }
+  }
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/hidden-hypertable");
+    w.txn().exec("CREATE EXTENSION IF NOT EXISTS timescaledb");
+    w.txn().exec("DROP SCHEMA IF EXISTS laswell_hidden CASCADE");
+    w.txn().exec("DROP TABLE IF EXISTS laswell_seen");
+    w.txn().exec("DROP ROLE IF EXISTS laswell_blind");
+    w.txn().exec("CREATE ROLE laswell_blind LOGIN PASSWORD 'laswell_blind'");
+    w.txn().exec("CREATE SCHEMA laswell_hidden");
+    w.txn().exec("CREATE TABLE laswell_hidden.h(ts timestamptz NOT NULL, v int)");
+    w.txn().exec("SELECT create_hypertable('laswell_hidden.h', by_range('ts'))");
+    w.txn().exec("CREATE TABLE laswell_seen(id int PRIMARY KEY, v text)");
+    w.txn().exec("GRANT SELECT ON laswell_seen TO laswell_blind");
+    w.commit();
+  }
+  pglaswell::ConnConfig as_role = cfg;
+  as_role.conninfo =
+      pglaswell::detail::is_conninfo_uri(url_)
+          ? url_ + (url_.find('?') == std::string::npos ? "?" : "&") +
+                "user=laswell_blind&password=laswell_blind"
+          : url_ + " user=laswell_blind password=laswell_blind";
+
+  pglaswell::Catalog cat(as_role);
+  pglaswell::Observations obs;
+  // It answers: the table is read, and the module's failure is recorded.
+  ASSERT_NO_THROW(obs = cat.observe({"public"}, {"laswell_seen"}));
+  EXPECT_TRUE(obs.table("public.laswell_seen").value("exists", false));
+  EXPECT_TRUE(obs.extension("timescaledb").empty());
+  ASSERT_TRUE(obs.extension_errors.contains("timescaledb")) << obs.extension_errors.dump();
+  EXPECT_NE(obs.extension_errors["timescaledb"].get<std::string>().find("permission denied"),
+            std::string::npos) << obs.extension_errors.dump();
+
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "add_column"}, {"schema", "public"},
+                                {"table", "laswell_seen"}, {"column", "n"}, {"type", "int"},
+                                {"nullable", true}, {"comment", "c"}}})),
+      obs, {});
+  EXPECT_FALSE(plan.ok);
+  ASSERT_FALSE(plan.conflicts.empty());
+  EXPECT_NE(plan.conflicts[0].find("the timescaledb module could not read this database"),
+            std::string::npos) << plan.conflicts[0];
+  EXPECT_NE(plan.conflicts[0].find("permission denied for schema laswell_hidden"),
+            std::string::npos) << plan.conflicts[0];
+
+  pglaswell::WriteSession w(cfg);
+  w.begin("pg_laswell/test/hidden-hypertable-drop");
+  w.txn().exec("DROP SCHEMA laswell_hidden CASCADE");
+  w.txn().exec("DROP TABLE laswell_seen");
+  w.txn().exec("DROP ROLE laswell_blind");
+  w.commit();
+}
+
 // A role the bootstrap did not name: the ledger is there, and this role has no
 // USAGE on its schema. Found 2026-10-01 while testing pg_cron: on PostgreSQL 18
 // every NAME-based probe -- to_regclass('laswell.x'), has_table_privilege(
@@ -5130,6 +5202,43 @@ TEST(Planner, TheTriggerRecipesWalkStopsAtTheHighestKeyThereWasWhenItStarted) {
   plan = pglaswell::plan_migration(pglaswell::parse_spec(doc), observations(2LL << 30, 8000000), {});
   ASSERT_NE(find_step(plan, "backfill"), nullptr);
   EXPECT_FALSE(find_step(plan, "backfill")->detail.contains("upper_bound_sql"));
+}
+
+// "non-volatile default is catalog-only" was said of every default, checked
+// for none. Measured: a constant and now() did not rewrite the table;
+// gen_random_uuid() did, under AccessExclusiveLock. What a function is, is in
+// pg_proc and not in the text, so the plan stops claiming and says how to know.
+TEST(Planner, ADefaultThatCallsAFunctionIsNotClaimedToBeCatalogOnly) {
+  const auto obs = observations(2LL << 30, 8000000);
+  const auto with_default = [&](const char* dflt) {
+    return pglaswell::plan_migration(
+        spec_of(json::array({json{{"kind", "add_column"}, {"schema", "shop"},
+                                  {"table", "orders"}, {"column", "token"}, {"type", "text"},
+                                  {"nullable", false}, {"default", dflt},
+                                  {"comment", "A token."}}})),
+        obs, {});
+  };
+  auto plan = with_default("'none'");
+  ASSERT_TRUE(plan.ok) << plan.render();
+  EXPECT_NE(plan.steps[0].why.find("a constant default is catalog-only"), std::string::npos)
+      << plan.steps[0].why;
+  for (const auto& w : plan.warnings) EXPECT_EQ(w.find("calls a function"), std::string::npos);
+  // A parenthesis inside a string is not a call.
+  plan = with_default("'a (b)'");
+  EXPECT_NE(plan.steps[0].why.find("a constant default"), std::string::npos);
+
+  plan = with_default("gen_random_uuid()::text");
+  ASSERT_TRUE(plan.ok) << plan.render();
+  EXPECT_NE(plan.steps[0].why.find("only if that function is not volatile"), std::string::npos)
+      << plan.steps[0].why;
+  EXPECT_EQ(plan.steps[0].detail.value("expected", ""),
+            "metadata only, unless the default is volatile");
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("REWRITES the whole table") != std::string::npos &&
+        w.find("provolatile") != std::string::npos) warned = true;
+  }
+  EXPECT_TRUE(warned) << plan.render();
 }
 
 // A table keyed (time, id) has no single-column primary key, and the fill

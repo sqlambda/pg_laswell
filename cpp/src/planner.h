@@ -965,6 +965,19 @@ inline void plan_add_column(const Intent& in, const Observations& obs,
   plan_defaulted_fill({&in}, after, cfg, plan, out);
 }
 
+namespace detail {
+// Whether an SQL expression calls anything: a parenthesis outside a quoted
+// string. "now()" and "gen_random_uuid()" do; "0", "'a (b)'" and "true" do not.
+inline bool calls_a_function(const std::string& expr) {
+  bool quoted = false;
+  for (const char c : expr) {
+    if (c == '\'') quoted = !quoted;
+    if (c == '(' && !quoted) return true;
+  }
+  return false;
+}
+}  // namespace detail
+
 inline void plan_add_column_plain(const Intent& in, const Observations& obs, Plan& plan,
                                   std::vector<Step>& out) {
   Step step;
@@ -1066,10 +1079,34 @@ inline void plan_add_column_plain(const Intent& in, const Observations& obs, Pla
     return;
   }
 
-  step.why = has_default
-                 ? "column absent; non-volatile default is catalog-only on PG 11+"
-                 : "column absent; nullable with no default is catalog-only";
-  step.detail["expected"] = "metadata only, no table rewrite";
+  // What is known of the default is its text. A constant is catalog-only
+  // (measured), and so is a call to a function that is not volatile -- now()
+  // did not rewrite. A VOLATILE one rewrites the table under
+  // AccessExclusiveLock: measured, gen_random_uuid() changed the relfilenode.
+  // Which a function is, is in pg_proc and not in the text, and this does not
+  // guess from a name: it stops claiming, and says how to find out.
+  const std::string default_text =
+      has_default ? (in.body["default"].is_string() ? in.body["default"].get<std::string>()
+                                                    : in.body["default"].dump())
+                  : std::string();
+  const bool calls = has_default && detail::calls_a_function(default_text);
+  step.why = !has_default ? "column absent; nullable with no default is catalog-only"
+             : !calls     ? "column absent; a constant default is catalog-only on PG 11+"
+                          : "column absent; the default calls a function, and is "
+                            "catalog-only on PG 11+ only if that function is not volatile";
+  step.detail["expected"] = calls ? "metadata only, unless the default is volatile"
+                                  : "metadata only, no table rewrite";
+  if (calls) {
+    plan.warnings.push_back(
+        qualified + "." + column + " takes the default " + default_text +
+        ", which calls a function. PostgreSQL keeps a default in the catalog when "
+        "it is not volatile -- measured: a constant, and now() -- and REWRITES the "
+        "whole table under AccessExclusiveLock when it is: measured, "
+        "gen_random_uuid(). pg_laswell does not know which this is. "
+        "SELECT proname, provolatile FROM pg_proc WHERE proname = '<the function>' "
+        "says: 'v' is volatile. For a volatile value on a table of any size, add "
+        "the column without the default and give the value as \"fill\".");
+  }
 }
 
 // Applies a planned step's effect to the projected catalog, so that later
@@ -7554,6 +7591,21 @@ inline Plan plan_migration(const Spec& spec, const Observations& obs,
 #define PGLASWELL_PLAN_GUARD(guard_fn) guard_fn(spec, obs, budget, refuse, advise);
 #include "modules/enabled_guards.h"
 #undef PGLASWELL_PLAN_GUARD
+    // A module whose reading could not be taken. Its slot is absent, and to a
+    // module absent means "not installed": planned on, a hypertable would be
+    // treated as a plain table and a distributed one as local. So nothing is
+    // planned, and the refusal carries the server's own message.
+    for (const auto& [module, error] : obs.extension_errors.items()) {
+      refusals.push_back(
+          "the " + module + " module could not read this database, so nothing is "
+          "planned: without that reading a table the extension manages would be "
+          "planned as an ordinary one. The server said: " +
+          (error.is_string() ? error.get<std::string>() : error.dump()) +
+          ". This is about the role or the extension's state, not about the "
+          "specification -- a role lacking USAGE on one of the extension's schemas, "
+          "or an extension release older than the module supports, are the usual "
+          "causes.");
+    }
     if (!refusals.empty()) {
       plan.ok = false;
       for (auto& r : refusals) plan.conflicts.push_back(std::move(r));

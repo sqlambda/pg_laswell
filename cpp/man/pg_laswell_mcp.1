@@ -915,6 +915,17 @@ A
 column with a
 .Va default
 that is not volatile is one catalog-only statement.
+Measured on 18.6: a constant, and
+.Fn now ,
+did not rewrite the table;
+.Fn gen_random_uuid ,
+which is volatile, rewrote it under
+.Va AccessExclusiveLock .
+Which a function is cannot be read from the text of a default, and pg_laswell
+does not guess from a name: for a default that calls a function the step says
+it is catalog-only only if the function is not volatile, and a warning names the
+query that tells
+.Pq Li provolatile No in Li pg_proc .
 Without a default,
 .Ic ADD COLUMN ... NOT NULL
 fails on the first existing row, and the column is refused unless the
