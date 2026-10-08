@@ -525,9 +525,36 @@ inline json plan_migration_tool(ToolContext& ctx, const json& args) {
   detail::observation_targets(spec, schemas, tables, object_keys);
   Catalog cat(cfg, ctx.cache);
   const auto obs = cat.observe(schemas, tables, object_keys);
-  const auto plan = plan_migration(spec, obs, cfg.executor);
+  auto plan = plan_migration(spec, obs, cfg.executor);
+
+  // An earlier form of this specification that was started and did not finish.
+  // Said, and nothing more: the plan is the same either way. A note and not a
+  // warning, so it is outside planDigest -- what the ledger holds is not part
+  // of what this plan will do.
+  json earlier_forms = json::array();
+  try {
+    Ledger forms(cfg, ctx.cache);
+    const auto earlier = forms.unfinished_earlier_forms(spec.id, spec.digest);
+    earlier_forms = earlier;
+    if (!earlier.empty()) {
+      for (const auto& f : earlier) {
+        plan.advisories.push_back(
+            "an earlier form of this specification (" +
+            f.value("specDigest", "").substr(0, 12) + "…) was started by job " +
+            f.value("jobId", "") + " at " + f.value("startedAt", "") +
+            " and did not finish (" + f.value("state", "") + "); its walks wrote " +
+            std::to_string(f.value("rowsWritten", 0LL)) +
+            " rows. Its cursor is not used: the specification has changed, so "
+            "this plan starts from the first row, and what the earlier job "
+            "committed is still in the table.");
+      }
+    }
+  } catch (const std::exception&) {
+    // No ledger yet, or one this role cannot read: nothing to say.
+  }
 
   json out = plan.to_json();
+  if (!earlier_forms.empty()) out["earlierForms"] = earlier_forms;
 
   // Apply the plan in a transaction that never commits, so the later steps are
   // checked against the schema the earlier ones produce. This is the property
@@ -921,6 +948,16 @@ inline json start_migration(ToolContext& ctx, const json& args) {
   }
 
   const auto& cfg = ctx.connection(args);
+  // Before anything is started: set the ledger right about jobs whose process
+  // died. Nothing else ever does -- a job's row is closed by the process that
+  // runs it -- and a ledger that says a change is in progress which is not is
+  // wrong about the one thing it is for. Never allowed to stop the run.
+  json reconciled = json::array();
+  try {
+    Ledger reconciler(cfg, nullptr);
+    reconciled = reconciler.reconcile_dead_jobs();
+  } catch (const std::exception&) {
+  }
   if (ctx.jobs->running_count() >= cfg.executor.max_concurrent_jobs) {
     return json{{"error", "the concurrency limit is reached"},
                 {"hint", "max_concurrent_jobs is " +
@@ -991,16 +1028,19 @@ inline json start_migration(ToolContext& ctx, const json& args) {
     Executor(cfg, job, ledger.get(), gate).run();
   });
 
-  return json{{"jobId", job->job_id},
-              {"accepted", true},
-              {"specId", spec.id},
-              {"specDigest", spec.digest},
-              {"planDigest", job->plan_digest},
-              {"signerKeyId", signer.key_id},
-              {"note",
-               "the work runs in the background; poll jobStatus for progress, "
-               "contention and an ETA. The planDigest above is the plan that "
-               "is being executed -- it must equal what planMigration showed."}};
+  json started{{"jobId", job->job_id},
+               {"accepted", true},
+               {"specId", spec.id},
+               {"specDigest", spec.digest},
+               {"planDigest", job->plan_digest},
+               {"signerKeyId", signer.key_id},
+               {"note",
+                "the work runs in the background; poll jobStatus for progress, "
+                "contention and an ETA. The planDigest above is the plan that "
+                "is being executed -- it must equal what planMigration showed."}};
+  if (!reconciled.empty()) started["interruptedJobsMarked"] = reconciled;
+  if (planned.contains("earlierForms")) started["earlierForms"] = planned["earlierForms"];
+  return started;
 }
 
 // --- jobStatus -------------------------------------------------------------

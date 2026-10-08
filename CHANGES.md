@@ -171,6 +171,44 @@ Batches that grow while the table is quiet were measured and not built: on
 35,000 to 48,000 at the larger sizes, and a concurrent writer's longest wait
 went from 3 to 12 ms and from 68 to 252 ms.
 
+### A job whose process died is noticed, marked, and run again
+
+A job's row in the ledger is closed by the process that runs it. Reported from
+a job stopped with SIGINT: two hours later, on a server restarted since, it was
+still `running`, beside its successor. Three things followed from that row.
+
+- **Its specification was never run again.** A job with no `finished_at`
+  classed its specification as `in_progress`, which is neither pending nor
+  failed, so applying the same file again skipped it for good and held back
+  everything that depends on it. A job counts as running now only while its own
+  backend holds its advisory lock.
+- **`jobStatus` could not see it while a successor ran.** The test was for the
+  lock key, and the key is the specification's id, which the successor holds
+  too. It is now for the job's own backend, started before the job was.
+- **Nothing ever wrote that it had ended.** When a run starts, `startMigration`
+  and `pg_laswell` mark such a job `interrupted`, with the time it was noticed,
+  and its running steps with it; its cursor is kept. Status calls report it and
+  write nothing.
+
+A plan for a specification whose earlier form (same id, another digest) was
+started and did not finish now says so: which job, when, how it ended and how
+many rows its walks wrote, and that its cursor is not used.
+
+### SIGINT and SIGTERM stop the jobs before the process exits
+
+Both programs exited at once. The first signal now asks every running job to
+stop as `cancelJob` does and waits for it: a walk commits the batch it is in
+and its cursor, a statement in flight that is not part of a walk is cancelled,
+and the job is written as `cancelled`. `pg_laswell` starts nothing further and
+exits 130. A second signal ends the process at once.
+
+### A walk cancelled as the last step was recorded as succeeded
+
+Found while adding the above. A walk that was cancelled returned to a loop that
+went on to the next step; where the walk was the last one, the job fell out of
+the loop and was written as `succeeded` with rows still to do (170 of 300 in
+the test that found it). This applied to `cancelJob` as well.
+
 ### `set_text_search_mapping`
 
 A text search configuration could be created by copying one and then not

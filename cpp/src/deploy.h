@@ -56,6 +56,7 @@
 #include <nlohmann/json.hpp>
 
 #include "tools.h"
+#include "signals.h"
 
 namespace pglaswell {
 
@@ -87,7 +88,8 @@ enum class DeployResult {
   kOk = 0,            // nothing pending, or everything applied
   kRefused = 1,       // a plan was refused, a spec untrusted, a job failed
   kRepoProblem = 2,   // drift, an unreadable spec, a broken dependency
-  kConfigProblem = 3  // no connection, no repository, nothing to work with
+  kConfigProblem = 3, // no connection, no repository, nothing to work with
+  kInterrupted = 130  // SIGINT or SIGTERM: the running jobs were stopped first
 };
 
 namespace detail {
@@ -420,6 +422,7 @@ class Deployment {
     std::size_t next = 0;
     while (next < ids.size() || !running.empty()) {
       while (next < ids.size() && static_cast<int>(running.size()) < cap) {
+        if (signals::received() != 0) break;  // nothing further is started
         const auto& id = ids[next++];
         json spec;
         try {
@@ -472,6 +475,22 @@ class Deployment {
           drain(out, running);
           return DeployResult::kRefused;
         }
+        // What the start found in the ledger and set right, or has to say
+        // about an earlier form of this specification.
+        for (const auto& j : started.value("interruptedJobsMarked", json::array())) {
+          out << "  note: job " << j.value("jobId", "") << " of " << j.value("specId", "")
+              << ", started " << j.value("startedAt", "")
+              << ", was still recorded as running and its session is gone. "
+                 "Marked interrupted; its cursor is kept.\n";
+        }
+        for (const auto& f : started.value("earlierForms", json::array())) {
+          out << "  note: an earlier form of " << id << " ("
+              << f.value("specDigest", "").substr(0, 12) << "…) was started by job "
+              << f.value("jobId", "") << " at " << f.value("startedAt", "")
+              << " and did not finish (" << f.value("state", "") << "), after writing "
+              << f.value("rowsWritten", 0LL)
+              << " rows. Its cursor is not used: the specification has changed.\n";
+        }
         out << "  " << id << ": started (" << started.value("jobId", "") << ")\n";
         // The rehearsal ran BEFORE the job exists, with real locks on the live
         // schema, and laswell.job.started_at is after it. Said here so the time
@@ -480,6 +499,10 @@ class Deployment {
         running.emplace_back(id, started.value("jobId", ""));
       }
 
+      if (stop_on_signal(out)) {
+        drain(out, running);
+        return DeployResult::kInterrupted;
+      }
       if (running.empty()) continue;
       std::this_thread::sleep_for(std::chrono::milliseconds(opts_.poll_ms));
 
@@ -515,6 +538,7 @@ class Deployment {
     out << "  waiting for " << running.size()
         << " migration(s) already running before stopping\n";
     while (!running.empty()) {
+      stop_on_signal(out);
       std::this_thread::sleep_for(std::chrono::milliseconds(opts_.poll_ms));
       for (auto it = running.begin(); it != running.end();) {
         const auto st = snapshot(it->second);
@@ -530,6 +554,25 @@ class Deployment {
       }
     }
   }
+
+  // SIGINT or SIGTERM (signals.h). The jobs are asked to stop as cancelJob
+  // asks -- a walk commits the batch it is in and its cursor, a statement in
+  // flight is cancelled -- and are then waited for like any others, so each
+  // one's end is written to the ledger and to this log. True from the first
+  // signal on; says so once.
+  bool stop_on_signal(std::ostream& out) {
+    const int sig = signals::received();
+    if (sig == 0) return false;
+    if (!stop_said_) {
+      stop_said_ = true;
+      const int asked = ctx_.jobs ? signals::stop_jobs(*ctx_.jobs) : 0;
+      out << "  " << (sig == SIGTERM ? "SIGTERM" : "SIGINT") << ": " << asked
+          << " running migration(s) asked to stop; nothing further is started. "
+             "A second signal ends this process at once.\n" << std::flush;
+    }
+    return true;
+  }
+  bool stop_said_ = false;
 
   // A line for a walk that is still running: how many rows, how fast, and how
   // long it has left where that can be estimated. A deployment said nothing

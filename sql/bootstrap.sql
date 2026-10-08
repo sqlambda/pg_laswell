@@ -299,7 +299,7 @@ COMMENT ON COLUMN laswell.job.plan           IS 'The full plan, as shown before 
 COMMENT ON COLUMN laswell.job.plan_digest    IS 'Digest of the plan. planMigration and startMigration must agree, which is how "what ran is what you were shown" becomes checkable.';
 COMMENT ON COLUMN laswell.job.observations   IS 'What the planner measured. A decision can be re-read later and argued with.';
 COMMENT ON COLUMN laswell.job.backend_pid    IS 'Coordination connection''s backend pid.';
-COMMENT ON COLUMN laswell.job.lock_key       IS 'The session advisory lock this job holds. Its absence from pg_locks is how a crashed job is detected, with no heartbeat and no timeout tuning.';
+COMMENT ON COLUMN laswell.job.lock_key       IS 'The session advisory lock this job holds. A job with no finished_at whose backend_pid no longer holds it has died: detected with no heartbeat and no timeout tuning, and marked interrupted when the next run starts.';
 COMMENT ON COLUMN laswell.job.error          IS 'Structured failure, with the hint that names what to change.';
 
 CREATE INDEX IF NOT EXISTS job_unfinished_idx
@@ -329,7 +329,7 @@ COMMENT ON COLUMN laswell.step.txn_group     IS 'Steps sharing a group ran in on
 COMMENT ON COLUMN laswell.step.txn_class     IS 'txn_forbidden means the statement cannot run inside a transaction block at all -- CREATE INDEX CONCURRENTLY.';
 COMMENT ON COLUMN laswell.step.sql           IS 'The statement verbatim, as executed. Never reconstructed from the spec.';
 COMMENT ON COLUMN laswell.step.why           IS 'The planner rule that chose this method, and the measurement behind it.';
-COMMENT ON COLUMN laswell.step.state         IS 'running | succeeded | failed | lock_not_acquired | skipped_satisfied | cancelled. running is a step under way, or one whose job died with its connection. skipped_satisfied is a success recorded with its justification, so "we did not need to" is distinguishable from "we forgot to".';
+COMMENT ON COLUMN laswell.step.state         IS 'running | succeeded | failed | lock_not_acquired | skipped_satisfied | cancelled | interrupted. running is a step under way, or one whose job died with its connection and has not been noticed yet; interrupted is such a step once a later run noticed. skipped_satisfied is a success recorded with its justification, so "we did not need to" is distinguishable from "we forgot to".';
 COMMENT ON COLUMN laswell.step.started_at    IS 'When the step began, written before it ran. Where a step was attempted more than once -- a transaction group retried for a lock -- the first attempt''s start, so that the waiting is part of what the step cost.';
 COMMENT ON COLUMN laswell.step.finished_at   IS 'When the step ended. NULL while it runs.';
 COMMENT ON COLUMN laswell.step.detail        IS 'Per-kind facts: the commit-reason histogram for a backfill, locker counts for a concurrent index build.';

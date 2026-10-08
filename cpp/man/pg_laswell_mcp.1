@@ -192,6 +192,8 @@ Also lists jobs that died with their connection.
 Asks a running migration to stop.
 Cooperative: it stops at the next batch boundary after committing what it has
 done, and the committed cursor lets a later job resume rather than start over.
+It knows the jobs of its own process; one left behind by a process that died is
+set right when the next run starts.
 .Sh THE REPOSITORY
 One or more directories of signed specifications, classified against one
 database's ledger.
@@ -2944,11 +2946,63 @@ it describes
 .Pp
 A job with no
 .Va finished_at
-whose advisory lock is absent from
-.Va pg_locks
-died with its connection.
+whose own backend
+.Pq Va backend_pid
+no longer holds its advisory lock died with its connection.
 A session advisory lock is released the moment its backend goes away, so a
 crashed job is detectable with no heartbeat and no timeout to tune.
+The test is for the job's own backend and not for the key, which is the
+specification's: a later job for the same specification holds the same key.
+.Ss A job that was interrupted
+A job's row is closed by the process that runs it.
+On
+.Dv SIGINT
+or
+.Dv SIGTERM
+that process stops its jobs as
+.Ic cancelJob
+does, waits for them, and writes each as
+.Ql cancelled :
+a walk commits the batch it is in and its cursor, and a statement in flight
+that is not part of a walk is cancelled.
+.Xr pg_laswell 1
+then exits 130.
+A second signal ends the process at once.
+.Pp
+A process that is killed outright, or whose machine goes away, writes nothing,
+and its job stays
+.Ql running
+in the ledger with no
+.Va finished_at .
+.Ic jobStatus
+lists such a job under
+.Va interrupted
+and
+.Ic listMigrations
+does not count it as running; neither writes.
+When the next run starts,
+.Ic startMigration
+and
+.Xr pg_laswell 1
+mark it: the job becomes
+.Ql interrupted
+with the time it was noticed in
+.Va error ,
+and so do its steps that were
+.Ql running .
+Its cursor is kept.
+.Pp
+Applying the same specification again then runs it again, and a walk resumes
+from the last committed batch of the job before it, whether that job was
+cancelled, interrupted or failed.
+Applying an edited specification does not resume: a cursor belongs to a digest,
+so the walk starts from the first row and its own predicate passes over what
+was already written.
+The plan carries a note naming the earlier job, when it started, how it ended
+and how many rows its walks wrote, and
+.Xr pg_laswell 1
+prints it.
+The earlier form stays in the ledger as a migration that did not finish.
 .Ss Operating without an agent
 The ledger is the interface for someone who has only psql.
 .Bd -literal -offset indent
@@ -3014,6 +3068,12 @@ Without
 .Fl -call ,
 .Nm
 speaks MCP over stdio and exits 0 unless it could not start.
+On
+.Dv SIGINT
+or
+.Dv SIGTERM
+it stops the jobs it is running, waits for them and exits 130; see
+.Sx A job that was interrupted .
 .Pp
 With
 .Fl -call

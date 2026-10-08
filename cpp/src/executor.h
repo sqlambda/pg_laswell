@@ -461,6 +461,14 @@ class Executor {
     try {
       execute();
     } catch (const std::exception& e) {
+      // The process was told to stop and the statement in flight was cancelled
+      // for it (signals.h): that is a cancelled job, not a failed one.
+      if (job_->pacing.stop_now.load() && job_->pacing.cancel_stop.load() &&
+          std::string(e.what()).find("canceling statement due to user request") !=
+              std::string::npos) {
+        job_->pacing.cancel_requested = false;
+        cancelled();
+      } else {
       json raw{{"error", e.what()},
                {"hint", "See laswell.step for the statement that failed."}};
       // "canceling statement due to statement timeout" reads as the server's
@@ -475,6 +483,7 @@ class Executor {
             raw["hint"].get<std::string>();
       }
       fail(raw);
+      }
     }
     {
       std::lock_guard<std::mutex> lock(job_->m);
@@ -549,6 +558,11 @@ class Executor {
 
       if (txn_class == "own_txn_per_batch") {
         run_backfill(worker, ordinal, step);
+        // A walk that was cancelled has said so and returned. Without this the
+        // loop went on, and where the walk was the LAST step it fell out of
+        // the loop and the job was recorded as succeeded with rows still to do
+        // (found adding the signal handling: 170 of 300 unwritten, "succeeded").
+        if (job_->state.load() == JobState::kCancelled) return;
         continue;
       }
       if (txn_class == "txn_forbidden") {
@@ -952,6 +966,13 @@ class Executor {
   void run_backfill(WriteSession& w, int ordinal, const json& step) {
     const auto& e = cfg_.executor;
     const auto detail_json = step.value("detail", json::object());
+    // A walk stops at its own batch boundary when the process is told to stop;
+    // the observer leaves its statements alone (jobs.h, in_walk).
+    struct Walking {
+      std::atomic<bool>& flag;
+      explicit Walking(std::atomic<bool>& f) : flag(f) { flag = true; }
+      ~Walking() { flag = false; }
+    } walking{job_->pacing.in_walk};
     // "paced": false puts one statement over the whole table ahead of the
     // walk's own (planner_dml.h, single_sql).
     const std::size_t first = detail_json.value("single_statement", false) ? 1 : 0;

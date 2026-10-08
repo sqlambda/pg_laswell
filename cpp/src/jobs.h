@@ -98,6 +98,11 @@ struct PacingState {
   // One statement over a whole table is running ("paced": false). It has no
   // batch boundary at which to notice cancel_stop, so the observer cancels it.
   std::atomic<bool> long_statement{false};
+  // The process was told to stop (signals.h). cancel_stop is set with it; this
+  // adds that a statement in flight is cancelled and not waited for -- unless
+  // the job is in a walk, which stops at its next batch boundary by itself.
+  std::atomic<bool> stop_now{false};
+  std::atomic<bool> in_walk{false};
   std::atomic<bool> throttled{false};
   std::atomic<bool> paused{false};
   std::atomic<long long> paused_since_ms{0};
@@ -459,7 +464,9 @@ class Observer {
       pids.push_back(pid);
       // cancelJob on a job inside one long statement: there is no batch
       // boundary for it to stop at, so the statement is cancelled here.
-      if (j->pacing.cancel_stop.load() && j->pacing.long_statement.load()) {
+      if (j->pacing.cancel_stop.load() &&
+          (j->pacing.long_statement.load() ||
+           (j->pacing.stop_now.load() && !j->pacing.in_walk.load()))) {
         request_cancel(*j);
       }
     }

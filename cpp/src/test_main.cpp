@@ -7127,6 +7127,105 @@ TEST_F(RepoTest, AnAppliedSpecThatWasEditedAfterwardsIsFlagged) {
       << "the hint must say what to do instead of re-applying";
 }
 
+// A job whose process died. Its row is closed by the process that runs it, so
+// it stayed `running` for good -- found in the field two hours later, on a
+// server restarted since, with a successor at work beside it. Three things
+// followed from that one row, and each is checked here.
+TEST_F(RepoTest, AJobWhoseProcessDiedIsNoticedMarkedAndRunAgain) {
+  make_shop(cfg());
+  json doc{{"laswell_spec_version", 1},
+           {"id", "0001"},
+           {"description", "every open order is shipped"},
+           {"intents", json::array({json{{"kind", "backfill"}, {"schema", "shop"},
+                                         {"table", "orders"}, {"key", "id"},
+                                         {"set", {{"status", "'shipped'"}}},
+                                         {"where", "orders.status = 'open'"}}})}};
+  write_spec("0001.json", doc);
+  const auto on_disk = [&] {
+    return json::parse(std::ifstream(dir_ + "/0001.json"), nullptr, true);
+  };
+  auto started = payload(call("startMigration", json{{"spec", on_disk()}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, started["jobId"], [](const json& x) {
+    return x.value("state", "") == "succeeded";
+  })) << status_of(started["jobId"]).dump(2);
+  const auto dead = started["jobId"].get<std::string>();
+  jobs_->join_all();  // its connections are gone, as a killed process's are
+
+  // What a kill leaves: the job and its walk `running`, nothing finished, and
+  // rows still to do.
+  const auto one = [&](const std::string& q) {
+    pglaswell::ReadSession r(cfg());
+    return r.txn().exec(q)[0][0].as<std::string>();
+  };
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/kill");
+    w.txn().exec("UPDATE laswell.job SET state = 'running', finished_at = NULL, error = NULL"
+                 " WHERE job_id = $1::uuid", pqxx::params{dead});
+    w.txn().exec("UPDATE laswell.step SET state = 'running', finished_at = NULL"
+                 " WHERE job_id = $1::uuid", pqxx::params{dead});
+    w.txn().exec("UPDATE shop.orders SET status = 'open' WHERE id > 200");
+    w.commit();
+  }
+
+  // 1. Its specification is not "in progress": nobody is running it. Classed
+  //    so, it was never pending again and was never run again.
+  EXPECT_EQ(scan(false)["migrations"][0].value("status", ""), "pending") << scan(false).dump(2);
+
+  // 2. It is seen as dead although ANOTHER session holds the lock key, as a
+  //    successor for the same specification does: the key is the
+  //    specification's id, and the test used to be for the key alone.
+  {
+    pqxx::connection successor(cfg().conninfo);
+    pqxx::nontransaction n(successor);
+    n.exec("SELECT pg_advisory_lock(lock_key) FROM laswell.job WHERE job_id = $1::uuid",
+           pqxx::params{dead});
+    const auto seen = pglaswell::Ledger(cfg()).interrupted_jobs();
+    ASSERT_EQ(seen.size(), 1u) << seen.dump(2);
+    EXPECT_EQ(seen[0].value("jobId", ""), dead);
+  }
+  // A status call says so and writes nothing.
+  const auto status = payload(call("jobStatus", json::object()));
+  ASSERT_EQ(status.value("interrupted", json::array()).size(), 1u) << status.dump(2);
+  EXPECT_EQ(one("SELECT state FROM laswell.job WHERE job_id = '" + dead + "'::uuid"), "running");
+
+  // 3. An edited form of the specification is told of the one before it.
+  auto edited = doc;
+  edited["description"] = "every open order is shipped (edited)";
+  {
+    const auto parsed = pglaswell::parse_spec(edited);
+    edited["signatures"] = json::array({{{"key_id", test_key().key_id},
+                                         {"algorithm", "ed25519"},
+                                         {"signature", base64(sign(parsed.canonical_bytes))}}});
+  }
+  const auto plan = payload(call("planMigration", json{{"spec", edited}}));
+  ASSERT_TRUE(plan.value("ok", false)) << plan.dump(2);
+  ASSERT_EQ(plan.value("earlierForms", json::array()).size(), 1u) << plan.dump(2);
+  EXPECT_EQ(plan["earlierForms"][0].value("jobId", ""), dead);
+  EXPECT_EQ(plan["earlierForms"][0].value("rowsWritten", 0LL), 300);
+  EXPECT_NE(plan["rendered"].get<std::string>().find("an earlier form of this specification"),
+            std::string::npos) << plan["rendered"].get<std::string>();
+
+  // Applying the unchanged specification again: the dead job is marked when
+  // the run starts, and the work is finished.
+  started = payload(call("startMigration", json{{"spec", on_disk()}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  ASSERT_EQ(started.value("interruptedJobsMarked", json::array()).size(), 1u) << started.dump(2);
+  EXPECT_EQ(started["interruptedJobsMarked"][0].value("jobId", ""), dead);
+  ASSERT_TRUE(wait_for_status(*this, started["jobId"], [](const json& x) {
+    return x.value("state", "") == "succeeded";
+  })) << status_of(started["jobId"]).dump(2);
+  EXPECT_EQ(one("SELECT state || ' ' || (finished_at IS NOT NULL)::text || ' ' ||"
+                " (error ? 'noticedAt')::text FROM laswell.job WHERE job_id = '" + dead +
+                "'::uuid"), "interrupted true true");
+  EXPECT_EQ(one("SELECT string_agg(DISTINCT state, ',') FROM laswell.step WHERE job_id = '" +
+                dead + "'::uuid"), "interrupted");
+  EXPECT_EQ(one("SELECT count(*) FROM shop.orders WHERE status <> 'shipped'"), "0");
+  EXPECT_TRUE(pglaswell::Ledger(cfg()).interrupted_jobs().empty());
+  EXPECT_EQ(scan(false)["migrations"][0].value("status", ""), "applied");
+}
+
 TEST_F(RepoTest, DependenciesEstablishTheOrder) {
   make_shop(cfg());
   write_spec("b.json", add_column_spec("b", "orders", "b", {"a"}));
@@ -16632,3 +16731,93 @@ TEST(Modules, EveryModuleKindCarriesItsModulesName) {
 }
 
 #include "modules/enabled_planner_tests.h"
+
+// SIGINT or SIGTERM while a deployment runs. Both binaries used to exit at
+// once, leaving the job `running` in the ledger for good. The first signal now
+// stops the jobs the way cancelJob does and waits for them, so each one's end
+// is written; the deployment then exits 130. The signal is simulated by
+// setting what its handler sets.
+TEST_F(DeployTest, ASignalStopsAWalkAtABatchBoundaryAndTheNextRunResumes) {
+  make_shop(cfg());
+  auto& e = ctx_->registry.mutable_get("default").executor;
+  e.batch_rows = 10;
+  e.batch_cap_rows = 10;
+  write_spec("0001.json",
+             json{{"laswell_spec_version", 1},
+                  {"id", "0001"},
+                  {"description", "every open order is shipped, slowly"},
+                  {"intents", json::array({json{
+                       {"kind", "backfill"}, {"schema", "shop"}, {"table", "orders"},
+                       {"key", "id"}, {"set", {{"status", "'shipped'"}}},
+                       {"where", "orders.status = 'open' AND pg_sleep(0.005) IS NOT NULL"}}})}});
+  const auto one = [&](const std::string& q) {
+    pglaswell::ReadSession r(cfg());
+    return r.txn().exec(q)[0][0].as<std::string>();
+  };
+
+  pglaswell::signals::g_received = 0;
+  std::thread sender([] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    pglaswell::signals::g_received = SIGINT;
+  });
+  const auto [code, text] = deploy();
+  sender.join();
+  pglaswell::signals::g_received = 0;
+
+  EXPECT_EQ(code, pglaswell::DeployResult::kInterrupted) << text;
+  EXPECT_NE(text.find("SIGINT: 1 running migration(s) asked to stop"), std::string::npos) << text;
+  EXPECT_NE(text.find("0001: cancelled"), std::string::npos) << text;
+  // The ledger says what happened, and what was committed is kept.
+  EXPECT_EQ(one("SELECT state || ' ' || (finished_at IS NOT NULL)::text FROM laswell.job"),
+            "cancelled true");
+  const auto shipped = std::stoll(one("SELECT count(*) FROM shop.orders WHERE status = 'shipped'"));
+  EXPECT_GT(shipped, 0);
+  EXPECT_LT(shipped, 300);
+  EXPECT_EQ(one("SELECT rows_done::text FROM laswell.backfill_cursor"), std::to_string(shipped));
+
+  // The same specification again: resumed from the cursor, and finished.
+  const auto [again, more] = deploy();
+  EXPECT_EQ(again, pglaswell::DeployResult::kOk) << more;
+  EXPECT_EQ(one("SELECT count(*) FROM shop.orders WHERE status <> 'shipped'"), "0");
+  EXPECT_EQ(one("SELECT (detail->>'resumedFrom') IS NOT NULL FROM laswell.step s JOIN laswell.job j"
+                " USING (job_id) WHERE j.state = 'succeeded'"), "t");
+}
+
+// A statement that is not a walk has no batch boundary to stop at: it is
+// cancelled, and the job is recorded as cancelled and not as failed.
+TEST_F(DeployTest, ASignalCancelsAStatementInFlight) {
+  make_shop(cfg());
+  write_spec("0001.json",
+             json{{"laswell_spec_version", 1},
+                  {"id", "0001"},
+                  {"description", "a validation that takes half a minute"},
+                  {"intents", json::array({json{
+                       {"kind", "add_check_constraint"}, {"schema", "shop"},
+                       {"table", "orders"}, {"name", "orders_status_slow"},
+                       {"expression", "length(status || pg_sleep(0.1)::text) >= 0"}}})}});
+  const auto one = [&](const std::string& q) {
+    pglaswell::ReadSession r(cfg());
+    return r.txn().exec(q)[0][0].as<std::string>();
+  };
+  pglaswell::signals::g_received = 0;
+  std::thread sender([] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    pglaswell::signals::g_received = SIGTERM;
+  });
+  const auto began = std::chrono::steady_clock::now();
+  const auto [code, text] = deploy();
+  std::ostringstream out;
+  out << text;
+  sender.join();
+  pglaswell::signals::g_received = 0;
+  const auto took = std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::steady_clock::now() - began).count();
+
+  EXPECT_EQ(code, pglaswell::DeployResult::kInterrupted) << out.str();
+  EXPECT_LT(took, 20) << "the statement was waited for, not cancelled";
+  EXPECT_NE(out.str().find("SIGTERM: 1 running migration(s) asked to stop"), std::string::npos)
+      << out.str();
+  EXPECT_EQ(one("SELECT state FROM laswell.job"), "cancelled") << out.str();
+  EXPECT_EQ(one("SELECT count(*) FROM pg_constraint WHERE conname = 'orders_status_slow'"
+                " AND convalidated"), "0");
+}
