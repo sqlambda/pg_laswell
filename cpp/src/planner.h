@@ -2665,19 +2665,29 @@ inline void plan_partitioned_index(const Intent& in, const json& t, Plan& plan,
   const auto where = in.body.value("where", "");
   const bool unique = in.body.value("unique", false);
 
+  // The key as the plain path reads it: a column may be a name alone or carry
+  // a direction, an operator class or be an expression. Read here as strings
+  // only, an object failed the whole plan with a JSON type error, and INCLUDE
+  // was left out of the parent's index and of every partition's without a
+  // word -- a different index from the one specified.
+  //
+  // `columns` holds names for the partition-key check, with an EMPTY name for
+  // an expression, which can never be a partition column.
+  const auto keys = index_columns(in.body);
   std::vector<std::string> columns;
-  for (const auto& c : in.body.value("columns", json::array())) {
-    columns.push_back(c.get<std::string>());
-  }
-  // Two lists, deliberately. `columns` is compared against the catalog's own
-  // column names -- which arrive unquoted -- so quoting it in place would make
-  // every equivalence check compare unequal things, which is the very failure
-  // require_identifier's comment warns about. `quoted_columns` is the one that
-  // reaches SQL.
+  for (const auto& k : keys) columns.push_back(k.name);
   std::vector<std::string> quoted_columns;
-  for (const auto& c : columns) quoted_columns.push_back(detail::quote_identifier(c));
+  for (const auto& k : keys) quoted_columns.push_back(index_column_sql(k));
   const std::string cols = detail::join(quoted_columns, ", ");
-  const std::string tail = " USING " + method + " (" + cols + ")" +
+  std::string include_sql;
+  if (in.body.contains("include")) {
+    std::vector<std::string> q;
+    for (const auto& c : in.body.value("include", json::array())) {
+      q.push_back(detail::quote_identifier(c.get<std::string>()));
+    }
+    if (!q.empty()) include_sql = " INCLUDE (" + detail::join(q, ", ") + ")";
+  }
+  const std::string tail = " USING " + method + " (" + cols + ")" + include_sql +
                            index_with_sql(in.body) +
                            (where.empty() ? "" : " WHERE " + where);
 

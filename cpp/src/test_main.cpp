@@ -2020,6 +2020,42 @@ TEST(Planner, AUniqueIndexOnAPartitionedTableMustContainThePartitionKey) {
   EXPECT_FALSE(plan.ok) << plan.render();
 }
 
+// create_index on a partitioned table read its columns as plain names: an
+// object form failed the plan with a JSON type error, and INCLUDE was dropped
+// from the parent's index and from every partition's without a word.
+TEST(Planner, APartitionedIndexKeepsItsColumnFormsAndItsInclude) {
+  auto obs = observations(8LL << 30, 50000000, 0, "partitioned_table");
+  auto& t = obs.tables["shop.orders"];
+  t["partition_key"] = "RANGE (created_at)";
+  t["partitions"] = json::array({"shop.orders_2024", "shop.orders_2025"});
+  t["columns"]["created_at"] = json{{"type", "timestamp with time zone"}, {"not_null", true}};
+  t["columns"]["code"] = json{{"type", "text"}, {"not_null", true}};
+  t["columns"]["total"] = json{{"type", "numeric"}, {"not_null", true}};
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array(
+          {json{{"kind", "create_index"}, {"schema", "shop"}, {"table", "orders"},
+                {"name", "orders_code_idx"},
+                {"columns", json::array({json{{"name", "code"}, {"opclass", "text_pattern_ops"}},
+                                         json{{"name", "created_at"}, {"direction", "desc"}},
+                                         json{{"expression", "lower(code)"}}})},
+                {"include", json::array({"total"})}, {"comment", "c"}}})),
+      obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  std::size_t builds = 0;
+  for (const auto* s : steps_of(plan, "create_index")) {
+    for (const auto& q : s->sql) {
+      if (q.rfind("CREATE INDEX", 0) != 0) continue;
+      ++builds;
+      EXPECT_NE(q.find("\"code\" \"text_pattern_ops\""), std::string::npos) << q;
+      EXPECT_NE(q.find("\"created_at\" DESC"), std::string::npos) << q;
+      EXPECT_NE(q.find("(lower(code))"), std::string::npos) << q;
+      EXPECT_NE(q.find(" INCLUDE (\"total\")"), std::string::npos) << q;
+    }
+  }
+  // Each partition, and the parent.
+  EXPECT_EQ(builds, 3u) << plan.render();
+}
+
 // The key's columns, out of pg_get_partkeydef's text.
 TEST(Planner, ThePartitionKeysColumnsAreReadOutOfItsDefinition) {
   using pglaswell::detail::partition_key_columns;

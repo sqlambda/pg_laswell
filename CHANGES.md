@@ -73,6 +73,14 @@ time, so the step is still listed as unverified, and `unverifiedWhy` says its
 definition was accepted. Where the role lacks `TEMP` on the database nothing
 is checked and nothing is claimed.
 
+### An index on a partitioned table keeps its `INCLUDE` and its column forms
+
+`create_index` on a partitioned table read its columns as plain names. A column
+given with a direction, an operator class or as an expression failed the whole
+plan with a JSON type error, and `include` was left out of the parent's index
+and of every partition's without a word -- a different index from the one
+specified. Both are rendered now as on a plain table.
+
 ### `set_text_search_mapping`
 
 A text search configuration could be created by copying one and then not
