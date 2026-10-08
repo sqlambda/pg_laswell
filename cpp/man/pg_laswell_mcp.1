@@ -2287,6 +2287,15 @@ otherwise, and is written into the statement with its schema either way.
 A token type the configuration's parser does not have, and a dictionary that
 is not there, are refused before anything runs.
 .Pp
+The mapping may follow, in one specification, the
+.Cm create_object
+that makes the configuration.
+There is then no catalog to compare with, so the plan drops whatever the copy
+holds for those token types and adds the mapping, and it is the dry run, which
+runs both statements, that refuses a wrong token type or dictionary.
+A dictionary brought by an extension the same specification creates is
+treated the same way: written as given, and checked by the dry run.
+.Pp
 The change itself locks no table.
 .Em What was built with the old mapping keeps it .
 An index on
@@ -2814,7 +2823,16 @@ every specification seen, with the exact bytes that were verified
 .It Va job
 one attempt to apply one migration
 .It Va step
-what each step did, with the statement verbatim and the rule that chose it
+what each step did, with the statement verbatim and the rule that chose it.
+A step's row is written when the step begins, in state
+.Sy running ,
+and completed when it ends, so
+.Va finished_at
+minus
+.Va started_at
+is what the step took and a long build can be seen while it runs.
+A step attempted more than once \(em a transaction group repeated for a lock
+\(em keeps the start of its first attempt.
 .It Va backfill_cursor
 resume position, written by the worker inside the same transaction as the data
 it describes

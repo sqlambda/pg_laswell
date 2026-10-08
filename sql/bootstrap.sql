@@ -329,7 +329,9 @@ COMMENT ON COLUMN laswell.step.txn_group     IS 'Steps sharing a group ran in on
 COMMENT ON COLUMN laswell.step.txn_class     IS 'txn_forbidden means the statement cannot run inside a transaction block at all -- CREATE INDEX CONCURRENTLY.';
 COMMENT ON COLUMN laswell.step.sql           IS 'The statement verbatim, as executed. Never reconstructed from the spec.';
 COMMENT ON COLUMN laswell.step.why           IS 'The planner rule that chose this method, and the measurement behind it.';
-COMMENT ON COLUMN laswell.step.state         IS 'succeeded | failed | skipped_satisfied | cancelled. skipped_satisfied is a success recorded with its justification, so "we did not need to" is distinguishable from "we forgot to".';
+COMMENT ON COLUMN laswell.step.state         IS 'running | succeeded | failed | lock_not_acquired | skipped_satisfied | cancelled. running is a step under way, or one whose job died with its connection. skipped_satisfied is a success recorded with its justification, so "we did not need to" is distinguishable from "we forgot to".';
+COMMENT ON COLUMN laswell.step.started_at    IS 'When the step began, written before it ran. Where a step was attempted more than once -- a transaction group retried for a lock -- the first attempt''s start, so that the waiting is part of what the step cost.';
+COMMENT ON COLUMN laswell.step.finished_at   IS 'When the step ended. NULL while it runs.';
 COMMENT ON COLUMN laswell.step.detail        IS 'Per-kind facts: the commit-reason histogram for a backfill, locker counts for a concurrent index build.';
 
 CREATE TABLE IF NOT EXISTS laswell.backfill_cursor (

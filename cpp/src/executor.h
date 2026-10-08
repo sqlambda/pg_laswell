@@ -521,6 +521,7 @@ class Executor {
         continue;
       }
       if (action != "apply") continue;
+      begin_step(ordinal, step);
 
       const bool needs_own = txn_class == "txn_forbidden" ||
                              txn_class == "own_txn_per_batch";
@@ -1468,6 +1469,16 @@ class Executor {
     }
     std::lock_guard<std::mutex> lock(job_->m);
     job_->backfill = std::move(b);
+  }
+
+  // The ledger's row for a step, before the step runs (ledger.h).
+  void begin_step(int ordinal, const json& step) {
+    if (ledger_ == nullptr) return;
+    try {
+      ledger_->begin_step(job_->job_id, ordinal, step);
+    } catch (const std::exception&) {
+      // As for record_step: a ledger write that fails does not stop the job.
+    }
   }
 
   void record_step(int ordinal, const json& step, const std::string& state,

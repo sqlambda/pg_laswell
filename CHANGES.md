@@ -81,6 +81,18 @@ plan with a JSON type error, and `include` was left out of the parent's index
 and of every partition's without a word -- a different index from the one
 specified. Both are rendered now as on a plain table.
 
+### A step's start is the time it started
+
+`laswell.step` was written once per step, when the step ended, with `started_at`
+and `finished_at` both `now()` in that statement: reported from the field as 90
+of 90 steps taking 0 s by the ledger, a 15-minute index build among them. The
+row is now written when the step begins, in state `running`, and completed
+when it ends. `finished_at - started_at` is what the step took, and a long step
+is visible while it runs. A step attempted more than once keeps the start of
+its first attempt; a step still `running` when its job ends is closed as
+`cancelled` or `failed` with the job. No ledger schema change: the column had
+no list of states to extend.
+
 ### `set_text_search_mapping`
 
 A text search configuration could be created by copying one and then not
@@ -98,6 +110,13 @@ CONCURRENTLY` for each and a validity check; on a hypertable, each chunk's
 index, since TimescaleDB rebuilds none as a whole. A stored `tsvector` is not
 recomputed, and the plan says which ones the catalog records. A dictionary's
 own options have no kind yet.
+
+The mapping may follow the `create_object` that makes its configuration in the
+same specification -- the first thing anyone writes, and at first refused as
+"does not exist". There is no catalog to compare with there, so the plan is
+`DROP MAPPING IF EXISTS` and `ADD MAPPING`, right whatever was copied, and the
+dry run is what refuses a wrong token type or dictionary. The same for a
+dictionary an extension created by that specification brings.
 
 ## 0.1.4
 

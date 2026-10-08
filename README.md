@@ -15,7 +15,7 @@ says so plainly where it can prove nothing. It converges databases that have
 drifted. And it never states a number it cannot derive.
 
 **Status: 0.1.4, young and moving.** The whole path works — repository,
-signing, planning, dry run, paced execution, ledger — with 647 tests green on
+signing, planning, dry run, paced execution, ledger — with 649 tests green on
 GCC and Clang, under AddressSanitizer/UBSan and ThreadSanitizer, plus live
 suites against a Citus coordinator and two workers, PostgreSQL with pg_cron and
 pgvector, and TimescaleDB in both editions. 113 intent kinds: 85 core, 17 from

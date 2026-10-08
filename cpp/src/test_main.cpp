@@ -2426,6 +2426,63 @@ TEST(Planner, ATextSearchMappingIsStatedAndTheStatementChosen) {
   EXPECT_EQ(applied, 1u) << plan.render();
 }
 
+// Reported using the kind itself: the mapping of a configuration created two
+// lines above it was refused, "does not exist", by a message naming the intent
+// that creates one.
+TEST(Planner, AMappingFollowsTheConfigurationItsSpecificationCreates) {
+  pglaswell::Observations obs;   // nothing in the catalog
+  const json create{{"kind", "create_object"}, {"object_type", "TEXT SEARCH CONFIGURATION"},
+                    {"schema", "shop"}, {"name", "names"}, {"definition", "(COPY = simple)"}};
+  auto plan = pglaswell::plan_migration(
+      spec_of(json::array({create, mapping_of(json::array({"word", "hword"}),
+                                              json::array({"unaccent", "public.simple"})),
+                           mapping_of(json::array({"email"}), json::array())})),
+      obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto s = steps_of(plan, "set_text_search_mapping");
+  ASSERT_EQ(s.size(), 2u) << plan.render();
+  // The pair that is right whatever the copied configuration holds, with the
+  // dictionaries as written: there is no catalog to resolve them in.
+  EXPECT_EQ(all_sql(*s[0]),
+            "ALTER TEXT SEARCH CONFIGURATION \"shop\".\"names\" DROP MAPPING IF EXISTS FOR "
+            "word, hword;\n"
+            "ALTER TEXT SEARCH CONFIGURATION \"shop\".\"names\" ADD MAPPING FOR word, hword "
+            "WITH \"unaccent\", \"public\".\"simple\";\n");
+  EXPECT_EQ(all_sql(*s[1]),
+            "ALTER TEXT SEARCH CONFIGURATION \"shop\".\"names\" DROP MAPPING IF EXISTS FOR "
+            "email;\n");
+  bool said = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("checked by the dry run, not before it") != std::string::npos) said = true;
+  }
+  EXPECT_TRUE(said) << json(plan.warnings).dump(2);
+
+  // In the other order there is still nothing to map.
+  plan = pglaswell::plan_migration(
+      spec_of(json::array({mapping_of(json::array({"word"}), json::array({"simple"})), create})),
+      obs, {});
+  EXPECT_FALSE(plan.ok);
+
+  // A configuration that is there, and a dictionary an extension created by
+  // this specification brings: written as given, the rest compared as usual.
+  obs = obs_with_configuration();
+  obs.objects["extension:dict_x"] = json{{"exists", false}, {"available", true}};
+  plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "create_extension"}, {"name", "dict_x"},
+                                {"schema", "public"}},
+                           mapping_of(json::array({"word"}), json::array({"x_dict", "simple"}))})),
+      obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  EXPECT_NE(all_sql(*steps_of(plan, "set_text_search_mapping")[0])
+                .find("ALTER MAPPING FOR word WITH \"x_dict\", \"pg_catalog\".\"simple\";"),
+            std::string::npos) << plan.render();
+  // Without that extension the same dictionary is refused, as before.
+  plan = pglaswell::plan_migration(
+      spec_of(json::array({mapping_of(json::array({"word"}), json::array({"x_dict"}))})),
+      obs_with_configuration(), {});
+  EXPECT_FALSE(plan.ok);
+}
+
 TEST(Planner, ATextSearchMappingRefusesWhatTheServerWould) {
   const auto obs = obs_with_configuration();
   auto refused = [&](json intent) {
@@ -4731,6 +4788,41 @@ TEST_F(ToolTest, StartMigrationReturnsAJobIdBeforeDoingTheWork) {
   })) << "the job never finished";
   const auto final_status = status_of(p["jobId"]);
   EXPECT_EQ(final_status.value("state", ""), "succeeded") << final_status.dump(2);
+}
+
+// A step's start is written before it runs. Reported from the field: 90 of 90
+// steps in a ledger had finished_at = started_at, a 15-minute index build
+// among them, because the row was written once, at the end, with now() twice.
+TEST_F(ToolTest, AStepsStartIsWrittenBeforeItRuns) {
+  make_shop(cfg());
+  json doc = minimal_spec();
+  doc["id"] = "0031-slow-step";
+  doc["description"] = "A step that takes long enough to measure.";
+  doc["intents"] = json::array({json{
+      {"kind", "create_table_as"}, {"schema", "shop"}, {"table", "slow_copy"},
+      {"definition", "SELECT 1 AS a FROM pg_sleep(0.6)"}, {"comment", "c"}}});
+  const auto p = payload(call("startMigration", json{{"spec", signed_doc(doc)}}));
+  ASSERT_TRUE(p.value("accepted", false)) << p.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, p["jobId"], [](const json& s) {
+    return s.value("state", "") == "succeeded";
+  })) << status_of(p["jobId"]).dump(2);
+
+  pglaswell::ReadSession r(cfg());
+  const auto rows = r.txn().exec(
+      "SELECT state, extract(epoch FROM finished_at - started_at)::float8,"
+      "       started_at >= (SELECT started_at FROM laswell.job WHERE job_id = $1::uuid)"
+      "  FROM laswell.step WHERE job_id = $1::uuid ORDER BY ordinal",
+      pqxx::params{p["jobId"].get<std::string>()});
+  ASSERT_FALSE(rows.empty());
+  double longest = 0;
+  for (const auto& row : rows) {
+    EXPECT_NE(row[0].as<std::string>(), "running") << "a finished job leaves no step running";
+    ASSERT_FALSE(row[1].is_null());
+    EXPECT_GE(row[1].as<double>(), 0.0);
+    EXPECT_TRUE(row[2].as<bool>());
+    longest = std::max(longest, row[1].as<double>());
+  }
+  EXPECT_GE(longest, 0.5) << "the step that slept 0.6 s must say so";
 }
 
 TEST_F(ToolTest, CopyRowsTravelsThroughTheRealExecutorAndLandsInTheLedger) {

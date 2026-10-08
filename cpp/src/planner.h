@@ -1120,6 +1120,26 @@ inline void plan_add_column_plain(const Intent& in, const Observations& obs, Pla
 // REORDER intents; it only accounts for the order the author chose.
 inline void project(const Intent& in, const Step& step, Observations& projected) {
   if (step.action != Action::kApply) return;
+  // A text search configuration made by the generic create_object, which has
+  // no object of its own to project into: set_text_search_mapping reads this
+  // slot, and without it a mapping could not follow the configuration it is
+  // for in one specification -- reported from the field as the first thing
+  // anyone writes. What the new configuration maps is not known here (it is a
+  // COPY of another, in SQL the planner does not parse), so it is marked as
+  // made by this specification and planned without comparing.
+  if ((in.kind == IntentKind::kCreateObject || in.kind == IntentKind::kDropObject) &&
+      in.body.value("object_type", "") == "TEXT SEARCH CONFIGURATION") {
+    auto name = in.body.value("name", "");
+    const auto schema = in.body.value("schema", "");
+    if (!schema.empty() && name.find('.') == std::string::npos) name = schema + "." + name;
+    if (name.find('.') != std::string::npos) {
+      projected.objects["tsconfig:" + name] =
+          in.kind == IntentKind::kCreateObject
+              ? json{{"exists", true}, {"created_in_spec", true}}
+              : json{{"exists", false}};
+    }
+    return;
+  }
   // Non-relation objects are keyed by name, not by schema.table, and they are
   // projected FIRST -- the tables guard below would return early for every one
   // of them, which made all of this dead code until a test looked.
@@ -1134,7 +1154,7 @@ inline void project(const Intent& in, const Step& step, Observations& projected)
         return;
       case IntentKind::kCreateExtension:
         projected.objects[object_key] =
-            json{{"exists", true}, {"kind", "extension"},
+            json{{"exists", true}, {"kind", "extension"}, {"created_in_spec", true},
                  {"depended_on_by", json::array()}};
         return;
       case IntentKind::kCreateType: {
@@ -1174,7 +1194,10 @@ inline void project(const Intent& in, const Step& step, Observations& projected)
       // The mapping as the step leaves it, so that a second intent on the same
       // configuration is planned against it.
       case IntentKind::kSetTextSearchMapping: {
-        if (projected.objects.contains(object_key)) {
+        // Not where the configuration is itself made by this specification:
+        // nothing is known of its mapping, and nothing is compared with it.
+        if (projected.objects.contains(object_key) &&
+            projected.objects[object_key].value("mapping", json()).is_object()) {
           json resolved = json::array();
           for (const auto& d : in.body.value("dictionaries", json::array())) {
             const auto given = d.get<std::string>();
@@ -8032,9 +8055,68 @@ inline void plan_set_text_search_mapping(const Intent& in, const Observations& o
     return;
   }
 
+  const auto quoted_name = [](const std::string& given) {
+    return given.find('.') == std::string::npos ? detail::quote_identifier(given)
+                                                : detail::quote_qualified(given);
+  };
+  std::vector<std::string> token_list;
+  for (const auto& tk : in.body.value("tokens", json::array())) {
+    token_list.push_back(tk.get<std::string>());
+  }
+
+  // A configuration an earlier intent of this specification creates is not in
+  // the catalog to compare with, so the statements are the pair that is right
+  // whatever it holds -- measured on 18.6: DROP MAPPING IF EXISTS passes over
+  // a token type with no mapping, and ADD MAPPING then never meets one that is
+  // there. What the catalog would have refused beforehand -- an unknown token
+  // type, a dictionary that is not there -- the dry run refuses instead, by
+  // running both statements after the one that creates the configuration.
+  if (o.value("created_in_spec", false)) {
+    std::vector<std::string> dicts;
+    for (const auto& d : in.body.value("dictionaries", json::array())) {
+      dicts.push_back(quoted_name(d.get<std::string>()));
+    }
+    Step step;
+    step.kind = in.kind_name;
+    step.txn_class = TxnClass::kRequired;
+    step.sql.push_back("ALTER TEXT SEARCH CONFIGURATION " + sql_config +
+                       " DROP MAPPING IF EXISTS FOR " + detail::join(token_list, ", ") + ";");
+    if (!dicts.empty()) {
+      step.sql.push_back("ALTER TEXT SEARCH CONFIGURATION " + sql_config + " ADD MAPPING FOR " +
+                         detail::join(token_list, ", ") + " WITH " + detail::join(dicts, ", ") +
+                         ";");
+    }
+    step.lock = "none on any table: the configuration's catalog rows only";
+    step.why = config + " is created earlier in this specification, so its mapping is "
+               "set without comparing with a catalog that does not hold it yet: whatever "
+               "it copied for these token types is dropped and the mapping added";
+    step.detail["configuration"] = config;
+    out.push_back(std::move(step));
+    plan.warnings.push_back(
+        "the mapping of " + config + " is planned without the catalog, because the "
+        "configuration is created by an earlier intent of this specification: its token "
+        "types and dictionaries are checked by the dry run, not before it, and a "
+        "dictionary named without a schema is found by the search path of the "
+        "connection that runs the job. Set the mapping before any index is built with "
+        "the configuration: one built in between would hold vectors of the copied "
+        "mapping.");
+    return;
+  }
+
+  // A dictionary that is not in the catalog may be one an extension brings,
+  // where an earlier intent of this specification creates the extension.
+  bool extension_created_here = false;
+  for (const auto& [key, value] : obs.objects.items()) {
+    if (key.rfind("extension:", 0) == 0 && value.value("created_in_spec", false)) {
+      extension_created_here = true;
+    }
+  }
+
   // Each dictionary resolved to schema.name, so that the statement does not
   // depend on the search_path of whichever connection runs it.
   std::vector<std::string> want;
+  std::vector<std::string> quoted_want;
+  bool unresolved = false;
   for (const auto& d : in.body.value("dictionaries", json::array())) {
     const auto given = d.get<std::string>();
     std::string found;
@@ -8048,6 +8130,14 @@ inline void plan_set_text_search_mapping(const Intent& in, const Observations& o
         ++candidates;
       }
     }
+    if (candidates != 1 && extension_created_here) {
+      // Written as given, and left to the dry run, which has created the
+      // extension by the time it reaches this step.
+      unresolved = true;
+      want.push_back(given);
+      quoted_want.push_back(quoted_name(given));
+      continue;
+    }
     if (candidates != 1) {
       fail("text search dictionary " + given + " was not found",
            "set_text_search_mapping on " + config + ": no text search dictionary \"" + given +
@@ -8060,6 +8150,13 @@ inline void plan_set_text_search_mapping(const Intent& in, const Observations& o
       return;
     }
     want.push_back(found);
+    quoted_want.push_back(detail::quote_qualified(found));
+  }
+  if (unresolved) {
+    plan.warnings.push_back(
+        "a dictionary of the mapping of " + config + " is not in the catalog, and an "
+        "earlier intent of this specification creates an extension that may bring it: "
+        "it is written as given and checked by the dry run, not before it.");
   }
 
   const json known_tokens = o.value("tokens", json::array());
@@ -8094,8 +8191,6 @@ inline void plan_set_text_search_mapping(const Intent& in, const Observations& o
     return;
   }
 
-  std::vector<std::string> quoted_want;
-  for (const auto& d : want) quoted_want.push_back(detail::quote_qualified(d));
   Step step;
   step.kind = in.kind_name;
   step.txn_class = TxnClass::kRequired;

@@ -404,6 +404,35 @@ class Ledger {
     return true;
   }
 
+  // A step that is about to run, written BEFORE it does. The row used to be
+  // written once, when the step ended, with started_at and finished_at both
+  // now() in that statement: reported from the field as 90 of 90 steps taking
+  // 0 s by the ledger, one of them a 15-minute index build. Written first, the
+  // start is the start -- and a long step shows as 'running' while it runs.
+  //
+  // clock_timestamp(), not now(): this is its own short transaction, so they
+  // differ by nothing, but the intent is the wall clock. An attempt that is
+  // repeated -- a group rolled back for a lock and run again -- keeps the
+  // FIRST start, so the time a step waited is part of what it cost.
+  void begin_step(const std::string& job_id, int ordinal, const json& step) {
+    if (!coordination_) return;
+    std::string sql;
+    for (const auto& q : step.value("sql", json::array())) {
+      sql += q.get<std::string>() + "\n";
+    }
+    coordination_->begin("pg_laswell/" + job_id + "/ledger");
+    coordination_->txn().exec("INSERT INTO laswell.step (job_id, ordinal, txn_group, kind,"
+              "  txn_class, sql, why, state, started_at, finished_at, detail)"
+              "  VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, 'running', clock_timestamp(),"
+              "          NULL, '{}'::jsonb)"
+              "  ON CONFLICT (job_id, ordinal) DO UPDATE"
+              "  SET state = 'running', finished_at = NULL",
+              pqxx::params{job_id, ordinal, step.value("txnGroup", 0),
+                           step.value("kind", ""), step.value("txnClass", ""),
+                           sql, step.value("why", "")});
+    coordination_->commit();
+  }
+
   void record_step(const std::string& job_id, int ordinal, const json& step,
                    const std::string& state, long long rows, const json& detail) {
     if (!coordination_) return;
@@ -415,9 +444,10 @@ class Ledger {
     coordination_->txn().exec("INSERT INTO laswell.step (job_id, ordinal, txn_group, kind,"
               "  txn_class, sql, why, state, started_at, finished_at,"
               "  rows_affected, detail)"
-              "  VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, now(), now(), $9, $10::jsonb)"
+              "  VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, clock_timestamp(),"
+              "          clock_timestamp(), $9, $10::jsonb)"
               "  ON CONFLICT (job_id, ordinal) DO UPDATE"
-              "  SET state = EXCLUDED.state, finished_at = now(),"
+              "  SET state = EXCLUDED.state, finished_at = clock_timestamp(),"
               "      rows_affected = EXCLUDED.rows_affected,"
               "      detail = EXCLUDED.detail",
               pqxx::params{job_id, ordinal, step.value("txnGroup", 0),
@@ -436,6 +466,13 @@ class Ledger {
                 "  error = $3::jsonb WHERE job_id = $1::uuid",
                 pqxx::params{job_id, state,
                              error.is_null() ? std::string("null") : error.dump()});
+      // A step left 'running' by a job that has ended did not end as a step:
+      // it was cancelled under way, or the job failed around it.
+      coordination_->txn().exec(
+          "UPDATE laswell.step SET finished_at = clock_timestamp(),"
+          "  state = CASE WHEN $2 = 'cancelled' THEN 'cancelled' ELSE 'failed' END"
+          "  WHERE job_id = $1::uuid AND state = 'running'",
+          pqxx::params{job_id, state});
       coordination_->commit();
     } catch (const std::exception&) {
     }
