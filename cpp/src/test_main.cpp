@@ -16755,9 +16755,14 @@ TEST_F(DeployTest, ASignalStopsAWalkAtABatchBoundaryAndTheNextRunResumes) {
     return r.txn().exec(q)[0][0].as<std::string>();
   };
 
+  // The signal comes once the walk has committed something, not after a fixed
+  // time: under Valgrind the job takes seconds to start.
   pglaswell::signals::g_received = 0;
-  std::thread sender([] {
-    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+  std::thread sender([&] {
+    for (int i = 0; i < 1200; ++i) {
+      if (one("SELECT count(*) FROM shop.orders WHERE status = 'shipped'") != "0") break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
     pglaswell::signals::g_received = SIGINT;
   });
   const auto [code, text] = deploy();
@@ -16799,9 +16804,15 @@ TEST_F(DeployTest, ASignalCancelsAStatementInFlight) {
     pglaswell::ReadSession r(cfg());
     return r.txn().exec(q)[0][0].as<std::string>();
   };
+  // The signal comes once the validation is running on the server.
   pglaswell::signals::g_received = 0;
-  std::thread sender([] {
-    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+  std::thread sender([&] {
+    for (int i = 0; i < 1200; ++i) {
+      if (one("SELECT count(*) FROM pg_stat_activity WHERE state = 'active'"
+              " AND datname = current_database() AND query LIKE '%VALIDATE CONSTRAINT%'"
+              " AND pid <> pg_backend_pid()") != "0") break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
     pglaswell::signals::g_received = SIGTERM;
   });
   const auto began = std::chrono::steady_clock::now();
