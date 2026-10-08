@@ -5975,8 +5975,18 @@ TEST_F(ToolTest, AnUnpacedFillThatSomeoneWaitsBehindFallsBackToTheWalk) {
   ASSERT_TRUE(p.value("accepted", false)) << p.dump(2);
 
   // A second session that wants the rows the statement has written. It gets
-  // them when the statement is cancelled and rolled back.
-  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  // them when the statement is cancelled and rolled back. Not before the
+  // statement is there and waiting for the row above: under Valgrind the job
+  // takes seconds to reach it, and a fixed sleep let this session through
+  // first, after which nobody waited behind anything.
+  bool waiting = false;
+  for (int i = 0; i < 600 && !waiting; ++i) {
+    waiting = one("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock'"
+                  " AND datname = current_database()"
+                  " AND query LIKE 'UPDATE \"shop\".\"orders\"%'") != "0";
+    if (!waiting) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  ASSERT_TRUE(waiting) << status_of(p["jobId"]).dump(2);
   {
     pqxx::connection other_conn(cfg().conninfo);
     pqxx::work other(other_conn);
