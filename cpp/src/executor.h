@@ -460,8 +460,20 @@ class Executor {
     try {
       execute();
     } catch (const std::exception& e) {
-      fail(json{{"error", e.what()},
-                {"hint", "See laswell.step for the statement that failed."}});
+      json raw{{"error", e.what()},
+               {"hint", "See laswell.step for the statement that failed."}};
+      // "canceling statement due to statement timeout" reads as the server's
+      // setting, and the server's is the first thing anyone checks. It is this
+      // tool's: every transaction of a job sets it (session.h).
+      if (cfg_.statement_timeout_ms > 0 &&
+          std::string(e.what()).find("statement timeout") != std::string::npos) {
+        raw["hint"] =
+            "The timeout is pg_laswell's, not the server's: statement_timeout_ms = " +
+            std::to_string(cfg_.statement_timeout_ms) +
+            " in this connection's section of the configuration (0 disables it). " +
+            raw["hint"].get<std::string>();
+      }
+      fail(raw);
     }
     {
       std::lock_guard<std::mutex> lock(job_->m);
@@ -713,6 +725,13 @@ class Executor {
     if (mwm > 0) {
       w.txn().exec("SET LOCAL maintenance_work_mem = '" + std::to_string(mwm) + "MB'");
     }
+    // A statement whose length is the table's (planner.h,
+    // lift_statement_timeout) runs without the statement timeout, as a
+    // concurrent build does. Put back after the step, like the memory above.
+    const bool untimed = cfg_.statement_timeout_ms > 0 &&
+                         step.value("detail", json::object())
+                             .value("no_statement_timeout", false);
+    if (untimed) w.txn().exec("SET LOCAL statement_timeout = 0");
     bool gated = false;
     long long gates_taken = 0;
     for (const auto& raw : step.value("sql", json::array())) {
@@ -755,6 +774,10 @@ class Executor {
       }
     }
     if (mwm > 0) w.txn().exec("SET LOCAL maintenance_work_mem TO DEFAULT");
+    if (untimed) {
+      w.txn().exec("SET LOCAL statement_timeout = " +
+                   std::to_string(cfg_.statement_timeout_ms));
+    }
     // The short timeout was this step's. The steps after it share the
     // transaction, and one that is not marked for a retry would fail outright
     // on a wait this short.
@@ -1537,11 +1560,20 @@ class Executor {
   // connection of its own -- the job's may be the thing that broke. Read-only,
   // bounded by the statement timeout, and never allowed to turn one failure
   // into two: if the reading itself fails, the error says so and nothing more.
+  //
+  // Whether the vendor is installed is asked in a statement of its own.
+  // PostgreSQL resolves every relation a statement names before it evaluates
+  // any of it, so a test for the extension cannot guard a reference to the
+  // extension's catalog in the same statement: on a server without Citus the
+  // report of an unrelated failure carried `relation "pg_dist_node" does not
+  // exist` (2026-10-08).
   json left_behind(json error) const {
-#define PGLASWELL_AFTER_FAILURE(module_name, applies_sql, reading_sql, hint_text)    \
+#define PGLASWELL_AFTER_FAILURE(module_name, installed_sql, applies_sql, reading_sql, hint_text) \
     try {                                                                              \
       ReadSession s(cfg_, kAfterFailureTimeoutMs);                                     \
-      const auto a = s.txn().exec(applies_sql);                                        \
+      const auto i = s.txn().exec(installed_sql);                                      \
+      const auto a = !i.empty() && i[0][0].as<bool>() ? s.txn().exec(applies_sql)      \
+                                                      : pqxx::result();                \
       if (!a.empty() && a[0][0].as<bool>()) {                                          \
         const auto r = s.txn().exec(reading_sql);                                      \
         if (!r.empty() && !r[0][0].is_null()) {                                        \

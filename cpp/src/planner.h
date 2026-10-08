@@ -1673,6 +1673,25 @@ inline std::string quoted_relation_at(const std::string& s, std::size_t at) {
   return s.substr(at, i - at);
 }
 
+// A statement the dry run leaves to the job because it reads or builds over
+// the whole table is, for the same reason, one whose length is the table's and
+// not the tool's to cap: statement_timeout_ms (two minutes by default) exists
+// for the short statements, and cancelled a key with a period on 69.5 million
+// rows at exactly two minutes, in the job, after a plan that had said how much
+// there was to index (2026-10-08). CREATE INDEX CONCURRENTLY has always run
+// without it (executor.h, run_nontransactional); this is the same decision for
+// a statement that has to be inside a transaction. Not for a step that is
+// cheap because a scan before it proved the rows: that one is short.
+inline void lift_statement_timeout(std::vector<Step>& steps) {
+  for (auto& step : steps) {
+    if (step.action != Action::kApply) continue;
+    if (step.txn_class == TxnClass::kForbidden) continue;
+    if (!step.detail.contains("not_rehearsed")) continue;
+    if (step.detail.value("not_rehearsed", "") == kNeedsTheScan) continue;
+    step.detail["no_statement_timeout"] = true;
+  }
+}
+
 // For whatever a kind's planner emitted: every index build and constraint
 // build the dry run will not run gets its definition checked on an empty copy
 // of the table it names (check_on_empty_copy, planner_base.h). Done here once,
@@ -8618,6 +8637,7 @@ inline Plan plan_migration(const Spec& spec, const Observations& obs,
     }
     detail::take_weaker_lock_first(in, projected, emitted);
     detail::check_definitions_on_empty_copy(in, emitted);
+    detail::lift_statement_timeout(emitted);
     detail::append_creation_comment(in, emitted);
     if (!emitted.empty()) project(in, emitted.front(), projected);
 
@@ -8719,6 +8739,10 @@ inline std::string Plan::render() const {
     for (const auto& q : s.sql) out += "    " + q + "\n";
     if (!s.lock.empty()) out += "    lock: " + s.lock + "\n";
     if (!s.why.empty()) out += "    why:  " + s.why + "\n";
+    if (s.detail.value("no_statement_timeout", false)) {
+      out += "    time: no statement timeout: it takes as long as the table is large, "
+             "and statement_timeout_ms is lifted for it\n";
+    }
   }
   for (const auto& w : warnings) out += "\n warn: " + w + "\n";
   // Not part of planDigest (see Plan::advisories), and labelled so a reader

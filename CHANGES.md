@@ -93,6 +93,29 @@ its first attempt; a step still `running` when its job ends is closed as
 `cancelled` or `failed` with the job. No ledger schema change: the column had
 no list of states to extend.
 
+### A build the plan announces is not cancelled by the statement timeout
+
+`statement_timeout_ms` defaults to two minutes and is set on every transaction
+a job opens. A key with a period over 69.5 million rows, planned with its size
+and its lock stated, was cancelled at exactly two minutes: it is the first kind
+whose one statement is both long and inside a transaction, where
+`CREATE INDEX CONCURRENTLY` has always run without the timeout. A step the dry
+run leaves to the job because it reads or builds over the whole table now runs
+without it too, for that step only, and the plan says so on a `time:` line. A
+step that is cheap because a scan before it proved the rows keeps the timeout.
+
+When a statement is cancelled by the timeout, the failure says the timeout is
+pg_laswell's and names the setting; the server's message reads as the server's
+own. The manual now documents `statement_timeout_ms`, which it did not.
+
+### A failure on a server without Citus no longer reports an error about Citus
+
+The reading of what Citus may have left behind tested for the extension and
+named `pg_dist_node` in one statement, and PostgreSQL resolves every relation
+before it evaluates anything, so on a server without Citus every failed job's
+report carried `relation "pg_dist_node" does not exist`. Whether the extension
+is installed is now asked first, in a statement of its own.
+
 ### `set_text_search_mapping`
 
 A text search configuration could be created by copying one and then not

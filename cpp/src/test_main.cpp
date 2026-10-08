@@ -4825,6 +4825,83 @@ TEST_F(ToolTest, AStepsStartIsWrittenBeforeItRuns) {
   EXPECT_GE(longest, 0.5) << "the step that slept 0.6 s must say so";
 }
 
+// The statement timeout is for the short statements. A step the dry run leaves
+// to the job because it reads the whole table takes as long as the table is
+// large, and the default two minutes cancelled a key with a period over 69.5
+// million rows after a plan that had said how much there was to index
+// (2026-10-08). Here the validation takes 1.2 s under a 400 ms timeout.
+TEST_F(ToolTest, AScanTheJobRunsIsNotCutByTheStatementTimeout) {
+  make_shop(cfg());
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/untimed");
+    w.txn().exec("CREATE TABLE shop.slow_scan(a int NOT NULL)");
+    w.txn().exec("INSERT INTO shop.slow_scan VALUES (1)");
+    w.commit();
+  }
+  ctx_->registry.mutable_get("default").statement_timeout_ms = 400;
+
+  json doc = minimal_spec();
+  doc["id"] = "0032-slow-scan";
+  doc["description"] = "A validation longer than the statement timeout.";
+  doc["intents"] = json::array({json{
+      {"kind", "add_check_constraint"}, {"schema", "shop"}, {"table", "slow_scan"},
+      {"name", "slow_scan_a_check"},
+      {"expression", "length(a::text || pg_sleep(1.2)::text) > 0"}}});
+
+  const auto plan = payload(call("planMigration", json{{"spec", signed_doc(doc)}}));
+  ASSERT_TRUE(plan.contains("rendered")) << plan.dump(2);
+  EXPECT_NE(plan["rendered"].get<std::string>().find("time: no statement timeout"),
+            std::string::npos)
+      << plan["rendered"].get<std::string>();
+
+  const auto p = payload(call("startMigration", json{{"spec", signed_doc(doc)}}));
+  ASSERT_TRUE(p.value("accepted", false)) << p.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, p["jobId"], [](const json& s) {
+    const auto state = s.value("state", "");
+    return state == "succeeded" || state == "failed";
+  })) << status_of(p["jobId"]).dump(2);
+  EXPECT_EQ(status_of(p["jobId"]).value("state", ""), "succeeded")
+      << status_of(p["jobId"]).dump(2);
+
+  // And the timeout is back for the statements after it.
+  pglaswell::ReadSession r(cfg());
+  EXPECT_TRUE(r.txn().exec("SELECT convalidated FROM pg_constraint"
+                           " WHERE conname = 'slow_scan_a_check'")[0][0].as<bool>());
+}
+
+// A short statement keeps the timeout, and when it is cancelled the report says
+// whose timeout it was: the message is the server's and reads as the server's
+// setting, which is 0 here.
+TEST_F(ToolTest, ACancelledStatementSaysTheTimeoutIsThisTools) {
+  make_shop(cfg());
+  ctx_->registry.mutable_get("default").statement_timeout_ms = 400;
+
+  json doc = minimal_spec();
+  doc["id"] = "0033-timed-out";
+  doc["description"] = "A statement longer than the statement timeout.";
+  doc["intents"] = json::array({json{
+      {"kind", "create_table_as"}, {"schema", "shop"}, {"table", "too_slow"},
+      {"definition", "SELECT 1 AS a FROM pg_sleep(1.5)"}, {"comment", "c"}}});
+  const auto p = payload(call("startMigration", json{{"spec", signed_doc(doc)}}));
+  ASSERT_TRUE(p.value("accepted", false)) << p.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, p["jobId"], [](const json& s) {
+    const auto state = s.value("state", "");
+    return state == "succeeded" || state == "failed";
+  })) << status_of(p["jobId"]).dump(2);
+  const auto st = status_of(p["jobId"]);
+  EXPECT_EQ(st.value("state", ""), "failed") << st.dump(2);
+  EXPECT_NE(st.dump().find("statement_timeout_ms = 400"), std::string::npos) << st.dump(2);
+  // And nothing about a vendor that is not here: the reading of what Citus may
+  // have left behind named pg_dist_node beside the test for the extension, and
+  // failed to parse on every server without it.
+  pglaswell::ReadSession r(cfg());
+  if (r.txn().exec("SELECT 1 FROM pg_extension WHERE extname = 'citus'").empty()) {
+    EXPECT_EQ(st.dump().find("pg_dist_node"), std::string::npos) << st.dump(2);
+    EXPECT_EQ(st.dump().find("left_behind_unread"), std::string::npos) << st.dump(2);
+  }
+}
+
 TEST_F(ToolTest, CopyRowsTravelsThroughTheRealExecutorAndLandsInTheLedger) {
   // The one step in the row-level family whose work is not entirely in its SQL:
   // the statement opens the stream and the rows follow it over the protocol.

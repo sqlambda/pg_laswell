@@ -197,7 +197,7 @@ foreach(_mod IN LISTS PGLASWELL_MODULES)
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/modules/${_mod}/after_failure.h)
         string(APPEND _afterfail_head "#include \"modules/${_mod}/after_failure.h\"\n")
         string(APPEND _afterfail_inc
-            "PGLASWELL_AFTER_FAILURE(\"${_mod}\", k${_mod}AfterFailureAppliesSql, k${_mod}AfterFailureSql, k${_mod}AfterFailureHint)\n")
+            "PGLASWELL_AFTER_FAILURE(\"${_mod}\", k${_mod}AfterFailureInstalledSql, k${_mod}AfterFailureAppliesSql, k${_mod}AfterFailureSql, k${_mod}AfterFailureHint)\n")
     endif()
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/modules/${_mod}/guard.h)
         string(APPEND _guard_head "#include \"modules/${_mod}/guard.h\"\n")

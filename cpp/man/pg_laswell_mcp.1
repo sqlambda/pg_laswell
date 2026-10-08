@@ -2765,6 +2765,7 @@ service  = shop-prod
 dbname   = shop
 user     = laswell_runner
 password = ...
+statement_timeout_ms = 120000
 .Ed
 .Pp
 Nothing is silently defaulted.
@@ -2776,6 +2777,23 @@ at or above
 .Va pause_waiters
 would make the breaker flap, and is refused when the file is read rather than
 discovered during a migration.
+.Pp
+.Va statement_timeout_ms
+in a connection section is the statement timeout every transaction of a job on
+that connection sets for itself, 120000 when left out and none when 0.
+It is this tool's and not the server's: a statement it cancels fails with the
+server's message,
+.Dq canceling statement due to statement timeout ,
+and the failure names the setting.
+It is for the short statements.
+A step that reads or builds over the whole table inside a transaction, which
+the dry run leaves to the job for that reason, runs without it and the plan
+says so on a line beginning
+.Ql time: ;
+.Cm CREATE INDEX CONCURRENTLY ,
+outside a transaction, has always run without it.
+What bounds such a step is its table, and
+.Ic cancelJob .
 .Pp
 A key with a dot in a connection section is a
 .Em module setting
