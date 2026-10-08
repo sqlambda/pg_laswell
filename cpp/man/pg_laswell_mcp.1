@@ -758,6 +758,7 @@ see
 .It Constraints
 .Cm add_primary_key ,
 .Cm add_unique_constraint ,
+.Cm add_exclusion_constraint ,
 .Cm add_foreign_key ,
 .Cm add_check_constraint ,
 .Cm drop_constraint ,
@@ -836,6 +837,8 @@ see
 .Cm alter_object ,
 .Cm drop_object ,
 .Cm set_comment .
+.It Text search
+.Cm set_text_search_mapping .
 .It Foreign data
 .Cm import_foreign_schema .
 .El
@@ -2140,6 +2143,151 @@ checked.
 Clear the leftover with a
 .Cm drop_index
 intent before retrying.
+.Ss Keys with a period and exclusion constraints
+PostgreSQL 18 can refuse two rows of one key whose periods overlap.
+The key lists its columns as usual and
+.Va without_overlaps
+says the last of them is the period:
+.Bd -literal -offset indent
+{"kind": "add_primary_key", "schema": "public", "table": "activity",
+ "name": "activity_pkey",
+ "columns": ["company", "code", "valid"],
+ "without_overlaps": true}
+.Ed
+.Pp
+.Cm add_unique_constraint
+takes the same flag, and so does
+.Cm create_table
+beside its
+.Va primary_key .
+The foreign key that references such a key says
+.Va period :
+true, which marks the last column of
+.Va columns
+and of
+.Va references_columns ;
+it is planned as any foreign key is, added
+.Ic NOT VALID
+and validated under a lock that lets the application work, and it takes no
+action but
+.Ic NO ACTION ,
+because PostgreSQL supports no other there.
+.Pp
+The period is one column of a range or multirange type; two columns holding a
+start and an end are not a period until they are one
+.Vt daterange
+or
+.Vt tstzrange .
+The key is a GiST index, and GiST indexes an integer, a text or a date only
+with the extension
+.Sy btree_gist .
+Both are checked before anything runs: a period that is not a range is
+refused, and so is a key column GiST has no operator class for, with the
+.Cm create_extension
+intent to add named when
+.Sy btree_gist
+is what is missing.
+.Pp
+.Cm add_exclusion_constraint
+is the general form, for what a period key does not say:
+.Bd -literal -offset indent
+{"kind": "add_exclusion_constraint", "schema": "public",
+ "table": "booking", "name": "booking_no_overlap",
+ "using": "gist",
+ "elements": [
+   {"column": "room_id", "with": "="},
+   {"expression": "tstzrange(starts, ends)", "with": "&&"}],
+ "where": "NOT cancelled"}
+.Ed
+.Pp
+Each element is a column or an expression and the operator that must not hold
+between two rows;
+.Va using
+is
+.Sy gist
+when left out, and
+.Va where
+restricts the constraint to the rows it is true for.
+.Pp
+.Em Neither can be added to a table that has rows without stopping it .
+The index is built by the statement that adds the constraint, under
+.Va AccessExclusiveLock ,
+for the whole build: measured on 18.6 at 20.8 seconds for two million rows,
+for either form.
+There is no
+.Ic NOT VALID
+form for them, and an index built concurrently beforehand cannot be adopted,
+because GiST has no unique indexes.
+So the plan is that one statement, with the lock, the size and a warning that
+every reader and writer waits for it; the weaker lock is taken first as for any
+exclusive step, and above 64 MiB the step is left out of the dry run, which
+would otherwise hold the same lock over the same build.
+.Pp
+On a partitioned table it is done a partition at a time: the constraint is
+added
+.Ic ON ONLY
+the parent, where it holds nothing; each partition then gets its own under a
+lock on that partition alone, and its index is attached to the parent's, which
+turns valid with the last.
+One partition waits at a time and not the table.
+The partition key must be among the columns compared for equality, and a
+partition that is itself partitioned is refused, as for a unique constraint.
+A specification applied again after a failure carries on from the partition
+that failed.
+.Ss Text search mappings
+A text search configuration made by
+.Cm create_object
+is a copy of another, and
+.Cm set_text_search_mapping
+is what makes it differ: it states which dictionaries a kind of token passes
+through.
+.Bd -literal -offset indent
+{"kind": "set_text_search_mapping",
+ "schema": "public", "name": "pt_name",
+ "tokens": ["word", "hword", "hword_part"],
+ "dictionaries": ["unaccent", "simple"]}
+.Ed
+.Pp
+The intent says what the mapping is to be, and the plan reads what it is:
+.Ic ADD MAPPING
+where the token type has none,
+.Ic ALTER MAPPING
+where it has another, nothing where it already matches, and
+.Ic DROP MAPPING
+for an empty
+.Va dictionaries ,
+after which tokens of those types are ignored.
+A dictionary is named bare when it is on the search path and as
+.Va schema.name
+otherwise, and is written into the statement with its schema either way.
+A token type the configuration's parser does not have, and a dictionary that
+is not there, are refused before anything runs.
+.Pp
+The change itself locks no table.
+.Em What was built with the old mapping keeps it .
+An index on
+.Fn to_tsvector
+of the configuration holds the vectors it computed, and a search is parsed
+with the new mapping: measured on 18.6, a row indexed before the change was
+found by neither the old spelling nor the new one until the index was rebuilt.
+PostgreSQL records which indexes name the configuration, so the plan follows
+the change with
+.Ic REINDEX INDEX CONCURRENTLY
+for each, and a check that each ended valid.
+Between the change and the end of an index's rebuild its answers are not to be
+trusted.
+If a rebuild fails the mapping stays changed, a later plan finds nothing left
+to do, and that index has to be rebuilt by hand.
+On a hypertable the index of each chunk is rebuilt, because TimescaleDB
+rebuilds no index of a hypertable as a whole.
+.Pp
+A stored
+.Vt tsvector
+-- a generated column, a column a trigger fills, a materialized view -- is not
+recomputed by anything here.
+The plan names the ones the catalog records and says that it cannot see one
+filled by a trigger or by the application.
+A dictionary's own options are not covered by any kind yet.
 .Ss Adding a column is the opposite case
 .Cm add_column
 is never blocked by a view -- only a type change and a drop are -- so nothing

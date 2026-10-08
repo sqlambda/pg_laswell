@@ -126,14 +126,25 @@ inline void timescaledb_plan_refusals(const Spec& spec, const Observations& obs,
                in.kind == IntentKind::kAddUniqueConstraint) {
       unique = true;
       for (const auto& c : in.body.value("columns", json::array())) key.push_back(c.get<std::string>());
+      if (in.body.value("without_overlaps", false) && !key.empty()) key.pop_back();
+    } else if (in.kind == IntentKind::kAddExclusionConstraint) {
+      // Measured on 2.30.2: the same refusal for an exclusion constraint that
+      // does not compare the partitioning column for equality.
+      unique = true;
+      for (const auto& e : in.body.value("elements", json::array())) {
+        if (e.contains("column") && e.value("with", "") == "=") key.push_back(e.value("column", ""));
+      }
     }
     if (unique) {
       const auto d = missing_dim(h, key);
       if (!d.empty()) {
-        refuse(what + ": the key (" + detail::join(key, ", ") + ") does not contain " + d +
+        const bool exclusion = in.kind == IntentKind::kAddExclusionConstraint;
+        refuse(what + ": " +
+               (exclusion ? "the columns it compares with \"=\" (" : "the key (") +
+               detail::join(key, ", ") + ") " + (exclusion ? "do" : "does") + " not contain " + d +
                ", and " + q + " is a hypertable partitioned on it. TimescaleDB: \"cannot "
                "create a unique index without the column \\\"" + d + "\\\" (used in "
-               "partitioning)\". Add " + d + " to the key.");
+               "partitioning)\". Add " + d + (exclusion ? ", compared with \"=\"." : " to the key."));
       }
     }
 
@@ -145,7 +156,7 @@ inline void timescaledb_plan_refusals(const Spec& spec, const Observations& obs,
     // Not when the constraint is there already: its own index is such an
     // index, and the intent is then simply satisfied.
     if ((in.kind == IntentKind::kAddPrimaryKey || in.kind == IntentKind::kAddUniqueConstraint) &&
-        missing_dim(h, key).empty() &&
+        !in.body.value("without_overlaps", false) && missing_dim(h, key).empty() &&
         !obs.table(q).value("constraints", json::object()).contains(in.body.value("name", ""))) {
       const json indexes = obs.table(q).value("indexes", json::object());
       for (const auto& [iname, ix] : indexes.items()) {

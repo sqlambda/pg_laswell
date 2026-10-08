@@ -177,6 +177,11 @@ for edition in tsl apache oldest; do
     "cannot create a unique index without the column" \
     "CREATE UNIQUE INDEX m_u ON public.m (id)" \
     "cannot create a unique index without the column \"ts\""
+  refused "an exclusion constraint that does not compare the time column" "$U" \
+    '{"kind":"add_exclusion_constraint","schema":"public","table":"m","name":"m_x","elements":[{"expression":"int4range(1,2)","with":"&&"}]}' \
+    "do not contain ts" \
+    "ALTER TABLE public.m ADD CONSTRAINT m_x EXCLUDE USING gist (int4range(1,2) WITH &&)" \
+    "cannot create a unique index without the column \"ts\""
   sql=$(plan_sql "$U" "$(idx m_uts '["id","ts"]' 1)")
   if echo "$sql" | grep -q '^CREATE UNIQUE INDEX "m_uts"' && ! echo "$sql" | grep -q 'CONCURRENTLY\|transaction_per_chunk'; then
     ok "a unique index with it is planned plain, the only build there is"

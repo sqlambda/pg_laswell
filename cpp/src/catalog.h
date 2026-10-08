@@ -92,6 +92,18 @@ SELECT COALESCE(
                    'type_oid', a.atttypid::bigint,
                    'type', format_type(a.atttypid, a.atttypmod),
                    'not_null', a.attnotnull,
+                   -- pg_type.typtype: 'r' and 'm' are a range and a multirange,
+                   -- the only things a period may be.
+                   'type_kind', (SELECT ty.typtype::text FROM pg_type ty
+                                  WHERE ty.oid = a.atttypid),
+                   -- Whether GiST has a default operator class for exactly this
+                   -- type: what a period key or a GiST exclusion constraint
+                   -- needs of every ordinary column, and what btree_gist
+                   -- supplies for integers, text, dates and the like.
+                   'gist_opclass', EXISTS (
+                      SELECT 1 FROM pg_opclass oc JOIN pg_am am ON am.oid = oc.opcmethod
+                       WHERE am.amname = 'gist' AND oc.opcdefault
+                         AND oc.opcintype = a.atttypid),
                    'has_default', a.atthasdef,
                    -- What a row-level INSERT is allowed to say about this
                    -- column. Measured (S21) on 18.6, all three refusals are
@@ -459,6 +471,70 @@ SELECT COALESCE(
 // precisely instead of letting execution fail with a hint suggesting CASCADE.
 // One query per object, $1 = kind, $2 = name, $3 = schema (ignored where the
 // object is not schema-qualified).
+// A text search configuration: its mapping, what the parser calls its token
+// types, every dictionary a mapping could name, and what was built with it.
+//
+// The last is the reason this kind exists apart from alter_object. An index on
+// to_tsvector('cfg', col) holds vectors computed with the mapping as it was,
+// and after ALTER MAPPING it keeps them -- measured on 18.6: a row indexed
+// before the change was found by neither the old spelling nor the new until
+// REINDEX. PostgreSQL records the dependency (pg_depend, on the regconfig
+// constant in the index expression), so the indexes can be named.
+//
+// relpages rather than pg_relation_size(): the size function takes a lock and
+// waits behind an ALTER, as noted for the table observation.
+inline constexpr const char* kTsConfigObservationSql = R"SQL(
+SELECT JSONB_BUILD_OBJECT(
+  'exists', true,
+  'kind', 'tsconfig',
+  'tokens', COALESCE((SELECT JSONB_AGG(t.alias ORDER BY t.tokid)
+                        FROM ts_token_type(c.cfgparser) t), '[]'::jsonb),
+  'mapping', COALESCE((
+     SELECT JSONB_OBJECT_AGG(m.alias, m.dicts)
+       FROM (SELECT t.alias,
+                    JSONB_AGG(dn.nspname || '.' || d.dictname ORDER BY m.mapseqno) AS dicts
+               FROM pg_ts_config_map m
+               JOIN ts_token_type(c.cfgparser) t ON t.tokid = m.maptokentype
+               JOIN pg_ts_dict d ON d.oid = m.mapdict
+               JOIN pg_namespace dn ON dn.oid = d.dictnamespace
+              WHERE m.mapcfg = c.oid
+              GROUP BY t.alias) m), '{}'::jsonb),
+  'dictionaries', COALESCE((
+     SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
+              'schema', dn.nspname, 'name', d.dictname,
+              'visible', pg_ts_dict_is_visible(d.oid)))
+       FROM pg_ts_dict d JOIN pg_namespace dn ON dn.oid = d.dictnamespace), '[]'::jsonb),
+  'indexes', COALESCE((
+     SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
+              'schema', xn.nspname, 'index', x.relname,
+              'table', tn.nspname || '.' || t.relname,
+              'partitioned', x.relkind = 'I',
+              'bytes', x.relpages::bigint * current_setting('block_size')::bigint)
+            ORDER BY xn.nspname, x.relname)
+       FROM (SELECT DISTINCT objid FROM pg_depend
+              WHERE refclassid = 'pg_ts_config'::regclass AND refobjid = c.oid
+                AND classid = 'pg_class'::regclass) dep
+       JOIN pg_class x ON x.oid = dep.objid AND x.relkind IN ('i', 'I')
+       JOIN pg_namespace xn ON xn.oid = x.relnamespace
+       JOIN pg_index i ON i.indexrelid = x.oid
+       JOIN pg_class t ON t.oid = i.indrelid
+       JOIN pg_namespace tn ON tn.oid = t.relnamespace
+      -- A partition's index is rebuilt with its parent's.
+      WHERE NOT x.relispartition), '[]'::jsonb),
+  'other_dependents', COALESCE((
+     SELECT JSONB_AGG(DISTINCT PG_DESCRIBE_OBJECT(d.classid, d.objid, d.objsubid))
+       FROM pg_depend d
+      WHERE d.refclassid = 'pg_ts_config'::regclass AND d.refobjid = c.oid
+        AND d.deptype = 'n'
+        AND NOT (d.classid = 'pg_class'::regclass AND EXISTS (
+              SELECT 1 FROM pg_class x WHERE x.oid = d.objid AND x.relkind IN ('i', 'I')))),
+     '[]'::jsonb)
+)
+  FROM pg_ts_config c
+  JOIN pg_namespace n ON n.oid = c.cfgnamespace
+ WHERE c.cfgname = $1 AND n.nspname = $2
+)SQL";
+
 inline constexpr const char* kObjectObservationSql = R"SQL(
 WITH target AS (
   SELECT CASE $1
@@ -686,6 +762,13 @@ class Catalog {
       } else {
         schema = rest.substr(0, dot);
         name = rest.substr(dot + 1);
+      }
+      if (kind == "tsconfig") {
+        const auto c = txn.exec(detail::kTsConfigObservationSql, pqxx::params{name, schema});
+        if (!c.empty() && !c[0][0].is_null()) {
+          obs.objects[key] = json::parse(c[0][0].as<std::string>());
+        }
+        continue;
       }
       const auto r = txn.exec(detail::kObjectObservationSql,
                                pqxx::params{kind, name, schema});

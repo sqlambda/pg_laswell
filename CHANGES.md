@@ -1,5 +1,78 @@
 # Changes
 
+## Unreleased
+
+Two things a specification could not say, reported while writing a schema whose
+rows each keep the period they were true for. Two new kinds, 113 in all. No
+ledger schema change.
+
+### A key that names no column is refused before anything runs
+
+`create_table` checked only that each entry of `primary_key` was a string, so
+`"valid WITHOUT OVERLAPS"` was quoted as a column name, planned, and first
+refused by the server in the dry run (42703). The key names columns the same
+intent declares; an entry that is none of them is now refused at validation,
+with no connection.
+
+### A key with a period
+
+PostgreSQL 18's `WITHOUT OVERLAPS`. `"without_overlaps": true` on
+`add_primary_key`, on `add_unique_constraint` and beside `create_table`'s
+`primary_key` says the last column listed is the period; `"period": true` on
+`add_foreign_key` marks the last column of both lists for the key that
+references one. Measured on 18.6:
+
+| | |
+|---|---|
+| A period that is not a range or multirange | refused by the server; now by the planner, from the catalog or the declared type |
+| A `bigint`, `text` or `date` key column without `btree_gist` | "no default operator class for access method gist"; now refused naming the `create_extension` to add, and seen when an earlier intent adds it |
+| A period foreign key with `CASCADE`, `RESTRICT` or `SET NULL` | "unsupported ON DELETE action"; refused at validation |
+| A period foreign key `NOT VALID`, then `VALIDATE` | the locks of an ordinary one, so the two-step recipe is unchanged |
+
+### `add_exclusion_constraint`
+
+The general form: a list of elements, each a column or an expression with the
+operator that must not hold between two rows, `using` (gist when left out) and
+an optional `where`. Structured rather than a clause of SQL because the planner
+has to see which columns are compared with `=`.
+
+### Neither can be added to a table with rows without stopping it
+
+The index of a period key or an exclusion constraint is built by the statement
+that adds the constraint, under AccessExclusiveLock. Measured on 18.6: 20.8 s
+for 2 million rows for either; `NOT VALID` is refused for both; an index built
+concurrently beforehand cannot be adopted ("is not a unique index"). So the
+plan is that one statement, saying so: the lock, the size, a warning that every
+reader and writer waits for the build, the weaker lock first, and above 64 MiB
+left out of the dry run.
+
+On a partitioned table it is done a partition at a time -- `ON ONLY` the parent,
+then each partition under a lock on that partition alone, attached, the parent's
+index valid with the last -- and resumes at the partition that failed. The
+partition key must be among the columns compared for equality.
+
+On a hypertable and on a Citus distributed table the constraint must compare
+the partitioning or distribution column for equality; the module refuses one
+that does not, in the words the extension would use.
+
+### `set_text_search_mapping`
+
+A text search configuration could be created by copying one and then not
+changed, so a configuration that removes accents could not be built. The new
+kind states which dictionaries a token type passes through, and the planner
+picks `ADD`, `ALTER` or `DROP MAPPING` from what the catalog holds (`ADD` fails
+on a mapping that is there). A token type the parser lacks and a dictionary
+that is not there are refused beforehand.
+
+An index built with the configuration keeps the vectors it computed. Measured
+on 18.6: after `ALTER MAPPING`, a row indexed before it was found by neither
+the old spelling nor the new until `REINDEX`. PostgreSQL records which indexes
+name a configuration, so the plan follows the change with `REINDEX INDEX
+CONCURRENTLY` for each and a validity check; on a hypertable, each chunk's
+index, since TimescaleDB rebuilds none as a whole. A stored `tsvector` is not
+recomputed, and the plan says which ones the catalog records. A dictionary's
+own options have no kind yet.
+
 ## 0.1.4
 
 Findings from a field report -- a 10-million-row table under 1,000 inserts

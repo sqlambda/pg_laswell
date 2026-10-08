@@ -15,10 +15,10 @@ says so plainly where it can prove nothing. It converges databases that have
 drifted. And it never states a number it cannot derive.
 
 **Status: 0.1.4, young and moving.** The whole path works — repository,
-signing, planning, dry run, paced execution, ledger — with 633 tests green on
+signing, planning, dry run, paced execution, ledger — with 644 tests green on
 GCC and Clang, under AddressSanitizer/UBSan and ThreadSanitizer, plus live
 suites against a Citus coordinator and two workers, PostgreSQL with pg_cron and
-pgvector, and TimescaleDB in both editions. 111 intent kinds: 83 core, 17 from
+pgvector, and TimescaleDB in both editions. 113 intent kinds: 85 core, 17 from
 the Citus module, 2 from pg_cron and 9 from TimescaleDB; the pgvector module adds
 no kinds, only the refusals pgvector would otherwise raise mid-build. Packages build for nine
 targets — deb, rpm and tarball, x86_64 and arm64, macOS arm64, and FreeBSD 14

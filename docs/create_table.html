@@ -83,6 +83,7 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
   &quot;to&quot;: &lt;required&gt;,
   &quot;columns&quot;: &lt;optional&gt;,
   &quot;primary_key&quot;: &lt;optional&gt;,
+  &quot;without_overlaps&quot;: &lt;optional&gt;,
   &quot;partition_by&quot;: &lt;optional&gt;,
   &quot;unlogged&quot;: &lt;optional&gt;,
   &quot;options&quot;: &lt;optional&gt;,
@@ -109,7 +110,9 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
 <dt>columns<span class="tag opt">optional</span></dt>
 <dd>Each entry needs name, type, nullable and comment — the same vocabulary add_column uses.</dd>
 <dt>primary_key<span class="tag opt">optional</span></dt>
-<dd>&nbsp;</dd>
+<dd>Each entry is the name of a column declared in &quot;columns&quot;, and nothing else: no ordering, no operator class, no clause. A key with a period is &quot;without_overlaps&quot;: true, with the period column last.</dd>
+<dt>without_overlaps<span class="tag opt">optional</span></dt>
+<dd>It says the last column of primary_key is a period.</dd>
 <dt>partition_by<span class="tag opt">optional</span></dt>
 <dd>&nbsp;</dd>
 <dt>unlogged<span class="tag opt">optional</span></dt>

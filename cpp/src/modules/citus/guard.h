@@ -139,12 +139,27 @@ inline void citus_plan_refusals(const Spec& spec, const Observations& obs,
         for (const auto& c : in.body.value("columns", json::array())) {
           key.push_back(c.get<std::string>());
         }
+        // The period is compared for overlap, not equality, so it is not
+        // where the distribution column can be.
+        if (in.body.value("without_overlaps", false) && !key.empty()) key.pop_back();
+      } else if (in.kind == IntentKind::kAddExclusionConstraint) {
+        // Measured on Citus 14: "cannot create constraint on" the table for an
+        // exclusion constraint, and for a key with a period, that does not
+        // compare the distribution column for equality.
+        unique = true;
+        for (const auto& e : in.body.value("elements", json::array())) {
+          if (e.contains("column") && e.value("with", "") == "=") key.push_back(e.value("column", ""));
+        }
       }
       if (unique && std::find(key.begin(), key.end(), is.column) == key.end()) {
-        refuse(what + ": the key (" + detail::join(key, ", ") + ") does not contain " +
+        const bool exclusion = in.kind == IntentKind::kAddExclusionConstraint;
+        refuse(what + ": " +
+               (exclusion ? "the columns it compares with \"=\" (" : "the key (") +
+               detail::join(key, ", ") + ") " + (exclusion ? "do" : "does") + " not contain " +
                is.column + ", and " + q + " is distributed on it. Citus: \"Distributed "
                "relations cannot have UNIQUE, EXCLUDE, or PRIMARY KEY constraints that do "
-               "not include the partition column\". Add " + is.column + " to the key.");
+               "not include the partition column\". Add " + is.column +
+               (exclusion ? ", compared with \"=\"." : " to the key."));
         continue;
       }
       if ((in.kind == IntentKind::kDropColumn || in.kind == IntentKind::kAlterColumnType) &&

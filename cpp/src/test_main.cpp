@@ -1046,6 +1046,12 @@ TEST(Spec, KnownKindsAreExactlyTheImplementedKinds) {
     "drop_object": {"kind":"drop_object","object_type":"COLLATION","name":"s.c"},
     "alter_object": {"kind":"alter_object","object_type":"COLLATION",
                      "name":"s.c","owner":"app"},
+    "add_exclusion_constraint": {"kind":"add_exclusion_constraint","schema":"s",
+                                 "table":"t","name":"t_ex",
+                                 "elements":[{"column":"c","with":"&&"}]},
+    "set_text_search_mapping": {"kind":"set_text_search_mapping","schema":"s",
+                                "name":"cfg","tokens":["word"],
+                                "dictionaries":["simple"]},
     "create_table_as": {"kind":"create_table_as","schema":"s","table":"t2",
                         "definition":"SELECT 1 AS a","comment":"d"},
     "import_foreign_schema": {"kind":"import_foreign_schema","server":"srv",
@@ -2025,6 +2031,386 @@ TEST(Planner, ThePartitionKeysColumnsAreReadOutOfItsDefinition) {
   EXPECT_EQ(partition_key_columns("HASH (id COLLATE \"C\")"), (std::vector<std::string>{"id"}));
   // An expression: no unique key can contain it.
   EXPECT_TRUE(partition_key_columns("RANGE (date_trunc('day'::text, at))").empty());
+}
+
+// --- keys with a period, exclusion constraints, text search mappings --------
+//
+// From a field report writing a schema whose rows each keep the period they
+// were true for: none of this could be said, and the one attempt that parsed
+// was first refused by the server.
+
+static json one_intent(json intent) {
+  json doc = minimal_spec();
+  doc["intents"] = json::array({std::move(intent)});
+  return doc;
+}
+
+TEST(Spec, ACreateTableKeyNamesOnlyColumnsItDeclares) {
+  json table{{"kind", "create_table"}, {"schema", "s"}, {"table", "t"}, {"comment", "c"},
+             {"columns", json::array(
+                 {json{{"name", "id"}, {"type", "bigint"}, {"nullable", false}, {"comment", "c"}},
+                  json{{"name", "valid"}, {"type", "daterange"}, {"nullable", false},
+                       {"comment", "c"}}})},
+             {"primary_key", json::array({"id", "valid WITHOUT OVERLAPS"})}};
+  // As reported: it was quoted as a column name and planned.
+  auto err = spec_error(one_intent(table));
+  EXPECT_NE(err.find("which is not one of its columns"), std::string::npos) << err;
+  EXPECT_NE(err.find("without_overlaps"), std::string::npos) << err;
+
+  table["primary_key"] = json::array({"id", "valid"});
+  table["without_overlaps"] = true;
+  EXPECT_NO_THROW(pglaswell::parse_spec(one_intent(table)));
+
+  // A period alone is refused by PostgreSQL, and here.
+  table["primary_key"] = json::array({"valid"});
+  err = spec_error(one_intent(table));
+  EXPECT_NE(err.find("needs at least two columns"), std::string::npos) << err;
+
+  table.erase("primary_key");
+  err = spec_error(one_intent(table));
+  EXPECT_NE(err.find("without a primary_key"), std::string::npos) << err;
+}
+
+TEST(Spec, APeriodForeignKeyTakesNoActionButNoAction) {
+  json fk{{"kind", "add_foreign_key"}, {"schema", "s"}, {"table", "c"}, {"name", "c_fk"},
+          {"columns", json::array({"id", "valid"})}, {"references_schema", "s"},
+          {"references_table", "p"}, {"references_columns", json::array({"id", "valid"})},
+          {"period", true}, {"on_delete", "CASCADE"}};
+  const auto err = spec_error(one_intent(fk));
+  EXPECT_NE(err.find("supports only NO ACTION"), std::string::npos) << err;
+  fk["on_delete"] = "NO ACTION";
+  EXPECT_NO_THROW(pglaswell::parse_spec(one_intent(fk)));
+  fk["columns"] = json::array({"valid"});
+  fk["references_columns"] = json::array({"valid"});
+  EXPECT_NE(spec_error(one_intent(fk)).find("at least two columns"), std::string::npos);
+}
+
+TEST(Spec, AnExclusionElementIsAColumnOrAnExpressionWithAnOperator) {
+  json ex{{"kind", "add_exclusion_constraint"}, {"schema", "s"}, {"table", "t"},
+          {"name", "t_ex"},
+          {"elements", json::array({json{{"column", "room"}, {"with", "="}},
+                                    json{{"expression", "tstzrange(a, b)"}, {"with", "&&"}}})},
+          {"where", "NOT cancelled"}};
+  EXPECT_NO_THROW(pglaswell::parse_spec(one_intent(ex)));
+  ex["elements"][0]["with"] = "=); DROP TABLE t; --";
+  EXPECT_NE(spec_error(one_intent(ex)).find("is not an operator"), std::string::npos);
+  ex["elements"][0] = json{{"column", "room"}, {"expression", "room"}, {"with", "="}};
+  EXPECT_NE(spec_error(one_intent(ex)).find("a column or an expression"), std::string::npos);
+}
+
+TEST(Planner, ACreateTableKeyWithAPeriodIsWrittenAndCheckedAgainstItsOwnColumns) {
+  const auto table = [](const char* key_type, const char* period_type) {
+    return json{{"kind", "create_table"}, {"schema", "shop"}, {"table", "price"},
+                {"comment", "c"},
+                {"columns", json::array(
+                    {json{{"name", "id"}, {"type", key_type}, {"nullable", false},
+                          {"comment", "c"}},
+                     json{{"name", "valid"}, {"type", period_type}, {"nullable", false},
+                          {"comment", "c"}}})},
+                {"primary_key", json::array({"id", "valid"})},
+                {"without_overlaps", true}};
+  };
+  pglaswell::Observations obs;
+  obs.objects["extension:btree_gist"] = json{{"exists", true}};
+  auto plan = pglaswell::plan_migration(spec_of(json::array({table("bigint", "daterange")})),
+                                        obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  EXPECT_NE(all_sql(*steps_of(plan, "create_table")[0])
+                .find("PRIMARY KEY (\"id\", \"valid\" WITHOUT OVERLAPS)"),
+            std::string::npos) << plan.render();
+
+  // Two dates are not a period.
+  plan = pglaswell::plan_migration(spec_of(json::array({table("bigint", "date")})), obs, {});
+  ASSERT_FALSE(plan.ok);
+  EXPECT_NE(plan.conflicts[0].find("one range or multirange column"), std::string::npos)
+      << plan.conflicts[0];
+
+  // Measured without the extension: "data type bigint has no default operator
+  // class for access method gist".
+  pglaswell::Observations bare;
+  plan = pglaswell::plan_migration(spec_of(json::array({table("bigint", "daterange")})),
+                                   bare, {});
+  ASSERT_FALSE(plan.ok);
+  EXPECT_NE(plan.conflicts[0].find("create_extension intent for btree_gist"),
+            std::string::npos) << plan.conflicts[0];
+
+  // An earlier intent that installs it is seen.
+  bare.objects["extension:btree_gist"] =
+      json{{"exists", false}, {"available", true}, {"default_version", "1.8"}};
+  plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "create_extension"}, {"name", "btree_gist"}},
+                           table("bigint", "daterange")})),
+      bare, {});
+  EXPECT_TRUE(plan.ok) << plan.render();
+}
+
+static pglaswell::Observations obs_with_period(long long size, const char* kind = "table") {
+  auto obs = observations(size, 2000000, 0, kind);
+  auto& t = obs.tables["shop.orders"];
+  t["columns"]["id"] = json{{"type", "bigint"}, {"not_null", true}, {"type_kind", "b"},
+                            {"gist_opclass", true}};
+  t["columns"]["tenant"] = json{{"type", "integer"}, {"not_null", true}, {"type_kind", "b"},
+                                {"gist_opclass", true}};
+  t["columns"]["valid"] = json{{"type", "daterange"}, {"not_null", true}, {"type_kind", "r"},
+                               {"gist_opclass", false}};
+  obs.objects["extension:btree_gist"] = json{{"exists", true}};
+  return obs;
+}
+
+static json period_key(const char* kind, json columns) {
+  return json{{"kind", kind}, {"schema", "shop"}, {"table", "orders"},
+              {"name", "orders_period"}, {"columns", std::move(columns)},
+              {"without_overlaps", true}};
+}
+
+// Measured on 18.6, 2 million rows: 20.8 s under AccessExclusiveLock, NOT VALID
+// refused, a GiST index built beforehand not adoptable.
+TEST(Planner, AKeyWithAPeriodIsOneStatementThatSaysWhatItLocks) {
+  auto obs = obs_with_period(2LL << 30);
+  auto plan = pglaswell::plan_migration(
+      spec_of(json::array({period_key("add_primary_key", json::array({"id", "valid"}))})),
+      obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto s = steps_of(plan, "add_primary_key");
+  ASSERT_EQ(s.size(), 1u) << plan.render();
+  const auto sql = all_sql(*s[0]);
+  EXPECT_NE(sql.find("ADD CONSTRAINT \"orders_period\" PRIMARY KEY (\"id\", \"valid\" "
+                     "WITHOUT OVERLAPS)"), std::string::npos) << sql;
+  EXPECT_EQ(sql.find("CONCURRENTLY"), std::string::npos) << sql;
+  // The weaker lock first, as every exclusive step; and not in the dry run.
+  EXPECT_TRUE(s[0]->detail.value("exclusive_retry", false)) << plan.render();
+  EXPECT_TRUE(s[0]->detail.contains("not_rehearsed")) << plan.render();
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("every reader and writer queues for the whole build") != std::string::npos) {
+      warned = true;
+    }
+  }
+  EXPECT_TRUE(warned) << json(plan.warnings).dump(2);
+
+  // A small quiet table: the same statement, rehearsed, no warning.
+  obs = obs_with_period(1 << 20);
+  plan = pglaswell::plan_migration(
+      spec_of(json::array({period_key("add_unique_constraint", json::array({"id", "valid"}))})),
+      obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto u = steps_of(plan, "add_unique_constraint");
+  ASSERT_EQ(u.size(), 1u);
+  EXPECT_NE(all_sql(*u[0]).find("UNIQUE (\"id\", \"valid\" WITHOUT OVERLAPS)"), std::string::npos);
+  EXPECT_FALSE(u[0]->detail.contains("not_rehearsed"));
+
+  // The period must be a range.
+  plan = pglaswell::plan_migration(
+      spec_of(json::array({period_key("add_unique_constraint", json::array({"valid", "id"}))})),
+      obs, {});
+  ASSERT_FALSE(plan.ok);
+  EXPECT_NE(plan.conflicts[0].find("is not a range or multirange type"), std::string::npos)
+      << plan.conflicts[0];
+
+  // GiST cannot index a bigint without btree_gist, and the catalog says so.
+  obs.tables["shop.orders"]["columns"]["id"]["gist_opclass"] = false;
+  obs.objects.erase("extension:btree_gist");
+  plan = pglaswell::plan_migration(
+      spec_of(json::array({period_key("add_unique_constraint", json::array({"id", "valid"}))})),
+      obs, {});
+  ASSERT_FALSE(plan.ok);
+  EXPECT_NE(plan.conflicts[0].find("create_extension intent for btree_gist"), std::string::npos)
+      << plan.conflicts[0];
+}
+
+// Measured on 18.6 for both forms: ONLY the parent, then each partition under
+// its own lock, attached; the parent's index turns valid with the last.
+TEST(Planner, AKeyWithAPeriodOnAPartitionedTableLocksOnePartitionAtATime) {
+  auto obs = obs_with_period(8LL << 30, "partitioned_table");
+  auto& t = obs.tables["shop.orders"];
+  t["partition_key"] = "LIST (tenant)";
+  t["partition_parts"] = json::array(
+      {json{{"relation", "shop.orders_a"}, {"partitioned", false}, {"indexes", json::object()}},
+       json{{"relation", "shop.orders_b"}, {"partitioned", false},
+            {"indexes", json{{"orders_b_orders_period",
+                              json{{"valid", true}, {"unique", true},
+                                   {"constraint", "orders_b_orders_period"},
+                                   {"attached_to", nullptr}}}}}}});
+  // The partition column has to be among those compared for equality.
+  auto plan = pglaswell::plan_migration(
+      spec_of(json::array({period_key("add_unique_constraint", json::array({"id", "valid"}))})),
+      obs, {});
+  ASSERT_FALSE(plan.ok);
+  EXPECT_NE(plan.conflicts[0].find("Add tenant to it"), std::string::npos) << plan.conflicts[0];
+
+  plan = pglaswell::plan_migration(
+      spec_of(json::array(
+          {period_key("add_unique_constraint", json::array({"tenant", "id", "valid"}))})),
+      obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto s = steps_of(plan, "add_unique_constraint");
+  // parent; partition a: add, attach; partition b (already built): attach.
+  ASSERT_EQ(s.size(), 4u) << plan.render();
+  EXPECT_NE(all_sql(*s[0]).find("ALTER TABLE ONLY \"shop\".\"orders\" ADD CONSTRAINT "
+                                "\"orders_period\" UNIQUE (\"tenant\", \"id\", \"valid\" "
+                                "WITHOUT OVERLAPS)"), std::string::npos) << all_sql(*s[0]);
+  EXPECT_NE(all_sql(*s[1]).find("ALTER TABLE \"shop\".\"orders_a\" ADD CONSTRAINT "
+                                "\"orders_a_orders_period\" UNIQUE"), std::string::npos);
+  EXPECT_TRUE(s[1]->detail.contains("not_rehearsed"));
+  EXPECT_NE(all_sql(*s[2]).find("ATTACH PARTITION \"shop\".\"orders_a_orders_period\""),
+            std::string::npos);
+  EXPECT_NE(all_sql(*s[3]).find("ATTACH PARTITION \"shop\".\"orders_b_orders_period\""),
+            std::string::npos);
+  EXPECT_EQ(steps_of(plan, "verify_index_valid").size(), 1u);
+}
+
+TEST(Planner, AnExclusionConstraintIsWrittenFromItsElements) {
+  auto obs = obs_with_period(1 << 20);
+  const json ex{{"kind", "add_exclusion_constraint"}, {"schema", "shop"}, {"table", "orders"},
+                {"name", "orders_ex"},
+                {"elements", json::array({json{{"column", "id"}, {"with", "="}},
+                                          json{{"expression", "valid"}, {"with", "&&"}}})},
+                {"where", "id > 0"}, {"comment", "No two at once."}};
+  auto plan = pglaswell::plan_migration(spec_of(json::array({ex})), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto s = steps_of(plan, "add_exclusion_constraint");
+  ASSERT_EQ(s.size(), 1u);
+  const auto sql = all_sql(*s[0]);
+  EXPECT_NE(sql.find("ADD CONSTRAINT \"orders_ex\" EXCLUDE USING \"gist\" (\"id\" WITH =, "
+                     "(valid) WITH &&) WHERE (id > 0);"), std::string::npos) << sql;
+  EXPECT_NE(sql.find("COMMENT ON CONSTRAINT \"orders_ex\""), std::string::npos) << sql;
+
+  obs.tables["shop.orders"]["constraints"]["orders_ex"] = json{{"type", "x"}};
+  plan = pglaswell::plan_migration(spec_of(json::array({ex})), obs, {});
+  ASSERT_TRUE(plan.ok);
+  EXPECT_EQ(steps_of(plan, "add_exclusion_constraint")[0]->action, pglaswell::Action::kSatisfied);
+
+  obs.tables["shop.orders"]["constraints"]["orders_ex"] = json{{"type", "c"}};
+  plan = pglaswell::plan_migration(spec_of(json::array({ex})), obs, {});
+  EXPECT_FALSE(plan.ok);
+}
+
+TEST(Planner, AForeignKeyWithAPeriodKeepsTheTwoStepRecipe) {
+  auto obs = obs_with_period(2LL << 30);
+  obs.tables["shop.prices"] = obs.tables["shop.orders"];
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "add_foreign_key"}, {"schema", "shop"},
+                                {"table", "orders"}, {"name", "orders_fk"},
+                                {"columns", json::array({"id", "valid"})},
+                                {"references_schema", "shop"}, {"references_table", "prices"},
+                                {"references_columns", json::array({"id", "valid"})},
+                                {"period", true}}})),
+      obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto s = steps_of(plan, "add_foreign_key");
+  ASSERT_EQ(s.size(), 2u) << plan.render();
+  EXPECT_NE(all_sql(*s[0]).find("FOREIGN KEY (\"id\", PERIOD \"valid\") REFERENCES "
+                                "\"shop\".\"prices\" (\"id\", PERIOD \"valid\") NOT VALID"),
+            std::string::npos) << all_sql(*s[0]);
+  EXPECT_NE(all_sql(*s[1]).find("VALIDATE CONSTRAINT"), std::string::npos);
+}
+
+static pglaswell::Observations obs_with_configuration() {
+  pglaswell::Observations obs;
+  obs.objects["tsconfig:shop.names"] = json{
+      {"exists", true},
+      {"tokens", json::array({"asciiword", "word", "email", "hword"})},
+      {"mapping", json{{"asciiword", json::array({"pg_catalog.simple"})},
+                       {"word", json::array({"pg_catalog.simple"})},
+                       {"email", json::array({"pg_catalog.simple"})}}},
+      {"dictionaries", json::array(
+          {json{{"schema", "pg_catalog"}, {"name", "simple"}, {"visible", true}},
+           json{{"schema", "public"}, {"name", "unaccent"}, {"visible", true}},
+           json{{"schema", "hidden"}, {"name", "syn"}, {"visible", false}}})},
+      {"indexes", json::array({json{{"schema", "shop"}, {"index", "people_fts"},
+                                    {"table", "shop.people"}, {"partitioned", false},
+                                    {"bytes", 8LL << 20}}})},
+      {"other_dependents", json::array({"default value for column v of table shop.people"})}};
+  return obs;
+}
+
+static json mapping_of(json tokens, json dictionaries) {
+  return json{{"kind", "set_text_search_mapping"}, {"schema", "shop"}, {"name", "names"},
+              {"tokens", std::move(tokens)}, {"dictionaries", std::move(dictionaries)}};
+}
+
+// Measured on 18.6: ADD fails on a mapping that is there, so the statement is
+// chosen from what the catalog holds; and an index built with the old mapping
+// misses rows until it is rebuilt.
+TEST(Planner, ATextSearchMappingIsStatedAndTheStatementChosen) {
+  const auto obs = obs_with_configuration();
+  auto plan = pglaswell::plan_migration(
+      spec_of(json::array({mapping_of(json::array({"word", "hword"}),
+                                      json::array({"unaccent", "simple"}))})),
+      obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto s = steps_of(plan, "set_text_search_mapping");
+  ASSERT_EQ(s.size(), 2u) << plan.render();
+  const auto sql = all_sql(*s[0]);
+  EXPECT_NE(sql.find("ALTER TEXT SEARCH CONFIGURATION \"shop\".\"names\" ADD MAPPING FOR hword "
+                     "WITH \"public\".\"unaccent\", \"pg_catalog\".\"simple\";"),
+            std::string::npos) << sql;
+  EXPECT_NE(sql.find("ALTER MAPPING FOR word WITH \"public\".\"unaccent\", "
+                     "\"pg_catalog\".\"simple\";"), std::string::npos) << sql;
+  // The index built with it, rebuilt without blocking, and checked.
+  EXPECT_EQ(all_sql(*s[1]), "REINDEX INDEX CONCURRENTLY \"shop\".\"people_fts\";\n");
+  EXPECT_EQ(s[1]->txn_class, pglaswell::TxnClass::kForbidden);
+  EXPECT_EQ(steps_of(plan, "verify_index_valid").size(), 1u);
+  bool stale = false, stored = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("can miss rows until it is rebuilt") != std::string::npos) stale = true;
+    if (w.find("default value for column v of table shop.people") != std::string::npos) {
+      stored = true;
+    }
+  }
+  EXPECT_TRUE(stale && stored) << json(plan.warnings).dump(2);
+
+  // An empty list removes the mapping.
+  plan = pglaswell::plan_migration(
+      spec_of(json::array({mapping_of(json::array({"email"}), json::array())})), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  EXPECT_NE(all_sql(*steps_of(plan, "set_text_search_mapping")[0]).find("DROP MAPPING FOR email;"),
+            std::string::npos);
+
+  // Already so: nothing to do, and no rebuild.
+  plan = pglaswell::plan_migration(
+      spec_of(json::array({mapping_of(json::array({"word"}), json::array({"simple"}))})),
+      obs, {});
+  ASSERT_TRUE(plan.ok);
+  ASSERT_EQ(steps_of(plan, "set_text_search_mapping").size(), 1u);
+  EXPECT_EQ(steps_of(plan, "set_text_search_mapping")[0]->action, pglaswell::Action::kSatisfied);
+
+  // Two intents on one configuration: the second sees what the first leaves.
+  plan = pglaswell::plan_migration(
+      spec_of(json::array({mapping_of(json::array({"hword"}), json::array({"simple"})),
+                           mapping_of(json::array({"hword"}), json::array({"simple"}))})),
+      obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  std::size_t applied = 0;
+  for (const auto* st : steps_of(plan, "set_text_search_mapping")) {
+    if (st->action == pglaswell::Action::kApply && all_sql(*st).find("MAPPING") != std::string::npos) {
+      ++applied;
+    }
+  }
+  EXPECT_EQ(applied, 1u) << plan.render();
+}
+
+TEST(Planner, ATextSearchMappingRefusesWhatTheServerWould) {
+  const auto obs = obs_with_configuration();
+  auto refused = [&](json intent) {
+    const auto plan = pglaswell::plan_migration(spec_of(json::array({std::move(intent)})), obs, {});
+    EXPECT_FALSE(plan.ok) << plan.render();
+    return plan.conflicts.empty() ? std::string() : plan.conflicts[0];
+  };
+  EXPECT_NE(refused(mapping_of(json::array({"nosuch"}), json::array({"simple"})))
+                .find("has no token type \"nosuch\""), std::string::npos);
+  EXPECT_NE(refused(mapping_of(json::array({"word"}), json::array({"portuguese_names"})))
+                .find("no text search dictionary \"portuguese_names\""), std::string::npos);
+  // Off the search path: found only by its schema.
+  EXPECT_NE(refused(mapping_of(json::array({"word"}), json::array({"syn"})))
+                .find("named as schema.name"), std::string::npos);
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({mapping_of(json::array({"word"}), json::array({"hidden.syn"}))})),
+      obs, {});
+  EXPECT_TRUE(plan.ok) << plan.render();
+  auto other = mapping_of(json::array({"word"}), json::array({"simple"}));
+  other["name"] = "absent";
+  EXPECT_NE(refused(other).find("does not exist"), std::string::npos);
 }
 
 // The constraint kinds on a partitioned table: never one statement over every
@@ -3213,6 +3599,108 @@ TEST_F(BootstrappedTest, StatusReportsAUsableLedgerAndItsTrustedKeys) {
   EXPECT_TRUE(st.usable) << st.error;
   ASSERT_EQ(st.trusted_key_ids.size(), 1u);
   EXPECT_EQ(st.trusted_key_ids[0], test_key().key_id);
+}
+
+// The recipe executed: a key with a period and an exclusion constraint on a
+// partitioned table that has rows, a partition at a time, and both valid at the
+// end. Then the foreign key that references the key.
+TEST_F(DatabaseTest, APeriodKeyAndAnExclusionConstraintAreBuiltAPartitionAtATime) {
+  pglaswell::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = url_;
+  {
+    pglaswell::ReadSession r(cfg);
+    if (r.txn().exec("SELECT 1 FROM pg_available_extensions WHERE name = 'btree_gist'").empty()) {
+      GTEST_SKIP() << "btree_gist is not available on this server";
+    }
+    if (r.txn().exec("SELECT current_setting('server_version_num')::int")[0][0].as<int>() < 180000) {
+      GTEST_SKIP() << "WITHOUT OVERLAPS needs PostgreSQL 18";
+    }
+  }
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/period");
+    w.txn().exec("CREATE EXTENSION IF NOT EXISTS btree_gist");
+    w.txn().exec("DROP TABLE IF EXISTS laswell_term, laswell_rate CASCADE");
+    w.txn().exec("CREATE TABLE laswell_rate (tenant int NOT NULL, id bigint NOT NULL,"
+                 " valid daterange) PARTITION BY LIST (tenant)");
+    w.txn().exec("CREATE TABLE laswell_rate_1 PARTITION OF laswell_rate FOR VALUES IN (1)");
+    w.txn().exec("CREATE TABLE laswell_rate_2 PARTITION OF laswell_rate FOR VALUES IN (2)");
+    w.txn().exec("INSERT INTO laswell_rate SELECT 1 + g % 2, g,"
+                 " daterange('2020-01-01'::date + g, '2020-01-02'::date + g)"
+                 " FROM generate_series(1, 400) g");
+    w.txn().exec("CREATE TABLE laswell_term (tenant int NOT NULL, id bigint NOT NULL,"
+                 " valid daterange NOT NULL)");
+    w.txn().exec("INSERT INTO laswell_term SELECT tenant, id, valid FROM laswell_rate LIMIT 50");
+    w.commit();
+  }
+  pglaswell::Catalog cat(cfg);
+  auto apply = [&](const json& intent) {
+    const auto obs = cat.observe({"public", "public"}, {"laswell_rate", "laswell_term"},
+                                 {"extension:btree_gist"});
+    json doc = minimal_spec();
+    doc["intents"] = json::array({intent});
+    const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(doc), obs, {});
+    EXPECT_TRUE(plan.ok) << plan.render();
+    for (const auto& step : plan.steps) {
+      pglaswell::WriteSession w(cfg);
+      w.begin("pg_laswell/test/period-apply");
+      for (const auto& q : step.sql) w.txn().exec(q.substr(0, q.size() - 1));
+      w.commit();
+    }
+    return plan;
+  };
+  auto scalar = [&](const std::string& q) {
+    pglaswell::ReadSession r(cfg);
+    return r.txn().exec(q)[0][0].as<std::string>();
+  };
+
+  // valid is nullable: the primary key makes it NOT NULL through the recipe.
+  const auto pk = apply(json{{"kind", "add_primary_key"}, {"schema", "public"},
+                             {"table", "laswell_rate"}, {"name", "laswell_rate_pk"},
+                             {"columns", json::array({"tenant", "id", "valid"})},
+                             {"without_overlaps", true}});
+  EXPECT_EQ(scalar("SELECT conperiod::text || ':' || (SELECT indisvalid::text FROM pg_index"
+                   " WHERE indexrelid = 'laswell_rate_pk'::regclass)"
+                   " FROM pg_constraint WHERE conname = 'laswell_rate_pk'"), "true:true");
+  EXPECT_EQ(scalar("SELECT count(*) FROM pg_constraint WHERE contype = 'p'"
+                   " AND conrelid IN ('laswell_rate_1'::regclass, 'laswell_rate_2'::regclass)"),
+            "2");
+
+  apply(json{{"kind", "add_exclusion_constraint"}, {"schema", "public"},
+             {"table", "laswell_rate"}, {"name", "laswell_rate_ex"},
+             {"elements", json::array({json{{"column", "tenant"}, {"with", "="}},
+                                       json{{"column", "id"}, {"with", "="}},
+                                       json{{"column", "valid"}, {"with", "&&"}}})}});
+  EXPECT_EQ(scalar("SELECT contype::text || ':' || (SELECT indisvalid::text FROM pg_index"
+                   " WHERE indexrelid = 'laswell_rate_ex'::regclass)"
+                   " FROM pg_constraint WHERE conname = 'laswell_rate_ex'"), "x:true");
+
+  // Planned again, both are there.
+  {
+    const auto obs = cat.observe({"public"}, {"laswell_rate"}, {"extension:btree_gist"});
+    json doc = minimal_spec();
+    doc["intents"] = json::array(
+        {json{{"kind", "add_primary_key"}, {"schema", "public"}, {"table", "laswell_rate"},
+              {"name", "laswell_rate_pk"}, {"columns", json::array({"tenant", "id", "valid"})},
+              {"without_overlaps", true}}});
+    const auto again = pglaswell::plan_migration(pglaswell::parse_spec(doc), obs, {});
+    ASSERT_TRUE(again.ok) << again.render();
+    for (const auto& st : again.steps) EXPECT_NE(st.action, pglaswell::Action::kApply) << again.render();
+  }
+
+  apply(json{{"kind", "add_foreign_key"}, {"schema", "public"}, {"table", "laswell_term"},
+             {"name", "laswell_term_fk"}, {"columns", json::array({"tenant", "id", "valid"})},
+             {"references_schema", "public"}, {"references_table", "laswell_rate"},
+             {"references_columns", json::array({"tenant", "id", "valid"})},
+             {"period", true}});
+  EXPECT_EQ(scalar("SELECT conperiod::text || ':' || convalidated::text FROM pg_constraint"
+                   " WHERE conname = 'laswell_term_fk'"), "true:true");
+
+  pglaswell::WriteSession w(cfg);
+  w.begin("pg_laswell/test/period-cleanup");
+  w.txn().exec("DROP TABLE IF EXISTS laswell_term, laswell_rate CASCADE");
+  w.commit();
 }
 
 // A module's reading is one statement over a vendor's catalogs, and one that
@@ -9913,6 +10401,7 @@ TEST(Spec, EveryKindThatPlansAgainstAnObjectHasAnObjectKey) {
 #undef PGLASWELL_NEEDS_OBJECT
       "create_schema", "drop_schema", "alter_schema",
       "create_extension", "drop_extension", "alter_extension",
+      "set_text_search_mapping",
       "create_type", "drop_type", "add_enum_value", "alter_domain",
       "create_function", "drop_function", "alter_function",
       "create_sequence", "drop_sequence", "alter_sequence"};

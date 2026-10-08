@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <set>
 #include <cstdio>
 #include <functional>
 #include <map>
@@ -645,6 +646,26 @@ inline json compute_budget(const Observations& obs, const ExecutorConfig& cfg) {
                      "configure maintenance_work_mem_mb to decide it instead."}};
   }
   return b;
+}
+
+// The built-in types a period cannot be, and that GiST indexes only through
+// btree_gist. Used where there is no catalog to ask -- a create_table declares
+// its columns as text -- and only to refuse what is certain: a type not listed
+// is left to the server.
+inline bool known_scalar_type(std::string type) {
+  for (auto& c : type) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  const auto paren = type.find('(');
+  if (paren != std::string::npos) type = type.substr(0, paren);
+  while (!type.empty() && type.back() == ' ') type.pop_back();
+  static const std::set<std::string> kScalars = {
+      "smallint", "integer", "bigint", "int2", "int4", "int8", "int", "text",
+      "character varying", "varchar", "character", "char", "bpchar", "date",
+      "timestamp", "timestamptz", "timestamp without time zone",
+      "timestamp with time zone", "time", "timetz", "time without time zone",
+      "time with time zone", "interval", "uuid", "numeric", "decimal", "boolean",
+      "bool", "real", "double precision", "float4", "float8", "oid", "money",
+      "bytea", "macaddr", "macaddr8"};
+  return kScalars.count(type) > 0;
 }
 
 // What a step left out of the dry run says when it is not the scan of a split
