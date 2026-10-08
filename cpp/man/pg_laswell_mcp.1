@@ -316,6 +316,30 @@ when the job starts.
 .Ic CREATE INDEX CONCURRENTLY
 cannot run inside a transaction block, so it is listed as unverified rather
 than silently passed.
+Its
+.Em definition
+is checked all the same.
+The dry run makes an empty temporary copy of the table and creates the index
+on that: a wrong operator class, a function that does not exist, a predicate
+that does not type-check, a volatile expression, an unknown storage parameter
+or an access method that cannot do what was asked is refused there, in the
+server's own words, as a problem of that step.
+Measured on a 269 MB table, each of those was planned as fine before and first
+refused by the job.
+The same is done for a constraint whose index is built by the statement that
+adds it and is left out as too heavy \(em a key with a period, an exclusion
+constraint.
+The copy costs
+.Va AccessShareLock
+on the table and a few milliseconds, holds no rows, and is gone with the
+transaction.
+It therefore says nothing about the rows \(em a unique index over duplicates
+passes it \(em and the step stays unverified, with
+.Va unverifiedWhy
+saying how far it was checked.
+Where the copy cannot be made, because the role lacks
+.Ic TEMP
+on the database, nothing is checked and nothing is claimed.
 .It
 The scan of a split recipe is not run.
 .Cm set_not_null ,

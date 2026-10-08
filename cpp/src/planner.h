@@ -1626,6 +1626,80 @@ inline void take_weaker_lock_first(const Intent& in, const Observations& obs,
 }
 }  // namespace detail
 
+namespace detail {
+// "schema"."name" at `at`, or "" when what is there is not that.
+inline std::string quoted_relation_at(const std::string& s, std::size_t at) {
+  std::size_t i = at;
+  for (int part = 0; part < 2; ++part) {
+    if (i >= s.size() || s[i] != '"') return {};
+    ++i;
+    while (i < s.size()) {
+      if (s[i] == '"') {
+        if (i + 1 < s.size() && s[i + 1] == '"') { i += 2; continue; }
+        break;
+      }
+      ++i;
+    }
+    if (i >= s.size()) return {};
+    ++i;
+    if (part == 0) {
+      if (i >= s.size() || s[i] != '.') return {};
+      ++i;
+    }
+  }
+  return s.substr(at, i - at);
+}
+
+// For whatever a kind's planner emitted: every index build and constraint
+// build the dry run will not run gets its definition checked on an empty copy
+// of the table it names (check_on_empty_copy, planner_base.h). Done here once,
+// for the same reason the weaker lock is: the builds are emitted at a dozen
+// sites, plain, per partition and per part.
+inline void check_definitions_on_empty_copy(const Intent& in, std::vector<Step>& steps) {
+  switch (in.kind) {
+    case IntentKind::kCreateIndex:
+    case IntentKind::kAddUniqueConstraint:
+    case IntentKind::kAddPrimaryKey:
+    case IntentKind::kAddExclusionConstraint:
+      break;
+    default:
+      return;
+  }
+  for (auto& step : steps) {
+    if (step.action != Action::kApply || step.detail.contains("rehearse_on_copy")) continue;
+    const bool left_out = step.txn_class == TxnClass::kForbidden ||
+                          (step.detail.contains("not_rehearsed") &&
+                           step.detail.value("not_rehearsed_leaves_gap", false));
+    if (!left_out) continue;
+    for (const auto& stmt : step.sql) {
+      std::size_t target = std::string::npos;
+      std::string on_copy = stmt;
+      if (stmt.rfind("CREATE INDEX ", 0) == 0 || stmt.rfind("CREATE UNIQUE INDEX ", 0) == 0) {
+        const auto conc = on_copy.find(" CONCURRENTLY ");
+        if (conc != std::string::npos && conc < on_copy.find(" ON ")) {
+          on_copy.erase(conc, std::string(" CONCURRENTLY").size());
+        }
+        const auto on = on_copy.find(" ON ");
+        if (on == std::string::npos) continue;
+        target = on + 4;
+        if (on_copy.compare(target, 5, "ONLY ") == 0) target += 5;
+      } else if (stmt.rfind("ALTER TABLE ", 0) == 0 &&
+                 stmt.find(" ADD CONSTRAINT ") != std::string::npos &&
+                 stmt.find(" USING INDEX ") == std::string::npos) {
+        target = std::string("ALTER TABLE ").size();
+        if (on_copy.compare(target, 5, "ONLY ") == 0) target += 5;
+      } else {
+        continue;
+      }
+      const auto rel = quoted_relation_at(on_copy, target);
+      if (rel.empty()) continue;
+      on_copy.replace(target, rel.size(), kEmptyCopy);
+      check_on_empty_copy(step, rel, on_copy);
+    }
+  }
+}
+}  // namespace detail
+
 // Every enabled module's answer to: how may an index be built and dropped on
 // this table? (planner_base.h, IndexTraits). EVERY module is asked and the
 // answers are merged, because they answer different questions: how to build,
@@ -2448,6 +2522,14 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
                          detail::quote_identifier(name) + " ON " + sql_rel + " USING " +
                          method + " (" + columns_sql + ")" + include_sql + with_sql +
                          (where.empty() ? "" : " WHERE " + where) + ";");
+      // The module's own option means nothing on a plain copy: the definition
+      // is checked there without it.
+      check_on_empty_copy(step, sql_rel,
+                          "CREATE " + std::string(unique ? "UNIQUE " : "") + "INDEX " +
+                              detail::quote_identifier(name) + " ON " + detail::kEmptyCopy +
+                              " USING " + method + " (" + columns_sql + ")" + include_sql +
+                              index_with_sql(in.body) +
+                              (where.empty() ? "" : " WHERE " + where) + ";");
       step.why = "size " + detail::human_bytes(size) + (waiters > 0 ? ", " +
                  std::to_string(waiters) + " lock waiters" : "") +
                  ", and " + traits_by + " says a concurrent build is not possible "
@@ -8430,6 +8512,7 @@ inline Plan plan_migration(const Spec& spec, const Observations& obs,
         plan_security(in, projected, plan, emitted); break;
     }
     detail::take_weaker_lock_first(in, projected, emitted);
+    detail::check_definitions_on_empty_copy(in, emitted);
     detail::append_creation_comment(in, emitted);
     if (!emitted.empty()) project(in, emitted.front(), projected);
 

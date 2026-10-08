@@ -1066,6 +1066,9 @@ class Catalog {
     // wait a rehearsal allows itself; -1 when every lock was had.
     int lock_unavailable_at = -1;
     bool depends_on_skipped = false;
+    // Steps that were not run and whose definition was accepted on an empty
+    // copy of their table. Still unverified: the build itself was not tried.
+    std::vector<int> definition_checked;
   };
 
   // pqxx hands back the server's line verbatim -- "ERROR:  extension ...\n".
@@ -1151,6 +1154,50 @@ class Catalog {
     return true;
   }
 
+  // The definition of a statement the rehearsal will not run, tried on an empty
+  // temporary copy of its table, inside a savepoint that takes the copy away
+  // again. Returns the server's refusal of the DEFINITION, if any. `checked` is
+  // false when the copy could not be made at all -- the role lacks TEMP on the
+  // database, the table is locked, or it is not there because an earlier step
+  // was itself left out -- which is nothing found, and nothing verified.
+  //
+  // LIKE with INCLUDING GENERATED, so an index on a generated column has its
+  // column; nothing else of the table matters to an index definition, and
+  // nothing else is copied.
+  static std::optional<Problem> check_on_empty_copies(pqxx::work& txn, const json& checks,
+                                                      bool& checked) {
+    checked = false;
+    const auto back = [&txn] {
+      txn.exec("ROLLBACK TO SAVEPOINT laswell_empty_copy");
+      txn.exec("RELEASE SAVEPOINT laswell_empty_copy");
+    };
+    for (const auto& c : checks) {
+      const auto of = c.value("of", "");
+      const auto stmt = detail::strip_trailing_semicolon(c.value("sql", ""));
+      if (of.empty() || stmt.empty()) continue;
+      txn.exec("SAVEPOINT laswell_empty_copy");
+      try {
+        txn.exec("CREATE TEMP TABLE laswell_shape (LIKE " + of +
+                 " INCLUDING GENERATED) ON COMMIT DROP");
+      } catch (const pqxx::sql_error&) {
+        back();
+        checked = false;
+        return std::nullopt;
+      }
+      try {
+        txn.exec(stmt);
+      } catch (const pqxx::sql_error& e) {
+        const Problem p{-1, std::string(e.sqlstate()), server_message(e.what()),
+                        stmt + "   -- on an empty copy of " + of};
+        back();
+        return p;
+      }
+      back();
+      checked = true;
+    }
+    return std::nullopt;
+  }
+
   // How a rehearsal of one plan's steps ended. Rollback is the CALLER's choice:
   // a single-plan dry run discards everything; a chained rehearsal discards only
   // the failing specification, back to its savepoint, and keeps going.
@@ -1169,7 +1216,12 @@ class Catalog {
       const std::vector<std::pair<int, std::vector<std::string>>>& steps,
       const std::vector<bool>& txn_forbidden, int server_version,
       const std::vector<json>& copy_payloads, DryRun& out, bool& skipped_any,
-      const std::vector<bool>& execute = {}) {
+      const std::vector<bool>& execute = {}, const std::vector<json>& on_copy = {}) {
+    // A step skipped with NOTHING checked: a later definition may then be
+    // refused for want of what that step would have made -- a column added by
+    // a statement left out -- which is a gap and not a defect. An index build
+    // whose definition passed leaves no such doubt for the next build.
+    bool skipped_unchecked = skipped_any;
     const auto note_unverified = [&out](int ordinal) {
       if (std::find(out.unverified_steps.begin(), out.unverified_steps.end(),
                     ordinal) == out.unverified_steps.end()) {
@@ -1179,6 +1231,18 @@ class Catalog {
     for (std::size_t i = 0; i < steps.size(); ++i) {
       if (txn_forbidden[i]) {
         note_unverified(steps[i].first);
+        bool checked = false;
+        if (i < on_copy.size() && on_copy[i].is_array() && !on_copy[i].empty()) {
+          const auto problem = check_on_empty_copies(txn, on_copy[i], checked);
+          if (problem && !skipped_unchecked) {
+            out.problems.push_back(Problem{steps[i].first, problem->sqlstate, problem->message,
+                                          problem->statement});
+            return Rehearsal::kFailed;
+          }
+          if (problem) checked = false;
+        }
+        if (checked) out.definition_checked.push_back(steps[i].first);
+        else skipped_unchecked = true;
         skipped_any = true;
         continue;
       }
@@ -1293,7 +1357,8 @@ class Catalog {
   DryRun dry_run(const std::vector<std::pair<int, std::vector<std::string>>>& steps,
                  const std::vector<bool>& txn_forbidden, int server_version,
                  const std::vector<json>& copy_payloads = {},
-                 const std::vector<bool>& execute = {}) {
+                 const std::vector<bool>& execute = {},
+                 const std::vector<json>& on_copy = {}) {
     DryRun out;
     WriteSession session(rehearsal_config());
     try {
@@ -1305,7 +1370,7 @@ class Catalog {
     out.ran = true;
     bool skipped_any = false;
     rehearse_steps(session.txn(), steps, txn_forbidden, server_version,
-                   copy_payloads, out, skipped_any, execute);
+                   copy_payloads, out, skipped_any, execute, on_copy);
     // Always. Nothing a dry run does is ever committed.
     session.rollback();
     return out;

@@ -55,6 +55,24 @@ On a hypertable and on a Citus distributed table the constraint must compare
 the partitioning or distribution column for equality; the module refuses one
 that does not, in the words the extension would use.
 
+### An index definition is checked although its build is not rehearsed
+
+A build outside a transaction, or one left out of the dry run as too heavy, was
+not checked at all. Measured on 18.6, a 269 MB table: a wrong operator class, a
+function that does not exist, a predicate that does not type-check, a volatile
+expression, an unknown storage parameter and a unique hash index were each
+planned as fine, and first refused when the job reached the build.
+
+The dry run now makes an empty temporary copy of the table (`LIKE`, in its
+rolled-back transaction) and runs the same statement on it, without
+`CONCURRENTLY`. Each of the six is refused there in the server's own words, as
+a problem of that step; so are GIN, GiST and HNSW definitions, per-partition
+and per-chunk builds, and the constraint builds above. It costs
+AccessShareLock on the table and about 2 ms. It tries neither the rows nor the
+time, so the step is still listed as unverified, and `unverifiedWhy` says its
+definition was accepted. Where the role lacks `TEMP` on the database nothing
+is checked and nothing is claimed.
+
 ### `set_text_search_mapping`
 
 A text search configuration could be created by copying one and then not

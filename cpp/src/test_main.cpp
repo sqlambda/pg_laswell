@@ -3601,6 +3601,68 @@ TEST_F(BootstrappedTest, StatusReportsAUsableLedgerAndItsTrustedKeys) {
   EXPECT_EQ(st.trusted_key_ids[0], test_key().key_id);
 }
 
+// The check itself, against a server: a definition PostgreSQL refuses is the
+// step's problem, one it accepts is recorded, and nothing is left behind.
+TEST_F(DatabaseTest, TheDryRunChecksASkippedBuildOnAnEmptyCopy) {
+  pglaswell::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = url_;
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/empty-copy");
+    w.txn().exec("DROP TABLE IF EXISTS laswell_shape_t");
+    w.txn().exec("CREATE TABLE laswell_shape_t (id bigint, code text, tags text[],"
+                 " twice bigint GENERATED ALWAYS AS (id * 2) STORED)");
+    w.txn().exec("INSERT INTO laswell_shape_t (id, code) VALUES (1, 'a'), (1, 'a')");
+    w.commit();
+  }
+  pglaswell::Catalog cat(cfg);
+  const auto run = [&](const std::vector<std::string>& on_copy) {
+    json checks = json::array();
+    for (const auto& q : on_copy) {
+      checks.push_back(json{{"of", "\"public\".\"laswell_shape_t\""}, {"sql", q}});
+    }
+    // One step that cannot run in a transaction, and one after it that can.
+    return cat.dry_run({{0, {"CREATE INDEX CONCURRENTLY x ON public.laswell_shape_t (id);"}},
+                        {1, {"COMMENT ON TABLE public.laswell_shape_t IS 'c';"}}},
+                       {true, false}, 180000, {}, {}, {checks, json()});
+  };
+
+  auto dry = run({"CREATE INDEX x ON pg_temp.laswell_shape USING gin (tags);",
+                  "CREATE INDEX y ON pg_temp.laswell_shape (twice, lower(code));"});
+  EXPECT_TRUE(dry.problems.empty()) << dry.problems[0].message;
+  EXPECT_EQ(dry.definition_checked, std::vector<int>{0});
+  EXPECT_EQ(dry.unverified_steps, std::vector<int>{0}) << "the build itself was not run";
+
+  // A unique index over rows that repeat: the copy is empty, so it passes --
+  // the check is of the definition and says nothing about the rows.
+  dry = run({"CREATE UNIQUE INDEX x ON pg_temp.laswell_shape (id);"});
+  EXPECT_TRUE(dry.problems.empty());
+
+  dry = run({"CREATE INDEX x ON pg_temp.laswell_shape (code int4_ops);"});
+  ASSERT_EQ(dry.problems.size(), 1u);
+  EXPECT_EQ(dry.problems[0].step, 0);
+  EXPECT_EQ(dry.problems[0].sqlstate, "42804");
+  EXPECT_NE(dry.problems[0].message.find("does not accept data type text"), std::string::npos);
+  EXPECT_NE(dry.problems[0].statement.find("on an empty copy of"), std::string::npos);
+  EXPECT_TRUE(dry.definition_checked.empty());
+
+  // A table that is not there to copy: nothing found, nothing claimed.
+  json missing = json::array({json{{"of", "\"public\".\"laswell_no_such\""},
+                                   {"sql", "CREATE INDEX x ON pg_temp.laswell_shape (id);"}}});
+  dry = cat.dry_run({{0, {"CREATE INDEX CONCURRENTLY x ON public.laswell_no_such (id);"}}},
+                    {true}, 180000, {}, {}, {missing});
+  EXPECT_TRUE(dry.problems.empty());
+  EXPECT_TRUE(dry.definition_checked.empty());
+
+  pglaswell::WriteSession w(cfg);
+  w.begin("pg_laswell/test/empty-copy-cleanup");
+  EXPECT_EQ(w.txn().exec("SELECT count(*) FROM pg_class WHERE relname IN ('laswell_shape', 'x', 'y')")
+                [0][0].as<int>(), 0);
+  w.txn().exec("DROP TABLE laswell_shape_t");
+  w.commit();
+}
+
 // The recipe executed: a key with a period and an exclusion constraint on a
 // partitioned table that has rows, a partition at a time, and both valid at the
 // end. Then the foreign key that references the key.
@@ -11169,6 +11231,70 @@ TEST(Planner, StepsThatNeedAnExclusiveLockTakeTheWeakerOneFirst) {
   EXPECT_EQ(f[0]->sql.at(0), gate);
   EXPECT_EQ(f[0]->sql.at(1), "LOCK TABLE \"shop\".\"warehouse\" IN SHARE UPDATE EXCLUSIVE MODE;");
   EXPECT_EQ(f[0]->detail.value("weaker_lock_first", 0), 2);
+}
+
+// What the dry run cannot run still has a definition the server can be asked
+// about. Measured on 18.6, a 269 MB table: six wrong index definitions were
+// each planned as fine and first refused by the job.
+TEST(Planner, ABuildTheDryRunSkipsHasItsDefinitionCheckedOnAnEmptyCopy) {
+  auto obs = observations(2LL << 30, 8000000);
+  obs.tables["shop.orders"]["columns"]["code"] = json{{"type", "text"}, {"not_null", true}};
+  auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "create_index"}, {"schema", "shop"},
+                                {"table", "orders"}, {"name", "orders_code_idx"},
+                                {"columns", json::array({json{{"name", "code"},
+                                                              {"opclass", "text_pattern_ops"}}})},
+                                {"where", "code <> ''"}, {"comment", "c"}}})),
+      obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto* build = steps_of(plan, "create_index")[0];
+  ASSERT_EQ(build->txn_class, pglaswell::TxnClass::kForbidden);
+  ASSERT_TRUE(build->detail.contains("rehearse_on_copy")) << build->detail.dump(2);
+  const auto& check = build->detail["rehearse_on_copy"][0];
+  EXPECT_EQ(check.value("of", ""), "\"shop\".\"orders\"");
+  // The same statement, on the copy, and not concurrently.
+  const auto sql = check.value("sql", "");
+  EXPECT_NE(sql.find("CREATE INDEX \"orders_code_idx\" ON pg_temp.laswell_shape USING btree"),
+            std::string::npos) << sql;
+  EXPECT_NE(sql.find("text_pattern_ops"), std::string::npos) << sql;
+  EXPECT_NE(sql.find("WHERE code <> ''"), std::string::npos) << sql;
+  EXPECT_EQ(sql.find("CONCURRENTLY"), std::string::npos) << sql;
+  // The step's own statement is untouched.
+  EXPECT_NE(all_sql(*build).find("INDEX CONCURRENTLY \"orders_code_idx\" ON \"shop\".\"orders\""),
+            std::string::npos);
+
+  const auto in = pglaswell::detail::rehearsal_inputs(plan);
+  ASSERT_EQ(in.on_copy.size(), in.steps.size());
+  EXPECT_TRUE(in.on_copy[0].is_array());
+
+  // The unique recipe's build, and a key with a period on a large table.
+  plan = pglaswell::plan_migration(unique_spec("add_unique_constraint", "orders_code_uq"),
+                                   obs_for_unique(2LL << 30), {});
+  ASSERT_TRUE(plan.ok);
+  const auto u = steps_of(plan, "add_unique_constraint");
+  EXPECT_EQ(u[0]->detail["rehearse_on_copy"][0].value("sql", ""),
+            "CREATE UNIQUE INDEX \"orders_code_uq\" ON pg_temp.laswell_shape (\"code\");");
+  // The adoption that follows needs the real index: nothing to check on a copy.
+  EXPECT_FALSE(u[1]->detail.contains("rehearse_on_copy"));
+
+  plan = pglaswell::plan_migration(
+      spec_of(json::array({period_key("add_unique_constraint", json::array({"id", "valid"}))})),
+      obs_with_period(2LL << 30), {});
+  ASSERT_TRUE(plan.ok);
+  const auto k = steps_of(plan, "add_unique_constraint");
+  EXPECT_EQ(k[0]->detail["rehearse_on_copy"][0].value("sql", ""),
+            "ALTER TABLE pg_temp.laswell_shape ADD CONSTRAINT \"orders_period\" UNIQUE "
+            "(\"id\", \"valid\" WITHOUT OVERLAPS);");
+
+  // A step the dry run does run needs no copy.
+  plan = pglaswell::plan_migration(
+      spec_of(json::array({period_key("add_unique_constraint", json::array({"id", "valid"}))})),
+      obs_with_period(1 << 20), {});
+  EXPECT_FALSE(steps_of(plan, "add_unique_constraint")[0]->detail.contains("rehearse_on_copy"));
+
+  // And the reason a checked step is still listed says how far it was checked.
+  const auto why = pglaswell::detail::unverified_reasons(plan, {0}, {0});
+  EXPECT_NE(why["0"].get<std::string>().find("accepted on an empty copy"), std::string::npos);
 }
 
 // What the rehearsal is handed: the marked steps as nothing to run. One that

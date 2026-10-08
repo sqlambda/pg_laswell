@@ -678,6 +678,26 @@ inline constexpr const char* kHeavyNotRehearsed =
 
 }  // namespace detail
 
+// A statement the dry run cannot run -- a build outside a transaction, or one
+// that would hold the table for its whole length -- still has a definition the
+// server can be asked about. The dry run makes an EMPTY temporary copy of the
+// table (LIKE) inside its transaction and runs `sql` against that, where
+// `sql` names the copy as kEmptyCopy. Measured on 18.6: on a 269 MB table a
+// wrong operator class, a function that does not exist, a predicate that does
+// not type-check, a volatile expression, an unknown storage parameter and a
+// unique hash index were each planned as fine and first refused by the job;
+// the copy refuses each in 2 ms, under AccessShareLock on the table, and GIN,
+// GiST and HNSW with it. It tries neither the rows nor the time the build
+// takes: the step stays unverified, and says how far it was checked.
+namespace detail {
+inline constexpr const char* kEmptyCopy = "pg_temp.laswell_shape";
+}
+inline void check_on_empty_copy(Step& step, const std::string& of_sql_rel,
+                                const std::string& sql) {
+  if (!step.detail.contains("rehearse_on_copy")) step.detail["rehearse_on_copy"] = json::array();
+  step.detail["rehearse_on_copy"].push_back(json{{"of", of_sql_rel}, {"sql", sql}});
+}
+
 // A step the dry run must not execute. `leaves_gap` says that later steps may
 // need what this one would have made: they are then reported as depending on a
 // step that was not rehearsed, not as failures of their own.
