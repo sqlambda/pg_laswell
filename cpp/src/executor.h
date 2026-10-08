@@ -19,6 +19,7 @@
 // for exactly this table.
 
 #include <chrono>
+#include <cmath>
 #include <optional>
 #include <string>
 #include <thread>
@@ -951,26 +952,32 @@ class Executor {
   void run_backfill(WriteSession& w, int ordinal, const json& step) {
     const auto& e = cfg_.executor;
     const auto detail_json = step.value("detail", json::object());
-    const auto sql = detail::strip_semicolon(step["sql"][0].get<std::string>());
+    // "paced": false puts one statement over the whole table ahead of the
+    // walk's own (planner_dml.h, single_sql).
+    const std::size_t first = detail_json.value("single_statement", false) ? 1 : 0;
+    const auto single_sql =
+        first == 1 ? detail::strip_semicolon(step["sql"][0].get<std::string>())
+                   : std::string();
+    const auto sql = detail::strip_semicolon(step["sql"][first].get<std::string>());
     // Two statements: select and lock the batch's keys, then apply to exactly
     // those keys. The CTE form could not be routed by Citus, and a single
     // statement's LIMIT can only bound a batch by rows -- accumulating to a byte
     // budget needs the keys in hand before the mutation is sent.
     const auto batch_mode = detail_json.value("batch_mode", "");
     const bool two_statement =
-        batch_mode == "two_statement" && step["sql"].size() > 1;
+        batch_mode == "two_statement" && step["sql"].size() > first + 1;
     // A grouped walk: three statements, and a cursor that is a pair. The
     // a module's kind asks for it, but the loop is core's -- a module declares
     // the mode, it does not bring its own executor.
     const bool grouped =
-        batch_mode == "grouped" && step["sql"].size() > 2;
+        batch_mode == "grouped" && step["sql"].size() > first + 2;
     // A composite walk: two statements, like the plain one, over all the key
     // columns of a unique index together. See run_composite_batch.
     // Or ONE statement over them, for the kinds whose rows come from the
     // specification: the mutation rides in the statement that names the batch.
     const bool composite_statement = batch_mode == "composite_statement";
     const bool composite =
-        (batch_mode == "composite" && step["sql"].size() > 1) || composite_statement;
+        (batch_mode == "composite" && step["sql"].size() > first + 1) || composite_statement;
     std::vector<std::string> composite_columns;
     for (const auto& c : detail_json.value("key_columns", json::array())) {
       composite_columns.push_back(c.get<std::string>());
@@ -978,10 +985,10 @@ class Executor {
     const auto apply_sql =
         (two_statement || grouped || (composite && !composite_statement))
             ? detail::strip_semicolon(
-                  step["sql"][grouped ? 2 : 1].get<std::string>())
+                  step["sql"][first + (grouped ? 2 : 1)].get<std::string>())
             : std::string();
     const auto confined_select_sql =
-        grouped ? detail::strip_semicolon(step["sql"][1].get<std::string>())
+        grouped ? detail::strip_semicolon(step["sql"][first + 1].get<std::string>())
                        : std::string();
     const auto key_column = detail_json.value("key", "id");
 
@@ -1052,6 +1059,76 @@ class Executor {
 
     const auto started = detail::steady_ms();
     bool done = false;
+    // Progress: where the walk is in the table, asked of the planner now if it
+    // resumes somewhere, and every progress_interval_ms from here on.
+    const std::string leading_column = !resume_columns_.empty()
+                                           ? resume_columns_[0]
+                                           : !resume_group_.empty() ? resume_group_ : key_column;
+    walk_started_ms_ = started;
+    walked_fraction_ = -1.0;
+    walked_at_start_ = 0.0;
+    if (resumed_from != "0") {
+      const double f = walked_fraction(w, ordinal, detail_json, cursor, leading_column);
+      if (f >= 0.0) walked_at_start_ = f;
+    }
+    long long progress_asked_ms = started;
+
+    // The one statement, where the specification asked for it and no earlier
+    // attempt left a cursor: a walk that had begun is continued, not redone.
+    // One transaction, without the statement timeout -- its length is the
+    // table's. The observer watches this backend as it watches a batch, and
+    // cancels the statement when a session has waited behind it longer than
+    // max_waiter_wait_ms; cancelJob cancels it too (jobs.h, long_statement).
+    // Either way nothing of it is kept.
+    if (!single_sql.empty() && resumed_from == "0") {
+      const auto slot = operation_slot();
+      if (job_->pacing.cancel_stop.load()) {
+        cancelled();
+        return;
+      }
+      w.begin(app_name(ordinal));
+      try {
+        if (cfg_.statement_timeout_ms > 0) w.txn().exec("SET LOCAL statement_timeout = 0");
+        job_->pacing.long_statement = true;
+        const auto r = w.txn().exec(single_sql);
+        job_->pacing.long_statement = false;
+        rows_done = static_cast<long long>(r.affected_rows());
+        w.commit();
+        commits = 1;
+        rows_committed = rows_done;
+        reasons["single_statement"] = 1;
+        done = true;
+      } catch (const pqxx::sql_error& ex) {
+        job_->pacing.long_statement = false;
+        const bool ours = detail::is_query_canceled(ex);
+        if (ours && job_->pacing.cancel_stop.load()) {
+          job_->pacing.cancel_requested = false;
+          w.rollback();
+          cancelled();
+          return;
+        }
+        if (ours && job_->pacing.cancel_requested.exchange(false)) {
+          w.rollback();
+          reasons["single_statement_cancelled"] = 1;
+          add_warning("the single statement was cancelled after a session had waited "
+                      "behind it longer than max_waiter_wait_ms, and nothing of it was "
+                      "kept; the paced walk did the work instead");
+        } else if (detail::is_lock_timeout(ex)) {
+          // It met a row another session holds and waited out lock_timeout:
+          // the table is in use after all. The walk waits for one batch's rows
+          // at a time, and keeps what it has done.
+          w.rollback();
+          reasons["single_statement_cancelled"] = 1;
+          add_warning("the single statement waited longer than lock_timeout for a row "
+                      "another session holds, and nothing of it was kept; the paced "
+                      "walk did the work instead");
+        } else {
+          record_step(ordinal, step, "failed", 0,
+                      json{{"sqlstate", ex.sqlstate()}, {"error", ex.what()}});
+          throw;
+        }
+      }
+    }
 
     while (!done) {
       if (job_->pacing.cancel_stop.load()) {
@@ -1221,12 +1298,24 @@ class Executor {
         reasons[to_string(reason)] += 1;
       }
 
+      if (!done && detail::steady_ms() - progress_asked_ms >= e.progress_interval_ms) {
+        progress_asked_ms = detail::steady_ms();
+        const double f = walked_fraction(w, ordinal, detail_json, cursor, leading_column);
+        if (f >= 0.0) walked_fraction_ = std::max(f, walked_at_start_);
+      }
+
       publish_backfill(ordinal, rows_done, rows_committed, commits, cursor,
                        reasons, detail_json, to_string(reason));
     }
 
-    json d{{"elapsedMs", detail::steady_ms() - started},
+    walk_started_ms_ = 0;
+    const auto elapsed_ms = detail::steady_ms() - started;
+    json d{{"elapsedMs", elapsed_ms},
            {"rowsDone", rows_done},
+           {"rowsPerSecond",
+            elapsed_ms > 0 ? std::round(static_cast<double>(rows_done) * 1000.0 /
+                                        static_cast<double>(elapsed_ms))
+                           : 0.0},
            {"commits", commits},
            {"commitReasons", reasons},
            {"finalCursor", cursor},
@@ -1352,6 +1441,12 @@ class Executor {
   std::string resume_key_;
   std::string resume_where_;
   std::string resume_group_;
+  // What a walk says of its own progress, beside the rows it has written
+  // (publish_backfill). The fraction is of the TABLE, by the planner's
+  // statistics: -1 while there is none.
+  long long walk_started_ms_ = 0;
+  double walked_fraction_ = -1.0;
+  double walked_at_start_ = 0.0;
   std::vector<std::string> resume_columns_;  // a composite walk's key, in order
 
   bool cursor_is_stale(ReadSession& r, const std::string& from) {
@@ -1490,8 +1585,75 @@ class Executor {
       b["percent"] = std::min(100.0, 100.0 * static_cast<double>(rows_done) /
                                          static_cast<double>(est));
     }
+    // The rate, and how far along the table the walk is. rowsDone against
+    // rowsEstimated is progress only for a walk that writes every row: found
+    // in the field, 27 million of 73 million rows were to be written, at 1 850
+    // a second, and nothing said either the rate or that it meant four hours.
+    // So where the planner can say what share of the table lies at or below
+    // the cursor, percent and the time left come from that.
+    const double elapsed_s =
+        static_cast<double>(detail::steady_ms() - walk_started_ms_) / 1000.0;
+    if (walk_started_ms_ > 0 && elapsed_s >= 1.0) {
+      b["rowsPerSecond"] = std::round(static_cast<double>(rows_done) / elapsed_s);
+    }
+    if (walked_fraction_ >= 0.0) {
+      b["fractionWalked"] = std::round(walked_fraction_ * 1000.0) / 1000.0;
+      b["percent"] = std::min(100.0, 100.0 * walked_fraction_);
+      b["progressBy"] =
+          "the planner's estimate of the rows at or below the cursor, from the "
+          "table's statistics";
+      const double gained = walked_fraction_ - walked_at_start_;
+      if (gained > 0.002 && elapsed_s >= 1.0) {
+        b["secondsRemaining"] =
+            std::round(elapsed_s * (1.0 - walked_fraction_) / gained);
+      }
+    }
     std::lock_guard<std::mutex> lock(job_->m);
     job_->backfill = std::move(b);
+  }
+
+  // What share of the table lies at or below the walk's cursor, as the planner
+  // estimates it: two EXPLAINs, planned and not run, in a transaction of their
+  // own between batches. It holds for any key type with statistics and is as
+  // good as the table's last ANALYZE. -1 where there is no telling: before the
+  // first row, on a table a module spreads over nodes (the coordinator plans a
+  // remote scan and estimates nothing of it), or when the reading fails --
+  // which must never fail the walk.
+  double walked_fraction(WriteSession& w, int ordinal, const json& detail_json,
+                         const std::string& cursor, const std::string& leading_column) {
+    if (cursor.empty() || cursor == "0" || detail_json.contains("confined_by")) return -1.0;
+    std::string at = cursor;
+    if (cursor.front() == '[') {
+      try {
+        const auto j = json::parse(cursor);
+        if (!j.is_array() || j.empty() || !j[0].is_string()) return -1.0;
+        at = j[0].get<std::string>();
+      } catch (const std::exception&) {
+        return -1.0;
+      }
+    }
+    const auto rel = detail::quote_qualified(detail_json.value("qualified", ""));
+    const auto rows_of = [](const pqxx::result& r) {
+      if (r.empty()) return -1.0;
+      const auto j = json::parse(r[0][0].as<std::string>());
+      return j[0]["Plan"].value("Plan Rows", -1.0);
+    };
+    try {
+      w.begin(app_name(ordinal));
+      const double all = rows_of(w.txn().exec("EXPLAIN (FORMAT JSON) SELECT 1 FROM " + rel));
+      const double below = rows_of(w.txn().exec(
+          "EXPLAIN (FORMAT JSON) SELECT 1 FROM " + rel + " WHERE " +
+          detail::quote_identifier(leading_column) + " <= " + w.txn().quote(at)));
+      w.commit();
+      if (all <= 0.0 || below < 0.0) return -1.0;
+      return std::min(1.0, below / all);
+    } catch (const std::exception&) {
+      try {
+        if (w.in_transaction()) w.rollback();
+      } catch (const std::exception&) {
+      }
+      return -1.0;
+    }
   }
 
   // The ledger's row for a step, before the step runs (ledger.h).

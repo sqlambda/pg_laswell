@@ -852,6 +852,34 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
                           it.value().get<std::string>());
   }
 
+  // VALUES COMPUTED ONCE PER ROW. Not part of the specification's language:
+  // add_column's fill with a default sets these (planner.h,
+  // plan_defaulted_fill), because its predicate and its assignment both need
+  // the value and pasting the expression wherever it is wanted evaluated it
+  // five times per column and row. Found in the field with a fill that is an
+  // EXISTS over an 87-million-row table: 10 copies in the update for two
+  // columns, 55 buffers a row, 1 850 rows a second.
+  //
+  //   computed      a LATERAL item for the SELECT that finds the batch, which
+  //                 evaluates each value once and names it
+  //   select_where  the predicate over those names, for that SELECT
+  //   apply_set     the whole SET list of the UPDATE, which evaluates each
+  //                 value once in a sub-select of its own
+  //
+  // The UPDATE then carries no predicate but the batch's keys. The rows were
+  // selected and locked by the SELECT in the same transaction, so the
+  // predicate cannot have changed for them; re-applying it would only
+  // evaluate the values again. `where` stays the predicate in full, for the
+  // readings that are not part of the walk (the resume check, the detail).
+  const auto computed = in.body.value("computed", "");
+  const auto select_where = in.body.value("select_where", where);
+  const std::string select_from =
+      (from.empty() ? "" : ", " + from) + (computed.empty() ? "" : ", " + computed);
+  const std::string set_list =
+      in.body.contains("apply_set") ? in.body["apply_set"].get<std::string>()
+                                    : detail::join(assignments, ", ");
+  const std::string and_where = computed.empty() ? " AND (" + where + ")" : "";
+
   // FOR UPDATE without SKIP LOCKED, deliberately. SKIP LOCKED would silently
   // skip contended rows while the cursor advanced past them, leaving a
   // backfill that reports complete and is not. It looks like the obviously
@@ -973,8 +1001,8 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
 
   const std::string select_sql =
       "SELECT " + rel + "." + k + "\n"
-      "  FROM " + sql_rel + (from.empty() ? "" : ", " + from) + "\n"
-      " WHERE " + rel + "." + k + " > $1" + bound_sql + " AND (" + where + ")\n"
+      "  FROM " + sql_rel + select_from + "\n"
+      " WHERE " + rel + "." + k + " > $1" + bound_sql + " AND (" + select_where + ")\n"
       " ORDER BY " + rel + "." + k + "\n"
       " LIMIT $2\n"
       " FOR UPDATE OF " + rel + ";";
@@ -986,10 +1014,60 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
   const std::string apply_sql =
       preserve_cte +
       "UPDATE " + sql_rel + "\n"
-      "   SET " + detail::join(assignments, ", ") + "\n" +
+      "   SET " + set_list + "\n" +
       (from.empty() ? "" : "  FROM " + from + "\n") +
-      " WHERE " + rel + "." + k + " = " + key_array + " AND (" + where + ")\n"
+      " WHERE " + rel + "." + k + " = " + key_array + and_where + "\n"
       "RETURNING " + rel + "." + k + ";";
+
+  // ONE STATEMENT FIRST, where the specification says "paced": false: for a
+  // table nothing else is using, where pacing protects nobody and costs a
+  // round trip and a commit every thousand rows. It runs before the walk and
+  // in place of it. The breaker watches it as it watches a batch: a session
+  // that waits behind it longer than max_waiter_wait_ms has it cancelled, it
+  // is rolled back whole, and the walk below does the work instead.
+  //
+  // Values computed once per row (`computed`) are joined back by the walk's
+  // key columns: UPDATE ... FROM cannot refer to the row being updated from a
+  // LATERAL item (measured on 18.6: "invalid reference to FROM-clause entry"),
+  // so the rows that take a value are found in a subquery over the table, and
+  // the UPDATE names them by their key.
+  std::string single_sql;
+  if (!in.body.value("paced", true)) {
+    if (computed.empty()) {
+      single_sql = "UPDATE " + sql_rel + "\n"
+                   "   SET " + set_list + "\n" +
+                   (from.empty() ? "" : "  FROM " + from + "\n") +
+                   " WHERE (" + where + ");";
+    } else {
+      std::vector<std::string> key_columns =
+          composite ? composite_columns
+                    : grouped ? std::vector<std::string>{group_column, key}
+                              : std::vector<std::string>{key};
+      const std::string fresh = detail::quote_identifier("laswell_new");
+      std::vector<std::string> selected, joined, assigned;
+      for (std::size_t c = 0; c < key_columns.size(); ++c) {
+        const auto kc = detail::quote_identifier(key_columns[c]);
+        const auto name = detail::quote_identifier("k" + std::to_string(c + 1));
+        selected.push_back(rel + "." + kc + " AS " + name);
+        joined.push_back(rel + "." + kc + " = " + fresh + "." + name);
+      }
+      const json single_columns = in.body.value("single_columns", json::array());
+      const json single_values = in.body.value("single_values", json::array());
+      for (std::size_t c = 0; c < single_columns.size(); ++c) {
+        const auto name = detail::quote_identifier("n" + std::to_string(c + 1));
+        selected.push_back(single_values[c].get<std::string>() + " AS " + name);
+        assigned.push_back(single_columns[c].get<std::string>() + " = " + fresh + "." + name);
+      }
+      single_sql = "UPDATE " + sql_rel + "\n"
+                   "   SET " + detail::join(assigned, ", ") + "\n"
+                   "  FROM (SELECT " + detail::join(selected, ", ") + "\n"
+                   "          FROM " + sql_rel + select_from + "\n"
+                   "         WHERE (" + select_where + ")) AS " + fresh + "\n"
+                   " WHERE " + detail::join(joined, " AND ") + ";";
+    }
+    step.sql.push_back(single_sql);
+    step.detail["single_statement"] = true;
+  }
 
   if (composite) {
     // Two statements, as the plain walk has, over the index's columns
@@ -1038,9 +1116,9 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
         " IN (SELECT * FROM unnest(" + detail::join(arrays, ", ") + "))) IS TRUE";
     step.sql.push_back(
         "SELECT " + detail::join(cols, ", ") + "\n"
-        "  FROM " + sql_rel + (from.empty() ? "" : ", " + from) + "\n"
+        "  FROM " + sql_rel + select_from + "\n"
         " WHERE (" + tuple + " > (" + detail::join(marks, ", ") + ") OR $1 IS NULL)" +
-            bound_sql + " AND (" + where + ")\n"
+            bound_sql + " AND (" + select_where + ")\n"
         " ORDER BY " + detail::join(cols, ", ") + "\n"
         " LIMIT $" + std::to_string(composite_columns.size() + 1) + "\n"
         " FOR UPDATE OF " + rel + ";");
@@ -1071,9 +1149,9 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
     step.sql.push_back(
         composite_preserve +
         "UPDATE " + sql_rel + "\n"
-        "   SET " + detail::join(assignments, ", ") + "\n" +
+        "   SET " + set_list + "\n" +
         (from.empty() ? "" : "  FROM " + from + "\n") +
-        " WHERE " + in_batch + " AND (" + where + ")\n"
+        " WHERE " + in_batch + and_where + "\n"
         "RETURNING " + detail::join(cols, ", ") + ";");
     step.detail["batch_mode"] = "composite";
     step.detail["key_columns"] = composite_columns;
@@ -1096,7 +1174,7 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
     // of parameter $1"; a cast would fix that and break EXPLAIN (GENERIC_PLAN)
     // instead, so the order is what satisfies both.
     const auto g = detail::quote_identifier(group_column);
-    const std::string from_list = from.empty() ? "" : ", " + from;
+    const std::string from_list = select_from;
     // WHICH GROUP IS NEXT: the next value after this one, and nothing more.
     //
     // It used to carry the backfill's predicate (and DISTINCT), so that a group
@@ -1118,7 +1196,7 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
         "SELECT " + rel + "." + k + "\n"
         "  FROM " + sql_rel + from_list + "\n"
         " WHERE " + rel + "." + g + " = $1\n"
-        "   AND (" + rel + "." + k + " > $2 OR $2 IS NULL) AND (" + where + ")\n"
+        "   AND (" + rel + "." + k + " > $2 OR $2 IS NULL) AND (" + select_where + ")\n"
         " ORDER BY " + rel + "." + k + "\n"
         " LIMIT $3\n"
         " FOR UPDATE OF " + rel + ";");
@@ -1145,10 +1223,10 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
     step.sql.push_back(
         grouped_preserve +
         "UPDATE " + sql_rel + "\n"
-        "   SET " + detail::join(assignments, ", ") + "\n" +
+        "   SET " + set_list + "\n" +
         (from.empty() ? "" : "  FROM " + from + "\n") +
         " WHERE " + rel + "." + g + " = $1\n"
-        "   AND " + rel + "." + k + " = " + in_batch + " AND (" + where + ")\n"
+        "   AND " + rel + "." + k + " = " + in_batch + and_where + "\n"
         "RETURNING " + rel + "." + k + ";");
     step.detail["batch_mode"] = "grouped";
     step.detail["group_column"] = group_column;
@@ -1190,6 +1268,18 @@ inline void plan_backfill(const Intent& in, const Observations& obs,
              " via " + supporting_index + ", " + std::to_string(cfg.batch_rows) +
              " rows per batch, committing on a lock waiter or " +
              std::to_string(cfg.commit_interval_ms) + "ms";
+  if (!single_sql.empty()) {
+    step.lock = "RowExclusiveLock; the one statement holds a row lock on every row it "
+                "writes until it commits, the walk releases its own at every commit";
+    step.why = "\"paced\": false: the first statement is tried alone, over the whole "
+               "table, in one transaction and without a statement timeout. It keeps "
+               "every row it writes locked and every old row version in place until "
+               "it commits, and sends its WAL in one burst. If a session waits behind "
+               "it for more than " + std::to_string(cfg.max_waiter_wait_ms) +
+               " ms it is cancelled and rolled back whole, and the walk does the "
+               "work instead; if it finishes, the walk is not run. The walk: " +
+               step.why;
+  }
   if (grouped) {
     step.why += confined_by.empty()
                     ? "; grouped because " + key + " is unique only within one " +

@@ -95,6 +95,9 @@ struct PacingState {
   std::atomic<int> quiet_ticks{0};        // consecutive ticks at or below resume
   std::atomic<bool> cancel_requested{false};
   std::atomic<bool> cancel_stop{false};   // operator cancellation, not pacing
+  // One statement over a whole table is running ("paced": false). It has no
+  // batch boundary at which to notice cancel_stop, so the observer cancels it.
+  std::atomic<bool> long_statement{false};
   std::atomic<bool> throttled{false};
   std::atomic<bool> paused{false};
   std::atomic<long long> paused_since_ms{0};
@@ -454,6 +457,11 @@ class Observer {
       if (pid <= 0) continue;
       live.push_back(j);
       pids.push_back(pid);
+      // cancelJob on a job inside one long statement: there is no batch
+      // boundary for it to stop at, so the statement is cancelled here.
+      if (j->pacing.cancel_stop.load() && j->pacing.long_statement.load()) {
+        request_cancel(*j);
+      }
     }
     if (live.empty()) return;
 

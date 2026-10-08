@@ -3,8 +3,8 @@
 ## Unreleased
 
 Two things a specification could not say, reported while writing a schema whose
-rows each keep the period they were true for. Two new kinds, 113 in all. No
-ledger schema change.
+rows each keep the period they were true for, and what was found using the
+answers on full tables. Two new kinds, 113 in all. No ledger schema change.
 
 ### A key that names no column is refused before anything runs
 
@@ -115,6 +115,61 @@ named `pg_dist_node` in one statement, and PostgreSQL resolves every relation
 before it evaluates anything, so on a server without Citus every failed job's
 report carried `relation "pg_dist_node" does not exist`. Whether the extension
 is installed is now asked first, in a statement of its own.
+
+### A fill is evaluated once per row, not wherever its value is wanted
+
+`add_column` with a `default` and a `fill` needs each value three times per
+column (is there one, does it differ from the default, and the value itself),
+in the statement that finds a batch and again in the one that writes it. The
+expression was pasted in each place: for two columns, 4 copies in the select
+and 10 in the update. Reported from a fill that is an `EXISTS` over an
+87-million-row table: 55 buffers a row and 1,850 rows a second.
+
+The select now names each value once in a `LATERAL` item, and the update
+assigns from one sub-select and carries no predicate but the batch's keys: the
+rows were selected and locked by the select in the same transaction. Measured
+on 18.6 with two such columns, 2 million rows against 2.25 million, a batch of
+1,000: 71,945 buffers for the select and 39,266 for the update before, 24,361
+and 15,802 after. `UPDATE ... FROM LATERAL` cannot refer to the row being
+updated, which is why the update uses a sub-select in `SET`.
+
+The plan now warns when a `fill` is a subquery: it is probed row by row, for
+the rows that keep the default too, and the `{"from", "on", "value"}` form is
+one join for the batch.
+
+### `"paced": false`: one statement, for a table nothing else is using
+
+On `add_column` with a `fill`, and on `backfill`. One statement over the whole
+table runs ahead of the walk, in one transaction and without a statement
+timeout; the plan states what that holds until it commits. The breaker that
+watches a batch watches it: when a session has waited behind it for longer
+than `max_waiter_wait_ms`, or it has waited `lock_timeout_ms` for a row someone
+else holds, it is cancelled and rolled back whole and the paced walk does the
+work. If it finishes, the walk is not run. `cancelJob` cancels it at once. Not
+with `preserve`.
+
+### A walk says how fast it goes and how long it has left
+
+A walk at 1,850 rows a second over 27 million rows was found by sampling
+`laswell.backfill_cursor` by hand: nothing reported a rate, and `percent` was
+rows written against the table's row estimate, which is progress only for a
+walk that writes every row.
+
+`jobStatus` now carries `rowsPerSecond`, and the step's row in the ledger keeps
+it. Every `progress_interval_ms` (10,000) the job asks the planner what share
+of the table lies at or below its cursor (an `EXPLAIN`, planned and not run),
+and reports `fractionWalked`, `percent` from it, and `secondsRemaining`. It is
+an estimate from the table's statistics and `progressBy` says so; on a Citus
+distributed table there is none and `percent` is as before.
+
+`pg_laswell` prints a line for each running walk after 10 seconds, then 20, 40
+and so on up to every ten minutes.
+
+Batches that grow while the table is quiet were measured and not built: on
+18.6, 2 million rows, a cheap fill ran at 192,000 to 236,000 rows a second at
+1,000, 5,000 and 10,000 rows a batch alike, a lookup fill at 88,000 against
+35,000 to 48,000 at the larger sizes, and a concurrent writer's longest wait
+went from 3 to 12 ms and from 68 to 252 ms.
 
 ### `set_text_search_mapping`
 

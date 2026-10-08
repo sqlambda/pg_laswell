@@ -2934,6 +2934,83 @@ TEST(Spec, AFillListTakesExpressionsAndSourceObjectsAndNothingElse) {
 // only step, then a walk that writes ONLY the rows whose value differs. No
 // trigger, no check, no validation scan, no SET NOT NULL -- and the one
 // exclusive lock comes before the walk, not after it.
+// "paced" belongs to a fill, and cannot be had with a pre-image.
+TEST(Spec, PacedIsABooleanOnAFillAndNotWithPreserve) {
+  const auto refuses = [](json intent, const std::string& needle) {
+    try {
+      (void)spec_with(json::array({intent}));
+    } catch (const std::exception& e) {
+      EXPECT_NE(std::string(e.what()).find(needle), std::string::npos) << e.what();
+      return;
+    }
+    ADD_FAILURE() << "accepted: " << intent.dump();
+  };
+  auto column = filled_column();
+  column["paced"] = "no";
+  refuses(column, "paced must be true or false");
+  column["paced"] = false;
+  column.erase("fill");
+  column.erase("after");
+  refuses(column, "\"paced\" and no \"fill\"");
+  json bf{{"kind", "backfill"}, {"schema", "shop"}, {"table", "orders"}, {"key", "id"},
+          {"set", {{"status", "'x'"}}}, {"where", "orders.status IS NULL"},
+          {"preserve", "shop.orders_before"}, {"paced", false}};
+  refuses(bf, "together with \"preserve\"");
+}
+
+// The one statement of "paced": false, as the planner writes it.
+TEST(Planner, AnUnpacedFillPutsOneStatementAheadOfTheWalk) {
+  const auto obs = observations(2LL << 30, 8000000);
+  auto in = filled_column();
+  in.erase("after");
+  in["default"] = "'none'";
+  in["paced"] = false;
+  const auto plan = pglaswell::plan_migration(spec_with(json::array({in})), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto& walk = plan.steps[1];
+  ASSERT_EQ(walk.kind, "backfill");
+  ASSERT_EQ(walk.sql.size(), 3u) << plan.render();
+  EXPECT_TRUE(walk.detail.value("single_statement", false));
+  // Values once per row, joined back by the walk's key: UPDATE ... FROM cannot
+  // refer to the row being updated from a LATERAL item.
+  EXPECT_EQ(walk.sql[0].rfind("UPDATE \"shop\".\"orders\"\n   SET \"region_code\" = "
+                              "\"laswell_new\".\"n1\"\n  FROM (SELECT \"orders\".\"id\" AS \"k1\"", 0),
+            0u) << walk.sql[0];
+  EXPECT_NE(walk.sql[0].find(" WHERE \"orders\".\"id\" = \"laswell_new\".\"k1\";"),
+            std::string::npos) << walk.sql[0];
+  EXPECT_EQ(walk.sql[0].find("$1"), std::string::npos) << walk.sql[0];
+  EXPECT_NE(walk.sql[1].find("LIMIT $2"), std::string::npos) << walk.sql[1];
+  EXPECT_NE(walk.why.find("the walk is not run"), std::string::npos) << walk.why;
+
+  // Without a default the statement is the walk's own UPDATE, unbatched.
+  auto triggered = filled_column();
+  triggered["paced"] = false;
+  const auto t = pglaswell::plan_migration(spec_with(json::array({triggered})), obs, {});
+  ASSERT_TRUE(t.ok) << t.render();
+  bool seen = false;
+  for (const auto& s : t.steps) {
+    if (s.kind != "backfill") continue;
+    seen = true;
+    ASSERT_TRUE(s.detail.value("single_statement", false));
+    EXPECT_NE(s.sql[0].find(" WHERE (\"orders\".\"region_code\" IS NULL);"), std::string::npos)
+        << s.sql[0];
+  }
+  EXPECT_TRUE(seen);
+
+  // Paced and unpaced columns do not share a walk.
+  auto second = in;
+  second["column"] = "region_len";
+  second["type"] = "integer";
+  second["default"] = "0";
+  second["fill"] = "length(fulfilment_region)";
+  second.erase("paced");
+  const auto two = pglaswell::plan_migration(spec_with(json::array({in, second})), obs, {});
+  ASSERT_TRUE(two.ok) << two.render();
+  int walks = 0;
+  for (const auto& s : two.steps) if (s.kind == "backfill") ++walks;
+  EXPECT_EQ(walks, 2) << two.render();
+}
+
 TEST(Planner, ADefaultWithAFillWritesOnlyTheRowsThatDifferFromTheDefault) {
   const auto obs = observations(2LL << 30, 8000000);
   auto in = filled_column();
@@ -2946,11 +3023,33 @@ TEST(Planner, ADefaultWithAFillWritesOnlyTheRowsThatDifferFromTheDefault) {
             std::string::npos) << all_sql(plan.steps[0]);
   ASSERT_EQ(plan.steps[1].kind, "backfill");
   const auto bf = all_sql(plan.steps[1]);
-  // Only while the row still HOLDS the default, and only if the value differs.
-  EXPECT_NE(bf.find("\"orders\".\"region_code\" IS NOT DISTINCT FROM ('none') AND "
-                    "(upper(fulfilment_region)) IS NOT NULL AND "
-                    "(upper(fulfilment_region)) IS DISTINCT FROM ('none')"),
+  // Only while the row still HOLDS the default, and only if the value differs
+  // -- from a value computed ONCE per row and named, not pasted wherever it is
+  // wanted (found in the field: fourteen evaluations per row for two columns).
+  EXPECT_NE(bf.find("LATERAL (SELECT (upper(fulfilment_region)) AS \"v1\" OFFSET 0) AS "
+                    "\"laswell_fill\""),
             std::string::npos) << bf;
+  EXPECT_NE(bf.find("\"orders\".\"region_code\" IS NOT DISTINCT FROM ('none') AND "
+                    "\"laswell_fill\".\"v1\" IS NOT NULL AND "
+                    "\"laswell_fill\".\"v1\" IS DISTINCT FROM ('none')"),
+            std::string::npos) << bf;
+  // The UPDATE names the batch's keys and nothing else: the rows were selected
+  // and locked by the SELECT, and the predicate again would be the value again.
+  ASSERT_EQ(plan.steps[1].sql.size(), 2u);
+  EXPECT_NE(plan.steps[1].sql[1].find("SET \"region_code\" = (upper(fulfilment_region))\n"
+                                      " WHERE \"orders\".\"id\" = ANY($1::bigint[])\n"
+                                      "RETURNING"),
+            std::string::npos) << plan.steps[1].sql[1];
+  const auto occurrences = [](const std::string& text, const std::string& what) {
+    int n = 0;
+    for (auto at = text.find(what); at != std::string::npos; at = text.find(what, at + 1)) ++n;
+    return n;
+  };
+  EXPECT_EQ(occurrences(plan.steps[1].sql[0], "upper(fulfilment_region)"), 1);
+  EXPECT_EQ(occurrences(plan.steps[1].sql[1], "upper(fulfilment_region)"), 1);
+  // The predicate in full is still carried for the readings outside the walk.
+  EXPECT_NE(plan.steps[1].detail.value("where", "").find("(upper(fulfilment_region)) IS NOT NULL"),
+            std::string::npos);
   for (const auto& s : plan.steps) {
     const auto sql = all_sql(s);
     EXPECT_EQ(sql.find("TRIGGER"), std::string::npos) << sql;
@@ -3004,15 +3103,17 @@ TEST(Planner, ADefaultWithAFillWritesOnlyTheRowsThatDifferFromTheDefault) {
   }
   EXPECT_EQ(walks, 1) << two.render();
   EXPECT_EQ(adds, 2) << two.render();
-  EXPECT_NE(walk.find("\"region_code\" = CASE WHEN \"orders\".\"region_code\" IS NOT DISTINCT FROM "
-                      "('none') AND (upper(fulfilment_region)) IS NOT NULL AND "
-                      "(upper(fulfilment_region)) IS DISTINCT FROM ('none') THEN "
-                      "(upper(fulfilment_region)) ELSE \"orders\".\"region_code\" END"),
-            std::string::npos) << walk;
-  EXPECT_NE(walk.find("\"region_len\" = CASE WHEN \"orders\".\"region_len\" IS NOT DISTINCT FROM (0)"),
+  EXPECT_NE(walk.find("SET (\"region_code\", \"region_len\") = (SELECT CASE WHEN "
+                      "\"orders\".\"region_code\" IS NOT DISTINCT FROM ('none') AND "
+                      "\"laswell_fill\".\"v1\" IS NOT NULL AND \"laswell_fill\".\"v1\" IS "
+                      "DISTINCT FROM ('none') THEN \"laswell_fill\".\"v1\" ELSE "
+                      "\"orders\".\"region_code\" END, CASE WHEN \"orders\".\"region_len\" IS "
+                      "NOT DISTINCT FROM (0)"),
             std::string::npos) << walk;
   EXPECT_NE(walk.find(") OR (\"orders\".\"region_len\" IS NOT DISTINCT FROM (0)"),
             std::string::npos) << walk;
+  EXPECT_EQ(occurrences(walk, "upper(fulfilment_region)"), 2) << walk;
+  EXPECT_EQ(occurrences(walk, "length(fulfilment_region)"), 2) << walk;
   EXPECT_NE(two.steps.back().why.find("planned together with intent 0"), std::string::npos);
   // A defaulted column and a trigger-filled one are different recipes.
   auto triggered = filled_column();
@@ -5720,6 +5821,184 @@ TEST_F(ToolTest, AFilledNotNullColumnIsAppliedEndToEndAndResumesAfterANull) {
                 started["jobId"].get<std::string>() + "'::uuid AND kind = 'backfill'"), "1");
   EXPECT_EQ(updates() - before_pair, touched)
       << "one write per row that differs in either column, and none for the rest";
+}
+
+// "paced": false. For a table nothing else is using, the fill is one statement:
+// pacing protects nobody there and costs a round trip and a commit every
+// thousand rows. Found in the field, where a lookup fill paced at 1 850 rows a
+// second was in the end done by hand in a single joined UPDATE.
+TEST_F(ToolTest, AnUnpacedFillIsOneStatementAndTheWalkIsNotRun) {
+  make_shop(cfg());
+  const auto one = [&](const std::string& q) {
+    pglaswell::ReadSession r(cfg());
+    return r.txn().exec(q)[0][0].as<std::string>();
+  };
+  json doc = minimal_spec();
+  doc["id"] = "0041-orders-in-r2";
+  doc["description"] = "Whether the order's warehouse is in region r2, and its code.";
+  doc["intents"] = json::array(
+      {json{{"kind", "add_column"}, {"schema", "shop"}, {"table", "orders"},
+            {"column", "in_r2"}, {"type", "boolean"}, {"nullable", false}, {"default", "false"},
+            {"fill", "EXISTS (SELECT 1 FROM shop.warehouse w WHERE w.id = orders.warehouse_id"
+                     " AND w.region = 'r2')"},
+            {"paced", false}, {"comment", "In r2."}},
+       json{{"kind", "add_column"}, {"schema", "shop"}, {"table", "orders"},
+            {"column", "wcode"}, {"type", "text"}, {"nullable", false}, {"default", "'W1'"},
+            {"fill", "'W' || orders.warehouse_id"}, {"paced", false}, {"comment", "Code."}}});
+
+  const auto plan = payload(call("planMigration", json{{"spec", signed_doc(doc)}}));
+  ASSERT_TRUE(plan.value("ok", false)) << plan.dump(2);
+  const auto rendered = plan["rendered"].get<std::string>();
+  EXPECT_NE(rendered.find("\"paced\": false: the first statement is tried alone"),
+            std::string::npos) << rendered;
+  // The subquery is said to be one, where the plan can still be changed.
+  EXPECT_NE(rendered.find("the fill of in_r2 is a subquery"), std::string::npos) << rendered;
+
+  const auto p = payload(call("startMigration", json{{"spec", signed_doc(doc)}}));
+  ASSERT_TRUE(p.value("accepted", false)) << p.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, p["jobId"], [](const json& s) {
+    const auto state = s.value("state", "");
+    return state == "succeeded" || state == "failed";
+  })) << status_of(p["jobId"]).dump(2);
+  ASSERT_EQ(status_of(p["jobId"]).value("state", ""), "succeeded")
+      << status_of(p["jobId"]).dump(2);
+
+  EXPECT_EQ(one("SELECT count(*) FROM shop.orders o WHERE in_r2 IS DISTINCT FROM"
+                " (SELECT w.region = 'r2' FROM shop.warehouse w WHERE w.id = o.warehouse_id)"
+                " OR wcode <> 'W' || warehouse_id"), "0");
+  // One commit, by the one statement, and only the rows that differ written.
+  const auto result = one(
+      "SELECT detail::text FROM laswell.step WHERE job_id = '" +
+      p["jobId"].get<std::string>() + "'::uuid AND kind = 'backfill'");
+  const auto r = json::parse(result);
+  EXPECT_EQ(r.value("commits", 0), 1) << result;
+  EXPECT_EQ(r["commitReasons"].value("single_statement", 0), 1) << result;
+  EXPECT_EQ(r.value("rowsDone", 0LL),
+            std::stoll(one("SELECT count(*) FROM shop.orders WHERE in_r2 OR wcode <> 'W1'")))
+      << result;
+}
+
+// A walk says how fast it goes and how far along the table it is. rowsDone
+// against rowsEstimated is progress only for a walk that writes every row:
+// found in the field with 27 million of 73 million to write, at 1 850 a second,
+// where nothing said either the rate or that it meant four hours.
+TEST_F(ToolTest, AWalkReportsItsRateAndHowMuchOfTheTableItHasWalked) {
+  make_shop(cfg());
+  auto& e = ctx_->registry.mutable_get("default").executor;
+  e.batch_rows = 20;
+  e.batch_cap_rows = 20;      // a commit every batch,
+  e.progress_interval_ms = 1; // and the planner asked after each
+  const auto one = [&](const std::string& q) {
+    pglaswell::ReadSession r(cfg());
+    return r.txn().exec(q)[0][0].as<std::string>();
+  };
+  json doc = minimal_spec();
+  doc["id"] = "0043-orders-odd";
+  doc["description"] = "Whether the order's number is odd: half the rows keep the default.";
+  doc["intents"] = json::array(
+      {json{{"kind", "add_column"}, {"schema", "shop"}, {"table", "orders"},
+            {"column", "odd"}, {"type", "boolean"}, {"nullable", false}, {"default", "false"},
+            {"fill", "orders.id % 2 = 1"}, {"comment", "Odd."}}});
+  const auto p = payload(call("startMigration", json{{"spec", signed_doc(doc)}}));
+  ASSERT_TRUE(p.value("accepted", false)) << p.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, p["jobId"], [](const json& s) {
+    const auto state = s.value("state", "");
+    return state == "succeeded" || state == "failed";
+  })) << status_of(p["jobId"]).dump(2);
+  const auto st = status_of(p["jobId"]);
+  ASSERT_EQ(st.value("state", ""), "succeeded") << st.dump(2);
+
+  // 150 of 300 rows written; by rows written the walk was never past 50%.
+  ASSERT_TRUE(st.contains("backfill")) << st.dump(2);
+  const auto& b = st["backfill"];
+  EXPECT_EQ(b.value("rowsDone", ""), "150") << b.dump(2);
+  ASSERT_TRUE(b.contains("fractionWalked")) << b.dump(2);
+  EXPECT_GT(b.value("fractionWalked", 0.0), 0.5) << b.dump(2);
+  EXPECT_LE(b.value("fractionWalked", 0.0), 1.0) << b.dump(2);
+  EXPECT_NE(b.value("progressBy", "").find("statistics"), std::string::npos) << b.dump(2);
+
+  const auto d = json::parse(one(
+      "SELECT detail::text FROM laswell.step WHERE job_id = '" +
+      p["jobId"].get<std::string>() + "'::uuid AND kind = 'backfill'"));
+  EXPECT_GT(d.value("rowsPerSecond", 0.0), 0.0) << d.dump(2);
+}
+
+TEST(Deploy, AProgressLineSaysRowsRateAndTimeLeft) {
+  json b{{"ordinal", 2}, {"rowsDone", "138000"}, {"rowsPerSecond", 1850.0}};
+  EXPECT_EQ(pglaswell::detail::progress_line("0240-flags", b),
+            "  0240-flags: step 2: 138,000 rows written, 1,850 rows/s");
+  b["fractionWalked"] = 0.004;
+  b["percent"] = 0.4;
+  EXPECT_EQ(pglaswell::detail::progress_line("0240-flags", b),
+            "  0240-flags: step 2: 138,000 rows written, 1,850 rows/s; about 0% of the table "
+            "walked (by the table's statistics)");
+  b["percent"] = 38.2;
+  b["secondsRemaining"] = 13800.0;
+  EXPECT_EQ(pglaswell::detail::progress_line("0240-flags", b),
+            "  0240-flags: step 2: 138,000 rows written, 1,850 rows/s; about 38% of the table "
+            "walked, about 3 h 50 min left (by the table's statistics)");
+  b["secondsRemaining"] = 95.0;
+  EXPECT_NE(pglaswell::detail::progress_line("x", b).find("about 1 min left"), std::string::npos);
+  b["secondsRemaining"] = 40.0;
+  EXPECT_NE(pglaswell::detail::progress_line("x", b).find("about 40 s left"), std::string::npos);
+}
+
+// The one statement on a table that IS in use. A session that waits behind it
+// longer than max_waiter_wait_ms has it cancelled; it is rolled back whole, and
+// the walk does the work.
+TEST_F(ToolTest, AnUnpacedFillThatSomeoneWaitsBehindFallsBackToTheWalk) {
+  make_shop(cfg());
+  ctx_->registry.mutable_get("default").executor.max_waiter_wait_ms = 300;
+  const auto one = [&](const std::string& q) {
+    pglaswell::ReadSession r(cfg());
+    return r.txn().exec(q)[0][0].as<std::string>();
+  };
+  // A backfill and no DDL before it: an open application transaction would hold
+  // an ADD COLUMN back, and this is about the statement that writes the rows.
+  json doc = minimal_spec();
+  doc["id"] = "0042-orders-shipped";
+  doc["description"] = "Every open order is shipped.";
+  doc["intents"] = json::array(
+      {json{{"kind", "backfill"}, {"schema", "shop"}, {"table", "orders"}, {"key", "id"},
+            {"set", {{"status", "'shipped'"}}}, {"where", "orders.status = 'open'"},
+            {"paced", false}}});
+  ASSERT_TRUE(payload(call("planMigration", json{{"spec", signed_doc(doc)}})).value("ok", false));
+
+  // An application transaction holding one row in the middle of the table: the
+  // one statement writes the rows before it and then waits there, holding them.
+  pqxx::connection app_conn(cfg().conninfo);
+  pqxx::work app(app_conn);
+  app.exec("UPDATE shop.orders SET status = status WHERE id = 150");
+
+  const auto p = payload(call("startMigration",
+                              json{{"spec", signed_doc(doc)}, {"dryRun", false}}));
+  ASSERT_TRUE(p.value("accepted", false)) << p.dump(2);
+
+  // A second session that wants the rows the statement has written. It gets
+  // them when the statement is cancelled and rolled back.
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  {
+    pqxx::connection other_conn(cfg().conninfo);
+    pqxx::work other(other_conn);
+    other.exec("UPDATE shop.orders SET status = status WHERE id <> 150");
+    other.commit();
+  }
+  app.commit();
+
+  ASSERT_TRUE(wait_for_status(*this, p["jobId"], [](const json& s) {
+    const auto state = s.value("state", "");
+    return state == "succeeded" || state == "failed";
+  })) << status_of(p["jobId"]).dump(2);
+  const auto st = status_of(p["jobId"]);
+  ASSERT_EQ(st.value("state", ""), "succeeded") << st.dump(2);
+  EXPECT_NE(st.dump().find("the paced walk did the work instead"), std::string::npos)
+      << st.dump(2);
+  EXPECT_EQ(one("SELECT count(*) FROM shop.orders WHERE status <> 'shipped'"), "0");
+  const auto result = one(
+      "SELECT detail::text FROM laswell.step WHERE job_id = '" +
+      p["jobId"].get<std::string>() + "'::uuid AND kind = 'backfill'");
+  EXPECT_EQ(json::parse(result)["commitReasons"].value("single_statement_cancelled", 0), 1)
+      << result;
 }
 
 // An exclusive step behind a long APPLICATION transaction. It used to wait all

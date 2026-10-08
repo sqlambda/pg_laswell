@@ -44,6 +44,8 @@
 // argument surface to keep in step: it drives the same tools.h entry points the
 // MCP server drives, in the one sequence a deployment needs.
 
+#include <cmath>
+#include <map>
 #include <chrono>
 #include <fstream>
 #include <set>
@@ -74,6 +76,9 @@ struct DeployOptions {
   bool chain = false;
   bool status_only = false;  // report what is pending, change nothing
   int poll_ms = 500;
+  // The first progress line of a running walk; each later one after twice as
+  // long, up to ten minutes.
+  int progress_first_s = 10;
   std::ostream* out = &std::cout;
 };
 
@@ -98,6 +103,42 @@ inline json read_spec_file(const std::string& path) {
   return json::parse(in);
 }
 
+}  // namespace detail
+
+namespace detail {
+// One line for a walk that is still running, from what jobStatus says of it.
+inline std::string progress_line(const std::string& id, const json& b) {
+  const auto grouped = [](const std::string& digits) {
+    std::string o;
+    for (std::size_t i = 0; i < digits.size(); ++i) {
+      if (i != 0 && (digits.size() - i) % 3 == 0) o += ',';
+      o += digits[i];
+    }
+    return o;
+  };
+  std::string out = "  " + id + ": step " + std::to_string(b.value("ordinal", 0)) + ": " +
+                    grouped(b.value("rowsDone", "0")) + " rows written, " +
+                    grouped(std::to_string(static_cast<long long>(b.value("rowsPerSecond", 0.0)))) +
+                    " rows/s";
+  if (b.contains("fractionWalked")) {
+    out += "; about " + std::to_string(static_cast<int>(std::round(b.value("percent", 0.0)))) +
+           "% of the table walked";
+    if (b.contains("secondsRemaining")) {
+      const auto left = static_cast<long long>(b.value("secondsRemaining", 0.0));
+      out += ", about ";
+      if (left >= 3600) {
+        out += std::to_string(left / 3600) + " h " + std::to_string((left % 3600) / 60) + " min";
+      } else if (left >= 60) {
+        out += std::to_string(left / 60) + " min";
+      } else {
+        out += std::to_string(left) + " s";
+      }
+      out += " left";
+    }
+    out += " (by the table's statistics)";
+  }
+  return out;
+}
 }  // namespace detail
 
 class Deployment {
@@ -446,6 +487,7 @@ class Deployment {
         const auto st = snapshot(it->second);
         const auto state = st.value("state", "");
         if (!detail::is_terminal(state)) {
+          report_progress(out, it->first, it->second, st);
           ++it;
           continue;
         }
@@ -477,13 +519,49 @@ class Deployment {
       for (auto it = running.begin(); it != running.end();) {
         const auto st = snapshot(it->second);
         const auto state = st.value("state", "");
-        if (!detail::is_terminal(state)) { ++it; continue; }
+        if (!detail::is_terminal(state)) {
+          report_progress(out, it->first, it->second, st);
+          ++it;
+          continue;
+        }
         out << "  " << it->first << ": " << state << "\n";
         if (state != "succeeded") report_failure(out, st);
         it = running.erase(it);
       }
     }
   }
+
+  // A line for a walk that is still running: how many rows, how fast, and how
+  // long it has left where that can be estimated. A deployment said nothing
+  // between starting a job and its end, and a walk at 1 850 rows a second over
+  // 27 million rows was found by sampling the ledger by hand.
+  //
+  // At 10 s, then 20, 40 and so on up to every 10 minutes: the rate is on the
+  // page three times in the first minute, where a plan can still be changed,
+  // and a walk of hours adds a few dozen lines to the log and not hundreds.
+  void report_progress(std::ostream& out, const std::string& id, const std::string& job_id,
+                       const json& st) {
+    if (!st.contains("backfill") || !st["backfill"].is_object()) return;
+    const auto& b = st["backfill"];
+    if (!b.contains("rowsPerSecond")) return;
+    const auto now = std::chrono::steady_clock::now();
+    auto& p = progress_[job_id + "/" + std::to_string(b.value("ordinal", 0))];
+    if (p.interval_s == 0) {
+      p.interval_s = opts_.progress_first_s;
+      p.next = now + std::chrono::seconds(p.interval_s);
+    }
+    if (now < p.next) return;
+    p.interval_s = std::min(p.interval_s * 2, 600);
+    p.next = now + std::chrono::seconds(p.interval_s);
+
+    out << detail::progress_line(id, b) << "\n" << std::flush;
+  }
+
+  struct Progress {
+    int interval_s = 0;
+    std::chrono::steady_clock::time_point next;
+  };
+  std::map<std::string, Progress> progress_;
 
   // What the server said, when a dry run is what refused the plan.
   //

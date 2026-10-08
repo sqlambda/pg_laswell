@@ -616,7 +616,7 @@ inline void parse_add_column(Intent& in) {
   detail::reject_unknown_keys(
       in.body,
       {"kind", "schema", "table", "column", "type", "nullable", "default",
-       "comment", "fill", "key", "after"},
+       "comment", "fill", "key", "after", "paced"},
       at);
   detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
   detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
@@ -630,6 +630,21 @@ inline void parse_add_column(Intent& in) {
                  "meant must be written down rather than inferred.");
   }
   (void)detail::require_string(in.body, "comment", at);
+
+  if (in.body.contains("paced")) {
+    if (!in.body["paced"].is_boolean()) {
+      detail::fail(at + ".paced must be true or false",
+                   "false fills the existing rows in one statement, for a table "
+                   "nothing else is using, and falls back to the paced walk if "
+                   "a session ends up waiting behind it. Leave it out for the "
+                   "walk alone.");
+    }
+    if (!in.body.contains("fill")) {
+      detail::fail(at + " has \"paced\" and no \"fill\"",
+                   "\"paced\" is about how existing rows are filled, so it "
+                   "belongs to an add_column with \"fill\".");
+    }
+  }
 
   // "fill": the value for a NOT NULL column that has no default, as one SQL
   // expression over the row's own columns. It selects the recipe that adds the
@@ -767,8 +782,23 @@ inline void parse_backfill(Intent& in) {
   detail::reject_unknown_keys(
       in.body,
       {"kind", "schema", "table", "key", "set", "from", "where",
-       "verify_remaining", "assert_invariants", "preserve"},
+       "verify_remaining", "assert_invariants", "preserve", "paced"},
       at);
+  // "paced": false asks for one statement over the whole table before the
+  // walk: for a table nothing else is using, where pacing protects nobody.
+  if (in.body.contains("paced")) {
+    if (!in.body["paced"].is_boolean()) {
+      detail::fail(at + ".paced must be true or false",
+                   "false fills in one statement and falls back to the paced "
+                   "walk if a session ends up waiting behind it. Leave it out "
+                   "for the walk alone.");
+    }
+    if (!in.body["paced"].get<bool>() && in.body.contains("preserve")) {
+      detail::fail(at + " asks for \"paced\": false together with \"preserve\"",
+                   "The pre-image is captured batch by batch, with the keys of "
+                   "each batch in hand. Leave \"paced\" out, or \"preserve\".");
+    }
+  }
   detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
   detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
   detail::require_identifier(detail::require_string(in.body, "key", at), "key", in.ordinal);

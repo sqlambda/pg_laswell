@@ -352,6 +352,45 @@ inline std::string fill_expression(const std::vector<FillSource>& sources) {
   for (const auto& src : sources) parts.push_back(one(src));
   return sources.size() == 1 ? parts[0] : "COALESCE(" + join(parts, ", ") + ")";
 }
+// A fill written as an expression that reads another table: a subquery. It is
+// accepted, it is the natural way to say "true if a row exists", and it is
+// probed row by row where the {"from", "on", "value"} form is a join for the
+// whole batch. Found in the field: nothing said so, and the walk took hours.
+inline bool fill_has_subquery(const json& body) {
+  for (const auto& src : fill_sources(body)) {
+    if (src.joined()) continue;
+    std::string lower;
+    for (const char ch : src.value) {
+      lower += static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+    for (std::size_t at = lower.find("select"); at != std::string::npos;
+         at = lower.find("select", at + 1)) {
+      const auto word = [&](std::size_t i) {
+        return i < lower.size() &&
+               (std::isalnum(static_cast<unsigned char>(lower[i])) || lower[i] == '_');
+      };
+      if ((at == 0 || !word(at - 1)) && !word(at + 6)) return true;
+    }
+  }
+  return false;
+}
+inline void warn_about_looked_up_fills(const std::vector<const Intent*>& group,
+                                       const std::string& qualified, Plan& plan) {
+  std::vector<std::string> which;
+  for (const auto* g : group) {
+    if (fill_has_subquery(g->body)) which.push_back(g->body.value("column", ""));
+  }
+  if (which.empty()) return;
+  plan.warnings.push_back(
+      qualified + ": the fill of " + join(which, ", ") + " is a subquery, so it is "
+      "evaluated row by row: once for every row the walk reads to find a batch, "
+      "whether or not that row takes a value, and once more for every row it "
+      "writes. On a large table that is the cost of the walk. A source written as "
+      "{\"from\", \"on\", \"value\"} is planned as one join for the batch "
+      "instead; it needs the other table to hold at most one row for each row of "
+      "this one. \"paced\": false fills in a single statement where nothing else "
+      "is using the table.");
+}
 // In words, for the plan.
 inline std::string fill_described(const std::vector<FillSource>& sources) {
   std::vector<std::string> parts;
@@ -621,6 +660,7 @@ inline void plan_add_columns_filled(const std::vector<const Intent*>& group,
       // this walk need not go past the highest key there is when it starts.
       // Not part of the specification's language: plan_backfill reads it.
       bf.body["new_rows_are_filled"] = true;
+      if (!in.body.value("paced", true)) bf.body["paced"] = false;
       if (where.joined()) {
         bf.body["from"] = where.from;
         bf.body["where"] = "(" + where.on + ") AND (" + detail::join(terms, " OR ") + ")";
@@ -795,6 +835,7 @@ inline std::vector<const Intent*> filled_column_group(const Spec& spec, std::siz
     if (next.qualified_table() != lead.qualified_table()) break;
     if (next.body.value("after", "") != lead.body.value("after", "")) break;
     if (next.body.value("key", "") != lead.body.value("key", "")) break;
+    if (next.body.value("paced", true) != lead.body.value("paced", true)) break;
     bool entangled = false;
     for (const auto* g : group) {
       if (names_word(detail::fill_text(next.body), g->body.value("column", "")) ||
@@ -867,9 +908,21 @@ inline void plan_defaulted_fill(const std::vector<const Intent*>& group,
     }
   }
 
+  // Each value is wanted three times per column -- is there one, does it differ
+  // from the default, and the value itself -- and by the SELECT that finds the
+  // batch as well as by the UPDATE. Pasted wherever it is wanted, an
+  // expression that is a lookup in another table was evaluated fourteen times
+  // per row for two columns (found in the field: 55 buffers a row). So unless
+  // the source is a join, which names a column of the joined row and costs
+  // nothing to repeat, each value is computed ONCE per row and per statement
+  // and named: by a LATERAL item in the SELECT, and by a sub-select in the SET
+  // of the UPDATE (plan_backfill, `computed`). OFFSET 0 is what keeps
+  // PostgreSQL from flattening the names back into copies of the expression.
+  const std::string fill_alias = detail::quote_identifier("laswell_fill");
   json set = json::object();
-  std::vector<std::string> any, described;
-  for (const auto* g : group) {
+  std::vector<std::string> any, any_named, described, named_values, taken, columns_set;
+  for (std::size_t n = 0; n < group.size(); ++n) {
+    const auto* g = group[n];
     const auto column = g->body.value("column", "");
     const auto c = rel + "." + detail::quote_identifier(column);
     const auto dflt = "(" + g->body.value("default", "") + ")";
@@ -887,6 +940,15 @@ inline void plan_defaulted_fill(const std::vector<const Intent*>& group,
     any.push_back(group.size() == 1 ? differs : "(" + differs + ")");
     described.push_back(column + " (default " + dflt + ") from " +
                         detail::fill_described(sources));
+
+    const std::string name = detail::quote_identifier("v" + std::to_string(n + 1));
+    const std::string v = fill_alias + "." + name;
+    const std::string differs_named = c + " IS NOT DISTINCT FROM " + dflt + " AND " + v +
+                                      " IS NOT NULL AND " + v + " IS DISTINCT FROM " + dflt;
+    named_values.push_back("(" + value + ") AS " + name);
+    any_named.push_back(group.size() == 1 ? differs_named : "(" + differs_named + ")");
+    taken.push_back("CASE WHEN " + differs_named + " THEN " + v + " ELSE " + c + " END");
+    columns_set.push_back(detail::quote_identifier(column));
   }
   Intent bf;
   bf.kind = IntentKind::kBackfill;
@@ -899,7 +961,23 @@ inline void plan_defaulted_fill(const std::vector<const Intent*>& group,
                        (group.size() == 1 ? any[0] : "(" + detail::join(any, " OR ") + ")");
   } else {
     bf.body["where"] = detail::join(any, " OR ");
+    const std::string once =
+        "(SELECT " + detail::join(named_values, ", ") + " OFFSET 0) AS " + fill_alias;
+    bf.body["computed"] = "LATERAL " + once;
+    bf.body["select_where"] = detail::join(any_named, " OR ");
+    // One column: the rows the SELECT locked are the rows that take the value.
+    // Several: each is written only where it holds for that column, from the
+    // values named once.
+    bf.body["apply_set"] =
+        group.size() == 1
+            ? columns_set[0] + " = " + set[group[0]->body.value("column", "")].get<std::string>()
+            : "(" + detail::join(columns_set, ", ") + ") = (SELECT " +
+                  detail::join(taken, ", ") + " FROM " + once + ")";
+    // For the one statement over the whole table ("paced": false).
+    bf.body["single_columns"] = columns_set;
+    bf.body["single_values"] = taken;
   }
+  if (!in.body.value("paced", true)) bf.body["paced"] = false;
   const auto before = out.size();
   plan_backfill(bf, obs, cfg, plan, out);
   for (std::size_t i = before; i < out.size(); ++i) {
@@ -907,6 +985,7 @@ inline void plan_defaulted_fill(const std::vector<const Intent*>& group,
     out[i].why = "only the rows whose value differs from the default are written: " +
                  detail::join(described, "; ") + ". " + out[i].why;
   }
+  detail::warn_about_looked_up_fills(group, qualified, plan);
   plan.warnings.push_back(
       qualified + ": " + detail::join(described, "; ") + " -- NOT NULL with " +
       (group.size() == 1 ? "its default" : "their defaults") + " from the first "

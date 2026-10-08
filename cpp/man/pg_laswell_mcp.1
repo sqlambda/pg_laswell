@@ -582,6 +582,47 @@ The lock-waiter trigger is an
 Time-based commit alone already bounds waiter latency; the waiter trigger is
 what lets the interval be raised, buying fewer commits and less WAL, without
 raising worst-case latency.
+.Ss Progress
+.Ic jobStatus
+reports, for a walk that is running, the rows it has written
+.Pq Va rowsDone ,
+the rows it writes a second
+.Pq Va rowsPerSecond
+and, where it can be estimated, how far along the table it is
+.Pq Va fractionWalked , percent
+and how long it has left
+.Pq Va secondsRemaining .
+Rows written are not progress for a walk that does not write every row, so the
+position is asked of the planner: every
+.Va progress_interval_ms
+(10000) the job plans, and does not run, a query for the rows at or below its
+cursor, and takes the share of the table that is.
+It is an estimate from the table's statistics, as good as the last
+.Ic ANALYZE ,
+and
+.Va progressBy
+says so.
+There is none before the first row, nor on a table a module spreads over
+several nodes, where the coordinator's planner estimates nothing of the scan;
+.Va percent
+is then rows written against rows estimated, as it was.
+The step's row in the ledger keeps the rate when the walk ends.
+.Pp
+.Xr pg_laswell 1
+prints a line for each running walk after 10 seconds, then after 20, 40 and so
+on up to every ten minutes:
+.Bd -literal -offset indent
+0240-flags: step 2: 138,000 rows written, 1,850 rows/s; about 38% of
+the table walked, about 3 h 50 min left (by the table's statistics)
+.Ed
+.Pp
+Batches do not grow when the table is quiet.
+Measured on 18.6, 2 million rows of which 666,666 were written, with a session
+updating a random row every 5 ms: a cheap fill ran at 192,000 to 236,000 rows a
+second at 1,000, 5,000 and 10,000 rows a batch alike, and a fill that looks
+each row up in another table at 88,000 a second at 1,000 and at 35,000 to
+48,000 at the larger sizes, where the planner changed its plan.
+The writer's longest wait went from 3 to 12 ms and from 68 to 252 ms.
 .Ss The contention breaker
 On the
 .Em transitive
@@ -1138,6 +1179,50 @@ Several columns with a default and a fill, written as consecutive intents on
 one table, share one walk as well: a row is selected when any of them still
 holds its default and has another value to take, and each column is written
 only where that is so for it.
+.Pp
+Each value is computed once for every row the walk reads and once for every row
+it writes, however many times the recipe needs it: the statement that finds a
+batch names the values in a
+.Ic LATERAL
+item and the one that writes them in a sub-select.
+A
+.Va fill
+that is a subquery, such as
+.Ql EXISTS (SELECT ... FROM other WHERE ...) ,
+is accepted and is still probed row by row, for the rows that keep the default
+as well as for the ones that do not.
+The plan warns of it: on a large table that is the cost of the walk, and a
+source written as
+.Brq Dq from , Dq on , Dq value
+is one join for the batch where the other table holds at most one row for each
+row of this one.
+.Pp
+.Va paced ,
+when false, on an
+.Cm add_column
+with a
+.Va fill
+or on a
+.Cm backfill ,
+asks for one statement over the whole table ahead of the walk: for a table
+nothing else is using, where pacing protects nobody.
+It runs in one transaction and without a statement timeout, keeps every row it
+writes locked and every old row version in place until it commits, and sends
+its WAL in one burst; the plan says so.
+It is watched as a batch is.
+If a session waits behind it for longer than
+.Va max_waiter_wait_ms ,
+or it waits longer than
+.Va lock_timeout_ms
+for a row another session holds, it is cancelled and rolled back whole, a
+warning says so, and the walk does the work instead.
+If it finishes, the walk is not run.
+.Ic cancelJob
+cancels it at once.
+A job applied again after a walk had begun continues the walk.
+It cannot be combined with
+.Va preserve ,
+whose pre-image is captured batch by batch.
 .Pp
 Where a vendor allows no row trigger on the table, the recipe that needs one is
 refused at planning and the form with a
@@ -2752,6 +2837,7 @@ public_key = MCowBQYDK2VwAyEA...
 batch_rows          = 1000
 commit_interval_ms  = 1000
 batch_cap_rows      = 10000
+progress_interval_ms = 10000
 lock_timeout_ms     = 3000
 observer_tick_ms    = 250
 max_concurrent_jobs = 2
