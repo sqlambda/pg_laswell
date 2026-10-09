@@ -2981,6 +2981,15 @@ TEST(Planner, AnUnpacedFillPutsOneStatementAheadOfTheWalk) {
   EXPECT_EQ(walk.sql[0].find("$1"), std::string::npos) << walk.sql[0];
   EXPECT_NE(walk.sql[1].find("LIMIT $2"), std::string::npos) << walk.sql[1];
   EXPECT_NE(walk.why.find("the walk is not run"), std::string::npos) << walk.why;
+  // The group is headed by what is tried first; a paced walk keeps its own.
+  EXPECT_NE(plan.render().find("---- one statement in one transaction; NOT atomic if it is "
+                               "cancelled: then paced, many commits --"),
+            std::string::npos) << plan.render();
+  in.erase("paced");
+  const auto paced = pglaswell::plan_migration(spec_with(json::array({in})), obs, {});
+  EXPECT_NE(paced.render().find("---- NOT atomic: paced, many commits --"), std::string::npos);
+  EXPECT_EQ(paced.render().find("one statement in one transaction"), std::string::npos);
+  in["paced"] = false;
 
   // Without a default the statement is the walk's own UPDATE, unbatched.
   auto triggered = filled_column();
@@ -5943,6 +5952,24 @@ TEST(Deploy, AProgressLineSaysRowsRateAndTimeLeft) {
   EXPECT_NE(pglaswell::detail::progress_line("x", b).find("about 40 s left"), std::string::npos);
 }
 
+// The one statement of a "paced": false fill: no rows and no rate to give, so
+// the line says that it runs, for how long, and what the table has grown by.
+TEST(Deploy, AProgressLineForTheOneStatementSaysHowLongAndHowMuchTheTableGrew) {
+  json b{{"ordinal", 2}, {"singleStatement", true}, {"elapsedSeconds", 720}};
+  EXPECT_EQ(pglaswell::detail::progress_line("0310-flags", b),
+            "  0310-flags: step 2: the one statement has run 12 min; it reports no progress "
+            "of its own");
+  b["tableBytesGrown"] = "1288490189";
+  EXPECT_EQ(pglaswell::detail::progress_line("0310-flags", b),
+            "  0310-flags: step 2: the one statement has run 12 min; it reports no progress "
+            "of its own; the table has grown 1.2 GB since it began");
+  b["elapsedSeconds"] = 40;
+  b["tableBytesGrown"] = "52428800";
+  EXPECT_EQ(pglaswell::detail::progress_line("0310-flags", b),
+            "  0310-flags: step 2: the one statement has run 40 s; it reports no progress "
+            "of its own; the table has grown 50 MB since it began");
+}
+
 // The one statement on a table that IS in use. A session that waits behind it
 // longer than max_waiter_wait_ms has it cancelled; it is rolled back whole, and
 // the walk does the work.
@@ -5987,6 +6014,18 @@ TEST_F(ToolTest, AnUnpacedFillThatSomeoneWaitsBehindFallsBackToTheWalk) {
     if (!waiting) std::this_thread::sleep_for(std::chrono::milliseconds(50));
   }
   ASSERT_TRUE(waiting) << status_of(p["jobId"]).dump(2);
+  // While it runs, jobStatus says that it is the one statement, for how long,
+  // and by how much the table has grown: there is no other progress to give.
+  ASSERT_TRUE(wait_for_status(*this, p["jobId"], [](const json& s) {
+    return s.contains("backfill") && s["backfill"].contains("tableBytesGrown");
+  })) << status_of(p["jobId"]).dump(2);
+  {
+    const auto b = status_of(p["jobId"])["backfill"];
+    EXPECT_TRUE(b.value("singleStatement", false)) << b.dump(2);
+    EXPECT_TRUE(b.contains("elapsedSeconds")) << b.dump(2);
+    EXPECT_EQ(b.value("progressBy", "").rfind("none:", 0), 0u) << b.dump(2);
+    EXPECT_FALSE(b.contains("rowsPerSecond")) << b.dump(2);
+  }
   {
     pqxx::connection other_conn(cfg().conninfo);
     pqxx::work other(other_conn);

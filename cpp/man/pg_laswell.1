@@ -54,6 +54,8 @@ While a migration walks a table,
 prints a line with the rows written, the rows a second and, where it can be
 estimated, the share of the table walked and the time left: after 10 seconds,
 then 20, 40 and so on up to every ten minutes.
+For the one statement of a fill that is not paced the line says how long it has
+run and by how much the table has grown, at the same intervals.
 See
 .Xr pg_laswell_mcp 1 ,
 .Sx Progress .

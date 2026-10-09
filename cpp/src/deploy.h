@@ -110,6 +110,28 @@ inline json read_spec_file(const std::string& path) {
 namespace detail {
 // One line for a walk that is still running, from what jobStatus says of it.
 inline std::string progress_line(const std::string& id, const json& b) {
+  const auto span = [](long long s) {
+    if (s >= 3600) return std::to_string(s / 3600) + " h " + std::to_string((s % 3600) / 60) + " min";
+    if (s >= 60) return std::to_string(s / 60) + " min";
+    return std::to_string(s) + " s";
+  };
+  // The one statement of a "paced": false fill has no rows to count yet.
+  if (b.value("singleStatement", false)) {
+    std::string out = "  " + id + ": step " + std::to_string(b.value("ordinal", 0)) +
+                      ": the one statement has run " + span(b.value("elapsedSeconds", 0LL)) +
+                      "; it reports no progress of its own";
+    if (b.contains("tableBytesGrown")) {
+      const double grown = std::stod(b.value("tableBytesGrown", "0"));
+      char text[32];
+      if (grown >= 1024.0 * 1024.0 * 1024.0) {
+        std::snprintf(text, sizeof text, "%.1f GB", grown / (1024.0 * 1024.0 * 1024.0));
+      } else {
+        std::snprintf(text, sizeof text, "%.0f MB", grown / (1024.0 * 1024.0));
+      }
+      out += std::string("; the table has grown ") + text + " since it began";
+    }
+    return out;
+  }
   const auto grouped = [](const std::string& digits) {
     std::string o;
     for (std::size_t i = 0; i < digits.size(); ++i) {
@@ -126,16 +148,7 @@ inline std::string progress_line(const std::string& id, const json& b) {
     out += "; about " + std::to_string(static_cast<int>(std::round(b.value("percent", 0.0)))) +
            "% of the table walked";
     if (b.contains("secondsRemaining")) {
-      const auto left = static_cast<long long>(b.value("secondsRemaining", 0.0));
-      out += ", about ";
-      if (left >= 3600) {
-        out += std::to_string(left / 3600) + " h " + std::to_string((left % 3600) / 60) + " min";
-      } else if (left >= 60) {
-        out += std::to_string(left / 60) + " min";
-      } else {
-        out += std::to_string(left) + " s";
-      }
-      out += " left";
+      out += ", about " + span(static_cast<long long>(b.value("secondsRemaining", 0.0))) + " left";
     }
     out += " (by the table's statistics)";
   }
@@ -586,9 +599,12 @@ class Deployment {
                        const json& st) {
     if (!st.contains("backfill") || !st["backfill"].is_object()) return;
     const auto& b = st["backfill"];
-    if (!b.contains("rowsPerSecond")) return;
+    // The one statement and the walk that may follow it are counted apart, so
+    // a walk begun after an hour's statement still says its rate at 10 s.
+    const bool one = b.value("singleStatement", false) && b.contains("elapsedSeconds");
+    if (!one && !b.contains("rowsPerSecond")) return;
     const auto now = std::chrono::steady_clock::now();
-    auto& p = progress_[job_id + "/" + std::to_string(b.value("ordinal", 0))];
+    auto& p = progress_[job_id + "/" + std::to_string(b.value("ordinal", 0)) + (one ? "/one" : "")];
     if (p.interval_s == 0) {
       p.interval_s = opts_.progress_first_s;
       p.next = now + std::chrono::seconds(p.interval_s);

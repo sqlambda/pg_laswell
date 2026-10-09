@@ -148,6 +148,19 @@ else holds, it is cancelled and rolled back whole and the paced walk does the
 work. If it finishes, the walk is not run. `cancelJob` cancels it at once. Not
 with `preserve`.
 
+The plan heads its group "one statement in one transaction; NOT atomic if it is
+cancelled: then paced, many commits". It was headed as a walk is, "NOT atomic:
+paced, many commits", above a step that ran as one transaction of 46 minutes.
+
+PostgreSQL reports no progress for an `UPDATE`, so while the statement runs
+`jobStatus` carries `singleStatement`, `elapsedSeconds` and `tableBytesGrown`,
+the growth of the table's heap since the statement began, read every five
+seconds from another connection. `pg_laswell` prints them at the intervals a
+walk's line has. The growth shows that the statement is writing and is not a
+share of the work: a new row version that fits in free space grows nothing.
+There is no `tableBytesGrown` for a Citus distributed table or a hypertable,
+whose own heap is empty.
+
 ### A walk says how fast it goes and how long it has left
 
 A walk at 1,850 rows a second over 27 million rows was found by sampling

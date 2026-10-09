@@ -1110,6 +1110,25 @@ class Executor {
       w.begin(app_name(ordinal));
       try {
         if (cfg_.statement_timeout_ms > 0) w.txn().exec("SET LOCAL statement_timeout = 0");
+        // What jobStatus says while it runs: that it is the one statement, for
+        // how long, and by how much the table's heap has grown (jobs.h).
+        job_->pacing.long_statement_relation = 0;
+        job_->pacing.long_statement_bytes_start = -1;
+        job_->pacing.long_statement_bytes_now = -1;
+        {
+          const auto sz = w.txn().exec(
+              "SELECT c::oid, pg_relation_size(c) FROM to_regclass($1) AS c WHERE c IS NOT NULL",
+              pqxx::params{detail::quote_qualified(detail_json.value("qualified", ""))});
+          if (!sz.empty() && sz[0][1].as<long long>() > 0) {
+            job_->pacing.long_statement_bytes_start = sz[0][1].as<long long>();
+            job_->pacing.long_statement_relation = sz[0][0].as<unsigned int>();
+          }
+        }
+        job_->pacing.long_statement_started_ms = detail::steady_ms();
+        {
+          std::lock_guard<std::mutex> lock(job_->m);
+          job_->backfill = json{{"ordinal", ordinal}, {"singleStatement", true}};
+        }
         job_->pacing.long_statement = true;
         const auto r = w.txn().exec(single_sql);
         job_->pacing.long_statement = false;

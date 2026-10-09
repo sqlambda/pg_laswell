@@ -610,6 +610,24 @@ several nodes, where the coordinator's planner estimates nothing of the scan;
 is then rows written against rows estimated, as it was.
 The step's row in the ledger keeps the rate when the walk ends.
 .Pp
+The one statement of a fill that is not paced has no rows to count:
+PostgreSQL reports no progress for an
+.Ic UPDATE .
+While it runs
+.Ic jobStatus
+reports
+.Va singleStatement ,
+how long it has run
+.Pq Va elapsedSeconds
+and by how much the table's heap has grown since it began
+.Pq Va tableBytesGrown ,
+read every five seconds from another connection.
+The growth shows that the statement is writing, which tells a long statement
+from a stuck one; it is not a share of the work, since a new row version that
+fits in free space grows nothing.
+It is absent for a table whose rows are on other nodes or in chunks, whose own
+heap is empty.
+.Pp
 .Xr pg_laswell 1
 prints a line for each running walk after 10 seconds, then after 20, 40 and so
 on up to every ten minutes:
@@ -1211,6 +1229,8 @@ nothing else is using, where pacing protects nobody.
 It runs in one transaction and without a statement timeout, keeps every row it
 writes locked and every old row version in place until it commits, and sends
 its WAL in one burst; the plan says so.
+The plan heads the step's group
+.Dq one statement in one transaction; NOT atomic if it is cancelled: then paced, many commits .
 It is watched as a batch is.
 If a session waits behind it for longer than
 .Va max_waiter_wait_ms ,

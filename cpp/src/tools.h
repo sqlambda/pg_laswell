@@ -1088,6 +1088,23 @@ inline json job_snapshot(const Job& j, const ExecutorConfig& e) {
   out["workerPid"] = j.pacing.worker_pid.load();
   out["steps"] = j.steps;
   if (!j.backfill.empty()) out["backfill"] = j.backfill;
+  // The one statement of a "paced": false fill, while it runs. PostgreSQL
+  // reports no progress for it, so this says how long it has run and how much
+  // the table's heap has grown: enough to tell a long statement from a stuck
+  // one, and not a share of the work -- new row versions that fit in free
+  // space grow nothing.
+  if (j.pacing.long_statement.load() && out.contains("backfill") &&
+      out["backfill"].value("singleStatement", false)) {
+    auto& b = out["backfill"];
+    b["elapsedSeconds"] =
+        (detail::steady_ms() - j.pacing.long_statement_started_ms.load()) / 1000;
+    const auto was = j.pacing.long_statement_bytes_start.load();
+    const auto is = j.pacing.long_statement_bytes_now.load();
+    if (was >= 0 && is >= 0) b["tableBytesGrown"] = std::to_string(std::max(0LL, is - was));
+    b["progressBy"] =
+        "none: PostgreSQL reports no progress for one UPDATE; the table's growth "
+        "shows that it is writing, not how far it has got";
+  }
   if (!j.warnings.empty()) out["warnings"] = j.warnings;
   if (!j.error.is_null()) out["error"] = j.error;
   return out;

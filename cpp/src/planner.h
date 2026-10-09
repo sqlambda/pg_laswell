@@ -8806,7 +8806,12 @@ inline std::string Plan::render() const {
       if (s.txn_class == TxnClass::kForbidden) {
         note = "NOT atomic: cannot run inside a transaction block";
       } else if (s.txn_class == TxnClass::kOwnTxnPerBatch) {
-        note = "NOT atomic: paced, many commits";
+        // "paced": false: what is tried first comes first, since this is the
+        // line a reviewer reads first.
+        note = s.detail.value("single_statement", false)
+                   ? "one statement in one transaction; NOT atomic if it is cancelled: "
+                     "then paced, many commits"
+                   : "NOT atomic: paced, many commits";
       }
       out += "\n-- transaction group " + std::to_string(current_group) +
              " ---------------- " + note + " --\n";
