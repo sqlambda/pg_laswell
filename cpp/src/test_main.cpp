@@ -16893,8 +16893,11 @@ TEST_F(DeployTest, ASignalCancelsAStatementInFlight) {
     pglaswell::ReadSession r(cfg());
     return r.txn().exec(q)[0][0].as<std::string>();
   };
-  // The signal comes once the validation is running on the server.
+  // The signal comes once the validation is running on the server, and the
+  // time is taken from the signal: under Valgrind the planning and the dry run
+  // before it took most of the twenty seconds by themselves.
   pglaswell::signals::g_received = 0;
+  auto signalled = std::chrono::steady_clock::now();
   std::thread sender([&] {
     for (int i = 0; i < 1200; ++i) {
       if (one("SELECT count(*) FROM pg_stat_activity WHERE state = 'active'"
@@ -16902,16 +16905,16 @@ TEST_F(DeployTest, ASignalCancelsAStatementInFlight) {
               " AND pid <> pg_backend_pid()") != "0") break;
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
+    signalled = std::chrono::steady_clock::now();
     pglaswell::signals::g_received = SIGTERM;
   });
-  const auto began = std::chrono::steady_clock::now();
   const auto [code, text] = deploy();
   std::ostringstream out;
   out << text;
   sender.join();
   pglaswell::signals::g_received = 0;
   const auto took = std::chrono::duration_cast<std::chrono::seconds>(
-                        std::chrono::steady_clock::now() - began).count();
+                        std::chrono::steady_clock::now() - signalled).count();
 
   EXPECT_EQ(code, pglaswell::DeployResult::kInterrupted) << out.str();
   EXPECT_LT(took, 20) << "the statement was waited for, not cancelled";

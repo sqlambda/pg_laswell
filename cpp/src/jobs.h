@@ -528,10 +528,10 @@ class Observer {
       // the only sign of progress there is (see long_statement_bytes_now).
       const auto now = std::chrono::steady_clock::now();
       if (now - sizes_read_ >= std::chrono::seconds(5)) {
-        sizes_read_ = now;
         for (const auto& j : live) {
           const auto rel = j->pacing.long_statement_relation.load();
           if (!j->pacing.long_statement.load() || rel == 0) continue;
+          sizes_read_ = now;
           const auto sz = txn.exec("SELECT pg_relation_size($1::oid)", pqxx::params{rel});
           if (!sz.empty() && !sz[0][0].is_null()) {
             j->pacing.long_statement_bytes_now = sz[0][0].as<long long>();

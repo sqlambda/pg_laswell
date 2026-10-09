@@ -1121,6 +1121,9 @@ class Executor {
               pqxx::params{detail::quote_qualified(detail_json.value("qualified", ""))});
           if (!sz.empty() && sz[0][1].as<long long>() > 0) {
             job_->pacing.long_statement_bytes_start = sz[0][1].as<long long>();
+            // Until the observer's first reading it has grown by nothing,
+            // which is true and says the figure will come.
+            job_->pacing.long_statement_bytes_now = sz[0][1].as<long long>();
             job_->pacing.long_statement_relation = sz[0][0].as<unsigned int>();
           }
         }
