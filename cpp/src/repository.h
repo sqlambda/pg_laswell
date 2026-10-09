@@ -775,7 +775,11 @@ class MigrationRepository {
           probe[0][2].as<std::string>() + ".");
     }
 
-    const auto r = s.txn().exec(R"SQL(
+    // "Running" is a job with no end whose own backend is still there. One
+    // whose process died has no end either, and counted as running it classed
+    // its specification as in progress for good: never pending, never run
+    // again, and everything depending on it blocked behind it.
+    const auto r = s.txn().exec(std::string(R"SQL(
       SELECT COALESCE(JSONB_OBJECT_AGG(epoch, by_id), '{}'::jsonb) FROM (
         SELECT epoch, JSONB_OBJECT_AGG(spec_id, entry) AS by_id FROM (
         SELECT m.epoch, m.spec_id,
@@ -784,7 +788,8 @@ class MigrationRepository {
                  'succeeded', COALESCE(JSONB_AGG(DISTINCT m.spec_digest)
                                 FILTER (WHERE j.state = 'succeeded'), '[]'::jsonb),
                  'running', COALESCE(JSONB_AGG(DISTINCT m.spec_digest)
-                              FILTER (WHERE j.finished_at IS NULL), '[]'::jsonb),
+                              FILTER (WHERE j.finished_at IS NULL AND NOT )SQL") +
+                                Ledger::job_is_dead_sql("j") + R"SQL(), '[]'::jsonb),
                  'failed', COALESCE(JSONB_AGG(DISTINCT m.spec_digest)
                              FILTER (WHERE j.state = 'failed'), '[]'::jsonb)
                ) AS entry

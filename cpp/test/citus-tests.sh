@@ -171,6 +171,10 @@ refused_as "a unique index without the distribution column" "does not contain id
 refused_as "a unique constraint without the distribution column" "does not contain id" \
   '{"kind":"add_unique_constraint","schema":"ct","table":"dist","name":"dist_v_uq","columns":["v"]}' \
   "ALTER TABLE ct.dist ADD CONSTRAINT dist_v_uq UNIQUE (v)" "cannot create constraint"
+# An expression element, so that the check needs no btree_gist on the cluster.
+refused_as "an exclusion constraint that does not compare the distribution column" "do not contain id" \
+  '{"kind":"add_exclusion_constraint","schema":"ct","table":"dist","name":"dist_x","elements":[{"expression":"int4range(1,2)","with":"&&"}]}' \
+  "ALTER TABLE ct.dist ADD CONSTRAINT dist_x EXCLUDE USING gist (int4range(1,2) WITH &&)" "cannot create constraint"
 refused_as "enabling or disabling a trigger on a distributed table" "triggers are not supported on distributed tables" \
   '{"kind":"set_trigger_state","schema":"ct","table":"dist","trigger":"t","enabled":false}' \
   "ALTER TABLE ct.dist DISABLE TRIGGER USER" "triggers are not supported on distributed tables"

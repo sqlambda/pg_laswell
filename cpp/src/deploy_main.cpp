@@ -21,6 +21,7 @@
 #include "deploy.h"
 #include "jobs.h"
 #include "tools.h"
+#include "signals.h"
 
 namespace {
 
@@ -56,6 +57,8 @@ void usage(const char* argv0) {
       "  1  a plan was refused, a specification was untrusted, or a job failed\n"
       "  2  a repository problem: drift, an unreadable spec, a broken depends_on\n"
       "  3  a configuration problem: no connection, or no repository\n"
+      "130  SIGINT or SIGTERM: the running migrations were stopped first,\n"
+      "     each at a batch boundary, and recorded as cancelled\n"
       "\n"
       "For authoring migrations, and for an agent to read the reasoning behind\n"
       "a plan, use pg_laswell_mcp(1).\n";
@@ -145,6 +148,9 @@ int main(int argc, char* argv[]) {
     pglaswell::ObserverPool observers(&jobs);
     ctx.observers = &observers;
 
+    // From here a signal is recorded, and the deployment stops its jobs before
+    // it exits (deploy.h, stop_on_signal). Until here the default applies.
+    pglaswell::signals::install();
     pglaswell::Deployment run(ctx, opts);
     const auto result = run.run();
 

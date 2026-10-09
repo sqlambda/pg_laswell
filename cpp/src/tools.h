@@ -359,6 +359,10 @@ struct RehearsalInputs {
   // scheduled from the maintenance database runs somewhere else, and whether
   // its command can work is only answerable there.
   std::vector<json> elsewhere;
+  // Parallel to `steps`: for a step the rehearsal does not run, the statements
+  // that check its definition on an empty copy of its table
+  // (detail.rehearse_on_copy), or null.
+  std::vector<json> on_copy;
   // Steps rehearsed as nothing, on purpose, that leave no gap behind them: a
   // VALIDATE CONSTRAINT. Reported as unverified by note_not_run.
   std::vector<int> not_run;
@@ -379,7 +383,8 @@ inline void note_not_run(const RehearsalInputs& inputs, Catalog::DryRun& dry) {
 
 // Why each unverified step was not checked, by ordinal: a reader deciding
 // whether to trust a plan is owed the reason, not a list of numbers.
-inline json unverified_reasons(const Plan& plan, const std::vector<int>& unverified) {
+inline json unverified_reasons(const Plan& plan, const std::vector<int>& unverified,
+                               const std::vector<int>& definition_checked = {}) {
   json why = json::object();
   for (const auto& step : plan.steps) {
     if (std::find(unverified.begin(), unverified.end(), step.ordinal) == unverified.end()) {
@@ -392,6 +397,11 @@ inline json unverified_reasons(const Plan& plan, const std::vector<int>& unverif
       reason = "it cannot run inside a transaction block";
     } else {
       reason = "it was not reached, or could only be checked weakly; see the note";
+    }
+    if (std::find(definition_checked.begin(), definition_checked.end(), step.ordinal) !=
+        definition_checked.end()) {
+      reason += ". Its definition was accepted on an empty copy of the table, which "
+                "tries neither the rows nor the time the build takes";
     }
     why[std::to_string(step.ordinal)] = reason;
   }
@@ -446,6 +456,7 @@ inline RehearsalInputs rehearsal_inputs(const Plan& plan, bool run_scans = false
       r.forbidden.push_back(gap);
       r.copy_payloads.push_back(json());
       r.execute.push_back(false);
+      r.on_copy.push_back(gap ? step.detail.value("rehearse_on_copy", json()) : json());
       if (!gap) r.not_run.push_back(step.ordinal);
       continue;
     }
@@ -478,6 +489,9 @@ inline RehearsalInputs rehearsal_inputs(const Plan& plan, bool run_scans = false
       r.elsewhere.push_back(std::move(e));
     }
     r.forbidden.push_back(step.txn_class == TxnClass::kForbidden);
+    r.on_copy.push_back(step.txn_class == TxnClass::kForbidden
+                            ? step.detail.value("rehearse_on_copy", json())
+                            : json());
     r.copy_payloads.push_back(step.detail.contains("copy_rows") ? step.detail : json());
     r.execute.push_back(step.detail.value("rehearse_by", "") == "execution");
   }
@@ -511,9 +525,36 @@ inline json plan_migration_tool(ToolContext& ctx, const json& args) {
   detail::observation_targets(spec, schemas, tables, object_keys);
   Catalog cat(cfg, ctx.cache);
   const auto obs = cat.observe(schemas, tables, object_keys);
-  const auto plan = plan_migration(spec, obs, cfg.executor);
+  auto plan = plan_migration(spec, obs, cfg.executor);
+
+  // An earlier form of this specification that was started and did not finish.
+  // Said, and nothing more: the plan is the same either way. A note and not a
+  // warning, so it is outside planDigest -- what the ledger holds is not part
+  // of what this plan will do.
+  json earlier_forms = json::array();
+  try {
+    Ledger forms(cfg, ctx.cache);
+    const auto earlier = forms.unfinished_earlier_forms(spec.id, spec.digest);
+    earlier_forms = earlier;
+    if (!earlier.empty()) {
+      for (const auto& f : earlier) {
+        plan.advisories.push_back(
+            "an earlier form of this specification (" +
+            f.value("specDigest", "").substr(0, 12) + "…) was started by job " +
+            f.value("jobId", "") + " at " + f.value("startedAt", "") +
+            " and did not finish (" + f.value("state", "") + "); its walks wrote " +
+            std::to_string(f.value("rowsWritten", 0LL)) +
+            " rows. Its cursor is not used: the specification has changed, so "
+            "this plan starts from the first row, and what the earlier job "
+            "committed is still in the table.");
+      }
+    }
+  } catch (const std::exception&) {
+    // No ledger yet, or one this role cannot read: nothing to say.
+  }
 
   json out = plan.to_json();
+  if (!earlier_forms.empty()) out["earlierForms"] = earlier_forms;
 
   // Apply the plan in a transaction that never commits, so the later steps are
   // checked against the schema the earlier ones produce. This is the property
@@ -526,7 +567,7 @@ inline json plan_migration_tool(ToolContext& ctx, const json& args) {
     // this document, so the time spent here is kept with the job.
     const auto rehearsal_began = std::chrono::steady_clock::now();
     auto dry = cat.dry_run(inputs.steps, inputs.forbidden, obs.server_version,
-                           inputs.copy_payloads, inputs.execute);
+                           inputs.copy_payloads, inputs.execute, inputs.on_copy);
     const auto rehearsal_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - rehearsal_began).count();
     detail::note_not_run(inputs, dry);
@@ -541,7 +582,8 @@ inline json plan_migration_tool(ToolContext& ctx, const json& args) {
     json d{{"ran", dry.ran},
            {"durationMs", rehearsal_ms},
            {"unverifiedSteps", dry.unverified_steps},
-           {"unverifiedWhy", detail::unverified_reasons(plan, dry.unverified_steps)},
+           {"unverifiedWhy", detail::unverified_reasons(plan, dry.unverified_steps,
+                                                        dry.definition_checked)},
            {"note",
             "the plan was applied in a transaction and rolled back; nothing "
             "was committed. It took the locks its steps take, on the live "
@@ -732,7 +774,7 @@ class ChainRehearsal {
       dry.ran = true;
       const auto result = Catalog::rehearse_steps(
           txn, inputs.steps, inputs.forbidden, link.server_version,
-          inputs.copy_payloads, dry, link.skipped_any, inputs.execute);
+          inputs.copy_payloads, dry, link.skipped_any, inputs.execute, inputs.on_copy);
       // A check in ANOTHER database is not made in a chain: what it would look
       // for there may be something an earlier specification of this very chain
       // creates, inside a transaction of its own that is not committed. Listed
@@ -906,6 +948,16 @@ inline json start_migration(ToolContext& ctx, const json& args) {
   }
 
   const auto& cfg = ctx.connection(args);
+  // Before anything is started: set the ledger right about jobs whose process
+  // died. Nothing else ever does -- a job's row is closed by the process that
+  // runs it -- and a ledger that says a change is in progress which is not is
+  // wrong about the one thing it is for. Never allowed to stop the run.
+  json reconciled = json::array();
+  try {
+    Ledger reconciler(cfg, nullptr);
+    reconciled = reconciler.reconcile_dead_jobs();
+  } catch (const std::exception&) {
+  }
   if (ctx.jobs->running_count() >= cfg.executor.max_concurrent_jobs) {
     return json{{"error", "the concurrency limit is reached"},
                 {"hint", "max_concurrent_jobs is " +
@@ -976,16 +1028,19 @@ inline json start_migration(ToolContext& ctx, const json& args) {
     Executor(cfg, job, ledger.get(), gate).run();
   });
 
-  return json{{"jobId", job->job_id},
-              {"accepted", true},
-              {"specId", spec.id},
-              {"specDigest", spec.digest},
-              {"planDigest", job->plan_digest},
-              {"signerKeyId", signer.key_id},
-              {"note",
-               "the work runs in the background; poll jobStatus for progress, "
-               "contention and an ETA. The planDigest above is the plan that "
-               "is being executed -- it must equal what planMigration showed."}};
+  json started{{"jobId", job->job_id},
+               {"accepted", true},
+               {"specId", spec.id},
+               {"specDigest", spec.digest},
+               {"planDigest", job->plan_digest},
+               {"signerKeyId", signer.key_id},
+               {"note",
+                "the work runs in the background; poll jobStatus for progress, "
+                "contention and an ETA. The planDigest above is the plan that "
+                "is being executed -- it must equal what planMigration showed."}};
+  if (!reconciled.empty()) started["interruptedJobsMarked"] = reconciled;
+  if (planned.contains("earlierForms")) started["earlierForms"] = planned["earlierForms"];
+  return started;
 }
 
 // --- jobStatus -------------------------------------------------------------
@@ -1033,6 +1088,23 @@ inline json job_snapshot(const Job& j, const ExecutorConfig& e) {
   out["workerPid"] = j.pacing.worker_pid.load();
   out["steps"] = j.steps;
   if (!j.backfill.empty()) out["backfill"] = j.backfill;
+  // The one statement of a "paced": false fill, while it runs. PostgreSQL
+  // reports no progress for it, so this says how long it has run and how much
+  // the table's heap has grown: enough to tell a long statement from a stuck
+  // one, and not a share of the work -- new row versions that fit in free
+  // space grow nothing.
+  if (j.pacing.long_statement.load() && out.contains("backfill") &&
+      out["backfill"].value("singleStatement", false)) {
+    auto& b = out["backfill"];
+    b["elapsedSeconds"] =
+        (detail::steady_ms() - j.pacing.long_statement_started_ms.load()) / 1000;
+    const auto was = j.pacing.long_statement_bytes_start.load();
+    const auto is = j.pacing.long_statement_bytes_now.load();
+    if (was >= 0 && is >= 0) b["tableBytesGrown"] = std::to_string(std::max(0LL, is - was));
+    b["progressBy"] =
+        "none: PostgreSQL reports no progress for one UPDATE; the table's growth "
+        "shows that it is writing, not how far it has got";
+  }
   if (!j.warnings.empty()) out["warnings"] = j.warnings;
   if (!j.error.is_null()) out["error"] = j.error;
   return out;

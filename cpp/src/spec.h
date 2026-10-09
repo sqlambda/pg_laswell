@@ -61,6 +61,7 @@ enum class IntentKind { kAddColumn, kBackfill, kCreateIndex, kDropIndex,
                         kDropPublication, kCreateSubscription,
                         kAlterSubscription, kDropSubscription,
                         kCreateObject, kDropObject, kAlterObject,
+                        kAddExclusionConstraint, kSetTextSearchMapping,
                         kCreateTableAs, kImportForeignSchema, kSecurityLabel,
                         kAlterDefaultPrivileges,
                         kInsertRows, kUpdateRows, kMergeRows, kCopyRows,
@@ -175,6 +176,8 @@ inline const std::map<std::string, IntentKind>& intent_kinds() {
       {"create_object", IntentKind::kCreateObject},
       {"drop_object", IntentKind::kDropObject},
       {"alter_object", IntentKind::kAlterObject},
+      {"add_exclusion_constraint", IntentKind::kAddExclusionConstraint},
+      {"set_text_search_mapping", IntentKind::kSetTextSearchMapping},
       {"create_table_as", IntentKind::kCreateTableAs},
       {"import_foreign_schema", IntentKind::kImportForeignSchema},
       {"security_label", IntentKind::kSecurityLabel},
@@ -231,6 +234,7 @@ inline std::string object_key_for(const Intent& in) {
     case IntentKind::kCreateSequence:
     case IntentKind::kDropSequence:
     case IntentKind::kAlterSequence:   return "sequence:" + schema + "." + name;
+    case IntentKind::kSetTextSearchMapping: return "tsconfig:" + schema + "." + name;
 // A module's kinds that plan against a non-relation object say so here. The
 // comment above records what a kind missing from this switch cost: it read back
 // as absent, for a whole batch of kinds, found only end-to-end.
@@ -310,6 +314,7 @@ inline std::vector<std::string> conflict_keys(const Intent& in) {
       // AccessExclusiveLock on the parent (measured), so it conflicts with any
       // other change to it.
       if (in.body.contains("partition_of")) add(in.body.value("partition_of", ""));
+      if (in.body.value("without_overlaps", false)) add("extension:btree_gist");
       for (const auto& c : in.body.value("columns", json::array())) {
         const auto type = c.value("type", "");
         if (type.find('.') != std::string::npos) {
@@ -336,6 +341,18 @@ inline std::vector<std::string> conflict_keys(const Intent& in) {
     case IntentKind::kAddForeignKey:
       add(in.body.value("references_schema", "") + "." +
           in.body.value("references_table", ""));
+      return keys;
+    // A key with a period, and most exclusion constraints, are GiST indexes
+    // over ordinary columns, and the operator classes for those come from
+    // btree_gist. Naming it here has it observed, so the planner can say it is
+    // missing before the server does, and orders the intent after a
+    // create_extension for it.
+    case IntentKind::kAddUniqueConstraint:
+    case IntentKind::kAddPrimaryKey:
+      if (in.body.value("without_overlaps", false)) add("extension:btree_gist");
+      return keys;
+    case IntentKind::kAddExclusionConstraint:
+      if (in.body.value("using", "gist") == "gist") add("extension:btree_gist");
       return keys;
     // Kinds whose RELATION is named in "name" rather than "table". Missing one
     // here does not just weaken the locking -- tools.h derives what to observe
@@ -532,6 +549,25 @@ inline std::vector<std::string> row_key_columns(const json& body, const std::str
   return keys;
 }
 
+// A key with a period: PostgreSQL 18's WITHOUT OVERLAPS, and PERIOD on the
+// foreign key that references one. Written as a flag beside the column list,
+// as SQL writes it after the last column: the list stays the whole key, and
+// its LAST column is the period. Measured on 18.6: "constraint using WITHOUT
+// OVERLAPS needs at least two columns", and the period cannot be anywhere but
+// last (a syntax error).
+inline void period_flag(const json& body, const char* flag, const char* list,
+                        const std::string& at) {
+  if (!body.contains(flag)) return;
+  if (!body[flag].is_boolean()) fail(at + "." + flag + " must be a boolean", "");
+  if (!body[flag].get<bool>()) return;
+  if (!body.contains(list) || !body[list].is_array() || body[list].size() < 2) {
+    fail(at + "." + flag + " needs at least two columns in \"" + list + "\"",
+         "The last column listed is the period -- a range or multirange -- and "
+         "the ones before it are the key whose periods must not overlap. "
+         "PostgreSQL refuses a period alone.");
+  }
+}
+
 inline void reject_unknown_keys(const json& obj, const std::set<std::string>& allowed,
                                 const std::string& at) {
   for (auto it = obj.begin(); it != obj.end(); ++it) {
@@ -580,7 +616,7 @@ inline void parse_add_column(Intent& in) {
   detail::reject_unknown_keys(
       in.body,
       {"kind", "schema", "table", "column", "type", "nullable", "default",
-       "comment", "fill", "key", "after"},
+       "comment", "fill", "key", "after", "paced"},
       at);
   detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
   detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
@@ -594,6 +630,21 @@ inline void parse_add_column(Intent& in) {
                  "meant must be written down rather than inferred.");
   }
   (void)detail::require_string(in.body, "comment", at);
+
+  if (in.body.contains("paced")) {
+    if (!in.body["paced"].is_boolean()) {
+      detail::fail(at + ".paced must be true or false",
+                   "false fills the existing rows in one statement, for a table "
+                   "nothing else is using, and falls back to the paced walk if "
+                   "a session ends up waiting behind it. Leave it out for the "
+                   "walk alone.");
+    }
+    if (!in.body.contains("fill")) {
+      detail::fail(at + " has \"paced\" and no \"fill\"",
+                   "\"paced\" is about how existing rows are filled, so it "
+                   "belongs to an add_column with \"fill\".");
+    }
+  }
 
   // "fill": the value for a NOT NULL column that has no default, as one SQL
   // expression over the row's own columns. It selects the recipe that adds the
@@ -731,8 +782,23 @@ inline void parse_backfill(Intent& in) {
   detail::reject_unknown_keys(
       in.body,
       {"kind", "schema", "table", "key", "set", "from", "where",
-       "verify_remaining", "assert_invariants", "preserve"},
+       "verify_remaining", "assert_invariants", "preserve", "paced"},
       at);
+  // "paced": false asks for one statement over the whole table before the
+  // walk: for a table nothing else is using, where pacing protects nobody.
+  if (in.body.contains("paced")) {
+    if (!in.body["paced"].is_boolean()) {
+      detail::fail(at + ".paced must be true or false",
+                   "false fills in one statement and falls back to the paced "
+                   "walk if a session ends up waiting behind it. Leave it out "
+                   "for the walk alone.");
+    }
+    if (!in.body["paced"].get<bool>() && in.body.contains("preserve")) {
+      detail::fail(at + " asks for \"paced\": false together with \"preserve\"",
+                   "The pre-image is captured batch by batch, with the keys of "
+                   "each batch in hand. Leave \"paced\" out, or \"preserve\".");
+    }
+  }
   detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
   detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
   detail::require_identifier(detail::require_string(in.body, "key", at), "key", in.ordinal);
@@ -1012,7 +1078,7 @@ inline void parse_add_foreign_key(Intent& in) {
       in.body,
       {"kind", "schema", "table", "name", "columns", "references_schema",
        "references_table", "references_columns", "on_delete", "on_update",
-       "comment"},
+       "comment", "period"},
       at);
   optional_creation_comment(in, at);
   detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
@@ -1054,6 +1120,112 @@ inline void parse_add_foreign_key(Intent& in) {
       }
       detail::fail(at + "." + std::string(key) + " must be one of: " + list,
                    "Spelled exactly as PostgreSQL spells them, upper case.");
+    }
+    // Measured on 18.6: CASCADE, RESTRICT and SET NULL each fail with
+    // "unsupported ON DELETE action for foreign key constraint using PERIOD",
+    // and ON UPDATE the same. NO ACTION is what is left.
+    if (in.body.value("period", false) && v != "NO ACTION") {
+      detail::fail(at + "." + std::string(key) + " is " + v + " on a foreign key with a period",
+                   "PostgreSQL 18 supports only NO ACTION there. Leave " +
+                       std::string(key) + " out.");
+    }
+  }
+  detail::period_flag(in.body, "period", "columns", at);
+}
+
+// An exclusion constraint: no two rows may have every listed element compare
+// true under its operator. Structured, not a clause of SQL, because the
+// planner has to see which columns are compared with "=": a partitioned table,
+// a hypertable and a distributed table each demand theirs there, and refuse
+// otherwise in words that do not say which column was meant.
+inline void parse_add_exclusion_constraint(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(
+      in.body, {"kind", "schema", "table", "name", "using", "elements", "where",
+                "comment"}, at);
+  optional_creation_comment(in, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "name", at), "name", in.ordinal);
+  if (in.body.contains("using")) {
+    detail::require_identifier(detail::require_string(in.body, "using", at), "using", in.ordinal);
+  }
+  if (in.body.contains("where") &&
+      (!in.body["where"].is_string() || in.body["where"].get<std::string>().empty())) {
+    detail::fail(at + ".where must be a non-empty string", "");
+  }
+  if (!in.body.contains("elements") || !in.body["elements"].is_array() ||
+      in.body["elements"].empty()) {
+    detail::fail(at + ".elements must be a non-empty array",
+                 "Each entry is {\"column\": ..., \"with\": ...} or "
+                 "{\"expression\": ..., \"with\": ...}: what is compared, and "
+                 "the operator that must not hold between two rows.");
+  }
+  for (const auto& e : in.body["elements"]) {
+    if (!e.is_object()) detail::fail(at + ".elements entries must be objects", "");
+    detail::reject_unknown_keys(e, {"column", "expression", "with"}, at + ".elements");
+    if (e.contains("column") == e.contains("expression")) {
+      detail::fail(at + ".elements entries name a column or an expression, one of them", "");
+    }
+    if (e.contains("column")) {
+      detail::require_identifier(detail::require_string(e, "column", at + ".elements"),
+                                 "elements.column", in.ordinal);
+    } else if (detail::require_string(e, "expression", at + ".elements").empty()) {
+      detail::fail(at + ".elements.expression must not be empty", "");
+    }
+    const auto op = detail::require_string(e, "with", at + ".elements");
+    // An operator's own characters and nothing else, so that it cannot carry
+    // anything into the statement but an operator.
+    if (op.empty() || op.size() > 63 ||
+        op.find_first_not_of("+-*/<>=~!@#%^&|`?") != std::string::npos ||
+        op.find("--") != std::string::npos || op.find("/*") != std::string::npos) {
+      detail::fail(at + ".elements.with is not an operator: \"" + op + "\"",
+                   "Give the operator as PostgreSQL writes it: = for the "
+                   "columns that must match, && for ranges that must not "
+                   "overlap.");
+    }
+  }
+}
+
+// Which dictionaries a text search configuration passes a kind of token
+// through, stated as the result. ALTER TEXT SEARCH CONFIGURATION has ADD,
+// ALTER and DROP MAPPING, and which one applies depends on what is there --
+// ADD fails on a mapping that exists (measured, 23505) -- so the specification
+// says what the mapping is to BE and the planner picks the statement.
+inline void parse_set_text_search_mapping(Intent& in) {
+  const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
+  detail::reject_unknown_keys(in.body, {"kind", "schema", "name", "tokens", "dictionaries"}, at);
+  detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
+  detail::require_identifier(detail::require_string(in.body, "name", at), "name", in.ordinal);
+  if (!in.body.contains("tokens") || !in.body["tokens"].is_array() ||
+      in.body["tokens"].empty()) {
+    detail::fail(at + ".tokens must be a non-empty array",
+                 "The token types the mapping is for, as the parser names them: "
+                 "word, hword, hword_part, asciiword and so on.");
+  }
+  std::set<std::string> seen;
+  for (const auto& t : in.body["tokens"]) {
+    if (!t.is_string()) detail::fail(at + ".tokens must be strings", "");
+    detail::require_identifier(t.get<std::string>(), "tokens", in.ordinal);
+    if (!seen.insert(t.get<std::string>()).second) {
+      detail::fail(at + ".tokens names " + t.get<std::string>() + " twice", "");
+    }
+  }
+  if (!in.body.contains("dictionaries") || !in.body["dictionaries"].is_array()) {
+    detail::fail(at + ".dictionaries must be an array",
+                 "The dictionaries each token is passed through, in order. An "
+                 "empty array removes the mapping: tokens of those types are "
+                 "then ignored.");
+  }
+  for (const auto& d : in.body["dictionaries"]) {
+    if (!d.is_string()) detail::fail(at + ".dictionaries must be strings", "");
+    const auto v = d.get<std::string>();
+    const auto dot = v.find('.');
+    if (dot == std::string::npos) {
+      detail::require_identifier(v, "dictionaries", in.ordinal);
+    } else {
+      detail::require_identifier(v.substr(0, dot), "dictionaries", in.ordinal);
+      detail::require_identifier(v.substr(dot + 1), "dictionaries", in.ordinal);
     }
   }
 }
@@ -2631,6 +2803,7 @@ inline void parse_create_table(Intent& in) {
   const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
   detail::reject_unknown_keys(
       in.body, {"kind", "schema", "table", "columns", "comment", "primary_key",
+                "without_overlaps",
                 "partition_by", "unlogged", "options", "partition_of", "from", "to",
                 "values", "default", "modulus", "remainder"}, at);
   detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
@@ -2681,7 +2854,7 @@ inline void parse_create_table(Intent& in) {
     }
     detail::require_identifier(parent.substr(0, dot), "partition_of", in.ordinal);
     detail::require_identifier(parent.substr(dot + 1), "partition_of", in.ordinal);
-    for (const char* k : {"columns", "primary_key"}) {
+    for (const char* k : {"columns", "primary_key", "without_overlaps"}) {
       if (in.body.contains(k)) {
         detail::fail(at + " gives " + k + " to a partition",
                      "A partition takes its columns and its parent's keys from "
@@ -2760,9 +2933,30 @@ inline void parse_create_table(Intent& in) {
     if (!in.body["primary_key"].is_array() || in.body["primary_key"].empty()) {
       detail::fail(at + ".primary_key must be a non-empty array of columns", "");
     }
+    std::set<std::string> declared;
+    for (const auto& col : in.body["columns"]) declared.insert(col.value("name", ""));
     for (const auto& c : in.body["primary_key"]) {
       if (!c.is_string()) detail::fail(at + ".primary_key must be strings", "");
+      // The key names columns this same intent declares, so a name that is
+      // none of them needs no database to refuse. Reported from the field:
+      // "valid WITHOUT OVERLAPS" was quoted as a column name, planned, and
+      // first objected to by the server in the dry run (42703).
+      if (!declared.count(c.get<std::string>())) {
+        detail::fail(at + ".primary_key names \"" + c.get<std::string>() +
+                         "\", which is not one of its columns",
+                     "Each entry is the name of a column declared in "
+                     "\"columns\", and nothing else: no ordering, no "
+                     "operator class, no clause. A key with a period is "
+                     "\"without_overlaps\": true, with the period column last.");
+      }
     }
+  }
+  if (in.body.contains("without_overlaps")) {
+    if (!in.body.contains("primary_key")) {
+      detail::fail(at + ".without_overlaps is given without a primary_key",
+                   "It says the last column of primary_key is a period.");
+    }
+    detail::period_flag(in.body, "without_overlaps", "primary_key", at);
   }
 }
 
@@ -2838,7 +3032,7 @@ inline void parse_detach_partition(Intent& in) {
 inline void parse_unique_like(Intent& in) {
   const std::string at = "intents[" + std::to_string(in.ordinal) + "]";
   detail::reject_unknown_keys(in.body, {"kind", "schema", "table", "name", "columns",
-                                       "comment"}, at);
+                                       "comment", "without_overlaps"}, at);
   optional_creation_comment(in, at);
   detail::require_identifier(detail::require_string(in.body, "schema", at), "schema", in.ordinal);
   detail::require_identifier(detail::require_string(in.body, "table", at), "table", in.ordinal);
@@ -2856,6 +3050,7 @@ inline void parse_unique_like(Intent& in) {
     if (!c.is_string()) detail::fail(at + ".columns must be strings", "");
     detail::require_identifier(c.get<std::string>(), "columns", in.ordinal);
   }
+  detail::period_flag(in.body, "without_overlaps", "columns", at);
 }
 
 inline void parse_replace_view(Intent& in) {
@@ -3147,6 +3342,8 @@ inline Spec parse_spec(const json& doc) {
     case IntentKind::kCreateObject: parse_create_object(in); break;
     case IntentKind::kDropObject: parse_drop_object(in); break;
     case IntentKind::kAlterObject: parse_alter_object(in); break;
+    case IntentKind::kAddExclusionConstraint: parse_add_exclusion_constraint(in); break;
+    case IntentKind::kSetTextSearchMapping: parse_set_text_search_mapping(in); break;
     case IntentKind::kCreateTableAs: parse_create_table_as(in); break;
     case IntentKind::kImportForeignSchema: parse_import_foreign_schema(in); break;
     case IntentKind::kSecurityLabel: parse_security_label(in); break;

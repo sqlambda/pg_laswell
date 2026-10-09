@@ -84,7 +84,8 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
   &quot;references_columns&quot;: &lt;optional&gt;,
   &quot;on_delete&quot;: &lt;optional&gt;,
   &quot;on_update&quot;: &lt;optional&gt;,
-  &quot;comment&quot;: &lt;optional&gt;
+  &quot;comment&quot;: &lt;optional&gt;,
+  &quot;period&quot;: &lt;optional&gt;
 }</pre>
 <h2>Description</h2>
 <p>—- add_foreign_key ———————————————————————————-</p>
@@ -111,6 +112,8 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
 <dd>&nbsp;</dd>
 <dt>comment<span class="tag opt">optional</span></dt>
 <dd>It becomes the object&#x27;s COMMENT ON, in the same transaction that creates it. Omit the key to leave the object uncommented.</dd>
+<dt>period<span class="tag opt">optional</span></dt>
+<dd>&nbsp;</dd>
 </dl>
 <div class="note">Any key not listed here is <strong>refused</strong>, not ignored: a key this binary skips and a newer one honours would be a silent difference between what was reviewed and what ran.</div>
 <h2>Examples</h2>
@@ -131,6 +134,6 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
  ]
 }</pre>
 <p>Afterwards, <code>SELECT convalidated::text || &#x27;:&#x27; || COALESCE(obj_description(oid, &#x27;pg_constraint&#x27;), &#x27;none&#x27;) FROM pg_constraint WHERE conname=&#x27;child_fk&#x27;</code> returns <code>true:documented by add_foreign_key</code>.</p>
-<h2>See also</h2><p><a href="add_check_constraint.html"><code>add_check_constraint</code></a>, <a href="drop_constraint.html"><code>drop_constraint</code></a>, <a href="add_unique_constraint.html"><code>add_unique_constraint</code></a>, <a href="add_primary_key.html"><code>add_primary_key</code></a>, <a href="rename_constraint.html"><code>rename_constraint</code></a></p>
+<h2>See also</h2><p><a href="add_check_constraint.html"><code>add_check_constraint</code></a>, <a href="drop_constraint.html"><code>drop_constraint</code></a>, <a href="add_unique_constraint.html"><code>add_unique_constraint</code></a>, <a href="add_primary_key.html"><code>add_primary_key</code></a>, <a href="rename_constraint.html"><code>rename_constraint</code></a>, <a href="add_exclusion_constraint.html"><code>add_exclusion_constraint</code></a></p>
 <footer>Generated from <code>cpp/src/spec.h</code> and <code>cpp/src/conformance.inc</code> by <code>tools/gen-manual.py</code>. The manual page <code>pg_laswell_mcp(1)</code> remains the authoritative reference for everything that is not a per-kind option.</footer>
 </div></body></html>

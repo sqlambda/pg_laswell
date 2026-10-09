@@ -83,7 +83,8 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
   &quot;default&quot;: &lt;optional&gt;,
   &quot;fill&quot;: &lt;optional&gt;,
   &quot;key&quot;: &lt;optional&gt;,
-  &quot;after&quot;: &quot;drop_trigger&quot; | &quot;keep_trigger&quot;
+  &quot;after&quot;: &quot;drop_trigger&quot; | &quot;keep_trigger&quot;,
+  &quot;paced&quot;: &lt;optional&gt;
 }</pre>
 <h2>Parameters</h2><dl class="params">
 <dt>schema<span class="tag req">required</span></dt>
@@ -106,6 +107,8 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
 <dd>With fill, optional: the column the backfill walks — unique, or contained in a unique index over NOT NULL columns. It defaults to a column of the table&#x27;s primary key.</dd>
 <dt>after<span class="tag opt">optional</span></dt>
 <dd>One of <code>drop_trigger</code>, <code>keep_trigger</code>. With a default and a fill, no trigger is created: the column is NOT NULL from the start, rows written from then on get the default unless the application supplies a value, and the backfill writes the existing rows whose value differs from the default. Remove &quot;after&quot;, or remove the default to have new rows filled by trigger.</dd>
+<dt>paced<span class="tag opt">optional</span></dt>
+<dd>false fills the existing rows in one statement, for a table nothing else is using, and falls back to the paced walk if a session ends up waiting behind it. Leave it out for the walk alone.</dd>
 </dl>
 <div class="note">Any key not listed here is <strong>refused</strong>, not ignored: a key this binary skips and a newer one honours would be a silent difference between what was reviewed and what ran.</div>
 <h2>Examples</h2>

@@ -19,6 +19,7 @@
 // for exactly this table.
 
 #include <chrono>
+#include <cmath>
 #include <optional>
 #include <string>
 #include <thread>
@@ -460,8 +461,29 @@ class Executor {
     try {
       execute();
     } catch (const std::exception& e) {
-      fail(json{{"error", e.what()},
-                {"hint", "See laswell.step for the statement that failed."}});
+      // The process was told to stop and the statement in flight was cancelled
+      // for it (signals.h): that is a cancelled job, not a failed one.
+      if (job_->pacing.stop_now.load() && job_->pacing.cancel_stop.load() &&
+          std::string(e.what()).find("canceling statement due to user request") !=
+              std::string::npos) {
+        job_->pacing.cancel_requested = false;
+        cancelled();
+      } else {
+      json raw{{"error", e.what()},
+               {"hint", "See laswell.step for the statement that failed."}};
+      // "canceling statement due to statement timeout" reads as the server's
+      // setting, and the server's is the first thing anyone checks. It is this
+      // tool's: every transaction of a job sets it (session.h).
+      if (cfg_.statement_timeout_ms > 0 &&
+          std::string(e.what()).find("statement timeout") != std::string::npos) {
+        raw["hint"] =
+            "The timeout is pg_laswell's, not the server's: statement_timeout_ms = " +
+            std::to_string(cfg_.statement_timeout_ms) +
+            " in this connection's section of the configuration (0 disables it). " +
+            raw["hint"].get<std::string>();
+      }
+      fail(raw);
+      }
     }
     {
       std::lock_guard<std::mutex> lock(job_->m);
@@ -521,6 +543,7 @@ class Executor {
         continue;
       }
       if (action != "apply") continue;
+      begin_step(ordinal, step);
 
       const bool needs_own = txn_class == "txn_forbidden" ||
                              txn_class == "own_txn_per_batch";
@@ -535,6 +558,11 @@ class Executor {
 
       if (txn_class == "own_txn_per_batch") {
         run_backfill(worker, ordinal, step);
+        // A walk that was cancelled has said so and returned. Without this the
+        // loop went on, and where the walk was the LAST step it fell out of
+        // the loop and the job was recorded as succeeded with rows still to do
+        // (found adding the signal handling: 170 of 300 unwritten, "succeeded").
+        if (job_->state.load() == JobState::kCancelled) return;
         continue;
       }
       if (txn_class == "txn_forbidden") {
@@ -712,6 +740,13 @@ class Executor {
     if (mwm > 0) {
       w.txn().exec("SET LOCAL maintenance_work_mem = '" + std::to_string(mwm) + "MB'");
     }
+    // A statement whose length is the table's (planner.h,
+    // lift_statement_timeout) runs without the statement timeout, as a
+    // concurrent build does. Put back after the step, like the memory above.
+    const bool untimed = cfg_.statement_timeout_ms > 0 &&
+                         step.value("detail", json::object())
+                             .value("no_statement_timeout", false);
+    if (untimed) w.txn().exec("SET LOCAL statement_timeout = 0");
     bool gated = false;
     long long gates_taken = 0;
     for (const auto& raw : step.value("sql", json::array())) {
@@ -754,6 +789,10 @@ class Executor {
       }
     }
     if (mwm > 0) w.txn().exec("SET LOCAL maintenance_work_mem TO DEFAULT");
+    if (untimed) {
+      w.txn().exec("SET LOCAL statement_timeout = " +
+                   std::to_string(cfg_.statement_timeout_ms));
+    }
     // The short timeout was this step's. The steps after it share the
     // transaction, and one that is not marked for a retry would fail outright
     // on a wait this short.
@@ -927,26 +966,39 @@ class Executor {
   void run_backfill(WriteSession& w, int ordinal, const json& step) {
     const auto& e = cfg_.executor;
     const auto detail_json = step.value("detail", json::object());
-    const auto sql = detail::strip_semicolon(step["sql"][0].get<std::string>());
+    // A walk stops at its own batch boundary when the process is told to stop;
+    // the observer leaves its statements alone (jobs.h, in_walk).
+    struct Walking {
+      std::atomic<bool>& flag;
+      explicit Walking(std::atomic<bool>& f) : flag(f) { flag = true; }
+      ~Walking() { flag = false; }
+    } walking{job_->pacing.in_walk};
+    // "paced": false puts one statement over the whole table ahead of the
+    // walk's own (planner_dml.h, single_sql).
+    const std::size_t first = detail_json.value("single_statement", false) ? 1 : 0;
+    const auto single_sql =
+        first == 1 ? detail::strip_semicolon(step["sql"][0].get<std::string>())
+                   : std::string();
+    const auto sql = detail::strip_semicolon(step["sql"][first].get<std::string>());
     // Two statements: select and lock the batch's keys, then apply to exactly
     // those keys. The CTE form could not be routed by Citus, and a single
     // statement's LIMIT can only bound a batch by rows -- accumulating to a byte
     // budget needs the keys in hand before the mutation is sent.
     const auto batch_mode = detail_json.value("batch_mode", "");
     const bool two_statement =
-        batch_mode == "two_statement" && step["sql"].size() > 1;
+        batch_mode == "two_statement" && step["sql"].size() > first + 1;
     // A grouped walk: three statements, and a cursor that is a pair. The
     // a module's kind asks for it, but the loop is core's -- a module declares
     // the mode, it does not bring its own executor.
     const bool grouped =
-        batch_mode == "grouped" && step["sql"].size() > 2;
+        batch_mode == "grouped" && step["sql"].size() > first + 2;
     // A composite walk: two statements, like the plain one, over all the key
     // columns of a unique index together. See run_composite_batch.
     // Or ONE statement over them, for the kinds whose rows come from the
     // specification: the mutation rides in the statement that names the batch.
     const bool composite_statement = batch_mode == "composite_statement";
     const bool composite =
-        (batch_mode == "composite" && step["sql"].size() > 1) || composite_statement;
+        (batch_mode == "composite" && step["sql"].size() > first + 1) || composite_statement;
     std::vector<std::string> composite_columns;
     for (const auto& c : detail_json.value("key_columns", json::array())) {
       composite_columns.push_back(c.get<std::string>());
@@ -954,10 +1006,10 @@ class Executor {
     const auto apply_sql =
         (two_statement || grouped || (composite && !composite_statement))
             ? detail::strip_semicolon(
-                  step["sql"][grouped ? 2 : 1].get<std::string>())
+                  step["sql"][first + (grouped ? 2 : 1)].get<std::string>())
             : std::string();
     const auto confined_select_sql =
-        grouped ? detail::strip_semicolon(step["sql"][1].get<std::string>())
+        grouped ? detail::strip_semicolon(step["sql"][first + 1].get<std::string>())
                        : std::string();
     const auto key_column = detail_json.value("key", "id");
 
@@ -1028,6 +1080,98 @@ class Executor {
 
     const auto started = detail::steady_ms();
     bool done = false;
+    // Progress: where the walk is in the table, asked of the planner now if it
+    // resumes somewhere, and every progress_interval_ms from here on.
+    const std::string leading_column = !resume_columns_.empty()
+                                           ? resume_columns_[0]
+                                           : !resume_group_.empty() ? resume_group_ : key_column;
+    walk_started_ms_ = started;
+    walked_fraction_ = -1.0;
+    walked_at_start_ = 0.0;
+    if (resumed_from != "0") {
+      const double f = walked_fraction(w, ordinal, detail_json, cursor, leading_column);
+      if (f >= 0.0) walked_at_start_ = f;
+    }
+    long long progress_asked_ms = started;
+
+    // The one statement, where the specification asked for it and no earlier
+    // attempt left a cursor: a walk that had begun is continued, not redone.
+    // One transaction, without the statement timeout -- its length is the
+    // table's. The observer watches this backend as it watches a batch, and
+    // cancels the statement when a session has waited behind it longer than
+    // max_waiter_wait_ms; cancelJob cancels it too (jobs.h, long_statement).
+    // Either way nothing of it is kept.
+    if (!single_sql.empty() && resumed_from == "0") {
+      const auto slot = operation_slot();
+      if (job_->pacing.cancel_stop.load()) {
+        cancelled();
+        return;
+      }
+      w.begin(app_name(ordinal));
+      try {
+        if (cfg_.statement_timeout_ms > 0) w.txn().exec("SET LOCAL statement_timeout = 0");
+        // What jobStatus says while it runs: that it is the one statement, for
+        // how long, and by how much the table's heap has grown (jobs.h).
+        job_->pacing.long_statement_relation = 0;
+        job_->pacing.long_statement_bytes_start = -1;
+        job_->pacing.long_statement_bytes_now = -1;
+        {
+          const auto sz = w.txn().exec(
+              "SELECT c::oid, pg_relation_size(c) FROM to_regclass($1) AS c WHERE c IS NOT NULL",
+              pqxx::params{detail::quote_qualified(detail_json.value("qualified", ""))});
+          if (!sz.empty() && sz[0][1].as<long long>() > 0) {
+            job_->pacing.long_statement_bytes_start = sz[0][1].as<long long>();
+            // Until the observer's first reading it has grown by nothing,
+            // which is true and says the figure will come.
+            job_->pacing.long_statement_bytes_now = sz[0][1].as<long long>();
+            job_->pacing.long_statement_relation = sz[0][0].as<unsigned int>();
+          }
+        }
+        job_->pacing.long_statement_started_ms = detail::steady_ms();
+        {
+          std::lock_guard<std::mutex> lock(job_->m);
+          job_->backfill = json{{"ordinal", ordinal}, {"singleStatement", true}};
+        }
+        job_->pacing.long_statement = true;
+        const auto r = w.txn().exec(single_sql);
+        job_->pacing.long_statement = false;
+        rows_done = static_cast<long long>(r.affected_rows());
+        w.commit();
+        commits = 1;
+        rows_committed = rows_done;
+        reasons["single_statement"] = 1;
+        done = true;
+      } catch (const pqxx::sql_error& ex) {
+        job_->pacing.long_statement = false;
+        const bool ours = detail::is_query_canceled(ex);
+        if (ours && job_->pacing.cancel_stop.load()) {
+          job_->pacing.cancel_requested = false;
+          w.rollback();
+          cancelled();
+          return;
+        }
+        if (ours && job_->pacing.cancel_requested.exchange(false)) {
+          w.rollback();
+          reasons["single_statement_cancelled"] = 1;
+          add_warning("the single statement was cancelled after a session had waited "
+                      "behind it longer than max_waiter_wait_ms, and nothing of it was "
+                      "kept; the paced walk did the work instead");
+        } else if (detail::is_lock_timeout(ex)) {
+          // It met a row another session holds and waited out lock_timeout:
+          // the table is in use after all. The walk waits for one batch's rows
+          // at a time, and keeps what it has done.
+          w.rollback();
+          reasons["single_statement_cancelled"] = 1;
+          add_warning("the single statement waited longer than lock_timeout for a row "
+                      "another session holds, and nothing of it was kept; the paced "
+                      "walk did the work instead");
+        } else {
+          record_step(ordinal, step, "failed", 0,
+                      json{{"sqlstate", ex.sqlstate()}, {"error", ex.what()}});
+          throw;
+        }
+      }
+    }
 
     while (!done) {
       if (job_->pacing.cancel_stop.load()) {
@@ -1197,12 +1341,24 @@ class Executor {
         reasons[to_string(reason)] += 1;
       }
 
+      if (!done && detail::steady_ms() - progress_asked_ms >= e.progress_interval_ms) {
+        progress_asked_ms = detail::steady_ms();
+        const double f = walked_fraction(w, ordinal, detail_json, cursor, leading_column);
+        if (f >= 0.0) walked_fraction_ = std::max(f, walked_at_start_);
+      }
+
       publish_backfill(ordinal, rows_done, rows_committed, commits, cursor,
                        reasons, detail_json, to_string(reason));
     }
 
-    json d{{"elapsedMs", detail::steady_ms() - started},
+    walk_started_ms_ = 0;
+    const auto elapsed_ms = detail::steady_ms() - started;
+    json d{{"elapsedMs", elapsed_ms},
            {"rowsDone", rows_done},
+           {"rowsPerSecond",
+            elapsed_ms > 0 ? std::round(static_cast<double>(rows_done) * 1000.0 /
+                                        static_cast<double>(elapsed_ms))
+                           : 0.0},
            {"commits", commits},
            {"commitReasons", reasons},
            {"finalCursor", cursor},
@@ -1328,6 +1484,12 @@ class Executor {
   std::string resume_key_;
   std::string resume_where_;
   std::string resume_group_;
+  // What a walk says of its own progress, beside the rows it has written
+  // (publish_backfill). The fraction is of the TABLE, by the planner's
+  // statistics: -1 while there is none.
+  long long walk_started_ms_ = 0;
+  double walked_fraction_ = -1.0;
+  double walked_at_start_ = 0.0;
   std::vector<std::string> resume_columns_;  // a composite walk's key, in order
 
   bool cursor_is_stale(ReadSession& r, const std::string& from) {
@@ -1466,8 +1628,85 @@ class Executor {
       b["percent"] = std::min(100.0, 100.0 * static_cast<double>(rows_done) /
                                          static_cast<double>(est));
     }
+    // The rate, and how far along the table the walk is. rowsDone against
+    // rowsEstimated is progress only for a walk that writes every row: found
+    // in the field, 27 million of 73 million rows were to be written, at 1 850
+    // a second, and nothing said either the rate or that it meant four hours.
+    // So where the planner can say what share of the table lies at or below
+    // the cursor, percent and the time left come from that.
+    const double elapsed_s =
+        static_cast<double>(detail::steady_ms() - walk_started_ms_) / 1000.0;
+    if (walk_started_ms_ > 0 && elapsed_s >= 1.0) {
+      b["rowsPerSecond"] = std::round(static_cast<double>(rows_done) / elapsed_s);
+    }
+    if (walked_fraction_ >= 0.0) {
+      b["fractionWalked"] = std::round(walked_fraction_ * 1000.0) / 1000.0;
+      b["percent"] = std::min(100.0, 100.0 * walked_fraction_);
+      b["progressBy"] =
+          "the planner's estimate of the rows at or below the cursor, from the "
+          "table's statistics";
+      const double gained = walked_fraction_ - walked_at_start_;
+      if (gained > 0.002 && elapsed_s >= 1.0) {
+        b["secondsRemaining"] =
+            std::round(elapsed_s * (1.0 - walked_fraction_) / gained);
+      }
+    }
     std::lock_guard<std::mutex> lock(job_->m);
     job_->backfill = std::move(b);
+  }
+
+  // What share of the table lies at or below the walk's cursor, as the planner
+  // estimates it: two EXPLAINs, planned and not run, in a transaction of their
+  // own between batches. It holds for any key type with statistics and is as
+  // good as the table's last ANALYZE. -1 where there is no telling: before the
+  // first row, on a table a module spreads over nodes (the coordinator plans a
+  // remote scan and estimates nothing of it), or when the reading fails --
+  // which must never fail the walk.
+  double walked_fraction(WriteSession& w, int ordinal, const json& detail_json,
+                         const std::string& cursor, const std::string& leading_column) {
+    if (cursor.empty() || cursor == "0" || detail_json.contains("confined_by")) return -1.0;
+    std::string at = cursor;
+    if (cursor.front() == '[') {
+      try {
+        const auto j = json::parse(cursor);
+        if (!j.is_array() || j.empty() || !j[0].is_string()) return -1.0;
+        at = j[0].get<std::string>();
+      } catch (const std::exception&) {
+        return -1.0;
+      }
+    }
+    const auto rel = detail::quote_qualified(detail_json.value("qualified", ""));
+    const auto rows_of = [](const pqxx::result& r) {
+      if (r.empty()) return -1.0;
+      const auto j = json::parse(r[0][0].as<std::string>());
+      return j[0]["Plan"].value("Plan Rows", -1.0);
+    };
+    try {
+      w.begin(app_name(ordinal));
+      const double all = rows_of(w.txn().exec("EXPLAIN (FORMAT JSON) SELECT 1 FROM " + rel));
+      const double below = rows_of(w.txn().exec(
+          "EXPLAIN (FORMAT JSON) SELECT 1 FROM " + rel + " WHERE " +
+          detail::quote_identifier(leading_column) + " <= " + w.txn().quote(at)));
+      w.commit();
+      if (all <= 0.0 || below < 0.0) return -1.0;
+      return std::min(1.0, below / all);
+    } catch (const std::exception&) {
+      try {
+        if (w.in_transaction()) w.rollback();
+      } catch (const std::exception&) {
+      }
+      return -1.0;
+    }
+  }
+
+  // The ledger's row for a step, before the step runs (ledger.h).
+  void begin_step(int ordinal, const json& step) {
+    if (ledger_ == nullptr) return;
+    try {
+      ledger_->begin_step(job_->job_id, ordinal, step);
+    } catch (const std::exception&) {
+      // As for record_step: a ledger write that fails does not stop the job.
+    }
   }
 
   void record_step(int ordinal, const json& step, const std::string& state,
@@ -1526,11 +1765,20 @@ class Executor {
   // connection of its own -- the job's may be the thing that broke. Read-only,
   // bounded by the statement timeout, and never allowed to turn one failure
   // into two: if the reading itself fails, the error says so and nothing more.
+  //
+  // Whether the vendor is installed is asked in a statement of its own.
+  // PostgreSQL resolves every relation a statement names before it evaluates
+  // any of it, so a test for the extension cannot guard a reference to the
+  // extension's catalog in the same statement: on a server without Citus the
+  // report of an unrelated failure carried `relation "pg_dist_node" does not
+  // exist` (2026-10-08).
   json left_behind(json error) const {
-#define PGLASWELL_AFTER_FAILURE(module_name, applies_sql, reading_sql, hint_text)    \
+#define PGLASWELL_AFTER_FAILURE(module_name, installed_sql, applies_sql, reading_sql, hint_text) \
     try {                                                                              \
       ReadSession s(cfg_, kAfterFailureTimeoutMs);                                     \
-      const auto a = s.txn().exec(applies_sql);                                        \
+      const auto i = s.txn().exec(installed_sql);                                      \
+      const auto a = !i.empty() && i[0][0].as<bool>() ? s.txn().exec(applies_sql)      \
+                                                      : pqxx::result();                \
       if (!a.empty() && a[0][0].as<bool>()) {                                          \
         const auto r = s.txn().exec(reading_sql);                                      \
         if (!r.empty() && !r[0][0].is_null()) {                                        \

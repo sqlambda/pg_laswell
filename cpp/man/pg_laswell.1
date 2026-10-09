@@ -48,6 +48,32 @@ reorder a level, does not merge two groups, and does not run an
 .Ql undecided
 pair together.
 Advisory locks refuse an unsafe overlap whatever anybody decided.
+.Pp
+While a migration walks a table,
+.Nm
+prints a line with the rows written, the rows a second and, where it can be
+estimated, the share of the table walked and the time left: after 10 seconds,
+then 20, 40 and so on up to every ten minutes.
+For the one statement of a fill that is not paced the line says how long it has
+run and by how much the table has grown, at the same intervals.
+See
+.Xr pg_laswell_mcp 1 ,
+.Sx Progress .
+.Pp
+On
+.Dv SIGINT
+or
+.Dv SIGTERM
+.Nm
+starts nothing further, asks the migrations it is running to stop, waits for
+them and exits 130: a walk commits the batch it is in and its cursor, a
+statement in flight that is not part of a walk is cancelled, and each job is
+written to the ledger as cancelled.
+Running
+.Nm
+again resumes.
+A second signal ends the process at once; the job it leaves recorded as running
+is marked interrupted when the next run starts, and that run says so.
 .Ss Options
 .Bl -tag -width Ds
 .It Fl -repo Ar directory

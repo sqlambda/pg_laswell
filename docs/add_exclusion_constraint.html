@@ -1,6 +1,6 @@
 <!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>set_comment — pg_laswell</title>
+<title>add_exclusion_constraint — pg_laswell</title>
 <style>
 :root{--fg:#333;--bg:#fff;--muted:#666;--rule:#ddd;--link:#0066a4;
       --code-bg:#f7f7f7;--code-rule:#e0e0e0;--req:#a33;--accent:#0e6ba8;
@@ -70,39 +70,54 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
  --dd:#c2c2c2;--req-bg:#3a2526;--req-rule:#573537;--opt-bg:#1d2a33;
  --opt-rule:#2b3f4d;--note-bg:#1a2126;--warn-bg:#2a2119}
 </style></head><body><div class="wrap">
-<nav class="crumb"><div class="l"><a href="index.html">Intent kinds</a><span>Other</span></div><div class="r"><a href="alter_policy.html">← alter_policy</a><a href="set_owner.html">set_owner →</a></div></nav>
-<h1><code>set_comment</code></h1>
+<nav class="crumb"><div class="l"><a href="index.html">Intent kinds</a><span>Constraints</span></div><div class="r"><a href="alter_object.html">← alter_object</a><a href="set_text_search_mapping.html">set_text_search_mapping →</a></div></nav>
+<h1><code>add_exclusion_constraint</code></h1>
+<p class="purpose">An exclusion constraint. What is there is compared by name and type, as for a unique constraint; what is to be built goes the one way there is.</p>
 <h2>Synopsis</h2><pre>{
-  &quot;kind&quot;: &quot;set_comment&quot;,
-  &quot;object_type&quot;: &lt;required&gt;,
+  &quot;kind&quot;: &quot;add_exclusion_constraint&quot;,
+  &quot;schema&quot;: &lt;required&gt;,
+  &quot;table&quot;: &lt;required&gt;,
   &quot;name&quot;: &lt;required&gt;,
-  &quot;comment&quot;: &lt;required&gt;,
-  &quot;schema&quot;: &lt;optional&gt;,
-  &quot;table&quot;: &lt;optional&gt;
+  &quot;using&quot;: &lt;required&gt;,
+  &quot;elements&quot;: &lt;optional&gt;,
+  &quot;where&quot;: &lt;optional&gt;,
+  &quot;comment&quot;: &lt;optional&gt;
 }</pre>
+<h2>Description</h2>
+<p>An exclusion constraint. What is there is compared by name and type, as for a unique constraint; what is to be built goes the one way there is.</p>
 <h2>Parameters</h2><dl class="params">
-<dt>object_type<span class="tag req">required</span></dt>
-<dd>Upper case, one of TABLE, COLUMN, VIEW, MATERIALIZED VIEW, INDEX, SEQUENCE, SCHEMA, TYPE, DOMAIN, FUNCTION, TRIGGER, CONSTRAINT, POLICY, RULE, EXTENSION, PUBLICATION, SUBSCRIPTION. Not passed through unchecked: it becomes DDL verbatim.</dd>
+<dt>schema<span class="tag req">required</span></dt>
+<dd>&nbsp;</dd>
+<dt>table<span class="tag req">required</span></dt>
+<dd>&nbsp;</dd>
 <dt>name<span class="tag req">required</span></dt>
 <dd>&nbsp;</dd>
-<dt>comment<span class="tag req">required</span></dt>
+<dt>using<span class="tag req">required</span></dt>
 <dd>&nbsp;</dd>
-<dt>schema<span class="tag opt">optional</span></dt>
-<dd>A schema or extension IS the object: put its name in &quot;name&quot;. Passing both produces a comment on whatever &quot;name&quot; happens to be, which is valid SQL for the wrong object.</dd>
-<dt>table<span class="tag opt">optional</span></dt>
-<dd>A column, trigger, constraint or policy is named relative to its table.</dd>
+<dt>elements<span class="tag opt">optional</span></dt>
+<dd>Each entry is {&quot;column&quot;: ..., &quot;with&quot;: ...} or {&quot;expression&quot;: ..., &quot;with&quot;: ...}: what is compared, and the operator that must not hold between two rows.</dd>
+<dt>where<span class="tag opt">optional</span></dt>
+<dd>&nbsp;</dd>
+<dt>comment<span class="tag opt">optional</span></dt>
+<dd>It becomes the object&#x27;s COMMENT ON, in the same transaction that creates it. Omit the key to leave the object uncommented.</dd>
 </dl>
 <div class="note">Any key not listed here is <strong>refused</strong>, not ignored: a key this binary skips and a newer one honours would be a silent difference between what was reviewed and what ran.</div>
 <h2>Examples</h2>
 <p>From the conformance suite, which plans this intent and <em>applies</em> it to a real PostgreSQL on every test run:</p>
 <pre>{
- &quot;kind&quot;: &quot;set_comment&quot;,
- &quot;object_type&quot;: &quot;TABLE&quot;,
+ &quot;kind&quot;: &quot;add_exclusion_constraint&quot;,
+ &quot;comment&quot;: &quot;documented by add_exclusion_constraint&quot;,
  &quot;schema&quot;: &quot;cf&quot;,
- &quot;name&quot;: &quot;t&quot;,
- &quot;comment&quot;: &quot;Re-documented.&quot;
+ &quot;table&quot;: &quot;booked&quot;,
+ &quot;name&quot;: &quot;booked_no_overlap&quot;,
+ &quot;elements&quot;: [
+  {
+   &quot;column&quot;: &quot;during&quot;,
+   &quot;with&quot;: &quot;&amp;&amp;&quot;
+  }
+ ]
 }</pre>
-<p>Afterwards, <code>SELECT obj_description(&#x27;cf.t&#x27;::regclass)</code> returns <code>Re-documented.</code>.</p>
-<h2>See also</h2><p><a href="set_text_search_mapping.html"><code>set_text_search_mapping</code></a></p>
+<p>Afterwards, <code>SELECT contype::text || &#x27;:&#x27; || COALESCE(obj_description(oid, &#x27;pg_constraint&#x27;), &#x27;none&#x27;) FROM pg_constraint WHERE conname=&#x27;booked_no_overlap&#x27;</code> returns <code>x:documented by add_exclusion_constraint</code>.</p>
+<h2>See also</h2><p><a href="add_foreign_key.html"><code>add_foreign_key</code></a>, <a href="add_check_constraint.html"><code>add_check_constraint</code></a>, <a href="drop_constraint.html"><code>drop_constraint</code></a>, <a href="add_unique_constraint.html"><code>add_unique_constraint</code></a>, <a href="add_primary_key.html"><code>add_primary_key</code></a>, <a href="rename_constraint.html"><code>rename_constraint</code></a></p>
 <footer>Generated from <code>cpp/src/spec.h</code> and <code>cpp/src/conformance.inc</code> by <code>tools/gen-manual.py</code>. The manual page <code>pg_laswell_mcp(1)</code> remains the authoritative reference for everything that is not a per-kind option.</footer>
 </div></body></html>

@@ -83,7 +83,8 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
   &quot;where&quot;: &lt;optional&gt;,
   &quot;verify_remaining&quot;: &lt;optional&gt;,
   &quot;assert_invariants&quot;: &lt;optional&gt;,
-  &quot;preserve&quot;: &lt;optional&gt;
+  &quot;preserve&quot;: &lt;optional&gt;,
+  &quot;paced&quot;: &lt;optional&gt;
 }</pre>
 <h2>Description</h2>
 <p>—- backfill ———————————————————————————————</p>
@@ -107,6 +108,8 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
 <dd>&nbsp;</dd>
 <dt>preserve<span class="tag opt">optional</span></dt>
 <dd>The pre-image has to go somewhere else, or the backfill would rewrite the record of what it changed.</dd>
+<dt>paced<span class="tag opt">optional</span></dt>
+<dd>false fills in one statement and falls back to the paced walk if a session ends up waiting behind it. Leave it out for the walk alone.</dd>
 </dl>
 <div class="note">Any key not listed here is <strong>refused</strong>, not ignored: a key this binary skips and a newer one honours would be a silent difference between what was reviewed and what ran.</div>
 <h2>Examples</h2>

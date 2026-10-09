@@ -1,6 +1,6 @@
 <!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>set_comment — pg_laswell</title>
+<title>set_text_search_mapping — pg_laswell</title>
 <style>
 :root{--fg:#333;--bg:#fff;--muted:#666;--rule:#ddd;--link:#0066a4;
       --code-bg:#f7f7f7;--code-rule:#e0e0e0;--req:#a33;--accent:#0e6ba8;
@@ -70,39 +70,44 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
  --dd:#c2c2c2;--req-bg:#3a2526;--req-rule:#573537;--opt-bg:#1d2a33;
  --opt-rule:#2b3f4d;--note-bg:#1a2126;--warn-bg:#2a2119}
 </style></head><body><div class="wrap">
-<nav class="crumb"><div class="l"><a href="index.html">Intent kinds</a><span>Other</span></div><div class="r"><a href="alter_policy.html">← alter_policy</a><a href="set_owner.html">set_owner →</a></div></nav>
-<h1><code>set_comment</code></h1>
+<nav class="crumb"><div class="l"><a href="index.html">Intent kinds</a><span>Other</span></div><div class="r"><a href="add_exclusion_constraint.html">← add_exclusion_constraint</a><a href="create_table_as.html">create_table_as →</a></div></nav>
+<h1><code>set_text_search_mapping</code></h1>
+<p class="purpose">set_text_search_mapping: the mapping stated, the statement chosen, and the indexes that were built with the old mapping rebuilt.</p>
 <h2>Synopsis</h2><pre>{
-  &quot;kind&quot;: &quot;set_comment&quot;,
-  &quot;object_type&quot;: &lt;required&gt;,
+  &quot;kind&quot;: &quot;set_text_search_mapping&quot;,
+  &quot;schema&quot;: &lt;required&gt;,
   &quot;name&quot;: &lt;required&gt;,
-  &quot;comment&quot;: &lt;required&gt;,
-  &quot;schema&quot;: &lt;optional&gt;,
-  &quot;table&quot;: &lt;optional&gt;
+  &quot;tokens&quot;: &lt;optional&gt;,
+  &quot;dictionaries&quot;: &lt;optional&gt;
 }</pre>
+<h2>Description</h2>
+<p>set_text_search_mapping: the mapping stated, the statement chosen, and the indexes that were built with the old mapping rebuilt.</p>
 <h2>Parameters</h2><dl class="params">
-<dt>object_type<span class="tag req">required</span></dt>
-<dd>Upper case, one of TABLE, COLUMN, VIEW, MATERIALIZED VIEW, INDEX, SEQUENCE, SCHEMA, TYPE, DOMAIN, FUNCTION, TRIGGER, CONSTRAINT, POLICY, RULE, EXTENSION, PUBLICATION, SUBSCRIPTION. Not passed through unchecked: it becomes DDL verbatim.</dd>
+<dt>schema<span class="tag req">required</span></dt>
+<dd>&nbsp;</dd>
 <dt>name<span class="tag req">required</span></dt>
 <dd>&nbsp;</dd>
-<dt>comment<span class="tag req">required</span></dt>
-<dd>&nbsp;</dd>
-<dt>schema<span class="tag opt">optional</span></dt>
-<dd>A schema or extension IS the object: put its name in &quot;name&quot;. Passing both produces a comment on whatever &quot;name&quot; happens to be, which is valid SQL for the wrong object.</dd>
-<dt>table<span class="tag opt">optional</span></dt>
-<dd>A column, trigger, constraint or policy is named relative to its table.</dd>
+<dt>tokens<span class="tag opt">optional</span></dt>
+<dd>The token types the mapping is for, as the parser names them: word, hword, hword_part, asciiword and so on.</dd>
+<dt>dictionaries<span class="tag opt">optional</span></dt>
+<dd>The dictionaries each token is passed through, in order. An empty array removes the mapping: tokens of those types are then ignored.</dd>
 </dl>
 <div class="note">Any key not listed here is <strong>refused</strong>, not ignored: a key this binary skips and a newer one honours would be a silent difference between what was reviewed and what ran.</div>
 <h2>Examples</h2>
 <p>From the conformance suite, which plans this intent and <em>applies</em> it to a real PostgreSQL on every test run:</p>
 <pre>{
- &quot;kind&quot;: &quot;set_comment&quot;,
- &quot;object_type&quot;: &quot;TABLE&quot;,
+ &quot;kind&quot;: &quot;set_text_search_mapping&quot;,
  &quot;schema&quot;: &quot;cf&quot;,
- &quot;name&quot;: &quot;t&quot;,
- &quot;comment&quot;: &quot;Re-documented.&quot;
+ &quot;name&quot;: &quot;words&quot;,
+ &quot;tokens&quot;: [
+  &quot;asciiword&quot;,
+  &quot;word&quot;
+ ],
+ &quot;dictionaries&quot;: [
+  &quot;english_stem&quot;
+ ]
 }</pre>
-<p>Afterwards, <code>SELECT obj_description(&#x27;cf.t&#x27;::regclass)</code> returns <code>Re-documented.</code>.</p>
-<h2>See also</h2><p><a href="set_text_search_mapping.html"><code>set_text_search_mapping</code></a></p>
+<p>Afterwards, <code>SELECT (SELECT string_agg(DISTINCT d.dictname, &#x27;,&#x27;) FROM pg_ts_config_map m JOIN pg_ts_dict d ON d.oid = m.mapdict JOIN pg_ts_config c ON c.oid = m.mapcfg JOIN ts_token_type(&#x27;default&#x27;) t ON t.tokid = m.maptokentype WHERE c.cfgname = &#x27;words&#x27; AND t.alias IN (&#x27;asciiword&#x27;,&#x27;word&#x27;)) || &#x27;:&#x27; || (SELECT count(*) FROM cf.docs WHERE to_tsvector(&#x27;cf.words&#x27;, body) @@ to_tsquery(&#x27;cf.words&#x27;, &#x27;run&#x27;))::text</code> returns <code>english_stem:1</code>.</p>
+<h2>See also</h2><p><a href="set_comment.html"><code>set_comment</code></a></p>
 <footer>Generated from <code>cpp/src/spec.h</code> and <code>cpp/src/conformance.inc</code> by <code>tools/gen-manual.py</code>. The manual page <code>pg_laswell_mcp(1)</code> remains the authoritative reference for everything that is not a per-kind option.</footer>
 </div></body></html>

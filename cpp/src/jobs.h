@@ -95,6 +95,22 @@ struct PacingState {
   std::atomic<int> quiet_ticks{0};        // consecutive ticks at or below resume
   std::atomic<bool> cancel_requested{false};
   std::atomic<bool> cancel_stop{false};   // operator cancellation, not pacing
+  // One statement over a whole table is running ("paced": false). It has no
+  // batch boundary at which to notice cancel_stop, so the observer cancels it.
+  std::atomic<bool> long_statement{false};
+  // What can be said of it while it runs, since PostgreSQL reports no progress
+  // for an UPDATE: when it began, and the size of the table's heap then and
+  // now. The observer reads the size; -1 where there is nothing to read, as on
+  // a table whose rows are on other nodes or in chunks, whose own heap is empty.
+  std::atomic<long long> long_statement_started_ms{0};
+  std::atomic<unsigned int> long_statement_relation{0};
+  std::atomic<long long> long_statement_bytes_start{-1};
+  std::atomic<long long> long_statement_bytes_now{-1};
+  // The process was told to stop (signals.h). cancel_stop is set with it; this
+  // adds that a statement in flight is cancelled and not waited for -- unless
+  // the job is in a walk, which stops at its next batch boundary by itself.
+  std::atomic<bool> stop_now{false};
+  std::atomic<bool> in_walk{false};
   std::atomic<bool> throttled{false};
   std::atomic<bool> paused{false};
   std::atomic<long long> paused_since_ms{0};
@@ -406,6 +422,8 @@ class Observer {
   const char* topology_any_sql_ = nullptr;
   const char* topology_observer_sql_ = nullptr;
 
+  std::chrono::steady_clock::time_point sizes_read_{};
+
   ~Observer() { stop(); }
 
   // Guarded by its own mutex, not by m_: m_ is what the loop waits on, and
@@ -454,6 +472,13 @@ class Observer {
       if (pid <= 0) continue;
       live.push_back(j);
       pids.push_back(pid);
+      // cancelJob on a job inside one long statement: there is no batch
+      // boundary for it to stop at, so the statement is cancelled here.
+      if (j->pacing.cancel_stop.load() &&
+          (j->pacing.long_statement.load() ||
+           (j->pacing.stop_now.load() && !j->pacing.in_walk.load()))) {
+        request_cancel(*j);
+      }
     }
     if (live.empty()) return;
 
@@ -497,6 +522,21 @@ class Observer {
         } while (false);
 #include "modules/enabled_topologies.h"
 #undef PGLASWELL_TOPOLOGY
+      }
+
+      // The heap of a table one long statement is writing, every few seconds:
+      // the only sign of progress there is (see long_statement_bytes_now).
+      const auto now = std::chrono::steady_clock::now();
+      if (now - sizes_read_ >= std::chrono::seconds(5)) {
+        for (const auto& j : live) {
+          const auto rel = j->pacing.long_statement_relation.load();
+          if (!j->pacing.long_statement.load() || rel == 0) continue;
+          sizes_read_ = now;
+          const auto sz = txn.exec("SELECT pg_relation_size($1::oid)", pqxx::params{rel});
+          if (!sz.empty() && !sz[0][0].is_null()) {
+            j->pacing.long_statement_bytes_now = sz[0][0].as<long long>();
+          }
+        }
       }
 
       const auto any = txn.exec(detail::kAnyWaitersSql);

@@ -5,6 +5,9 @@
 // same reason there is no logging framework: the dependency list is the thing
 // an operator has to install, and five options do not justify a line in it.
 
+#include <chrono>
+#include <thread>
+#include <atomic>
 #include <sys/stat.h>
 
 #include <cstdlib>
@@ -18,6 +21,7 @@
 #include "server.h"
 #include "session.h"
 #include "tools.h"
+#include "signals.h"
 
 namespace {
 
@@ -244,7 +248,29 @@ int main(int argc, char* argv[]) {
       return failed ? 1 : 0;
     }
 
+    // SIGINT or SIGTERM while jobs run: they are asked to stop as cancelJob
+    // asks, waited for so that each one's end reaches the ledger, and only
+    // then does the process go -- with _Exit, because the main thread is still
+    // inside a read of stdin that nothing here can end. A second signal ends
+    // the process at once (signals.h).
+    pglaswell::signals::install();
+    std::atomic<bool> serving{true};
+    std::thread on_signal([&] {
+      while (serving.load() && pglaswell::signals::received() == 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      }
+      if (pglaswell::signals::received() == 0) return;
+      const int asked = pglaswell::signals::stop_jobs(jobs);
+      std::cerr << "pg_laswell_mcp: signal " << pglaswell::signals::received() << ": "
+                << asked << " running migration(s) asked to stop" << std::endl;
+      jobs.join_all();
+      observers.stop_all();
+      std::_Exit(130);
+    });
+
     server.run();
+    serving = false;
+    on_signal.join();
 
     // Joined, never abandoned. A worker thread racing PQfinish against static
     // destruction is the classic intermittent crash at shutdown.

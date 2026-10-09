@@ -404,6 +404,35 @@ class Ledger {
     return true;
   }
 
+  // A step that is about to run, written BEFORE it does. The row used to be
+  // written once, when the step ended, with started_at and finished_at both
+  // now() in that statement: reported from the field as 90 of 90 steps taking
+  // 0 s by the ledger, one of them a 15-minute index build. Written first, the
+  // start is the start -- and a long step shows as 'running' while it runs.
+  //
+  // clock_timestamp(), not now(): this is its own short transaction, so they
+  // differ by nothing, but the intent is the wall clock. An attempt that is
+  // repeated -- a group rolled back for a lock and run again -- keeps the
+  // FIRST start, so the time a step waited is part of what it cost.
+  void begin_step(const std::string& job_id, int ordinal, const json& step) {
+    if (!coordination_) return;
+    std::string sql;
+    for (const auto& q : step.value("sql", json::array())) {
+      sql += q.get<std::string>() + "\n";
+    }
+    coordination_->begin("pg_laswell/" + job_id + "/ledger");
+    coordination_->txn().exec("INSERT INTO laswell.step (job_id, ordinal, txn_group, kind,"
+              "  txn_class, sql, why, state, started_at, finished_at, detail)"
+              "  VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, 'running', clock_timestamp(),"
+              "          NULL, '{}'::jsonb)"
+              "  ON CONFLICT (job_id, ordinal) DO UPDATE"
+              "  SET state = 'running', finished_at = NULL",
+              pqxx::params{job_id, ordinal, step.value("txnGroup", 0),
+                           step.value("kind", ""), step.value("txnClass", ""),
+                           sql, step.value("why", "")});
+    coordination_->commit();
+  }
+
   void record_step(const std::string& job_id, int ordinal, const json& step,
                    const std::string& state, long long rows, const json& detail) {
     if (!coordination_) return;
@@ -415,9 +444,10 @@ class Ledger {
     coordination_->txn().exec("INSERT INTO laswell.step (job_id, ordinal, txn_group, kind,"
               "  txn_class, sql, why, state, started_at, finished_at,"
               "  rows_affected, detail)"
-              "  VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, now(), now(), $9, $10::jsonb)"
+              "  VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, clock_timestamp(),"
+              "          clock_timestamp(), $9, $10::jsonb)"
               "  ON CONFLICT (job_id, ordinal) DO UPDATE"
-              "  SET state = EXCLUDED.state, finished_at = now(),"
+              "  SET state = EXCLUDED.state, finished_at = clock_timestamp(),"
               "      rows_affected = EXCLUDED.rows_affected,"
               "      detail = EXCLUDED.detail",
               pqxx::params{job_id, ordinal, step.value("txnGroup", 0),
@@ -436,6 +466,13 @@ class Ledger {
                 "  error = $3::jsonb WHERE job_id = $1::uuid",
                 pqxx::params{job_id, state,
                              error.is_null() ? std::string("null") : error.dump()});
+      // A step left 'running' by a job that has ended did not end as a step:
+      // it was cancelled under way, or the job failed around it.
+      coordination_->txn().exec(
+          "UPDATE laswell.step SET finished_at = clock_timestamp(),"
+          "  state = CASE WHEN $2 = 'cancelled' THEN 'cancelled' ELSE 'failed' END"
+          "  WHERE job_id = $1::uuid AND state = 'running'",
+          pqxx::params{job_id, state});
       coordination_->commit();
     } catch (const std::exception&) {
     }
@@ -453,24 +490,98 @@ class Ledger {
     held_.clear();
   }
 
-  // A job with no finished_at whose advisory lock is absent from pg_locks died
-  // with its connection. No heartbeat table, no timeout to tune, and no false
-  // positive from a merely slow job: a session advisory lock is released by
-  // the server the moment the backend goes away.
+  // A job with no finished_at whose OWN backend no longer holds its advisory
+  // lock died with its connection. No heartbeat table, no timeout to tune, and
+  // no false positive from a merely slow job: a session advisory lock is
+  // released by the server the moment the backend goes away.
+  //
+  // Its own backend, and not the key alone. The key is the specification's id,
+  // so a second job for the same specification holds the same key: found in
+  // the field, where a job killed two hours earlier read as alive for as long
+  // as its successor ran. And a backend that began after the job did is some
+  // other session given the same pid by a restarted server.
+  static std::string job_is_dead_sql(const std::string& j) {
+    return "(" + j + ".finished_at IS NULL AND NOT EXISTS ("
+           "SELECT 1 FROM pg_locks l"
+           "  LEFT JOIN pg_stat_activity a ON a.pid = l.pid"
+           " WHERE l.locktype = 'advisory' AND l.granted"
+           "   AND l.pid = " + j + ".backend_pid"
+           "   AND ((l.classid::bigint << 32) | l.objid::bigint) = " + j + ".lock_key"
+           "   AND (a.backend_start IS NULL OR a.backend_start <= " + j + ".started_at)))";
+  }
+
   json interrupted_jobs() {
     ReadSession s(cfg_, std::nullopt, cache_, kLedgerLockTimeoutMs);
-    const auto r = s.txn().exec(R"SQL(
-      SELECT COALESCE(JSONB_AGG(JSONB_BUILD_OBJECT(
-               'jobId', j.job_id, 'state', j.state,
-               'startedAt', j.started_at,
-               'specDigest', m.spec_digest, 'specId', m.spec_id)), '[]'::jsonb)
-        FROM laswell.job j
-        JOIN laswell.migration m ON m.migration_id = j.migration_id
-       WHERE j.finished_at IS NULL
-         AND NOT EXISTS (SELECT 1 FROM pg_locks l
-                          WHERE l.locktype = 'advisory'
-                            AND ((l.classid::bigint << 32) | l.objid::bigint) = j.lock_key)
-    )SQL");
+    const auto r = s.txn().exec(
+        "SELECT COALESCE(JSONB_AGG(JSONB_BUILD_OBJECT("
+        "         'jobId', j.job_id, 'state', j.state,"
+        "         'startedAt', j.started_at,"
+        "         'specDigest', m.spec_digest, 'specId', m.spec_id)), '[]'::jsonb)"
+        "  FROM laswell.job j"
+        "  JOIN laswell.migration m ON m.migration_id = j.migration_id"
+        " WHERE " + job_is_dead_sql("j"));
+    if (r.empty() || r[0][0].is_null()) return json::array();
+    return json::parse(r[0][0].as<std::string>());
+  }
+
+  // Set the ledger right about jobs that died: called when a run starts, never
+  // by a status call. The job becomes `interrupted` with the time it was
+  // noticed, its steps left `running` likewise, and its cursor stays where it
+  // is: a later job for the same specification resumes from it
+  // (executor.h, resume_cursor). Returns what was marked.
+  json reconcile_dead_jobs() {
+    if (!coordination_) coordination_ = std::make_unique<WriteSession>(cfg_);
+    coordination_->begin("pg_laswell/reconcile");
+    json marked = json::array();
+    try {
+      const auto r = coordination_->txn().exec(
+          "WITH dead AS ("
+          "  UPDATE laswell.job j SET state = 'interrupted', finished_at = now(),"
+          "         error = JSONB_BUILD_OBJECT("
+          "           'error', 'the process running this job ended without finishing it',"
+          "           'hint', 'Its session (backend ' || j.backend_pid || ') no longer holds "
+          "the job''s advisory lock. Noticed when a later run started. What it committed is "
+          "kept, and applying the same specification again resumes from its cursor.',"
+          "           'noticedAt', now())"
+          "   WHERE " + job_is_dead_sql("j") +
+          "  RETURNING j.job_id, j.migration_id, j.started_at),"
+          " steps AS ("
+          "  UPDATE laswell.step s SET state = 'interrupted', finished_at = clock_timestamp()"
+          "    FROM dead WHERE s.job_id = dead.job_id AND s.state = 'running')"
+          " SELECT COALESCE(JSONB_AGG(JSONB_BUILD_OBJECT("
+          "          'jobId', dead.job_id, 'specId', m.spec_id, 'specDigest', m.spec_digest,"
+          "          'startedAt', dead.started_at)), '[]'::jsonb)"
+          "   FROM dead JOIN laswell.migration m ON m.migration_id = dead.migration_id");
+      if (!r.empty() && !r[0][0].is_null()) marked = json::parse(r[0][0].as<std::string>());
+      coordination_->commit();
+    } catch (const std::exception&) {
+      coordination_->rollback();
+      throw;
+    }
+    return marked;
+  }
+
+  // Jobs of an EARLIER FORM of this specification -- its id, another digest --
+  // that began and did not succeed. Nothing connects the two otherwise: a
+  // resume is by digest, so the new form starts from the first row, and the
+  // ledger holds a migration no file corresponds to any more.
+  json unfinished_earlier_forms(const std::string& spec_id, const std::string& spec_digest) {
+    ReadSession s(cfg_, std::nullopt, cache_, kLedgerLockTimeoutMs);
+    const auto r = s.txn().exec(
+        "SELECT COALESCE(JSONB_AGG(JSONB_BUILD_OBJECT("
+        "         'jobId', j.job_id, 'state', j.state, 'startedAt', j.started_at,"
+        "         'specDigest', m.spec_digest,"
+        "         'rowsWritten', (SELECT COALESCE(sum(c.rows_done), 0)"
+        "                           FROM laswell.backfill_cursor c WHERE c.job_id = j.job_id))"
+        "         ORDER BY j.started_at), '[]'::jsonb)"
+        "  FROM laswell.migration m"
+        "  JOIN laswell.job j ON j.migration_id = m.migration_id"
+        " WHERE m.spec_id = $1 AND m.spec_digest <> $2"
+        "   AND (j.finished_at IS NULL OR j.state IN"
+        "        ('failed','cancelled','interrupted','aborted_contention'))"
+        "   AND NOT EXISTS (SELECT 1 FROM laswell.job ok"
+        "                    WHERE ok.migration_id = m.migration_id AND ok.state = 'succeeded')",
+        pqxx::params{spec_id, spec_digest});
     if (r.empty() || r[0][0].is_null()) return json::array();
     return json::parse(r[0][0].as<std::string>());
   }

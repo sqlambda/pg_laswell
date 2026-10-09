@@ -44,6 +44,8 @@
 // argument surface to keep in step: it drives the same tools.h entry points the
 // MCP server drives, in the one sequence a deployment needs.
 
+#include <cmath>
+#include <map>
 #include <chrono>
 #include <fstream>
 #include <set>
@@ -54,6 +56,7 @@
 #include <nlohmann/json.hpp>
 
 #include "tools.h"
+#include "signals.h"
 
 namespace pglaswell {
 
@@ -74,6 +77,9 @@ struct DeployOptions {
   bool chain = false;
   bool status_only = false;  // report what is pending, change nothing
   int poll_ms = 500;
+  // The first progress line of a running walk; each later one after twice as
+  // long, up to ten minutes.
+  int progress_first_s = 10;
   std::ostream* out = &std::cout;
 };
 
@@ -82,7 +88,8 @@ enum class DeployResult {
   kOk = 0,            // nothing pending, or everything applied
   kRefused = 1,       // a plan was refused, a spec untrusted, a job failed
   kRepoProblem = 2,   // drift, an unreadable spec, a broken dependency
-  kConfigProblem = 3  // no connection, no repository, nothing to work with
+  kConfigProblem = 3, // no connection, no repository, nothing to work with
+  kInterrupted = 130  // SIGINT or SIGTERM: the running jobs were stopped first
 };
 
 namespace detail {
@@ -98,6 +105,55 @@ inline json read_spec_file(const std::string& path) {
   return json::parse(in);
 }
 
+}  // namespace detail
+
+namespace detail {
+// One line for a walk that is still running, from what jobStatus says of it.
+inline std::string progress_line(const std::string& id, const json& b) {
+  const auto span = [](long long s) {
+    if (s >= 3600) return std::to_string(s / 3600) + " h " + std::to_string((s % 3600) / 60) + " min";
+    if (s >= 60) return std::to_string(s / 60) + " min";
+    return std::to_string(s) + " s";
+  };
+  // The one statement of a "paced": false fill has no rows to count yet.
+  if (b.value("singleStatement", false)) {
+    std::string out = "  " + id + ": step " + std::to_string(b.value("ordinal", 0)) +
+                      ": the one statement has run " + span(b.value("elapsedSeconds", 0LL)) +
+                      "; it reports no progress of its own";
+    if (b.contains("tableBytesGrown")) {
+      const double grown = std::stod(b.value("tableBytesGrown", "0"));
+      char text[32];
+      if (grown >= 1024.0 * 1024.0 * 1024.0) {
+        std::snprintf(text, sizeof text, "%.1f GB", grown / (1024.0 * 1024.0 * 1024.0));
+      } else {
+        std::snprintf(text, sizeof text, "%.0f MB", grown / (1024.0 * 1024.0));
+      }
+      out += std::string("; the table has grown ") + text + " since it began";
+    }
+    return out;
+  }
+  const auto grouped = [](const std::string& digits) {
+    std::string o;
+    for (std::size_t i = 0; i < digits.size(); ++i) {
+      if (i != 0 && (digits.size() - i) % 3 == 0) o += ',';
+      o += digits[i];
+    }
+    return o;
+  };
+  std::string out = "  " + id + ": step " + std::to_string(b.value("ordinal", 0)) + ": " +
+                    grouped(b.value("rowsDone", "0")) + " rows written, " +
+                    grouped(std::to_string(static_cast<long long>(b.value("rowsPerSecond", 0.0)))) +
+                    " rows/s";
+  if (b.contains("fractionWalked")) {
+    out += "; about " + std::to_string(static_cast<int>(std::round(b.value("percent", 0.0)))) +
+           "% of the table walked";
+    if (b.contains("secondsRemaining")) {
+      out += ", about " + span(static_cast<long long>(b.value("secondsRemaining", 0.0))) + " left";
+    }
+    out += " (by the table's statistics)";
+  }
+  return out;
+}
 }  // namespace detail
 
 class Deployment {
@@ -379,6 +435,7 @@ class Deployment {
     std::size_t next = 0;
     while (next < ids.size() || !running.empty()) {
       while (next < ids.size() && static_cast<int>(running.size()) < cap) {
+        if (signals::received() != 0) break;  // nothing further is started
         const auto& id = ids[next++];
         json spec;
         try {
@@ -431,6 +488,22 @@ class Deployment {
           drain(out, running);
           return DeployResult::kRefused;
         }
+        // What the start found in the ledger and set right, or has to say
+        // about an earlier form of this specification.
+        for (const auto& j : started.value("interruptedJobsMarked", json::array())) {
+          out << "  note: job " << j.value("jobId", "") << " of " << j.value("specId", "")
+              << ", started " << j.value("startedAt", "")
+              << ", was still recorded as running and its session is gone. "
+                 "Marked interrupted; its cursor is kept.\n";
+        }
+        for (const auto& f : started.value("earlierForms", json::array())) {
+          out << "  note: an earlier form of " << id << " ("
+              << f.value("specDigest", "").substr(0, 12) << "…) was started by job "
+              << f.value("jobId", "") << " at " << f.value("startedAt", "")
+              << " and did not finish (" << f.value("state", "") << "), after writing "
+              << f.value("rowsWritten", 0LL)
+              << " rows. Its cursor is not used: the specification has changed.\n";
+        }
         out << "  " << id << ": started (" << started.value("jobId", "") << ")\n";
         // The rehearsal ran BEFORE the job exists, with real locks on the live
         // schema, and laswell.job.started_at is after it. Said here so the time
@@ -439,6 +512,10 @@ class Deployment {
         running.emplace_back(id, started.value("jobId", ""));
       }
 
+      if (stop_on_signal(out)) {
+        drain(out, running);
+        return DeployResult::kInterrupted;
+      }
       if (running.empty()) continue;
       std::this_thread::sleep_for(std::chrono::milliseconds(opts_.poll_ms));
 
@@ -446,6 +523,7 @@ class Deployment {
         const auto st = snapshot(it->second);
         const auto state = st.value("state", "");
         if (!detail::is_terminal(state)) {
+          report_progress(out, it->first, it->second, st);
           ++it;
           continue;
         }
@@ -473,17 +551,76 @@ class Deployment {
     out << "  waiting for " << running.size()
         << " migration(s) already running before stopping\n";
     while (!running.empty()) {
+      stop_on_signal(out);
       std::this_thread::sleep_for(std::chrono::milliseconds(opts_.poll_ms));
       for (auto it = running.begin(); it != running.end();) {
         const auto st = snapshot(it->second);
         const auto state = st.value("state", "");
-        if (!detail::is_terminal(state)) { ++it; continue; }
+        if (!detail::is_terminal(state)) {
+          report_progress(out, it->first, it->second, st);
+          ++it;
+          continue;
+        }
         out << "  " << it->first << ": " << state << "\n";
         if (state != "succeeded") report_failure(out, st);
         it = running.erase(it);
       }
     }
   }
+
+  // SIGINT or SIGTERM (signals.h). The jobs are asked to stop as cancelJob
+  // asks -- a walk commits the batch it is in and its cursor, a statement in
+  // flight is cancelled -- and are then waited for like any others, so each
+  // one's end is written to the ledger and to this log. True from the first
+  // signal on; says so once.
+  bool stop_on_signal(std::ostream& out) {
+    const int sig = signals::received();
+    if (sig == 0) return false;
+    if (!stop_said_) {
+      stop_said_ = true;
+      const int asked = ctx_.jobs ? signals::stop_jobs(*ctx_.jobs) : 0;
+      out << "  " << (sig == SIGTERM ? "SIGTERM" : "SIGINT") << ": " << asked
+          << " running migration(s) asked to stop; nothing further is started. "
+             "A second signal ends this process at once.\n" << std::flush;
+    }
+    return true;
+  }
+  bool stop_said_ = false;
+
+  // A line for a walk that is still running: how many rows, how fast, and how
+  // long it has left where that can be estimated. A deployment said nothing
+  // between starting a job and its end, and a walk at 1 850 rows a second over
+  // 27 million rows was found by sampling the ledger by hand.
+  //
+  // At 10 s, then 20, 40 and so on up to every 10 minutes: the rate is on the
+  // page three times in the first minute, where a plan can still be changed,
+  // and a walk of hours adds a few dozen lines to the log and not hundreds.
+  void report_progress(std::ostream& out, const std::string& id, const std::string& job_id,
+                       const json& st) {
+    if (!st.contains("backfill") || !st["backfill"].is_object()) return;
+    const auto& b = st["backfill"];
+    // The one statement and the walk that may follow it are counted apart, so
+    // a walk begun after an hour's statement still says its rate at 10 s.
+    const bool one = b.value("singleStatement", false) && b.contains("elapsedSeconds");
+    if (!one && !b.contains("rowsPerSecond")) return;
+    const auto now = std::chrono::steady_clock::now();
+    auto& p = progress_[job_id + "/" + std::to_string(b.value("ordinal", 0)) + (one ? "/one" : "")];
+    if (p.interval_s == 0) {
+      p.interval_s = opts_.progress_first_s;
+      p.next = now + std::chrono::seconds(p.interval_s);
+    }
+    if (now < p.next) return;
+    p.interval_s = std::min(p.interval_s * 2, 600);
+    p.next = now + std::chrono::seconds(p.interval_s);
+
+    out << detail::progress_line(id, b) << "\n" << std::flush;
+  }
+
+  struct Progress {
+    int interval_s = 0;
+    std::chrono::steady_clock::time_point next;
+  };
+  std::map<std::string, Progress> progress_;
 
   // What the server said, when a dry run is what refused the plan.
   //

@@ -40,6 +40,9 @@ struct ExecutorConfig {
   int batch_rows = 1000;
   int commit_interval_ms = 1000;
   int batch_cap_rows = 10000;  // backstop against pathological row widths
+  // How often a walk asks the planner how far along the table its cursor is
+  // (executor.h, walked_fraction): what its time left is estimated from.
+  int progress_interval_ms = 10000;
   // How much KEY MATERIAL one batch may accumulate before it is applied, in
   // bytes. batch_rows bounds the row count; this bounds the memory the executor
   // holds and the size of the array literal it sends. They are different limits
@@ -374,6 +377,7 @@ inline bool apply_executor_key(ExecutorConfig& e, const std::string& key,
   if (key == "batch_rows") { e.batch_rows = detail::positive_int(value, key, w); return true; }
   if (key == "batch_bytes") { e.batch_bytes = detail::positive_int(value, key, w); return true; }
   if (key == "commit_interval_ms") { e.commit_interval_ms = detail::positive_int(value, key, w); return true; }
+  if (key == "progress_interval_ms") { e.progress_interval_ms = detail::positive_int(value, key, w); return true; }
   if (key == "batch_cap_rows") { e.batch_cap_rows = detail::positive_int(value, key, w); return true; }
   if (key == "max_concurrent_operations") { e.max_concurrent_operations = detail::non_negative_int(value, key, w); return true; }
   if (key == "dml_single_txn_rows") { e.dml_single_txn_rows = detail::positive_int(value, key, w); return true; }

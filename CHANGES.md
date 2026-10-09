@@ -1,5 +1,264 @@
 # Changes
 
+## Unreleased
+
+Two things a specification could not say, reported while writing a schema whose
+rows each keep the period they were true for, and what was found using the
+answers on full tables. Two new kinds, 113 in all. No ledger schema change.
+
+### A key that names no column is refused before anything runs
+
+`create_table` checked only that each entry of `primary_key` was a string, so
+`"valid WITHOUT OVERLAPS"` was quoted as a column name, planned, and first
+refused by the server in the dry run (42703). The key names columns the same
+intent declares; an entry that is none of them is now refused at validation,
+with no connection.
+
+### A key with a period
+
+PostgreSQL 18's `WITHOUT OVERLAPS`. `"without_overlaps": true` on
+`add_primary_key`, on `add_unique_constraint` and beside `create_table`'s
+`primary_key` says the last column listed is the period; `"period": true` on
+`add_foreign_key` marks the last column of both lists for the key that
+references one. Measured on 18.6:
+
+| | |
+|---|---|
+| A period that is not a range or multirange | refused by the server; now by the planner, from the catalog or the declared type |
+| A `bigint`, `text` or `date` key column without `btree_gist` | "no default operator class for access method gist"; now refused naming the `create_extension` to add, and seen when an earlier intent adds it |
+| A period foreign key with `CASCADE`, `RESTRICT` or `SET NULL` | "unsupported ON DELETE action"; refused at validation |
+| A period foreign key `NOT VALID`, then `VALIDATE` | the locks of an ordinary one, so the two-step recipe is unchanged |
+
+### `add_exclusion_constraint`
+
+The general form: a list of elements, each a column or an expression with the
+operator that must not hold between two rows, `using` (gist when left out) and
+an optional `where`. Structured rather than a clause of SQL because the planner
+has to see which columns are compared with `=`.
+
+### Neither can be added to a table with rows without stopping it
+
+The index of a period key or an exclusion constraint is built by the statement
+that adds the constraint, under AccessExclusiveLock. Measured on 18.6: 20.8 s
+for 2 million rows for either; `NOT VALID` is refused for both; an index built
+concurrently beforehand cannot be adopted ("is not a unique index"). So the
+plan is that one statement, saying so: the lock, the size, a warning that every
+reader and writer waits for the build, the weaker lock first, and above 64 MiB
+left out of the dry run.
+
+On a partitioned table it is done a partition at a time -- `ON ONLY` the parent,
+then each partition under a lock on that partition alone, attached, the parent's
+index valid with the last -- and resumes at the partition that failed. The
+partition key must be among the columns compared for equality.
+
+On a hypertable and on a Citus distributed table the constraint must compare
+the partitioning or distribution column for equality; the module refuses one
+that does not, in the words the extension would use.
+
+### An index definition is checked although its build is not rehearsed
+
+A build outside a transaction, or one left out of the dry run as too heavy, was
+not checked at all. Measured on 18.6, a 269 MB table: a wrong operator class, a
+function that does not exist, a predicate that does not type-check, a volatile
+expression, an unknown storage parameter and a unique hash index were each
+planned as fine, and first refused when the job reached the build.
+
+The dry run now makes an empty temporary copy of the table (`LIKE`, in its
+rolled-back transaction) and runs the same statement on it, without
+`CONCURRENTLY`. Each of the six is refused there in the server's own words, as
+a problem of that step; so are GIN, GiST and HNSW definitions, per-partition
+and per-chunk builds, and the constraint builds above. It costs
+AccessShareLock on the table and about 2 ms. It tries neither the rows nor the
+time, so the step is still listed as unverified, and `unverifiedWhy` says its
+definition was accepted. Where the role lacks `TEMP` on the database nothing
+is checked and nothing is claimed.
+
+### An index on a partitioned table keeps its `INCLUDE` and its column forms
+
+`create_index` on a partitioned table read its columns as plain names. A column
+given with a direction, an operator class or as an expression failed the whole
+plan with a JSON type error, and `include` was left out of the parent's index
+and of every partition's without a word -- a different index from the one
+specified. Both are rendered now as on a plain table.
+
+### A step's start is the time it started
+
+`laswell.step` was written once per step, when the step ended, with `started_at`
+and `finished_at` both `now()` in that statement: reported from the field as 90
+of 90 steps taking 0 s by the ledger, a 15-minute index build among them. The
+row is now written when the step begins, in state `running`, and completed
+when it ends. `finished_at - started_at` is what the step took, and a long step
+is visible while it runs. A step attempted more than once keeps the start of
+its first attempt; a step still `running` when its job ends is closed as
+`cancelled` or `failed` with the job. No ledger schema change: the column had
+no list of states to extend.
+
+### A key declared in the same specification counts as an index
+
+`add_foreign_key` warned "no index leads with" the referencing column although
+the primary key the same file's `create_table` declares leads with it. A later
+intent sees the indexes of earlier ones, and only `create_index` recorded one:
+`add_primary_key` and `add_unique_constraint` recorded a constraint, and
+`create_table` with a `primary_key` an empty list. All three now record the
+key's index as the catalog reports it once it exists, under the constraint's
+name, so every reader of a table's indexes plans against the same table before
+and after the key is there. Against a table whose key already existed there
+was no warning.
+
+### A build the plan announces is not cancelled by the statement timeout
+
+`statement_timeout_ms` defaults to two minutes and is set on every transaction
+a job opens. A key with a period over 69.5 million rows, planned with its size
+and its lock stated, was cancelled at exactly two minutes: it is the first kind
+whose one statement is both long and inside a transaction, where
+`CREATE INDEX CONCURRENTLY` has always run without the timeout. A step the dry
+run leaves to the job because it reads or builds over the whole table now runs
+without it too, for that step only, and the plan says so on a `time:` line. A
+step that is cheap because a scan before it proved the rows keeps the timeout.
+
+When a statement is cancelled by the timeout, the failure says the timeout is
+pg_laswell's and names the setting; the server's message reads as the server's
+own. The manual now documents `statement_timeout_ms`, which it did not.
+
+### A failure on a server without Citus no longer reports an error about Citus
+
+The reading of what Citus may have left behind tested for the extension and
+named `pg_dist_node` in one statement, and PostgreSQL resolves every relation
+before it evaluates anything, so on a server without Citus every failed job's
+report carried `relation "pg_dist_node" does not exist`. Whether the extension
+is installed is now asked first, in a statement of its own.
+
+### A fill is evaluated once per row, not wherever its value is wanted
+
+`add_column` with a `default` and a `fill` needs each value three times per
+column (is there one, does it differ from the default, and the value itself),
+in the statement that finds a batch and again in the one that writes it. The
+expression was pasted in each place: for two columns, 4 copies in the select
+and 10 in the update. Reported from a fill that is an `EXISTS` over an
+87-million-row table: 55 buffers a row and 1,850 rows a second.
+
+The select now names each value once in a `LATERAL` item, and the update
+assigns from one sub-select and carries no predicate but the batch's keys: the
+rows were selected and locked by the select in the same transaction. Measured
+on 18.6 with two such columns, 2 million rows against 2.25 million, a batch of
+1,000: 71,945 buffers for the select and 39,266 for the update before, 24,361
+and 15,802 after. `UPDATE ... FROM LATERAL` cannot refer to the row being
+updated, which is why the update uses a sub-select in `SET`.
+
+The plan now warns when a `fill` is a subquery: it is probed row by row, for
+the rows that keep the default too, and the `{"from", "on", "value"}` form is
+one join for the batch.
+
+### `"paced": false`: one statement, for a table nothing else is using
+
+On `add_column` with a `fill`, and on `backfill`. One statement over the whole
+table runs ahead of the walk, in one transaction and without a statement
+timeout; the plan states what that holds until it commits. The breaker that
+watches a batch watches it: when a session has waited behind it for longer
+than `max_waiter_wait_ms`, or it has waited `lock_timeout_ms` for a row someone
+else holds, it is cancelled and rolled back whole and the paced walk does the
+work. If it finishes, the walk is not run. `cancelJob` cancels it at once. Not
+with `preserve`.
+
+The plan heads its group "one statement in one transaction; NOT atomic if it is
+cancelled: then paced, many commits". It was headed as a walk is, "NOT atomic:
+paced, many commits", above a step that ran as one transaction of 46 minutes.
+
+PostgreSQL reports no progress for an `UPDATE`, so while the statement runs
+`jobStatus` carries `singleStatement`, `elapsedSeconds` and `tableBytesGrown`,
+the growth of the table's heap since the statement began, read every five
+seconds from another connection. `pg_laswell` prints them at the intervals a
+walk's line has. The growth shows that the statement is writing and is not a
+share of the work: a new row version that fits in free space grows nothing.
+There is no `tableBytesGrown` for a Citus distributed table or a hypertable,
+whose own heap is empty.
+
+### A walk says how fast it goes and how long it has left
+
+A walk at 1,850 rows a second over 27 million rows was found by sampling
+`laswell.backfill_cursor` by hand: nothing reported a rate, and `percent` was
+rows written against the table's row estimate, which is progress only for a
+walk that writes every row.
+
+`jobStatus` now carries `rowsPerSecond`, and the step's row in the ledger keeps
+it. Every `progress_interval_ms` (10,000) the job asks the planner what share
+of the table lies at or below its cursor (an `EXPLAIN`, planned and not run),
+and reports `fractionWalked`, `percent` from it, and `secondsRemaining`. It is
+an estimate from the table's statistics and `progressBy` says so; on a Citus
+distributed table there is none and `percent` is as before.
+
+`pg_laswell` prints a line for each running walk after 10 seconds, then 20, 40
+and so on up to every ten minutes.
+
+Batches that grow while the table is quiet were measured and not built: on
+18.6, 2 million rows, a cheap fill ran at 192,000 to 236,000 rows a second at
+1,000, 5,000 and 10,000 rows a batch alike, a lookup fill at 88,000 against
+35,000 to 48,000 at the larger sizes, and a concurrent writer's longest wait
+went from 3 to 12 ms and from 68 to 252 ms.
+
+### A job whose process died is noticed, marked, and run again
+
+A job's row in the ledger is closed by the process that runs it. Reported from
+a job stopped with SIGINT: two hours later, on a server restarted since, it was
+still `running`, beside its successor. Three things followed from that row.
+
+- **Its specification was never run again.** A job with no `finished_at`
+  classed its specification as `in_progress`, which is neither pending nor
+  failed, so applying the same file again skipped it for good and held back
+  everything that depends on it. A job counts as running now only while its own
+  backend holds its advisory lock.
+- **`jobStatus` could not see it while a successor ran.** The test was for the
+  lock key, and the key is the specification's id, which the successor holds
+  too. It is now for the job's own backend, started before the job was.
+- **Nothing ever wrote that it had ended.** When a run starts, `startMigration`
+  and `pg_laswell` mark such a job `interrupted`, with the time it was noticed,
+  and its running steps with it; its cursor is kept. Status calls report it and
+  write nothing.
+
+A plan for a specification whose earlier form (same id, another digest) was
+started and did not finish now says so: which job, when, how it ended and how
+many rows its walks wrote, and that its cursor is not used.
+
+### SIGINT and SIGTERM stop the jobs before the process exits
+
+Both programs exited at once. The first signal now asks every running job to
+stop as `cancelJob` does and waits for it: a walk commits the batch it is in
+and its cursor, a statement in flight that is not part of a walk is cancelled,
+and the job is written as `cancelled`. `pg_laswell` starts nothing further and
+exits 130. A second signal ends the process at once.
+
+### A walk cancelled as the last step was recorded as succeeded
+
+Found while adding the above. A walk that was cancelled returned to a loop that
+went on to the next step; where the walk was the last one, the job fell out of
+the loop and was written as `succeeded` with rows still to do (170 of 300 in
+the test that found it). This applied to `cancelJob` as well.
+
+### `set_text_search_mapping`
+
+A text search configuration could be created by copying one and then not
+changed, so a configuration that removes accents could not be built. The new
+kind states which dictionaries a token type passes through, and the planner
+picks `ADD`, `ALTER` or `DROP MAPPING` from what the catalog holds (`ADD` fails
+on a mapping that is there). A token type the parser lacks and a dictionary
+that is not there are refused beforehand.
+
+An index built with the configuration keeps the vectors it computed. Measured
+on 18.6: after `ALTER MAPPING`, a row indexed before it was found by neither
+the old spelling nor the new until `REINDEX`. PostgreSQL records which indexes
+name a configuration, so the plan follows the change with `REINDEX INDEX
+CONCURRENTLY` for each and a validity check; on a hypertable, each chunk's
+index, since TimescaleDB rebuilds none as a whole. A stored `tsvector` is not
+recomputed, and the plan says which ones the catalog records. A dictionary's
+own options have no kind yet.
+
+The mapping may follow the `create_object` that makes its configuration in the
+same specification -- the first thing anyone writes, and at first refused as
+"does not exist". There is no catalog to compare with there, so the plan is
+`DROP MAPPING IF EXISTS` and `ADD MAPPING`, right whatever was copied, and the
+dry run is what refuses a wrong token type or dictionary. The same for a
+dictionary an extension created by that specification brings.
+
 ## 0.1.4
 
 Findings from a field report -- a 10-million-row table under 1,000 inserts

@@ -1046,6 +1046,12 @@ TEST(Spec, KnownKindsAreExactlyTheImplementedKinds) {
     "drop_object": {"kind":"drop_object","object_type":"COLLATION","name":"s.c"},
     "alter_object": {"kind":"alter_object","object_type":"COLLATION",
                      "name":"s.c","owner":"app"},
+    "add_exclusion_constraint": {"kind":"add_exclusion_constraint","schema":"s",
+                                 "table":"t","name":"t_ex",
+                                 "elements":[{"column":"c","with":"&&"}]},
+    "set_text_search_mapping": {"kind":"set_text_search_mapping","schema":"s",
+                                "name":"cfg","tokens":["word"],
+                                "dictionaries":["simple"]},
     "create_table_as": {"kind":"create_table_as","schema":"s","table":"t2",
                         "definition":"SELECT 1 AS a","comment":"d"},
     "import_foreign_schema": {"kind":"import_foreign_schema","server":"srv",
@@ -2014,6 +2020,42 @@ TEST(Planner, AUniqueIndexOnAPartitionedTableMustContainThePartitionKey) {
   EXPECT_FALSE(plan.ok) << plan.render();
 }
 
+// create_index on a partitioned table read its columns as plain names: an
+// object form failed the plan with a JSON type error, and INCLUDE was dropped
+// from the parent's index and from every partition's without a word.
+TEST(Planner, APartitionedIndexKeepsItsColumnFormsAndItsInclude) {
+  auto obs = observations(8LL << 30, 50000000, 0, "partitioned_table");
+  auto& t = obs.tables["shop.orders"];
+  t["partition_key"] = "RANGE (created_at)";
+  t["partitions"] = json::array({"shop.orders_2024", "shop.orders_2025"});
+  t["columns"]["created_at"] = json{{"type", "timestamp with time zone"}, {"not_null", true}};
+  t["columns"]["code"] = json{{"type", "text"}, {"not_null", true}};
+  t["columns"]["total"] = json{{"type", "numeric"}, {"not_null", true}};
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array(
+          {json{{"kind", "create_index"}, {"schema", "shop"}, {"table", "orders"},
+                {"name", "orders_code_idx"},
+                {"columns", json::array({json{{"name", "code"}, {"opclass", "text_pattern_ops"}},
+                                         json{{"name", "created_at"}, {"direction", "desc"}},
+                                         json{{"expression", "lower(code)"}}})},
+                {"include", json::array({"total"})}, {"comment", "c"}}})),
+      obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  std::size_t builds = 0;
+  for (const auto* s : steps_of(plan, "create_index")) {
+    for (const auto& q : s->sql) {
+      if (q.rfind("CREATE INDEX", 0) != 0) continue;
+      ++builds;
+      EXPECT_NE(q.find("\"code\" \"text_pattern_ops\""), std::string::npos) << q;
+      EXPECT_NE(q.find("\"created_at\" DESC"), std::string::npos) << q;
+      EXPECT_NE(q.find("(lower(code))"), std::string::npos) << q;
+      EXPECT_NE(q.find(" INCLUDE (\"total\")"), std::string::npos) << q;
+    }
+  }
+  // Each partition, and the parent.
+  EXPECT_EQ(builds, 3u) << plan.render();
+}
+
 // The key's columns, out of pg_get_partkeydef's text.
 TEST(Planner, ThePartitionKeysColumnsAreReadOutOfItsDefinition) {
   using pglaswell::detail::partition_key_columns;
@@ -2025,6 +2067,443 @@ TEST(Planner, ThePartitionKeysColumnsAreReadOutOfItsDefinition) {
   EXPECT_EQ(partition_key_columns("HASH (id COLLATE \"C\")"), (std::vector<std::string>{"id"}));
   // An expression: no unique key can contain it.
   EXPECT_TRUE(partition_key_columns("RANGE (date_trunc('day'::text, at))").empty());
+}
+
+// --- keys with a period, exclusion constraints, text search mappings --------
+//
+// From a field report writing a schema whose rows each keep the period they
+// were true for: none of this could be said, and the one attempt that parsed
+// was first refused by the server.
+
+static json one_intent(json intent) {
+  json doc = minimal_spec();
+  doc["intents"] = json::array({std::move(intent)});
+  return doc;
+}
+
+TEST(Spec, ACreateTableKeyNamesOnlyColumnsItDeclares) {
+  json table{{"kind", "create_table"}, {"schema", "s"}, {"table", "t"}, {"comment", "c"},
+             {"columns", json::array(
+                 {json{{"name", "id"}, {"type", "bigint"}, {"nullable", false}, {"comment", "c"}},
+                  json{{"name", "valid"}, {"type", "daterange"}, {"nullable", false},
+                       {"comment", "c"}}})},
+             {"primary_key", json::array({"id", "valid WITHOUT OVERLAPS"})}};
+  // As reported: it was quoted as a column name and planned.
+  auto err = spec_error(one_intent(table));
+  EXPECT_NE(err.find("which is not one of its columns"), std::string::npos) << err;
+  EXPECT_NE(err.find("without_overlaps"), std::string::npos) << err;
+
+  table["primary_key"] = json::array({"id", "valid"});
+  table["without_overlaps"] = true;
+  EXPECT_NO_THROW(pglaswell::parse_spec(one_intent(table)));
+
+  // A period alone is refused by PostgreSQL, and here.
+  table["primary_key"] = json::array({"valid"});
+  err = spec_error(one_intent(table));
+  EXPECT_NE(err.find("needs at least two columns"), std::string::npos) << err;
+
+  table.erase("primary_key");
+  err = spec_error(one_intent(table));
+  EXPECT_NE(err.find("without a primary_key"), std::string::npos) << err;
+}
+
+TEST(Spec, APeriodForeignKeyTakesNoActionButNoAction) {
+  json fk{{"kind", "add_foreign_key"}, {"schema", "s"}, {"table", "c"}, {"name", "c_fk"},
+          {"columns", json::array({"id", "valid"})}, {"references_schema", "s"},
+          {"references_table", "p"}, {"references_columns", json::array({"id", "valid"})},
+          {"period", true}, {"on_delete", "CASCADE"}};
+  const auto err = spec_error(one_intent(fk));
+  EXPECT_NE(err.find("supports only NO ACTION"), std::string::npos) << err;
+  fk["on_delete"] = "NO ACTION";
+  EXPECT_NO_THROW(pglaswell::parse_spec(one_intent(fk)));
+  fk["columns"] = json::array({"valid"});
+  fk["references_columns"] = json::array({"valid"});
+  EXPECT_NE(spec_error(one_intent(fk)).find("at least two columns"), std::string::npos);
+}
+
+TEST(Spec, AnExclusionElementIsAColumnOrAnExpressionWithAnOperator) {
+  json ex{{"kind", "add_exclusion_constraint"}, {"schema", "s"}, {"table", "t"},
+          {"name", "t_ex"},
+          {"elements", json::array({json{{"column", "room"}, {"with", "="}},
+                                    json{{"expression", "tstzrange(a, b)"}, {"with", "&&"}}})},
+          {"where", "NOT cancelled"}};
+  EXPECT_NO_THROW(pglaswell::parse_spec(one_intent(ex)));
+  ex["elements"][0]["with"] = "=); DROP TABLE t; --";
+  EXPECT_NE(spec_error(one_intent(ex)).find("is not an operator"), std::string::npos);
+  ex["elements"][0] = json{{"column", "room"}, {"expression", "room"}, {"with", "="}};
+  EXPECT_NE(spec_error(one_intent(ex)).find("a column or an expression"), std::string::npos);
+}
+
+TEST(Planner, ACreateTableKeyWithAPeriodIsWrittenAndCheckedAgainstItsOwnColumns) {
+  const auto table = [](const char* key_type, const char* period_type) {
+    return json{{"kind", "create_table"}, {"schema", "shop"}, {"table", "price"},
+                {"comment", "c"},
+                {"columns", json::array(
+                    {json{{"name", "id"}, {"type", key_type}, {"nullable", false},
+                          {"comment", "c"}},
+                     json{{"name", "valid"}, {"type", period_type}, {"nullable", false},
+                          {"comment", "c"}}})},
+                {"primary_key", json::array({"id", "valid"})},
+                {"without_overlaps", true}};
+  };
+  pglaswell::Observations obs;
+  obs.objects["extension:btree_gist"] = json{{"exists", true}};
+  auto plan = pglaswell::plan_migration(spec_of(json::array({table("bigint", "daterange")})),
+                                        obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  EXPECT_NE(all_sql(*steps_of(plan, "create_table")[0])
+                .find("PRIMARY KEY (\"id\", \"valid\" WITHOUT OVERLAPS)"),
+            std::string::npos) << plan.render();
+
+  // Two dates are not a period.
+  plan = pglaswell::plan_migration(spec_of(json::array({table("bigint", "date")})), obs, {});
+  ASSERT_FALSE(plan.ok);
+  EXPECT_NE(plan.conflicts[0].find("one range or multirange column"), std::string::npos)
+      << plan.conflicts[0];
+
+  // Measured without the extension: "data type bigint has no default operator
+  // class for access method gist".
+  pglaswell::Observations bare;
+  plan = pglaswell::plan_migration(spec_of(json::array({table("bigint", "daterange")})),
+                                   bare, {});
+  ASSERT_FALSE(plan.ok);
+  EXPECT_NE(plan.conflicts[0].find("create_extension intent for btree_gist"),
+            std::string::npos) << plan.conflicts[0];
+
+  // An earlier intent that installs it is seen.
+  bare.objects["extension:btree_gist"] =
+      json{{"exists", false}, {"available", true}, {"default_version", "1.8"}};
+  plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "create_extension"}, {"name", "btree_gist"}},
+                           table("bigint", "daterange")})),
+      bare, {});
+  EXPECT_TRUE(plan.ok) << plan.render();
+}
+
+static pglaswell::Observations obs_with_period(long long size, const char* kind = "table") {
+  auto obs = observations(size, 2000000, 0, kind);
+  auto& t = obs.tables["shop.orders"];
+  t["columns"]["id"] = json{{"type", "bigint"}, {"not_null", true}, {"type_kind", "b"},
+                            {"gist_opclass", true}};
+  t["columns"]["tenant"] = json{{"type", "integer"}, {"not_null", true}, {"type_kind", "b"},
+                                {"gist_opclass", true}};
+  t["columns"]["valid"] = json{{"type", "daterange"}, {"not_null", true}, {"type_kind", "r"},
+                               {"gist_opclass", false}};
+  obs.objects["extension:btree_gist"] = json{{"exists", true}};
+  return obs;
+}
+
+static json period_key(const char* kind, json columns) {
+  return json{{"kind", kind}, {"schema", "shop"}, {"table", "orders"},
+              {"name", "orders_period"}, {"columns", std::move(columns)},
+              {"without_overlaps", true}};
+}
+
+// Measured on 18.6, 2 million rows: 20.8 s under AccessExclusiveLock, NOT VALID
+// refused, a GiST index built beforehand not adoptable.
+TEST(Planner, AKeyWithAPeriodIsOneStatementThatSaysWhatItLocks) {
+  auto obs = obs_with_period(2LL << 30);
+  auto plan = pglaswell::plan_migration(
+      spec_of(json::array({period_key("add_primary_key", json::array({"id", "valid"}))})),
+      obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto s = steps_of(plan, "add_primary_key");
+  ASSERT_EQ(s.size(), 1u) << plan.render();
+  const auto sql = all_sql(*s[0]);
+  EXPECT_NE(sql.find("ADD CONSTRAINT \"orders_period\" PRIMARY KEY (\"id\", \"valid\" "
+                     "WITHOUT OVERLAPS)"), std::string::npos) << sql;
+  EXPECT_EQ(sql.find("CONCURRENTLY"), std::string::npos) << sql;
+  // The weaker lock first, as every exclusive step; and not in the dry run.
+  EXPECT_TRUE(s[0]->detail.value("exclusive_retry", false)) << plan.render();
+  EXPECT_TRUE(s[0]->detail.contains("not_rehearsed")) << plan.render();
+  bool warned = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("every reader and writer queues for the whole build") != std::string::npos) {
+      warned = true;
+    }
+  }
+  EXPECT_TRUE(warned) << json(plan.warnings).dump(2);
+
+  // A small quiet table: the same statement, rehearsed, no warning.
+  obs = obs_with_period(1 << 20);
+  plan = pglaswell::plan_migration(
+      spec_of(json::array({period_key("add_unique_constraint", json::array({"id", "valid"}))})),
+      obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto u = steps_of(plan, "add_unique_constraint");
+  ASSERT_EQ(u.size(), 1u);
+  EXPECT_NE(all_sql(*u[0]).find("UNIQUE (\"id\", \"valid\" WITHOUT OVERLAPS)"), std::string::npos);
+  EXPECT_FALSE(u[0]->detail.contains("not_rehearsed"));
+
+  // The period must be a range.
+  plan = pglaswell::plan_migration(
+      spec_of(json::array({period_key("add_unique_constraint", json::array({"valid", "id"}))})),
+      obs, {});
+  ASSERT_FALSE(plan.ok);
+  EXPECT_NE(plan.conflicts[0].find("is not a range or multirange type"), std::string::npos)
+      << plan.conflicts[0];
+
+  // GiST cannot index a bigint without btree_gist, and the catalog says so.
+  obs.tables["shop.orders"]["columns"]["id"]["gist_opclass"] = false;
+  obs.objects.erase("extension:btree_gist");
+  plan = pglaswell::plan_migration(
+      spec_of(json::array({period_key("add_unique_constraint", json::array({"id", "valid"}))})),
+      obs, {});
+  ASSERT_FALSE(plan.ok);
+  EXPECT_NE(plan.conflicts[0].find("create_extension intent for btree_gist"), std::string::npos)
+      << plan.conflicts[0];
+}
+
+// Measured on 18.6 for both forms: ONLY the parent, then each partition under
+// its own lock, attached; the parent's index turns valid with the last.
+TEST(Planner, AKeyWithAPeriodOnAPartitionedTableLocksOnePartitionAtATime) {
+  auto obs = obs_with_period(8LL << 30, "partitioned_table");
+  auto& t = obs.tables["shop.orders"];
+  t["partition_key"] = "LIST (tenant)";
+  t["partition_parts"] = json::array(
+      {json{{"relation", "shop.orders_a"}, {"partitioned", false}, {"indexes", json::object()}},
+       json{{"relation", "shop.orders_b"}, {"partitioned", false},
+            {"indexes", json{{"orders_b_orders_period",
+                              json{{"valid", true}, {"unique", true},
+                                   {"constraint", "orders_b_orders_period"},
+                                   {"attached_to", nullptr}}}}}}});
+  // The partition column has to be among those compared for equality.
+  auto plan = pglaswell::plan_migration(
+      spec_of(json::array({period_key("add_unique_constraint", json::array({"id", "valid"}))})),
+      obs, {});
+  ASSERT_FALSE(plan.ok);
+  EXPECT_NE(plan.conflicts[0].find("Add tenant to it"), std::string::npos) << plan.conflicts[0];
+
+  plan = pglaswell::plan_migration(
+      spec_of(json::array(
+          {period_key("add_unique_constraint", json::array({"tenant", "id", "valid"}))})),
+      obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto s = steps_of(plan, "add_unique_constraint");
+  // parent; partition a: add, attach; partition b (already built): attach.
+  ASSERT_EQ(s.size(), 4u) << plan.render();
+  EXPECT_NE(all_sql(*s[0]).find("ALTER TABLE ONLY \"shop\".\"orders\" ADD CONSTRAINT "
+                                "\"orders_period\" UNIQUE (\"tenant\", \"id\", \"valid\" "
+                                "WITHOUT OVERLAPS)"), std::string::npos) << all_sql(*s[0]);
+  EXPECT_NE(all_sql(*s[1]).find("ALTER TABLE \"shop\".\"orders_a\" ADD CONSTRAINT "
+                                "\"orders_a_orders_period\" UNIQUE"), std::string::npos);
+  EXPECT_TRUE(s[1]->detail.contains("not_rehearsed"));
+  EXPECT_NE(all_sql(*s[2]).find("ATTACH PARTITION \"shop\".\"orders_a_orders_period\""),
+            std::string::npos);
+  EXPECT_NE(all_sql(*s[3]).find("ATTACH PARTITION \"shop\".\"orders_b_orders_period\""),
+            std::string::npos);
+  EXPECT_EQ(steps_of(plan, "verify_index_valid").size(), 1u);
+}
+
+TEST(Planner, AnExclusionConstraintIsWrittenFromItsElements) {
+  auto obs = obs_with_period(1 << 20);
+  const json ex{{"kind", "add_exclusion_constraint"}, {"schema", "shop"}, {"table", "orders"},
+                {"name", "orders_ex"},
+                {"elements", json::array({json{{"column", "id"}, {"with", "="}},
+                                          json{{"expression", "valid"}, {"with", "&&"}}})},
+                {"where", "id > 0"}, {"comment", "No two at once."}};
+  auto plan = pglaswell::plan_migration(spec_of(json::array({ex})), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto s = steps_of(plan, "add_exclusion_constraint");
+  ASSERT_EQ(s.size(), 1u);
+  const auto sql = all_sql(*s[0]);
+  EXPECT_NE(sql.find("ADD CONSTRAINT \"orders_ex\" EXCLUDE USING \"gist\" (\"id\" WITH =, "
+                     "(valid) WITH &&) WHERE (id > 0);"), std::string::npos) << sql;
+  EXPECT_NE(sql.find("COMMENT ON CONSTRAINT \"orders_ex\""), std::string::npos) << sql;
+
+  obs.tables["shop.orders"]["constraints"]["orders_ex"] = json{{"type", "x"}};
+  plan = pglaswell::plan_migration(spec_of(json::array({ex})), obs, {});
+  ASSERT_TRUE(plan.ok);
+  EXPECT_EQ(steps_of(plan, "add_exclusion_constraint")[0]->action, pglaswell::Action::kSatisfied);
+
+  obs.tables["shop.orders"]["constraints"]["orders_ex"] = json{{"type", "c"}};
+  plan = pglaswell::plan_migration(spec_of(json::array({ex})), obs, {});
+  EXPECT_FALSE(plan.ok);
+}
+
+TEST(Planner, AForeignKeyWithAPeriodKeepsTheTwoStepRecipe) {
+  auto obs = obs_with_period(2LL << 30);
+  obs.tables["shop.prices"] = obs.tables["shop.orders"];
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "add_foreign_key"}, {"schema", "shop"},
+                                {"table", "orders"}, {"name", "orders_fk"},
+                                {"columns", json::array({"id", "valid"})},
+                                {"references_schema", "shop"}, {"references_table", "prices"},
+                                {"references_columns", json::array({"id", "valid"})},
+                                {"period", true}}})),
+      obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto s = steps_of(plan, "add_foreign_key");
+  ASSERT_EQ(s.size(), 2u) << plan.render();
+  EXPECT_NE(all_sql(*s[0]).find("FOREIGN KEY (\"id\", PERIOD \"valid\") REFERENCES "
+                                "\"shop\".\"prices\" (\"id\", PERIOD \"valid\") NOT VALID"),
+            std::string::npos) << all_sql(*s[0]);
+  EXPECT_NE(all_sql(*s[1]).find("VALIDATE CONSTRAINT"), std::string::npos);
+}
+
+static pglaswell::Observations obs_with_configuration() {
+  pglaswell::Observations obs;
+  obs.objects["tsconfig:shop.names"] = json{
+      {"exists", true},
+      {"tokens", json::array({"asciiword", "word", "email", "hword"})},
+      {"mapping", json{{"asciiword", json::array({"pg_catalog.simple"})},
+                       {"word", json::array({"pg_catalog.simple"})},
+                       {"email", json::array({"pg_catalog.simple"})}}},
+      {"dictionaries", json::array(
+          {json{{"schema", "pg_catalog"}, {"name", "simple"}, {"visible", true}},
+           json{{"schema", "public"}, {"name", "unaccent"}, {"visible", true}},
+           json{{"schema", "hidden"}, {"name", "syn"}, {"visible", false}}})},
+      {"indexes", json::array({json{{"schema", "shop"}, {"index", "people_fts"},
+                                    {"table", "shop.people"}, {"partitioned", false},
+                                    {"bytes", 8LL << 20}}})},
+      {"other_dependents", json::array({"default value for column v of table shop.people"})}};
+  return obs;
+}
+
+static json mapping_of(json tokens, json dictionaries) {
+  return json{{"kind", "set_text_search_mapping"}, {"schema", "shop"}, {"name", "names"},
+              {"tokens", std::move(tokens)}, {"dictionaries", std::move(dictionaries)}};
+}
+
+// Measured on 18.6: ADD fails on a mapping that is there, so the statement is
+// chosen from what the catalog holds; and an index built with the old mapping
+// misses rows until it is rebuilt.
+TEST(Planner, ATextSearchMappingIsStatedAndTheStatementChosen) {
+  const auto obs = obs_with_configuration();
+  auto plan = pglaswell::plan_migration(
+      spec_of(json::array({mapping_of(json::array({"word", "hword"}),
+                                      json::array({"unaccent", "simple"}))})),
+      obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto s = steps_of(plan, "set_text_search_mapping");
+  ASSERT_EQ(s.size(), 2u) << plan.render();
+  const auto sql = all_sql(*s[0]);
+  EXPECT_NE(sql.find("ALTER TEXT SEARCH CONFIGURATION \"shop\".\"names\" ADD MAPPING FOR hword "
+                     "WITH \"public\".\"unaccent\", \"pg_catalog\".\"simple\";"),
+            std::string::npos) << sql;
+  EXPECT_NE(sql.find("ALTER MAPPING FOR word WITH \"public\".\"unaccent\", "
+                     "\"pg_catalog\".\"simple\";"), std::string::npos) << sql;
+  // The index built with it, rebuilt without blocking, and checked.
+  EXPECT_EQ(all_sql(*s[1]), "REINDEX INDEX CONCURRENTLY \"shop\".\"people_fts\";\n");
+  EXPECT_EQ(s[1]->txn_class, pglaswell::TxnClass::kForbidden);
+  EXPECT_EQ(steps_of(plan, "verify_index_valid").size(), 1u);
+  bool stale = false, stored = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("can miss rows until it is rebuilt") != std::string::npos) stale = true;
+    if (w.find("default value for column v of table shop.people") != std::string::npos) {
+      stored = true;
+    }
+  }
+  EXPECT_TRUE(stale && stored) << json(plan.warnings).dump(2);
+
+  // An empty list removes the mapping.
+  plan = pglaswell::plan_migration(
+      spec_of(json::array({mapping_of(json::array({"email"}), json::array())})), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  EXPECT_NE(all_sql(*steps_of(plan, "set_text_search_mapping")[0]).find("DROP MAPPING FOR email;"),
+            std::string::npos);
+
+  // Already so: nothing to do, and no rebuild.
+  plan = pglaswell::plan_migration(
+      spec_of(json::array({mapping_of(json::array({"word"}), json::array({"simple"}))})),
+      obs, {});
+  ASSERT_TRUE(plan.ok);
+  ASSERT_EQ(steps_of(plan, "set_text_search_mapping").size(), 1u);
+  EXPECT_EQ(steps_of(plan, "set_text_search_mapping")[0]->action, pglaswell::Action::kSatisfied);
+
+  // Two intents on one configuration: the second sees what the first leaves.
+  plan = pglaswell::plan_migration(
+      spec_of(json::array({mapping_of(json::array({"hword"}), json::array({"simple"})),
+                           mapping_of(json::array({"hword"}), json::array({"simple"}))})),
+      obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  std::size_t applied = 0;
+  for (const auto* st : steps_of(plan, "set_text_search_mapping")) {
+    if (st->action == pglaswell::Action::kApply && all_sql(*st).find("MAPPING") != std::string::npos) {
+      ++applied;
+    }
+  }
+  EXPECT_EQ(applied, 1u) << plan.render();
+}
+
+// Reported using the kind itself: the mapping of a configuration created two
+// lines above it was refused, "does not exist", by a message naming the intent
+// that creates one.
+TEST(Planner, AMappingFollowsTheConfigurationItsSpecificationCreates) {
+  pglaswell::Observations obs;   // nothing in the catalog
+  const json create{{"kind", "create_object"}, {"object_type", "TEXT SEARCH CONFIGURATION"},
+                    {"schema", "shop"}, {"name", "names"}, {"definition", "(COPY = simple)"}};
+  auto plan = pglaswell::plan_migration(
+      spec_of(json::array({create, mapping_of(json::array({"word", "hword"}),
+                                              json::array({"unaccent", "public.simple"})),
+                           mapping_of(json::array({"email"}), json::array())})),
+      obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto s = steps_of(plan, "set_text_search_mapping");
+  ASSERT_EQ(s.size(), 2u) << plan.render();
+  // The pair that is right whatever the copied configuration holds, with the
+  // dictionaries as written: there is no catalog to resolve them in.
+  EXPECT_EQ(all_sql(*s[0]),
+            "ALTER TEXT SEARCH CONFIGURATION \"shop\".\"names\" DROP MAPPING IF EXISTS FOR "
+            "word, hword;\n"
+            "ALTER TEXT SEARCH CONFIGURATION \"shop\".\"names\" ADD MAPPING FOR word, hword "
+            "WITH \"unaccent\", \"public\".\"simple\";\n");
+  EXPECT_EQ(all_sql(*s[1]),
+            "ALTER TEXT SEARCH CONFIGURATION \"shop\".\"names\" DROP MAPPING IF EXISTS FOR "
+            "email;\n");
+  bool said = false;
+  for (const auto& w : plan.warnings) {
+    if (w.find("checked by the dry run, not before it") != std::string::npos) said = true;
+  }
+  EXPECT_TRUE(said) << json(plan.warnings).dump(2);
+
+  // In the other order there is still nothing to map.
+  plan = pglaswell::plan_migration(
+      spec_of(json::array({mapping_of(json::array({"word"}), json::array({"simple"})), create})),
+      obs, {});
+  EXPECT_FALSE(plan.ok);
+
+  // A configuration that is there, and a dictionary an extension created by
+  // this specification brings: written as given, the rest compared as usual.
+  obs = obs_with_configuration();
+  obs.objects["extension:dict_x"] = json{{"exists", false}, {"available", true}};
+  plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "create_extension"}, {"name", "dict_x"},
+                                {"schema", "public"}},
+                           mapping_of(json::array({"word"}), json::array({"x_dict", "simple"}))})),
+      obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  EXPECT_NE(all_sql(*steps_of(plan, "set_text_search_mapping")[0])
+                .find("ALTER MAPPING FOR word WITH \"x_dict\", \"pg_catalog\".\"simple\";"),
+            std::string::npos) << plan.render();
+  // Without that extension the same dictionary is refused, as before.
+  plan = pglaswell::plan_migration(
+      spec_of(json::array({mapping_of(json::array({"word"}), json::array({"x_dict"}))})),
+      obs_with_configuration(), {});
+  EXPECT_FALSE(plan.ok);
+}
+
+TEST(Planner, ATextSearchMappingRefusesWhatTheServerWould) {
+  const auto obs = obs_with_configuration();
+  auto refused = [&](json intent) {
+    const auto plan = pglaswell::plan_migration(spec_of(json::array({std::move(intent)})), obs, {});
+    EXPECT_FALSE(plan.ok) << plan.render();
+    return plan.conflicts.empty() ? std::string() : plan.conflicts[0];
+  };
+  EXPECT_NE(refused(mapping_of(json::array({"nosuch"}), json::array({"simple"})))
+                .find("has no token type \"nosuch\""), std::string::npos);
+  EXPECT_NE(refused(mapping_of(json::array({"word"}), json::array({"portuguese_names"})))
+                .find("no text search dictionary \"portuguese_names\""), std::string::npos);
+  // Off the search path: found only by its schema.
+  EXPECT_NE(refused(mapping_of(json::array({"word"}), json::array({"syn"})))
+                .find("named as schema.name"), std::string::npos);
+  const auto plan = pglaswell::plan_migration(
+      spec_of(json::array({mapping_of(json::array({"word"}), json::array({"hidden.syn"}))})),
+      obs, {});
+  EXPECT_TRUE(plan.ok) << plan.render();
+  auto other = mapping_of(json::array({"word"}), json::array({"simple"}));
+  other["name"] = "absent";
+  EXPECT_NE(refused(other).find("does not exist"), std::string::npos);
 }
 
 // The constraint kinds on a partitioned table: never one statement over every
@@ -2455,6 +2934,92 @@ TEST(Spec, AFillListTakesExpressionsAndSourceObjectsAndNothingElse) {
 // only step, then a walk that writes ONLY the rows whose value differs. No
 // trigger, no check, no validation scan, no SET NOT NULL -- and the one
 // exclusive lock comes before the walk, not after it.
+// "paced" belongs to a fill, and cannot be had with a pre-image.
+TEST(Spec, PacedIsABooleanOnAFillAndNotWithPreserve) {
+  const auto refuses = [](json intent, const std::string& needle) {
+    try {
+      (void)spec_with(json::array({intent}));
+    } catch (const std::exception& e) {
+      EXPECT_NE(std::string(e.what()).find(needle), std::string::npos) << e.what();
+      return;
+    }
+    ADD_FAILURE() << "accepted: " << intent.dump();
+  };
+  auto column = filled_column();
+  column["paced"] = "no";
+  refuses(column, "paced must be true or false");
+  column["paced"] = false;
+  column.erase("fill");
+  column.erase("after");
+  refuses(column, "\"paced\" and no \"fill\"");
+  json bf{{"kind", "backfill"}, {"schema", "shop"}, {"table", "orders"}, {"key", "id"},
+          {"set", {{"status", "'x'"}}}, {"where", "orders.status IS NULL"},
+          {"preserve", "shop.orders_before"}, {"paced", false}};
+  refuses(bf, "together with \"preserve\"");
+}
+
+// The one statement of "paced": false, as the planner writes it.
+TEST(Planner, AnUnpacedFillPutsOneStatementAheadOfTheWalk) {
+  const auto obs = observations(2LL << 30, 8000000);
+  auto in = filled_column();
+  in.erase("after");
+  in["default"] = "'none'";
+  in["paced"] = false;
+  const auto plan = pglaswell::plan_migration(spec_with(json::array({in})), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto& walk = plan.steps[1];
+  ASSERT_EQ(walk.kind, "backfill");
+  ASSERT_EQ(walk.sql.size(), 3u) << plan.render();
+  EXPECT_TRUE(walk.detail.value("single_statement", false));
+  // Values once per row, joined back by the walk's key: UPDATE ... FROM cannot
+  // refer to the row being updated from a LATERAL item.
+  EXPECT_EQ(walk.sql[0].rfind("UPDATE \"shop\".\"orders\"\n   SET \"region_code\" = "
+                              "\"laswell_new\".\"n1\"\n  FROM (SELECT \"orders\".\"id\" AS \"k1\"", 0),
+            0u) << walk.sql[0];
+  EXPECT_NE(walk.sql[0].find(" WHERE \"orders\".\"id\" = \"laswell_new\".\"k1\";"),
+            std::string::npos) << walk.sql[0];
+  EXPECT_EQ(walk.sql[0].find("$1"), std::string::npos) << walk.sql[0];
+  EXPECT_NE(walk.sql[1].find("LIMIT $2"), std::string::npos) << walk.sql[1];
+  EXPECT_NE(walk.why.find("the walk is not run"), std::string::npos) << walk.why;
+  // The group is headed by what is tried first; a paced walk keeps its own.
+  EXPECT_NE(plan.render().find("---- one statement in one transaction; NOT atomic if it is "
+                               "cancelled: then paced, many commits --"),
+            std::string::npos) << plan.render();
+  in.erase("paced");
+  const auto paced = pglaswell::plan_migration(spec_with(json::array({in})), obs, {});
+  EXPECT_NE(paced.render().find("---- NOT atomic: paced, many commits --"), std::string::npos);
+  EXPECT_EQ(paced.render().find("one statement in one transaction"), std::string::npos);
+  in["paced"] = false;
+
+  // Without a default the statement is the walk's own UPDATE, unbatched.
+  auto triggered = filled_column();
+  triggered["paced"] = false;
+  const auto t = pglaswell::plan_migration(spec_with(json::array({triggered})), obs, {});
+  ASSERT_TRUE(t.ok) << t.render();
+  bool seen = false;
+  for (const auto& s : t.steps) {
+    if (s.kind != "backfill") continue;
+    seen = true;
+    ASSERT_TRUE(s.detail.value("single_statement", false));
+    EXPECT_NE(s.sql[0].find(" WHERE (\"orders\".\"region_code\" IS NULL);"), std::string::npos)
+        << s.sql[0];
+  }
+  EXPECT_TRUE(seen);
+
+  // Paced and unpaced columns do not share a walk.
+  auto second = in;
+  second["column"] = "region_len";
+  second["type"] = "integer";
+  second["default"] = "0";
+  second["fill"] = "length(fulfilment_region)";
+  second.erase("paced");
+  const auto two = pglaswell::plan_migration(spec_with(json::array({in, second})), obs, {});
+  ASSERT_TRUE(two.ok) << two.render();
+  int walks = 0;
+  for (const auto& s : two.steps) if (s.kind == "backfill") ++walks;
+  EXPECT_EQ(walks, 2) << two.render();
+}
+
 TEST(Planner, ADefaultWithAFillWritesOnlyTheRowsThatDifferFromTheDefault) {
   const auto obs = observations(2LL << 30, 8000000);
   auto in = filled_column();
@@ -2467,11 +3032,33 @@ TEST(Planner, ADefaultWithAFillWritesOnlyTheRowsThatDifferFromTheDefault) {
             std::string::npos) << all_sql(plan.steps[0]);
   ASSERT_EQ(plan.steps[1].kind, "backfill");
   const auto bf = all_sql(plan.steps[1]);
-  // Only while the row still HOLDS the default, and only if the value differs.
-  EXPECT_NE(bf.find("\"orders\".\"region_code\" IS NOT DISTINCT FROM ('none') AND "
-                    "(upper(fulfilment_region)) IS NOT NULL AND "
-                    "(upper(fulfilment_region)) IS DISTINCT FROM ('none')"),
+  // Only while the row still HOLDS the default, and only if the value differs
+  // -- from a value computed ONCE per row and named, not pasted wherever it is
+  // wanted (found in the field: fourteen evaluations per row for two columns).
+  EXPECT_NE(bf.find("LATERAL (SELECT (upper(fulfilment_region)) AS \"v1\" OFFSET 0) AS "
+                    "\"laswell_fill\""),
             std::string::npos) << bf;
+  EXPECT_NE(bf.find("\"orders\".\"region_code\" IS NOT DISTINCT FROM ('none') AND "
+                    "\"laswell_fill\".\"v1\" IS NOT NULL AND "
+                    "\"laswell_fill\".\"v1\" IS DISTINCT FROM ('none')"),
+            std::string::npos) << bf;
+  // The UPDATE names the batch's keys and nothing else: the rows were selected
+  // and locked by the SELECT, and the predicate again would be the value again.
+  ASSERT_EQ(plan.steps[1].sql.size(), 2u);
+  EXPECT_NE(plan.steps[1].sql[1].find("SET \"region_code\" = (upper(fulfilment_region))\n"
+                                      " WHERE \"orders\".\"id\" = ANY($1::bigint[])\n"
+                                      "RETURNING"),
+            std::string::npos) << plan.steps[1].sql[1];
+  const auto occurrences = [](const std::string& text, const std::string& what) {
+    int n = 0;
+    for (auto at = text.find(what); at != std::string::npos; at = text.find(what, at + 1)) ++n;
+    return n;
+  };
+  EXPECT_EQ(occurrences(plan.steps[1].sql[0], "upper(fulfilment_region)"), 1);
+  EXPECT_EQ(occurrences(plan.steps[1].sql[1], "upper(fulfilment_region)"), 1);
+  // The predicate in full is still carried for the readings outside the walk.
+  EXPECT_NE(plan.steps[1].detail.value("where", "").find("(upper(fulfilment_region)) IS NOT NULL"),
+            std::string::npos);
   for (const auto& s : plan.steps) {
     const auto sql = all_sql(s);
     EXPECT_EQ(sql.find("TRIGGER"), std::string::npos) << sql;
@@ -2525,15 +3112,17 @@ TEST(Planner, ADefaultWithAFillWritesOnlyTheRowsThatDifferFromTheDefault) {
   }
   EXPECT_EQ(walks, 1) << two.render();
   EXPECT_EQ(adds, 2) << two.render();
-  EXPECT_NE(walk.find("\"region_code\" = CASE WHEN \"orders\".\"region_code\" IS NOT DISTINCT FROM "
-                      "('none') AND (upper(fulfilment_region)) IS NOT NULL AND "
-                      "(upper(fulfilment_region)) IS DISTINCT FROM ('none') THEN "
-                      "(upper(fulfilment_region)) ELSE \"orders\".\"region_code\" END"),
-            std::string::npos) << walk;
-  EXPECT_NE(walk.find("\"region_len\" = CASE WHEN \"orders\".\"region_len\" IS NOT DISTINCT FROM (0)"),
+  EXPECT_NE(walk.find("SET (\"region_code\", \"region_len\") = (SELECT CASE WHEN "
+                      "\"orders\".\"region_code\" IS NOT DISTINCT FROM ('none') AND "
+                      "\"laswell_fill\".\"v1\" IS NOT NULL AND \"laswell_fill\".\"v1\" IS "
+                      "DISTINCT FROM ('none') THEN \"laswell_fill\".\"v1\" ELSE "
+                      "\"orders\".\"region_code\" END, CASE WHEN \"orders\".\"region_len\" IS "
+                      "NOT DISTINCT FROM (0)"),
             std::string::npos) << walk;
   EXPECT_NE(walk.find(") OR (\"orders\".\"region_len\" IS NOT DISTINCT FROM (0)"),
             std::string::npos) << walk;
+  EXPECT_EQ(occurrences(walk, "upper(fulfilment_region)"), 2) << walk;
+  EXPECT_EQ(occurrences(walk, "length(fulfilment_region)"), 2) << walk;
   EXPECT_NE(two.steps.back().why.find("planned together with intent 0"), std::string::npos);
   // A defaulted column and a trigger-filled one are different recipes.
   auto triggered = filled_column();
@@ -3213,6 +3802,170 @@ TEST_F(BootstrappedTest, StatusReportsAUsableLedgerAndItsTrustedKeys) {
   EXPECT_TRUE(st.usable) << st.error;
   ASSERT_EQ(st.trusted_key_ids.size(), 1u);
   EXPECT_EQ(st.trusted_key_ids[0], test_key().key_id);
+}
+
+// The check itself, against a server: a definition PostgreSQL refuses is the
+// step's problem, one it accepts is recorded, and nothing is left behind.
+TEST_F(DatabaseTest, TheDryRunChecksASkippedBuildOnAnEmptyCopy) {
+  pglaswell::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = url_;
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/empty-copy");
+    w.txn().exec("DROP TABLE IF EXISTS laswell_shape_t");
+    w.txn().exec("CREATE TABLE laswell_shape_t (id bigint, code text, tags text[],"
+                 " twice bigint GENERATED ALWAYS AS (id * 2) STORED)");
+    w.txn().exec("INSERT INTO laswell_shape_t (id, code) VALUES (1, 'a'), (1, 'a')");
+    w.commit();
+  }
+  pglaswell::Catalog cat(cfg);
+  const auto run = [&](const std::vector<std::string>& on_copy) {
+    json checks = json::array();
+    for (const auto& q : on_copy) {
+      checks.push_back(json{{"of", "\"public\".\"laswell_shape_t\""}, {"sql", q}});
+    }
+    // One step that cannot run in a transaction, and one after it that can.
+    return cat.dry_run({{0, {"CREATE INDEX CONCURRENTLY x ON public.laswell_shape_t (id);"}},
+                        {1, {"COMMENT ON TABLE public.laswell_shape_t IS 'c';"}}},
+                       {true, false}, 180000, {}, {}, {checks, json()});
+  };
+
+  auto dry = run({"CREATE INDEX x ON pg_temp.laswell_shape USING gin (tags);",
+                  "CREATE INDEX y ON pg_temp.laswell_shape (twice, lower(code));"});
+  EXPECT_TRUE(dry.problems.empty()) << dry.problems[0].message;
+  EXPECT_EQ(dry.definition_checked, std::vector<int>{0});
+  EXPECT_EQ(dry.unverified_steps, std::vector<int>{0}) << "the build itself was not run";
+
+  // A unique index over rows that repeat: the copy is empty, so it passes --
+  // the check is of the definition and says nothing about the rows.
+  dry = run({"CREATE UNIQUE INDEX x ON pg_temp.laswell_shape (id);"});
+  EXPECT_TRUE(dry.problems.empty());
+
+  dry = run({"CREATE INDEX x ON pg_temp.laswell_shape (code int4_ops);"});
+  ASSERT_EQ(dry.problems.size(), 1u);
+  EXPECT_EQ(dry.problems[0].step, 0);
+  EXPECT_EQ(dry.problems[0].sqlstate, "42804");
+  EXPECT_NE(dry.problems[0].message.find("does not accept data type text"), std::string::npos);
+  EXPECT_NE(dry.problems[0].statement.find("on an empty copy of"), std::string::npos);
+  EXPECT_TRUE(dry.definition_checked.empty());
+
+  // A table that is not there to copy: nothing found, nothing claimed.
+  json missing = json::array({json{{"of", "\"public\".\"laswell_no_such\""},
+                                   {"sql", "CREATE INDEX x ON pg_temp.laswell_shape (id);"}}});
+  dry = cat.dry_run({{0, {"CREATE INDEX CONCURRENTLY x ON public.laswell_no_such (id);"}}},
+                    {true}, 180000, {}, {}, {missing});
+  EXPECT_TRUE(dry.problems.empty());
+  EXPECT_TRUE(dry.definition_checked.empty());
+
+  pglaswell::WriteSession w(cfg);
+  w.begin("pg_laswell/test/empty-copy-cleanup");
+  EXPECT_EQ(w.txn().exec("SELECT count(*) FROM pg_class WHERE relname IN ('laswell_shape', 'x', 'y')")
+                [0][0].as<int>(), 0);
+  w.txn().exec("DROP TABLE laswell_shape_t");
+  w.commit();
+}
+
+// The recipe executed: a key with a period and an exclusion constraint on a
+// partitioned table that has rows, a partition at a time, and both valid at the
+// end. Then the foreign key that references the key.
+TEST_F(DatabaseTest, APeriodKeyAndAnExclusionConstraintAreBuiltAPartitionAtATime) {
+  pglaswell::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = url_;
+  {
+    pglaswell::ReadSession r(cfg);
+    if (r.txn().exec("SELECT 1 FROM pg_available_extensions WHERE name = 'btree_gist'").empty()) {
+      GTEST_SKIP() << "btree_gist is not available on this server";
+    }
+    if (r.txn().exec("SELECT current_setting('server_version_num')::int")[0][0].as<int>() < 180000) {
+      GTEST_SKIP() << "WITHOUT OVERLAPS needs PostgreSQL 18";
+    }
+  }
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/period");
+    w.txn().exec("CREATE EXTENSION IF NOT EXISTS btree_gist");
+    w.txn().exec("DROP TABLE IF EXISTS laswell_term, laswell_rate CASCADE");
+    w.txn().exec("CREATE TABLE laswell_rate (tenant int NOT NULL, id bigint NOT NULL,"
+                 " valid daterange) PARTITION BY LIST (tenant)");
+    w.txn().exec("CREATE TABLE laswell_rate_1 PARTITION OF laswell_rate FOR VALUES IN (1)");
+    w.txn().exec("CREATE TABLE laswell_rate_2 PARTITION OF laswell_rate FOR VALUES IN (2)");
+    w.txn().exec("INSERT INTO laswell_rate SELECT 1 + g % 2, g,"
+                 " daterange('2020-01-01'::date + g, '2020-01-02'::date + g)"
+                 " FROM generate_series(1, 400) g");
+    w.txn().exec("CREATE TABLE laswell_term (tenant int NOT NULL, id bigint NOT NULL,"
+                 " valid daterange NOT NULL)");
+    w.txn().exec("INSERT INTO laswell_term SELECT tenant, id, valid FROM laswell_rate LIMIT 50");
+    w.commit();
+  }
+  pglaswell::Catalog cat(cfg);
+  auto apply = [&](const json& intent) {
+    const auto obs = cat.observe({"public", "public"}, {"laswell_rate", "laswell_term"},
+                                 {"extension:btree_gist"});
+    json doc = minimal_spec();
+    doc["intents"] = json::array({intent});
+    const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(doc), obs, {});
+    EXPECT_TRUE(plan.ok) << plan.render();
+    for (const auto& step : plan.steps) {
+      pglaswell::WriteSession w(cfg);
+      w.begin("pg_laswell/test/period-apply");
+      for (const auto& q : step.sql) w.txn().exec(q.substr(0, q.size() - 1));
+      w.commit();
+    }
+    return plan;
+  };
+  auto scalar = [&](const std::string& q) {
+    pglaswell::ReadSession r(cfg);
+    return r.txn().exec(q)[0][0].as<std::string>();
+  };
+
+  // valid is nullable: the primary key makes it NOT NULL through the recipe.
+  const auto pk = apply(json{{"kind", "add_primary_key"}, {"schema", "public"},
+                             {"table", "laswell_rate"}, {"name", "laswell_rate_pk"},
+                             {"columns", json::array({"tenant", "id", "valid"})},
+                             {"without_overlaps", true}});
+  EXPECT_EQ(scalar("SELECT conperiod::text || ':' || (SELECT indisvalid::text FROM pg_index"
+                   " WHERE indexrelid = 'laswell_rate_pk'::regclass)"
+                   " FROM pg_constraint WHERE conname = 'laswell_rate_pk'"), "true:true");
+  EXPECT_EQ(scalar("SELECT count(*) FROM pg_constraint WHERE contype = 'p'"
+                   " AND conrelid IN ('laswell_rate_1'::regclass, 'laswell_rate_2'::regclass)"),
+            "2");
+
+  apply(json{{"kind", "add_exclusion_constraint"}, {"schema", "public"},
+             {"table", "laswell_rate"}, {"name", "laswell_rate_ex"},
+             {"elements", json::array({json{{"column", "tenant"}, {"with", "="}},
+                                       json{{"column", "id"}, {"with", "="}},
+                                       json{{"column", "valid"}, {"with", "&&"}}})}});
+  EXPECT_EQ(scalar("SELECT contype::text || ':' || (SELECT indisvalid::text FROM pg_index"
+                   " WHERE indexrelid = 'laswell_rate_ex'::regclass)"
+                   " FROM pg_constraint WHERE conname = 'laswell_rate_ex'"), "x:true");
+
+  // Planned again, both are there.
+  {
+    const auto obs = cat.observe({"public"}, {"laswell_rate"}, {"extension:btree_gist"});
+    json doc = minimal_spec();
+    doc["intents"] = json::array(
+        {json{{"kind", "add_primary_key"}, {"schema", "public"}, {"table", "laswell_rate"},
+              {"name", "laswell_rate_pk"}, {"columns", json::array({"tenant", "id", "valid"})},
+              {"without_overlaps", true}}});
+    const auto again = pglaswell::plan_migration(pglaswell::parse_spec(doc), obs, {});
+    ASSERT_TRUE(again.ok) << again.render();
+    for (const auto& st : again.steps) EXPECT_NE(st.action, pglaswell::Action::kApply) << again.render();
+  }
+
+  apply(json{{"kind", "add_foreign_key"}, {"schema", "public"}, {"table", "laswell_term"},
+             {"name", "laswell_term_fk"}, {"columns", json::array({"tenant", "id", "valid"})},
+             {"references_schema", "public"}, {"references_table", "laswell_rate"},
+             {"references_columns", json::array({"tenant", "id", "valid"})},
+             {"period", true}});
+  EXPECT_EQ(scalar("SELECT conperiod::text || ':' || convalidated::text FROM pg_constraint"
+                   " WHERE conname = 'laswell_term_fk'"), "true:true");
+
+  pglaswell::WriteSession w(cfg);
+  w.begin("pg_laswell/test/period-cleanup");
+  w.txn().exec("DROP TABLE IF EXISTS laswell_term, laswell_rate CASCADE");
+  w.commit();
 }
 
 // A module's reading is one statement over a vendor's catalogs, and one that
@@ -4147,6 +4900,118 @@ TEST_F(ToolTest, StartMigrationReturnsAJobIdBeforeDoingTheWork) {
   EXPECT_EQ(final_status.value("state", ""), "succeeded") << final_status.dump(2);
 }
 
+// A step's start is written before it runs. Reported from the field: 90 of 90
+// steps in a ledger had finished_at = started_at, a 15-minute index build
+// among them, because the row was written once, at the end, with now() twice.
+TEST_F(ToolTest, AStepsStartIsWrittenBeforeItRuns) {
+  make_shop(cfg());
+  json doc = minimal_spec();
+  doc["id"] = "0031-slow-step";
+  doc["description"] = "A step that takes long enough to measure.";
+  doc["intents"] = json::array({json{
+      {"kind", "create_table_as"}, {"schema", "shop"}, {"table", "slow_copy"},
+      {"definition", "SELECT 1 AS a FROM pg_sleep(0.6)"}, {"comment", "c"}}});
+  const auto p = payload(call("startMigration", json{{"spec", signed_doc(doc)}}));
+  ASSERT_TRUE(p.value("accepted", false)) << p.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, p["jobId"], [](const json& s) {
+    return s.value("state", "") == "succeeded";
+  })) << status_of(p["jobId"]).dump(2);
+
+  pglaswell::ReadSession r(cfg());
+  const auto rows = r.txn().exec(
+      "SELECT state, extract(epoch FROM finished_at - started_at)::float8,"
+      "       started_at >= (SELECT started_at FROM laswell.job WHERE job_id = $1::uuid)"
+      "  FROM laswell.step WHERE job_id = $1::uuid ORDER BY ordinal",
+      pqxx::params{p["jobId"].get<std::string>()});
+  ASSERT_FALSE(rows.empty());
+  double longest = 0;
+  for (const auto& row : rows) {
+    EXPECT_NE(row[0].as<std::string>(), "running") << "a finished job leaves no step running";
+    ASSERT_FALSE(row[1].is_null());
+    EXPECT_GE(row[1].as<double>(), 0.0);
+    EXPECT_TRUE(row[2].as<bool>());
+    longest = std::max(longest, row[1].as<double>());
+  }
+  EXPECT_GE(longest, 0.5) << "the step that slept 0.6 s must say so";
+}
+
+// The statement timeout is for the short statements. A step the dry run leaves
+// to the job because it reads the whole table takes as long as the table is
+// large, and the default two minutes cancelled a key with a period over 69.5
+// million rows after a plan that had said how much there was to index
+// (2026-10-08). Here the validation takes 1.2 s under a 400 ms timeout.
+TEST_F(ToolTest, AScanTheJobRunsIsNotCutByTheStatementTimeout) {
+  make_shop(cfg());
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/untimed");
+    w.txn().exec("CREATE TABLE shop.slow_scan(a int NOT NULL)");
+    w.txn().exec("INSERT INTO shop.slow_scan VALUES (1)");
+    w.commit();
+  }
+  ctx_->registry.mutable_get("default").statement_timeout_ms = 400;
+
+  json doc = minimal_spec();
+  doc["id"] = "0032-slow-scan";
+  doc["description"] = "A validation longer than the statement timeout.";
+  doc["intents"] = json::array({json{
+      {"kind", "add_check_constraint"}, {"schema", "shop"}, {"table", "slow_scan"},
+      {"name", "slow_scan_a_check"},
+      {"expression", "length(a::text || pg_sleep(1.2)::text) > 0"}}});
+
+  const auto plan = payload(call("planMigration", json{{"spec", signed_doc(doc)}}));
+  ASSERT_TRUE(plan.contains("rendered")) << plan.dump(2);
+  EXPECT_NE(plan["rendered"].get<std::string>().find("time: no statement timeout"),
+            std::string::npos)
+      << plan["rendered"].get<std::string>();
+
+  const auto p = payload(call("startMigration", json{{"spec", signed_doc(doc)}}));
+  ASSERT_TRUE(p.value("accepted", false)) << p.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, p["jobId"], [](const json& s) {
+    const auto state = s.value("state", "");
+    return state == "succeeded" || state == "failed";
+  })) << status_of(p["jobId"]).dump(2);
+  EXPECT_EQ(status_of(p["jobId"]).value("state", ""), "succeeded")
+      << status_of(p["jobId"]).dump(2);
+
+  // And the timeout is back for the statements after it.
+  pglaswell::ReadSession r(cfg());
+  EXPECT_TRUE(r.txn().exec("SELECT convalidated FROM pg_constraint"
+                           " WHERE conname = 'slow_scan_a_check'")[0][0].as<bool>());
+}
+
+// A short statement keeps the timeout, and when it is cancelled the report says
+// whose timeout it was: the message is the server's and reads as the server's
+// setting, which is 0 here.
+TEST_F(ToolTest, ACancelledStatementSaysTheTimeoutIsThisTools) {
+  make_shop(cfg());
+  ctx_->registry.mutable_get("default").statement_timeout_ms = 400;
+
+  json doc = minimal_spec();
+  doc["id"] = "0033-timed-out";
+  doc["description"] = "A statement longer than the statement timeout.";
+  doc["intents"] = json::array({json{
+      {"kind", "create_table_as"}, {"schema", "shop"}, {"table", "too_slow"},
+      {"definition", "SELECT 1 AS a FROM pg_sleep(1.5)"}, {"comment", "c"}}});
+  const auto p = payload(call("startMigration", json{{"spec", signed_doc(doc)}}));
+  ASSERT_TRUE(p.value("accepted", false)) << p.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, p["jobId"], [](const json& s) {
+    const auto state = s.value("state", "");
+    return state == "succeeded" || state == "failed";
+  })) << status_of(p["jobId"]).dump(2);
+  const auto st = status_of(p["jobId"]);
+  EXPECT_EQ(st.value("state", ""), "failed") << st.dump(2);
+  EXPECT_NE(st.dump().find("statement_timeout_ms = 400"), std::string::npos) << st.dump(2);
+  // And nothing about a vendor that is not here: the reading of what Citus may
+  // have left behind named pg_dist_node beside the test for the extension, and
+  // failed to parse on every server without it.
+  pglaswell::ReadSession r(cfg());
+  if (r.txn().exec("SELECT 1 FROM pg_extension WHERE extname = 'citus'").empty()) {
+    EXPECT_EQ(st.dump().find("pg_dist_node"), std::string::npos) << st.dump(2);
+    EXPECT_EQ(st.dump().find("left_behind_unread"), std::string::npos) << st.dump(2);
+  }
+}
+
 TEST_F(ToolTest, CopyRowsTravelsThroughTheRealExecutorAndLandsInTheLedger) {
   // The one step in the row-level family whose work is not entirely in its SQL:
   // the statement opens the stream and the rows follow it over the protocol.
@@ -4965,6 +5830,224 @@ TEST_F(ToolTest, AFilledNotNullColumnIsAppliedEndToEndAndResumesAfterANull) {
                 started["jobId"].get<std::string>() + "'::uuid AND kind = 'backfill'"), "1");
   EXPECT_EQ(updates() - before_pair, touched)
       << "one write per row that differs in either column, and none for the rest";
+}
+
+// "paced": false. For a table nothing else is using, the fill is one statement:
+// pacing protects nobody there and costs a round trip and a commit every
+// thousand rows. Found in the field, where a lookup fill paced at 1 850 rows a
+// second was in the end done by hand in a single joined UPDATE.
+TEST_F(ToolTest, AnUnpacedFillIsOneStatementAndTheWalkIsNotRun) {
+  make_shop(cfg());
+  const auto one = [&](const std::string& q) {
+    pglaswell::ReadSession r(cfg());
+    return r.txn().exec(q)[0][0].as<std::string>();
+  };
+  json doc = minimal_spec();
+  doc["id"] = "0041-orders-in-r2";
+  doc["description"] = "Whether the order's warehouse is in region r2, and its code.";
+  doc["intents"] = json::array(
+      {json{{"kind", "add_column"}, {"schema", "shop"}, {"table", "orders"},
+            {"column", "in_r2"}, {"type", "boolean"}, {"nullable", false}, {"default", "false"},
+            {"fill", "EXISTS (SELECT 1 FROM shop.warehouse w WHERE w.id = orders.warehouse_id"
+                     " AND w.region = 'r2')"},
+            {"paced", false}, {"comment", "In r2."}},
+       json{{"kind", "add_column"}, {"schema", "shop"}, {"table", "orders"},
+            {"column", "wcode"}, {"type", "text"}, {"nullable", false}, {"default", "'W1'"},
+            {"fill", "'W' || orders.warehouse_id"}, {"paced", false}, {"comment", "Code."}}});
+
+  const auto plan = payload(call("planMigration", json{{"spec", signed_doc(doc)}}));
+  ASSERT_TRUE(plan.value("ok", false)) << plan.dump(2);
+  const auto rendered = plan["rendered"].get<std::string>();
+  EXPECT_NE(rendered.find("\"paced\": false: the first statement is tried alone"),
+            std::string::npos) << rendered;
+  // The subquery is said to be one, where the plan can still be changed.
+  EXPECT_NE(rendered.find("the fill of in_r2 is a subquery"), std::string::npos) << rendered;
+
+  const auto p = payload(call("startMigration", json{{"spec", signed_doc(doc)}}));
+  ASSERT_TRUE(p.value("accepted", false)) << p.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, p["jobId"], [](const json& s) {
+    const auto state = s.value("state", "");
+    return state == "succeeded" || state == "failed";
+  })) << status_of(p["jobId"]).dump(2);
+  ASSERT_EQ(status_of(p["jobId"]).value("state", ""), "succeeded")
+      << status_of(p["jobId"]).dump(2);
+
+  EXPECT_EQ(one("SELECT count(*) FROM shop.orders o WHERE in_r2 IS DISTINCT FROM"
+                " (SELECT w.region = 'r2' FROM shop.warehouse w WHERE w.id = o.warehouse_id)"
+                " OR wcode <> 'W' || warehouse_id"), "0");
+  // One commit, by the one statement, and only the rows that differ written.
+  const auto result = one(
+      "SELECT detail::text FROM laswell.step WHERE job_id = '" +
+      p["jobId"].get<std::string>() + "'::uuid AND kind = 'backfill'");
+  const auto r = json::parse(result);
+  EXPECT_EQ(r.value("commits", 0), 1) << result;
+  EXPECT_EQ(r["commitReasons"].value("single_statement", 0), 1) << result;
+  EXPECT_EQ(r.value("rowsDone", 0LL),
+            std::stoll(one("SELECT count(*) FROM shop.orders WHERE in_r2 OR wcode <> 'W1'")))
+      << result;
+}
+
+// A walk says how fast it goes and how far along the table it is. rowsDone
+// against rowsEstimated is progress only for a walk that writes every row:
+// found in the field with 27 million of 73 million to write, at 1 850 a second,
+// where nothing said either the rate or that it meant four hours.
+TEST_F(ToolTest, AWalkReportsItsRateAndHowMuchOfTheTableItHasWalked) {
+  make_shop(cfg());
+  auto& e = ctx_->registry.mutable_get("default").executor;
+  e.batch_rows = 20;
+  e.batch_cap_rows = 20;      // a commit every batch,
+  e.progress_interval_ms = 1; // and the planner asked after each
+  const auto one = [&](const std::string& q) {
+    pglaswell::ReadSession r(cfg());
+    return r.txn().exec(q)[0][0].as<std::string>();
+  };
+  json doc = minimal_spec();
+  doc["id"] = "0043-orders-odd";
+  doc["description"] = "Whether the order's number is odd: half the rows keep the default.";
+  doc["intents"] = json::array(
+      {json{{"kind", "add_column"}, {"schema", "shop"}, {"table", "orders"},
+            {"column", "odd"}, {"type", "boolean"}, {"nullable", false}, {"default", "false"},
+            {"fill", "orders.id % 2 = 1"}, {"comment", "Odd."}}});
+  const auto p = payload(call("startMigration", json{{"spec", signed_doc(doc)}}));
+  ASSERT_TRUE(p.value("accepted", false)) << p.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, p["jobId"], [](const json& s) {
+    const auto state = s.value("state", "");
+    return state == "succeeded" || state == "failed";
+  })) << status_of(p["jobId"]).dump(2);
+  const auto st = status_of(p["jobId"]);
+  ASSERT_EQ(st.value("state", ""), "succeeded") << st.dump(2);
+
+  // 150 of 300 rows written; by rows written the walk was never past 50%.
+  ASSERT_TRUE(st.contains("backfill")) << st.dump(2);
+  const auto& b = st["backfill"];
+  EXPECT_EQ(b.value("rowsDone", ""), "150") << b.dump(2);
+  ASSERT_TRUE(b.contains("fractionWalked")) << b.dump(2);
+  EXPECT_GT(b.value("fractionWalked", 0.0), 0.5) << b.dump(2);
+  EXPECT_LE(b.value("fractionWalked", 0.0), 1.0) << b.dump(2);
+  EXPECT_NE(b.value("progressBy", "").find("statistics"), std::string::npos) << b.dump(2);
+
+  const auto d = json::parse(one(
+      "SELECT detail::text FROM laswell.step WHERE job_id = '" +
+      p["jobId"].get<std::string>() + "'::uuid AND kind = 'backfill'"));
+  EXPECT_GT(d.value("rowsPerSecond", 0.0), 0.0) << d.dump(2);
+}
+
+TEST(Deploy, AProgressLineSaysRowsRateAndTimeLeft) {
+  json b{{"ordinal", 2}, {"rowsDone", "138000"}, {"rowsPerSecond", 1850.0}};
+  EXPECT_EQ(pglaswell::detail::progress_line("0240-flags", b),
+            "  0240-flags: step 2: 138,000 rows written, 1,850 rows/s");
+  b["fractionWalked"] = 0.004;
+  b["percent"] = 0.4;
+  EXPECT_EQ(pglaswell::detail::progress_line("0240-flags", b),
+            "  0240-flags: step 2: 138,000 rows written, 1,850 rows/s; about 0% of the table "
+            "walked (by the table's statistics)");
+  b["percent"] = 38.2;
+  b["secondsRemaining"] = 13800.0;
+  EXPECT_EQ(pglaswell::detail::progress_line("0240-flags", b),
+            "  0240-flags: step 2: 138,000 rows written, 1,850 rows/s; about 38% of the table "
+            "walked, about 3 h 50 min left (by the table's statistics)");
+  b["secondsRemaining"] = 95.0;
+  EXPECT_NE(pglaswell::detail::progress_line("x", b).find("about 1 min left"), std::string::npos);
+  b["secondsRemaining"] = 40.0;
+  EXPECT_NE(pglaswell::detail::progress_line("x", b).find("about 40 s left"), std::string::npos);
+}
+
+// The one statement of a "paced": false fill: no rows and no rate to give, so
+// the line says that it runs, for how long, and what the table has grown by.
+TEST(Deploy, AProgressLineForTheOneStatementSaysHowLongAndHowMuchTheTableGrew) {
+  json b{{"ordinal", 2}, {"singleStatement", true}, {"elapsedSeconds", 720}};
+  EXPECT_EQ(pglaswell::detail::progress_line("0310-flags", b),
+            "  0310-flags: step 2: the one statement has run 12 min; it reports no progress "
+            "of its own");
+  b["tableBytesGrown"] = "1288490189";
+  EXPECT_EQ(pglaswell::detail::progress_line("0310-flags", b),
+            "  0310-flags: step 2: the one statement has run 12 min; it reports no progress "
+            "of its own; the table has grown 1.2 GB since it began");
+  b["elapsedSeconds"] = 40;
+  b["tableBytesGrown"] = "52428800";
+  EXPECT_EQ(pglaswell::detail::progress_line("0310-flags", b),
+            "  0310-flags: step 2: the one statement has run 40 s; it reports no progress "
+            "of its own; the table has grown 50 MB since it began");
+}
+
+// The one statement on a table that IS in use. A session that waits behind it
+// longer than max_waiter_wait_ms has it cancelled; it is rolled back whole, and
+// the walk does the work.
+TEST_F(ToolTest, AnUnpacedFillThatSomeoneWaitsBehindFallsBackToTheWalk) {
+  make_shop(cfg());
+  ctx_->registry.mutable_get("default").executor.max_waiter_wait_ms = 300;
+  const auto one = [&](const std::string& q) {
+    pglaswell::ReadSession r(cfg());
+    return r.txn().exec(q)[0][0].as<std::string>();
+  };
+  // A backfill and no DDL before it: an open application transaction would hold
+  // an ADD COLUMN back, and this is about the statement that writes the rows.
+  json doc = minimal_spec();
+  doc["id"] = "0042-orders-shipped";
+  doc["description"] = "Every open order is shipped.";
+  doc["intents"] = json::array(
+      {json{{"kind", "backfill"}, {"schema", "shop"}, {"table", "orders"}, {"key", "id"},
+            {"set", {{"status", "'shipped'"}}}, {"where", "orders.status = 'open'"},
+            {"paced", false}}});
+  ASSERT_TRUE(payload(call("planMigration", json{{"spec", signed_doc(doc)}})).value("ok", false));
+
+  // An application transaction holding one row in the middle of the table: the
+  // one statement writes the rows before it and then waits there, holding them.
+  pqxx::connection app_conn(cfg().conninfo);
+  pqxx::work app(app_conn);
+  app.exec("UPDATE shop.orders SET status = status WHERE id = 150");
+
+  const auto p = payload(call("startMigration",
+                              json{{"spec", signed_doc(doc)}, {"dryRun", false}}));
+  ASSERT_TRUE(p.value("accepted", false)) << p.dump(2);
+
+  // A second session that wants the rows the statement has written. It gets
+  // them when the statement is cancelled and rolled back. Not before the
+  // statement is there and waiting for the row above: under Valgrind the job
+  // takes seconds to reach it, and a fixed sleep let this session through
+  // first, after which nobody waited behind anything.
+  bool waiting = false;
+  for (int i = 0; i < 600 && !waiting; ++i) {
+    waiting = one("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock'"
+                  " AND datname = current_database()"
+                  " AND query LIKE 'UPDATE \"shop\".\"orders\"%'") != "0";
+    if (!waiting) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  ASSERT_TRUE(waiting) << status_of(p["jobId"]).dump(2);
+  // While it runs, jobStatus says that it is the one statement, for how long,
+  // and by how much the table has grown: there is no other progress to give.
+  ASSERT_TRUE(wait_for_status(*this, p["jobId"], [](const json& s) {
+    return s.contains("backfill") && s["backfill"].contains("tableBytesGrown");
+  })) << status_of(p["jobId"]).dump(2);
+  {
+    const auto b = status_of(p["jobId"])["backfill"];
+    EXPECT_TRUE(b.value("singleStatement", false)) << b.dump(2);
+    EXPECT_TRUE(b.contains("elapsedSeconds")) << b.dump(2);
+    EXPECT_EQ(b.value("progressBy", "").rfind("none:", 0), 0u) << b.dump(2);
+    EXPECT_FALSE(b.contains("rowsPerSecond")) << b.dump(2);
+  }
+  {
+    pqxx::connection other_conn(cfg().conninfo);
+    pqxx::work other(other_conn);
+    other.exec("UPDATE shop.orders SET status = status WHERE id <> 150");
+    other.commit();
+  }
+  app.commit();
+
+  ASSERT_TRUE(wait_for_status(*this, p["jobId"], [](const json& s) {
+    const auto state = s.value("state", "");
+    return state == "succeeded" || state == "failed";
+  })) << status_of(p["jobId"]).dump(2);
+  const auto st = status_of(p["jobId"]);
+  ASSERT_EQ(st.value("state", ""), "succeeded") << st.dump(2);
+  EXPECT_NE(st.dump().find("the paced walk did the work instead"), std::string::npos)
+      << st.dump(2);
+  EXPECT_EQ(one("SELECT count(*) FROM shop.orders WHERE status <> 'shipped'"), "0");
+  const auto result = one(
+      "SELECT detail::text FROM laswell.step WHERE job_id = '" +
+      p["jobId"].get<std::string>() + "'::uuid AND kind = 'backfill'");
+  EXPECT_EQ(json::parse(result)["commitReasons"].value("single_statement_cancelled", 0), 1)
+      << result;
 }
 
 // An exclusive step behind a long APPLICATION transaction. It used to wait all
@@ -6081,6 +7164,105 @@ TEST_F(RepoTest, AnAppliedSpecThatWasEditedAfterwardsIsFlagged) {
   EXPECT_NE(e->value("appliedDigest", ""), e->value("digest", ""));
   EXPECT_NE(e->value("hint", "").find("write a NEW spec"), std::string::npos)
       << "the hint must say what to do instead of re-applying";
+}
+
+// A job whose process died. Its row is closed by the process that runs it, so
+// it stayed `running` for good -- found in the field two hours later, on a
+// server restarted since, with a successor at work beside it. Three things
+// followed from that one row, and each is checked here.
+TEST_F(RepoTest, AJobWhoseProcessDiedIsNoticedMarkedAndRunAgain) {
+  make_shop(cfg());
+  json doc{{"laswell_spec_version", 1},
+           {"id", "0001"},
+           {"description", "every open order is shipped"},
+           {"intents", json::array({json{{"kind", "backfill"}, {"schema", "shop"},
+                                         {"table", "orders"}, {"key", "id"},
+                                         {"set", {{"status", "'shipped'"}}},
+                                         {"where", "orders.status = 'open'"}}})}};
+  write_spec("0001.json", doc);
+  const auto on_disk = [&] {
+    return json::parse(std::ifstream(dir_ + "/0001.json"), nullptr, true);
+  };
+  auto started = payload(call("startMigration", json{{"spec", on_disk()}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, started["jobId"], [](const json& x) {
+    return x.value("state", "") == "succeeded";
+  })) << status_of(started["jobId"]).dump(2);
+  const auto dead = started["jobId"].get<std::string>();
+  jobs_->join_all();  // its connections are gone, as a killed process's are
+
+  // What a kill leaves: the job and its walk `running`, nothing finished, and
+  // rows still to do.
+  const auto one = [&](const std::string& q) {
+    pglaswell::ReadSession r(cfg());
+    return r.txn().exec(q)[0][0].as<std::string>();
+  };
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/kill");
+    w.txn().exec("UPDATE laswell.job SET state = 'running', finished_at = NULL, error = NULL"
+                 " WHERE job_id = $1::uuid", pqxx::params{dead});
+    w.txn().exec("UPDATE laswell.step SET state = 'running', finished_at = NULL"
+                 " WHERE job_id = $1::uuid", pqxx::params{dead});
+    w.txn().exec("UPDATE shop.orders SET status = 'open' WHERE id > 200");
+    w.commit();
+  }
+
+  // 1. Its specification is not "in progress": nobody is running it. Classed
+  //    so, it was never pending again and was never run again.
+  EXPECT_EQ(scan(false)["migrations"][0].value("status", ""), "pending") << scan(false).dump(2);
+
+  // 2. It is seen as dead although ANOTHER session holds the lock key, as a
+  //    successor for the same specification does: the key is the
+  //    specification's id, and the test used to be for the key alone.
+  {
+    pqxx::connection successor(cfg().conninfo);
+    pqxx::nontransaction n(successor);
+    n.exec("SELECT pg_advisory_lock(lock_key) FROM laswell.job WHERE job_id = $1::uuid",
+           pqxx::params{dead});
+    const auto seen = pglaswell::Ledger(cfg()).interrupted_jobs();
+    ASSERT_EQ(seen.size(), 1u) << seen.dump(2);
+    EXPECT_EQ(seen[0].value("jobId", ""), dead);
+  }
+  // A status call says so and writes nothing.
+  const auto status = payload(call("jobStatus", json::object()));
+  ASSERT_EQ(status.value("interrupted", json::array()).size(), 1u) << status.dump(2);
+  EXPECT_EQ(one("SELECT state FROM laswell.job WHERE job_id = '" + dead + "'::uuid"), "running");
+
+  // 3. An edited form of the specification is told of the one before it.
+  auto edited = doc;
+  edited["description"] = "every open order is shipped (edited)";
+  {
+    const auto parsed = pglaswell::parse_spec(edited);
+    edited["signatures"] = json::array({{{"key_id", test_key().key_id},
+                                         {"algorithm", "ed25519"},
+                                         {"signature", base64(sign(parsed.canonical_bytes))}}});
+  }
+  const auto plan = payload(call("planMigration", json{{"spec", edited}}));
+  ASSERT_TRUE(plan.value("ok", false)) << plan.dump(2);
+  ASSERT_EQ(plan.value("earlierForms", json::array()).size(), 1u) << plan.dump(2);
+  EXPECT_EQ(plan["earlierForms"][0].value("jobId", ""), dead);
+  EXPECT_EQ(plan["earlierForms"][0].value("rowsWritten", 0LL), 300);
+  EXPECT_NE(plan["rendered"].get<std::string>().find("an earlier form of this specification"),
+            std::string::npos) << plan["rendered"].get<std::string>();
+
+  // Applying the unchanged specification again: the dead job is marked when
+  // the run starts, and the work is finished.
+  started = payload(call("startMigration", json{{"spec", on_disk()}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  ASSERT_EQ(started.value("interruptedJobsMarked", json::array()).size(), 1u) << started.dump(2);
+  EXPECT_EQ(started["interruptedJobsMarked"][0].value("jobId", ""), dead);
+  ASSERT_TRUE(wait_for_status(*this, started["jobId"], [](const json& x) {
+    return x.value("state", "") == "succeeded";
+  })) << status_of(started["jobId"]).dump(2);
+  EXPECT_EQ(one("SELECT state || ' ' || (finished_at IS NOT NULL)::text || ' ' ||"
+                " (error ? 'noticedAt')::text FROM laswell.job WHERE job_id = '" + dead +
+                "'::uuid"), "interrupted true true");
+  EXPECT_EQ(one("SELECT string_agg(DISTINCT state, ',') FROM laswell.step WHERE job_id = '" +
+                dead + "'::uuid"), "interrupted");
+  EXPECT_EQ(one("SELECT count(*) FROM shop.orders WHERE status <> 'shipped'"), "0");
+  EXPECT_TRUE(pglaswell::Ledger(cfg()).interrupted_jobs().empty());
+  EXPECT_EQ(scan(false)["migrations"][0].value("status", ""), "applied");
 }
 
 TEST_F(RepoTest, DependenciesEstablishTheOrder) {
@@ -9913,6 +11095,7 @@ TEST(Spec, EveryKindThatPlansAgainstAnObjectHasAnObjectKey) {
 #undef PGLASWELL_NEEDS_OBJECT
       "create_schema", "drop_schema", "alter_schema",
       "create_extension", "drop_extension", "alter_extension",
+      "set_text_search_mapping",
       "create_type", "drop_type", "add_enum_value", "alter_domain",
       "create_function", "drop_function", "alter_function",
       "create_sequence", "drop_sequence", "alter_sequence"};
@@ -10682,6 +11865,70 @@ TEST(Planner, StepsThatNeedAnExclusiveLockTakeTheWeakerOneFirst) {
   EXPECT_EQ(f[0]->detail.value("weaker_lock_first", 0), 2);
 }
 
+// What the dry run cannot run still has a definition the server can be asked
+// about. Measured on 18.6, a 269 MB table: six wrong index definitions were
+// each planned as fine and first refused by the job.
+TEST(Planner, ABuildTheDryRunSkipsHasItsDefinitionCheckedOnAnEmptyCopy) {
+  auto obs = observations(2LL << 30, 8000000);
+  obs.tables["shop.orders"]["columns"]["code"] = json{{"type", "text"}, {"not_null", true}};
+  auto plan = pglaswell::plan_migration(
+      spec_of(json::array({json{{"kind", "create_index"}, {"schema", "shop"},
+                                {"table", "orders"}, {"name", "orders_code_idx"},
+                                {"columns", json::array({json{{"name", "code"},
+                                                              {"opclass", "text_pattern_ops"}}})},
+                                {"where", "code <> ''"}, {"comment", "c"}}})),
+      obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto* build = steps_of(plan, "create_index")[0];
+  ASSERT_EQ(build->txn_class, pglaswell::TxnClass::kForbidden);
+  ASSERT_TRUE(build->detail.contains("rehearse_on_copy")) << build->detail.dump(2);
+  const auto& check = build->detail["rehearse_on_copy"][0];
+  EXPECT_EQ(check.value("of", ""), "\"shop\".\"orders\"");
+  // The same statement, on the copy, and not concurrently.
+  const auto sql = check.value("sql", "");
+  EXPECT_NE(sql.find("CREATE INDEX \"orders_code_idx\" ON pg_temp.laswell_shape USING btree"),
+            std::string::npos) << sql;
+  EXPECT_NE(sql.find("text_pattern_ops"), std::string::npos) << sql;
+  EXPECT_NE(sql.find("WHERE code <> ''"), std::string::npos) << sql;
+  EXPECT_EQ(sql.find("CONCURRENTLY"), std::string::npos) << sql;
+  // The step's own statement is untouched.
+  EXPECT_NE(all_sql(*build).find("INDEX CONCURRENTLY \"orders_code_idx\" ON \"shop\".\"orders\""),
+            std::string::npos);
+
+  const auto in = pglaswell::detail::rehearsal_inputs(plan);
+  ASSERT_EQ(in.on_copy.size(), in.steps.size());
+  EXPECT_TRUE(in.on_copy[0].is_array());
+
+  // The unique recipe's build, and a key with a period on a large table.
+  plan = pglaswell::plan_migration(unique_spec("add_unique_constraint", "orders_code_uq"),
+                                   obs_for_unique(2LL << 30), {});
+  ASSERT_TRUE(plan.ok);
+  const auto u = steps_of(plan, "add_unique_constraint");
+  EXPECT_EQ(u[0]->detail["rehearse_on_copy"][0].value("sql", ""),
+            "CREATE UNIQUE INDEX \"orders_code_uq\" ON pg_temp.laswell_shape (\"code\");");
+  // The adoption that follows needs the real index: nothing to check on a copy.
+  EXPECT_FALSE(u[1]->detail.contains("rehearse_on_copy"));
+
+  plan = pglaswell::plan_migration(
+      spec_of(json::array({period_key("add_unique_constraint", json::array({"id", "valid"}))})),
+      obs_with_period(2LL << 30), {});
+  ASSERT_TRUE(plan.ok);
+  const auto k = steps_of(plan, "add_unique_constraint");
+  EXPECT_EQ(k[0]->detail["rehearse_on_copy"][0].value("sql", ""),
+            "ALTER TABLE pg_temp.laswell_shape ADD CONSTRAINT \"orders_period\" UNIQUE "
+            "(\"id\", \"valid\" WITHOUT OVERLAPS);");
+
+  // A step the dry run does run needs no copy.
+  plan = pglaswell::plan_migration(
+      spec_of(json::array({period_key("add_unique_constraint", json::array({"id", "valid"}))})),
+      obs_with_period(1 << 20), {});
+  EXPECT_FALSE(steps_of(plan, "add_unique_constraint")[0]->detail.contains("rehearse_on_copy"));
+
+  // And the reason a checked step is still listed says how far it was checked.
+  const auto why = pglaswell::detail::unverified_reasons(plan, {0}, {0});
+  EXPECT_NE(why["0"].get<std::string>().find("accepted on an empty copy"), std::string::npos);
+}
+
 // What the rehearsal is handed: the marked steps as nothing to run. One that
 // leaves a gap is treated as a step that cannot run in a transaction is; one
 // that leaves none is listed as not run. The chain rehearsal -- for an empty
@@ -10783,6 +12030,56 @@ TEST(Planner, AnUnindexedForeignKeyColumnWarns) {
     if (w.find("will scan") != std::string::npos) warned = true;
   }
   EXPECT_TRUE(warned) << json(plan.warnings).dump(2);
+}
+
+// A key declared earlier in the same specification brings its index with it.
+// Found in the field: a foreign key on the leading column of a primary key the
+// same file's create_table declares was warned to have no index.
+TEST(Planner, AKeyDeclaredInTheSameSpecificationCountsAsTheForeignKeysIndex) {
+  const auto scans = [](const pglaswell::Plan& plan) {
+    for (const auto& w : plan.warnings) {
+      if (w.find("no index leads with") != std::string::npos) return true;
+    }
+    return false;
+  };
+  const auto fk = [](const std::string& table, const std::string& column) {
+    return json{{"kind", "add_foreign_key"}, {"schema", "shop"}, {"table", table},
+                {"name", "fk_" + column}, {"columns", json::array({column})},
+                {"references_schema", "shop"}, {"references_table", "warehouse"},
+                {"references_columns", json::array({"id"})}};
+  };
+  const json table{{"kind", "create_table"}, {"schema", "shop"}, {"table", "rule_scope"},
+                   {"comment", "Which rule applies to which project."},
+                   {"columns", json::array(
+                        {json{{"name", "rule_id"}, {"type", "bigint"}, {"nullable", false},
+                              {"comment", "The rule."}},
+                         json{{"name", "project_id"}, {"type", "bigint"}, {"nullable", false},
+                              {"comment", "The project."}}})},
+                   {"primary_key", json::array({"rule_id", "project_id"})}};
+  auto obs = observations(1024, 10);
+  obs.tables["shop.rule_scope"] = json{{"exists", false}};
+
+  const auto leading = pglaswell::plan_migration(
+      spec_of(json::array({table, fk("rule_scope", "rule_id")})), obs, {});
+  ASSERT_TRUE(leading.ok) << leading.render();
+  EXPECT_FALSE(scans(leading)) << json(leading.warnings).dump(2);
+
+  // The key's second column is not what the index leads with.
+  const auto second = pglaswell::plan_migration(
+      spec_of(json::array({table, fk("rule_scope", "project_id")})), obs, {});
+  ASSERT_TRUE(second.ok) << second.render();
+  EXPECT_TRUE(scans(second)) << json(second.warnings).dump(2);
+
+  // And a key added to a table that exists, by add_primary_key's sibling.
+  const auto unique = pglaswell::plan_migration(
+      spec_of(json::array(
+          {json{{"kind", "add_unique_constraint"}, {"schema", "shop"}, {"table", "orders"},
+                {"name", "orders_warehouse_id_key"},
+                {"columns", json::array({"warehouse_id", "id"})}},
+           fk("orders", "warehouse_id")})),
+      obs, {});
+  ASSERT_TRUE(unique.ok) << unique.render();
+  EXPECT_FALSE(scans(unique)) << json(unique.warnings).dump(2);
 }
 
 TEST(Spec, AForeignKeyWithMismatchedColumnCountsIsRefused) {
@@ -15523,3 +16820,107 @@ TEST(Modules, EveryModuleKindCarriesItsModulesName) {
 }
 
 #include "modules/enabled_planner_tests.h"
+
+// SIGINT or SIGTERM while a deployment runs. Both binaries used to exit at
+// once, leaving the job `running` in the ledger for good. The first signal now
+// stops the jobs the way cancelJob does and waits for them, so each one's end
+// is written; the deployment then exits 130. The signal is simulated by
+// setting what its handler sets.
+TEST_F(DeployTest, ASignalStopsAWalkAtABatchBoundaryAndTheNextRunResumes) {
+  make_shop(cfg());
+  auto& e = ctx_->registry.mutable_get("default").executor;
+  e.batch_rows = 10;
+  e.batch_cap_rows = 10;
+  write_spec("0001.json",
+             json{{"laswell_spec_version", 1},
+                  {"id", "0001"},
+                  {"description", "every open order is shipped, slowly"},
+                  {"intents", json::array({json{
+                       {"kind", "backfill"}, {"schema", "shop"}, {"table", "orders"},
+                       {"key", "id"}, {"set", {{"status", "'shipped'"}}},
+                       {"where", "orders.status = 'open' AND pg_sleep(0.005) IS NOT NULL"}}})}});
+  const auto one = [&](const std::string& q) {
+    pglaswell::ReadSession r(cfg());
+    return r.txn().exec(q)[0][0].as<std::string>();
+  };
+
+  // The signal comes once the walk has committed something, not after a fixed
+  // time: under Valgrind the job takes seconds to start.
+  pglaswell::signals::g_received = 0;
+  std::thread sender([&] {
+    for (int i = 0; i < 1200; ++i) {
+      if (one("SELECT count(*) FROM shop.orders WHERE status = 'shipped'") != "0") break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    pglaswell::signals::g_received = SIGINT;
+  });
+  const auto [code, text] = deploy();
+  sender.join();
+  pglaswell::signals::g_received = 0;
+
+  EXPECT_EQ(code, pglaswell::DeployResult::kInterrupted) << text;
+  EXPECT_NE(text.find("SIGINT: 1 running migration(s) asked to stop"), std::string::npos) << text;
+  EXPECT_NE(text.find("0001: cancelled"), std::string::npos) << text;
+  // The ledger says what happened, and what was committed is kept.
+  EXPECT_EQ(one("SELECT state || ' ' || (finished_at IS NOT NULL)::text FROM laswell.job"),
+            "cancelled true");
+  const auto shipped = std::stoll(one("SELECT count(*) FROM shop.orders WHERE status = 'shipped'"));
+  EXPECT_GT(shipped, 0);
+  EXPECT_LT(shipped, 300);
+  EXPECT_EQ(one("SELECT rows_done::text FROM laswell.backfill_cursor"), std::to_string(shipped));
+
+  // The same specification again: resumed from the cursor, and finished.
+  const auto [again, more] = deploy();
+  EXPECT_EQ(again, pglaswell::DeployResult::kOk) << more;
+  EXPECT_EQ(one("SELECT count(*) FROM shop.orders WHERE status <> 'shipped'"), "0");
+  EXPECT_EQ(one("SELECT (detail->>'resumedFrom') IS NOT NULL FROM laswell.step s JOIN laswell.job j"
+                " USING (job_id) WHERE j.state = 'succeeded'"), "t");
+}
+
+// A statement that is not a walk has no batch boundary to stop at: it is
+// cancelled, and the job is recorded as cancelled and not as failed.
+TEST_F(DeployTest, ASignalCancelsAStatementInFlight) {
+  make_shop(cfg());
+  write_spec("0001.json",
+             json{{"laswell_spec_version", 1},
+                  {"id", "0001"},
+                  {"description", "a validation that takes half a minute"},
+                  {"intents", json::array({json{
+                       {"kind", "add_check_constraint"}, {"schema", "shop"},
+                       {"table", "orders"}, {"name", "orders_status_slow"},
+                       {"expression", "length(status || pg_sleep(0.1)::text) >= 0"}}})}});
+  const auto one = [&](const std::string& q) {
+    pglaswell::ReadSession r(cfg());
+    return r.txn().exec(q)[0][0].as<std::string>();
+  };
+  // The signal comes once the validation is running on the server, and the
+  // time is taken from the signal: under Valgrind the planning and the dry run
+  // before it took most of the twenty seconds by themselves.
+  pglaswell::signals::g_received = 0;
+  auto signalled = std::chrono::steady_clock::now();
+  std::thread sender([&] {
+    for (int i = 0; i < 1200; ++i) {
+      if (one("SELECT count(*) FROM pg_stat_activity WHERE state = 'active'"
+              " AND datname = current_database() AND query LIKE '%VALIDATE CONSTRAINT%'"
+              " AND pid <> pg_backend_pid()") != "0") break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    signalled = std::chrono::steady_clock::now();
+    pglaswell::signals::g_received = SIGTERM;
+  });
+  const auto [code, text] = deploy();
+  std::ostringstream out;
+  out << text;
+  sender.join();
+  pglaswell::signals::g_received = 0;
+  const auto took = std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::steady_clock::now() - signalled).count();
+
+  EXPECT_EQ(code, pglaswell::DeployResult::kInterrupted) << out.str();
+  EXPECT_LT(took, 20) << "the statement was waited for, not cancelled";
+  EXPECT_NE(out.str().find("SIGTERM: 1 running migration(s) asked to stop"), std::string::npos)
+      << out.str();
+  EXPECT_EQ(one("SELECT state FROM laswell.job"), "cancelled") << out.str();
+  EXPECT_EQ(one("SELECT count(*) FROM pg_constraint WHERE conname = 'orders_status_slow'"
+                " AND convalidated"), "0");
+}
