@@ -1197,6 +1197,38 @@ inline void plan_add_column_plain(const Intent& in, const Observations& obs, Pla
 // column does not exist yet. Intents are ORDERED, and each one must be planned
 // against the state after the ones before it. The planner still does not
 // REORDER intents; it only accounts for the order the author chose.
+// The index a key brings with it, as the catalog would report it once the key
+// exists: PostgreSQL names it after the constraint. A later intent in the same
+// specification reads `indexes`, and a key that projected only a constraint
+// left it looking at a table without one -- a foreign key on the leading column
+// of a primary key declared two intents above was warned to have no index.
+// Measured on 18.6: the index of a key WITHOUT OVERLAPS is gist, and unique.
+inline void project_key_index(json& table, const std::string& name, const json& columns,
+                              bool primary, bool without_overlaps, int ordinal) {
+  if (name.empty() || !columns.is_array() || columns.empty()) return;
+  json order = json::array(), opclasses = json::array();
+  for (std::size_t i = 0; i < columns.size(); ++i) {
+    order.push_back("asc nulls last");
+    opclasses.push_back("");
+  }
+  table["indexes"][name] =
+      json{{"is_valid", true},
+           {"is_unique", true},
+           {"is_primary", primary},
+           {"leading_column", columns[0]},
+           {"columns", columns},
+           {"key_column_count", static_cast<int>(columns.size())},
+           {"column_order", order},
+           {"column_opclasses", opclasses},
+           {"method", without_overlaps ? "gist" : "btree"},
+           {"predicate", ""},
+           {"options", json::array()},
+           {"has_expressions", false},
+           {"constraint_backed", true},
+           {"definition", "(planned by step " + std::to_string(ordinal) + ")"},
+           {"projected_by_step", ordinal}};
+}
+
 inline void project(const Intent& in, const Step& step, Observations& projected) {
   if (step.action != Action::kApply) return;
   // A text search configuration made by the generic create_object, which has
@@ -1452,6 +1484,11 @@ inline void project(const Intent& in, const Step& step, Observations& projected)
       }
       if (!parent.empty()) entry["is_partition"] = true;
       projected.tables[qualified] = entry;
+      if (in.body.contains("primary_key")) {
+        project_key_index(projected.tables[qualified], in.table() + "_pkey",
+                          in.body["primary_key"], /*primary=*/true,
+                          in.body.value("without_overlaps", false), step.ordinal);
+      }
       return;
     }
     case IntentKind::kDropTable:
@@ -1604,6 +1641,10 @@ inline void project(const Intent& in, const Step& step, Observations& projected)
           projected.tables[qualified]["columns"][c.get<std::string>()]["not_null"] = true;
         }
       }
+      project_key_index(projected.tables[qualified], in.body.value("name", ""),
+                        in.body.value("columns", json::array()),
+                        in.kind == IntentKind::kAddPrimaryKey,
+                        in.body.value("without_overlaps", false), step.ordinal);
       return;
     case IntentKind::kReplaceView: {
       const auto v = in.body.value("schema", "") + "." + in.body.value("name", "");

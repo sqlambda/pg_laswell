@@ -12032,6 +12032,56 @@ TEST(Planner, AnUnindexedForeignKeyColumnWarns) {
   EXPECT_TRUE(warned) << json(plan.warnings).dump(2);
 }
 
+// A key declared earlier in the same specification brings its index with it.
+// Found in the field: a foreign key on the leading column of a primary key the
+// same file's create_table declares was warned to have no index.
+TEST(Planner, AKeyDeclaredInTheSameSpecificationCountsAsTheForeignKeysIndex) {
+  const auto scans = [](const pglaswell::Plan& plan) {
+    for (const auto& w : plan.warnings) {
+      if (w.find("no index leads with") != std::string::npos) return true;
+    }
+    return false;
+  };
+  const auto fk = [](const std::string& table, const std::string& column) {
+    return json{{"kind", "add_foreign_key"}, {"schema", "shop"}, {"table", table},
+                {"name", "fk_" + column}, {"columns", json::array({column})},
+                {"references_schema", "shop"}, {"references_table", "warehouse"},
+                {"references_columns", json::array({"id"})}};
+  };
+  const json table{{"kind", "create_table"}, {"schema", "shop"}, {"table", "rule_scope"},
+                   {"comment", "Which rule applies to which project."},
+                   {"columns", json::array(
+                        {json{{"name", "rule_id"}, {"type", "bigint"}, {"nullable", false},
+                              {"comment", "The rule."}},
+                         json{{"name", "project_id"}, {"type", "bigint"}, {"nullable", false},
+                              {"comment", "The project."}}})},
+                   {"primary_key", json::array({"rule_id", "project_id"})}};
+  auto obs = observations(1024, 10);
+  obs.tables["shop.rule_scope"] = json{{"exists", false}};
+
+  const auto leading = pglaswell::plan_migration(
+      spec_of(json::array({table, fk("rule_scope", "rule_id")})), obs, {});
+  ASSERT_TRUE(leading.ok) << leading.render();
+  EXPECT_FALSE(scans(leading)) << json(leading.warnings).dump(2);
+
+  // The key's second column is not what the index leads with.
+  const auto second = pglaswell::plan_migration(
+      spec_of(json::array({table, fk("rule_scope", "project_id")})), obs, {});
+  ASSERT_TRUE(second.ok) << second.render();
+  EXPECT_TRUE(scans(second)) << json(second.warnings).dump(2);
+
+  // And a key added to a table that exists, by add_primary_key's sibling.
+  const auto unique = pglaswell::plan_migration(
+      spec_of(json::array(
+          {json{{"kind", "add_unique_constraint"}, {"schema", "shop"}, {"table", "orders"},
+                {"name", "orders_warehouse_id_key"},
+                {"columns", json::array({"warehouse_id", "id"})}},
+           fk("orders", "warehouse_id")})),
+      obs, {});
+  ASSERT_TRUE(unique.ok) << unique.render();
+  EXPECT_FALSE(scans(unique)) << json(unique.warnings).dump(2);
+}
+
 TEST(Spec, AForeignKeyWithMismatchedColumnCountsIsRefused) {
   json doc = minimal_spec();
   doc["intents"] = json::array({json{

@@ -1507,6 +1507,8 @@ naming one table locks two, and the table nobody mentioned is often the busier
 one.
 It warns when no index leads with the referencing column, because without one
 every parent update or delete scans the child.
+The index of a key counts, and so does one an earlier intent of the same
+specification creates or a key it declares.
 .Pp
 .Cm add_check_constraint
 takes the same two-step shape as a foreign key, for the same measured reason.

@@ -93,6 +93,18 @@ its first attempt; a step still `running` when its job ends is closed as
 `cancelled` or `failed` with the job. No ledger schema change: the column had
 no list of states to extend.
 
+### A key declared in the same specification counts as an index
+
+`add_foreign_key` warned "no index leads with" the referencing column although
+the primary key the same file's `create_table` declares leads with it. A later
+intent sees the indexes of earlier ones, and only `create_index` recorded one:
+`add_primary_key` and `add_unique_constraint` recorded a constraint, and
+`create_table` with a `primary_key` an empty list. All three now record the
+key's index as the catalog reports it once it exists, under the constraint's
+name, so every reader of a table's indexes plans against the same table before
+and after the key is there. Against a table whose key already existed there
+was no warning.
+
 ### A build the plan announces is not cancelled by the statement timeout
 
 `statement_timeout_ms` defaults to two minutes and is set on every transaction
