@@ -177,6 +177,34 @@ inline std::vector<Case> cases() {
           {"name","t_code_uq"},{"columns",json::array({"code"})}},
      "SELECT contype::text || ':' || COALESCE(obj_description(oid, 'pg_constraint'), 'none') FROM pg_constraint WHERE conname='t_code_uq'", "u:documented by add_unique_constraint"},
 
+    // A range column has GiST's own operator class, so this needs no
+    // btree_gist on the server the suite runs against.
+    {"add_exclusion_constraint",
+     {"CREATE TABLE cf.booked (during int4range NOT NULL)",
+      "INSERT INTO cf.booked VALUES ('[1,5)'), ('[5,9)')"},
+     json{{"kind","add_exclusion_constraint"},{"comment","documented by add_exclusion_constraint"},
+          {"schema","cf"},{"table","booked"},{"name","booked_no_overlap"},
+          {"elements",json::array({json{{"column","during"},{"with","&&"}}})}},
+     "SELECT contype::text || ':' || COALESCE(obj_description(oid, 'pg_constraint'), 'none') FROM pg_constraint WHERE conname='booked_no_overlap'",
+     "x:documented by add_exclusion_constraint"},
+
+    // With an index built on the configuration, so that the rebuild the plan
+    // adds is executed too.
+    {"set_text_search_mapping",
+     {"CREATE TEXT SEARCH CONFIGURATION cf.words (COPY = simple)",
+      "CREATE TABLE cf.docs (body text)",
+      "INSERT INTO cf.docs VALUES ('running quickly')",
+      "CREATE INDEX docs_fts ON cf.docs USING gin (to_tsvector('cf.words', body))"},
+     json{{"kind","set_text_search_mapping"},{"schema","cf"},{"name","words"},
+          {"tokens",json::array({"asciiword","word"})},
+          {"dictionaries",json::array({"english_stem"})}},
+     "SELECT (SELECT string_agg(DISTINCT d.dictname, ',') FROM pg_ts_config_map m "
+     "JOIN pg_ts_dict d ON d.oid = m.mapdict JOIN pg_ts_config c ON c.oid = m.mapcfg "
+     "JOIN ts_token_type('default') t ON t.tokid = m.maptokentype "
+     "WHERE c.cfgname = 'words' AND t.alias IN ('asciiword','word')) || ':' || "
+     "(SELECT count(*) FROM cf.docs WHERE to_tsvector('cf.words', body) @@ to_tsquery('cf.words', 'run'))::text",
+     "english_stem:1"},
+
     {"add_check_constraint", {},
      json{{"kind","add_check_constraint"},{"comment","documented by add_check_constraint"},{"schema","cf"},{"table","t"},
           {"name","t_amount_ck"},{"expression","amount IS NULL OR amount >= 0"}},

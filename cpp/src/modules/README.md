@@ -51,7 +51,7 @@ required, and a build naming the module fails at configure time without them.
 | `confine.h` | no | `<name>_required_confinement(obs, table)`: the one reading core's paced walks consult |
 | `index.h` | no | `<name>_index_traits(obs, table, intent) -> IndexTraits`: how an index may be built and dropped on this table -- concurrently or not, by a per-part option, and the data's real size |
 | `constraint.h` | no | `<name>_constraint_traits(obs, table) -> ConstraintTraits`: whether a constraint on this table can be validated in a step of its own, the vendor's refusal in its words, and the data's real size |
-| `after_failure.h` | no | `k<name>AfterFailureAppliesSql`, `k<name>AfterFailureSql`, `k<name>AfterFailureHint`: a read-only query the executor runs when a job fails, on its own connection, whose result is added to the job's error as `left_behind` (Citus: prepared transactions on the nodes) |
+| `after_failure.h` | no | `k<name>AfterFailureInstalledSql` (whether the vendor is here at all, in a statement that names nothing of the vendor's), `k<name>AfterFailureAppliesSql`, `k<name>AfterFailureSql`, `k<name>AfterFailureHint`: a read-only query the executor runs when a job fails, on its own connection, whose result is added to the job's error as `left_behind` (Citus: prepared transactions on the nodes) |
 | `observer.h` | no | Where contention is visible when it is not in `pg_locks` (Citus: on the workers) |
 | `tests.inc` | no, in practice yes | Deferred-case reasons and one representative body per kind, for core's coverage tests |
 | `tests_planner.inc` | no, in practice yes | The module's planner tests, compiled into the test binary only when it is enabled |

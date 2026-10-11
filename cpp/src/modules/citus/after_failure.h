@@ -17,11 +17,15 @@
 //   {"workers": {"worker1:5432": [{"gid": "...", "owner": "...", "age_s": 0}]}}
 // A worker that cannot be asked is reported as unreadable rather than as clean.
 
-// Whether there is a cluster to ask: Citus installed here, with a worker.
+// Whether Citus is installed here. Its own statement, and naming nothing of
+// Citus's: the next one names pg_dist_node, which does not parse without it.
+inline const char* kcitusAfterFailureInstalledSql =
+    "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'citus')";
+
+// Whether there is a cluster to ask: a worker. Run only where Citus is.
 inline const char* kcitusAfterFailureAppliesSql =
-    "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'citus')"
-    "   AND (SELECT count(*) > 0 FROM pg_dist_node"
-    "         WHERE isactive AND noderole = 'primary' AND groupid <> 0)";
+    "SELECT count(*) > 0 FROM pg_dist_node"
+    " WHERE isactive AND noderole = 'primary' AND groupid <> 0";
 
 inline const char* kcitusAfterFailureSql = R"SQL(
 SELECT NULLIF(JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(

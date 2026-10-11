@@ -352,6 +352,45 @@ inline std::string fill_expression(const std::vector<FillSource>& sources) {
   for (const auto& src : sources) parts.push_back(one(src));
   return sources.size() == 1 ? parts[0] : "COALESCE(" + join(parts, ", ") + ")";
 }
+// A fill written as an expression that reads another table: a subquery. It is
+// accepted, it is the natural way to say "true if a row exists", and it is
+// probed row by row where the {"from", "on", "value"} form is a join for the
+// whole batch. Found in the field: nothing said so, and the walk took hours.
+inline bool fill_has_subquery(const json& body) {
+  for (const auto& src : fill_sources(body)) {
+    if (src.joined()) continue;
+    std::string lower;
+    for (const char ch : src.value) {
+      lower += static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+    for (std::size_t at = lower.find("select"); at != std::string::npos;
+         at = lower.find("select", at + 1)) {
+      const auto word = [&](std::size_t i) {
+        return i < lower.size() &&
+               (std::isalnum(static_cast<unsigned char>(lower[i])) || lower[i] == '_');
+      };
+      if ((at == 0 || !word(at - 1)) && !word(at + 6)) return true;
+    }
+  }
+  return false;
+}
+inline void warn_about_looked_up_fills(const std::vector<const Intent*>& group,
+                                       const std::string& qualified, Plan& plan) {
+  std::vector<std::string> which;
+  for (const auto* g : group) {
+    if (fill_has_subquery(g->body)) which.push_back(g->body.value("column", ""));
+  }
+  if (which.empty()) return;
+  plan.warnings.push_back(
+      qualified + ": the fill of " + join(which, ", ") + " is a subquery, so it is "
+      "evaluated row by row: once for every row the walk reads to find a batch, "
+      "whether or not that row takes a value, and once more for every row it "
+      "writes. On a large table that is the cost of the walk. A source written as "
+      "{\"from\", \"on\", \"value\"} is planned as one join for the batch "
+      "instead; it needs the other table to hold at most one row for each row of "
+      "this one. \"paced\": false fills in a single statement where nothing else "
+      "is using the table.");
+}
 // In words, for the plan.
 inline std::string fill_described(const std::vector<FillSource>& sources) {
   std::vector<std::string> parts;
@@ -621,6 +660,7 @@ inline void plan_add_columns_filled(const std::vector<const Intent*>& group,
       // this walk need not go past the highest key there is when it starts.
       // Not part of the specification's language: plan_backfill reads it.
       bf.body["new_rows_are_filled"] = true;
+      if (!in.body.value("paced", true)) bf.body["paced"] = false;
       if (where.joined()) {
         bf.body["from"] = where.from;
         bf.body["where"] = "(" + where.on + ") AND (" + detail::join(terms, " OR ") + ")";
@@ -795,6 +835,7 @@ inline std::vector<const Intent*> filled_column_group(const Spec& spec, std::siz
     if (next.qualified_table() != lead.qualified_table()) break;
     if (next.body.value("after", "") != lead.body.value("after", "")) break;
     if (next.body.value("key", "") != lead.body.value("key", "")) break;
+    if (next.body.value("paced", true) != lead.body.value("paced", true)) break;
     bool entangled = false;
     for (const auto* g : group) {
       if (names_word(detail::fill_text(next.body), g->body.value("column", "")) ||
@@ -867,9 +908,21 @@ inline void plan_defaulted_fill(const std::vector<const Intent*>& group,
     }
   }
 
+  // Each value is wanted three times per column -- is there one, does it differ
+  // from the default, and the value itself -- and by the SELECT that finds the
+  // batch as well as by the UPDATE. Pasted wherever it is wanted, an
+  // expression that is a lookup in another table was evaluated fourteen times
+  // per row for two columns (found in the field: 55 buffers a row). So unless
+  // the source is a join, which names a column of the joined row and costs
+  // nothing to repeat, each value is computed ONCE per row and per statement
+  // and named: by a LATERAL item in the SELECT, and by a sub-select in the SET
+  // of the UPDATE (plan_backfill, `computed`). OFFSET 0 is what keeps
+  // PostgreSQL from flattening the names back into copies of the expression.
+  const std::string fill_alias = detail::quote_identifier("laswell_fill");
   json set = json::object();
-  std::vector<std::string> any, described;
-  for (const auto* g : group) {
+  std::vector<std::string> any, any_named, described, named_values, taken, columns_set;
+  for (std::size_t n = 0; n < group.size(); ++n) {
+    const auto* g = group[n];
     const auto column = g->body.value("column", "");
     const auto c = rel + "." + detail::quote_identifier(column);
     const auto dflt = "(" + g->body.value("default", "") + ")";
@@ -887,6 +940,15 @@ inline void plan_defaulted_fill(const std::vector<const Intent*>& group,
     any.push_back(group.size() == 1 ? differs : "(" + differs + ")");
     described.push_back(column + " (default " + dflt + ") from " +
                         detail::fill_described(sources));
+
+    const std::string name = detail::quote_identifier("v" + std::to_string(n + 1));
+    const std::string v = fill_alias + "." + name;
+    const std::string differs_named = c + " IS NOT DISTINCT FROM " + dflt + " AND " + v +
+                                      " IS NOT NULL AND " + v + " IS DISTINCT FROM " + dflt;
+    named_values.push_back("(" + value + ") AS " + name);
+    any_named.push_back(group.size() == 1 ? differs_named : "(" + differs_named + ")");
+    taken.push_back("CASE WHEN " + differs_named + " THEN " + v + " ELSE " + c + " END");
+    columns_set.push_back(detail::quote_identifier(column));
   }
   Intent bf;
   bf.kind = IntentKind::kBackfill;
@@ -899,7 +961,23 @@ inline void plan_defaulted_fill(const std::vector<const Intent*>& group,
                        (group.size() == 1 ? any[0] : "(" + detail::join(any, " OR ") + ")");
   } else {
     bf.body["where"] = detail::join(any, " OR ");
+    const std::string once =
+        "(SELECT " + detail::join(named_values, ", ") + " OFFSET 0) AS " + fill_alias;
+    bf.body["computed"] = "LATERAL " + once;
+    bf.body["select_where"] = detail::join(any_named, " OR ");
+    // One column: the rows the SELECT locked are the rows that take the value.
+    // Several: each is written only where it holds for that column, from the
+    // values named once.
+    bf.body["apply_set"] =
+        group.size() == 1
+            ? columns_set[0] + " = " + set[group[0]->body.value("column", "")].get<std::string>()
+            : "(" + detail::join(columns_set, ", ") + ") = (SELECT " +
+                  detail::join(taken, ", ") + " FROM " + once + ")";
+    // For the one statement over the whole table ("paced": false).
+    bf.body["single_columns"] = columns_set;
+    bf.body["single_values"] = taken;
   }
+  if (!in.body.value("paced", true)) bf.body["paced"] = false;
   const auto before = out.size();
   plan_backfill(bf, obs, cfg, plan, out);
   for (std::size_t i = before; i < out.size(); ++i) {
@@ -907,6 +985,7 @@ inline void plan_defaulted_fill(const std::vector<const Intent*>& group,
     out[i].why = "only the rows whose value differs from the default are written: " +
                  detail::join(described, "; ") + ". " + out[i].why;
   }
+  detail::warn_about_looked_up_fills(group, qualified, plan);
   plan.warnings.push_back(
       qualified + ": " + detail::join(described, "; ") + " -- NOT NULL with " +
       (group.size() == 1 ? "its default" : "their defaults") + " from the first "
@@ -1118,8 +1197,60 @@ inline void plan_add_column_plain(const Intent& in, const Observations& obs, Pla
 // column does not exist yet. Intents are ORDERED, and each one must be planned
 // against the state after the ones before it. The planner still does not
 // REORDER intents; it only accounts for the order the author chose.
+// The index a key brings with it, as the catalog would report it once the key
+// exists: PostgreSQL names it after the constraint. A later intent in the same
+// specification reads `indexes`, and a key that projected only a constraint
+// left it looking at a table without one -- a foreign key on the leading column
+// of a primary key declared two intents above was warned to have no index.
+// Measured on 18.6: the index of a key WITHOUT OVERLAPS is gist, and unique.
+inline void project_key_index(json& table, const std::string& name, const json& columns,
+                              bool primary, bool without_overlaps, int ordinal) {
+  if (name.empty() || !columns.is_array() || columns.empty()) return;
+  json order = json::array(), opclasses = json::array();
+  for (std::size_t i = 0; i < columns.size(); ++i) {
+    order.push_back("asc nulls last");
+    opclasses.push_back("");
+  }
+  table["indexes"][name] =
+      json{{"is_valid", true},
+           {"is_unique", true},
+           {"is_primary", primary},
+           {"leading_column", columns[0]},
+           {"columns", columns},
+           {"key_column_count", static_cast<int>(columns.size())},
+           {"column_order", order},
+           {"column_opclasses", opclasses},
+           {"method", without_overlaps ? "gist" : "btree"},
+           {"predicate", ""},
+           {"options", json::array()},
+           {"has_expressions", false},
+           {"constraint_backed", true},
+           {"definition", "(planned by step " + std::to_string(ordinal) + ")"},
+           {"projected_by_step", ordinal}};
+}
+
 inline void project(const Intent& in, const Step& step, Observations& projected) {
   if (step.action != Action::kApply) return;
+  // A text search configuration made by the generic create_object, which has
+  // no object of its own to project into: set_text_search_mapping reads this
+  // slot, and without it a mapping could not follow the configuration it is
+  // for in one specification -- reported from the field as the first thing
+  // anyone writes. What the new configuration maps is not known here (it is a
+  // COPY of another, in SQL the planner does not parse), so it is marked as
+  // made by this specification and planned without comparing.
+  if ((in.kind == IntentKind::kCreateObject || in.kind == IntentKind::kDropObject) &&
+      in.body.value("object_type", "") == "TEXT SEARCH CONFIGURATION") {
+    auto name = in.body.value("name", "");
+    const auto schema = in.body.value("schema", "");
+    if (!schema.empty() && name.find('.') == std::string::npos) name = schema + "." + name;
+    if (name.find('.') != std::string::npos) {
+      projected.objects["tsconfig:" + name] =
+          in.kind == IntentKind::kCreateObject
+              ? json{{"exists", true}, {"created_in_spec", true}}
+              : json{{"exists", false}};
+    }
+    return;
+  }
   // Non-relation objects are keyed by name, not by schema.table, and they are
   // projected FIRST -- the tables guard below would return early for every one
   // of them, which made all of this dead code until a test looked.
@@ -1134,7 +1265,7 @@ inline void project(const Intent& in, const Step& step, Observations& projected)
         return;
       case IntentKind::kCreateExtension:
         projected.objects[object_key] =
-            json{{"exists", true}, {"kind", "extension"},
+            json{{"exists", true}, {"kind", "extension"}, {"created_in_spec", true},
                  {"depended_on_by", json::array()}};
         return;
       case IntentKind::kCreateType: {
@@ -1171,6 +1302,31 @@ inline void project(const Intent& in, const Step& step, Observations& projected)
         projected.objects[object_key] = json{{"exists", false}};
         (void)oq;
         return;
+      // The mapping as the step leaves it, so that a second intent on the same
+      // configuration is planned against it.
+      case IntentKind::kSetTextSearchMapping: {
+        // Not where the configuration is itself made by this specification:
+        // nothing is known of its mapping, and nothing is compared with it.
+        if (projected.objects.contains(object_key) &&
+            projected.objects[object_key].value("mapping", json()).is_object()) {
+          json resolved = json::array();
+          for (const auto& d : in.body.value("dictionaries", json::array())) {
+            const auto given = d.get<std::string>();
+            for (const auto& known : projected.objects[object_key].value("dictionaries", json::array())) {
+              const auto full = known.value("schema", "") + "." + known.value("name", "");
+              if (full == given || (known.value("name", "") == given && known.value("visible", false))) {
+                resolved.push_back(full);
+                break;
+              }
+            }
+          }
+          for (const auto& tk : in.body.value("tokens", json::array())) {
+            if (resolved.empty()) projected.objects[object_key]["mapping"].erase(tk.get<std::string>());
+            else projected.objects[object_key]["mapping"][tk.get<std::string>()] = resolved;
+          }
+        }
+        return;
+      }
       default: return;
     }
   }
@@ -1328,6 +1484,11 @@ inline void project(const Intent& in, const Step& step, Observations& projected)
       }
       if (!parent.empty()) entry["is_partition"] = true;
       projected.tables[qualified] = entry;
+      if (in.body.contains("primary_key")) {
+        project_key_index(projected.tables[qualified], in.table() + "_pkey",
+                          in.body["primary_key"], /*primary=*/true,
+                          in.body.value("without_overlaps", false), step.ordinal);
+      }
       return;
     }
     case IntentKind::kDropTable:
@@ -1480,6 +1641,10 @@ inline void project(const Intent& in, const Step& step, Observations& projected)
           projected.tables[qualified]["columns"][c.get<std::string>()]["not_null"] = true;
         }
       }
+      project_key_index(projected.tables[qualified], in.body.value("name", ""),
+                        in.body.value("columns", json::array()),
+                        in.kind == IntentKind::kAddPrimaryKey,
+                        in.body.value("without_overlaps", false), step.ordinal);
       return;
     case IntentKind::kReplaceView: {
       const auto v = in.body.value("schema", "") + "." + in.body.value("name", "");
@@ -1488,6 +1653,12 @@ inline void project(const Intent& in, const Step& step, Observations& projected)
       projected.tables[v]["view_definition"] = in.body.value("definition", "");
       return;
     }
+    case IntentKind::kAddExclusionConstraint:
+      projected.tables[qualified]["constraints"][in.body.value("name", "")] =
+          json{{"type", "x"}, {"has_index", true}, {"depended_on_by", json::array()}};
+      return;
+    case IntentKind::kSetTextSearchMapping:
+      return;   // an object, projected above
     case IntentKind::kAddForeignKey:
     case IntentKind::kAddCheckConstraint:
       // A constraint, not a relation or a column: nothing a later intent in
@@ -1545,6 +1716,7 @@ inline void take_weaker_lock_first(const Intent& in, const Observations& obs,
     case IntentKind::kSetOwner:
     case IntentKind::kAddPrimaryKey:
     case IntentKind::kAddUniqueConstraint:
+    case IntentKind::kAddExclusionConstraint:
     case IntentKind::kAddCheckConstraint:
     case IntentKind::kAddForeignKey:
     case IntentKind::kSetNotNull:
@@ -1593,6 +1765,99 @@ inline void take_weaker_lock_first(const Intent& in, const Observations& obs,
     if (step.sql.front().rfind("ALTER INDEX ", 0) == 0) skip = true;
     if (skip) continue;
     weaker_lock_first(step, lockable);
+  }
+}
+}  // namespace detail
+
+namespace detail {
+// "schema"."name" at `at`, or "" when what is there is not that.
+inline std::string quoted_relation_at(const std::string& s, std::size_t at) {
+  std::size_t i = at;
+  for (int part = 0; part < 2; ++part) {
+    if (i >= s.size() || s[i] != '"') return {};
+    ++i;
+    while (i < s.size()) {
+      if (s[i] == '"') {
+        if (i + 1 < s.size() && s[i + 1] == '"') { i += 2; continue; }
+        break;
+      }
+      ++i;
+    }
+    if (i >= s.size()) return {};
+    ++i;
+    if (part == 0) {
+      if (i >= s.size() || s[i] != '.') return {};
+      ++i;
+    }
+  }
+  return s.substr(at, i - at);
+}
+
+// A statement the dry run leaves to the job because it reads or builds over
+// the whole table is, for the same reason, one whose length is the table's and
+// not the tool's to cap: statement_timeout_ms (two minutes by default) exists
+// for the short statements, and cancelled a key with a period on 69.5 million
+// rows at exactly two minutes, in the job, after a plan that had said how much
+// there was to index (2026-10-08). CREATE INDEX CONCURRENTLY has always run
+// without it (executor.h, run_nontransactional); this is the same decision for
+// a statement that has to be inside a transaction. Not for a step that is
+// cheap because a scan before it proved the rows: that one is short.
+inline void lift_statement_timeout(std::vector<Step>& steps) {
+  for (auto& step : steps) {
+    if (step.action != Action::kApply) continue;
+    if (step.txn_class == TxnClass::kForbidden) continue;
+    if (!step.detail.contains("not_rehearsed")) continue;
+    if (step.detail.value("not_rehearsed", "") == kNeedsTheScan) continue;
+    step.detail["no_statement_timeout"] = true;
+  }
+}
+
+// For whatever a kind's planner emitted: every index build and constraint
+// build the dry run will not run gets its definition checked on an empty copy
+// of the table it names (check_on_empty_copy, planner_base.h). Done here once,
+// for the same reason the weaker lock is: the builds are emitted at a dozen
+// sites, plain, per partition and per part.
+inline void check_definitions_on_empty_copy(const Intent& in, std::vector<Step>& steps) {
+  switch (in.kind) {
+    case IntentKind::kCreateIndex:
+    case IntentKind::kAddUniqueConstraint:
+    case IntentKind::kAddPrimaryKey:
+    case IntentKind::kAddExclusionConstraint:
+      break;
+    default:
+      return;
+  }
+  for (auto& step : steps) {
+    if (step.action != Action::kApply || step.detail.contains("rehearse_on_copy")) continue;
+    const bool left_out = step.txn_class == TxnClass::kForbidden ||
+                          (step.detail.contains("not_rehearsed") &&
+                           step.detail.value("not_rehearsed_leaves_gap", false));
+    if (!left_out) continue;
+    for (const auto& stmt : step.sql) {
+      std::size_t target = std::string::npos;
+      std::string on_copy = stmt;
+      if (stmt.rfind("CREATE INDEX ", 0) == 0 || stmt.rfind("CREATE UNIQUE INDEX ", 0) == 0) {
+        const auto conc = on_copy.find(" CONCURRENTLY ");
+        if (conc != std::string::npos && conc < on_copy.find(" ON ")) {
+          on_copy.erase(conc, std::string(" CONCURRENTLY").size());
+        }
+        const auto on = on_copy.find(" ON ");
+        if (on == std::string::npos) continue;
+        target = on + 4;
+        if (on_copy.compare(target, 5, "ONLY ") == 0) target += 5;
+      } else if (stmt.rfind("ALTER TABLE ", 0) == 0 &&
+                 stmt.find(" ADD CONSTRAINT ") != std::string::npos &&
+                 stmt.find(" USING INDEX ") == std::string::npos) {
+        target = std::string("ALTER TABLE ").size();
+        if (on_copy.compare(target, 5, "ONLY ") == 0) target += 5;
+      } else {
+        continue;
+      }
+      const auto rel = quoted_relation_at(on_copy, target);
+      if (rel.empty()) continue;
+      on_copy.replace(target, rel.size(), kEmptyCopy);
+      check_on_empty_copy(step, rel, on_copy);
+    }
   }
 }
 }  // namespace detail
@@ -2419,6 +2684,14 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
                          detail::quote_identifier(name) + " ON " + sql_rel + " USING " +
                          method + " (" + columns_sql + ")" + include_sql + with_sql +
                          (where.empty() ? "" : " WHERE " + where) + ";");
+      // The module's own option means nothing on a plain copy: the definition
+      // is checked there without it.
+      check_on_empty_copy(step, sql_rel,
+                          "CREATE " + std::string(unique ? "UNIQUE " : "") + "INDEX " +
+                              detail::quote_identifier(name) + " ON " + detail::kEmptyCopy +
+                              " USING " + method + " (" + columns_sql + ")" + include_sql +
+                              index_with_sql(in.body) +
+                              (where.empty() ? "" : " WHERE " + where) + ";");
       step.why = "size " + detail::human_bytes(size) + (waiters > 0 ? ", " +
                  std::to_string(waiters) + " lock waiters" : "") +
                  ", and " + traits_by + " says a concurrent build is not possible "
@@ -2554,19 +2827,29 @@ inline void plan_partitioned_index(const Intent& in, const json& t, Plan& plan,
   const auto where = in.body.value("where", "");
   const bool unique = in.body.value("unique", false);
 
+  // The key as the plain path reads it: a column may be a name alone or carry
+  // a direction, an operator class or be an expression. Read here as strings
+  // only, an object failed the whole plan with a JSON type error, and INCLUDE
+  // was left out of the parent's index and of every partition's without a
+  // word -- a different index from the one specified.
+  //
+  // `columns` holds names for the partition-key check, with an EMPTY name for
+  // an expression, which can never be a partition column.
+  const auto keys = index_columns(in.body);
   std::vector<std::string> columns;
-  for (const auto& c : in.body.value("columns", json::array())) {
-    columns.push_back(c.get<std::string>());
-  }
-  // Two lists, deliberately. `columns` is compared against the catalog's own
-  // column names -- which arrive unquoted -- so quoting it in place would make
-  // every equivalence check compare unequal things, which is the very failure
-  // require_identifier's comment warns about. `quoted_columns` is the one that
-  // reaches SQL.
+  for (const auto& k : keys) columns.push_back(k.name);
   std::vector<std::string> quoted_columns;
-  for (const auto& c : columns) quoted_columns.push_back(detail::quote_identifier(c));
+  for (const auto& k : keys) quoted_columns.push_back(index_column_sql(k));
   const std::string cols = detail::join(quoted_columns, ", ");
-  const std::string tail = " USING " + method + " (" + cols + ")" +
+  std::string include_sql;
+  if (in.body.contains("include")) {
+    std::vector<std::string> q;
+    for (const auto& c : in.body.value("include", json::array())) {
+      q.push_back(detail::quote_identifier(c.get<std::string>()));
+    }
+    if (!q.empty()) include_sql = " INCLUDE (" + detail::join(q, ", ") + ")";
+  }
+  const std::string tail = " USING " + method + " (" + cols + ")" + include_sql +
                            index_with_sql(in.body) +
                            (where.empty() ? "" : " WHERE " + where);
 
@@ -5509,6 +5792,42 @@ inline void plan_create_table(const Intent& in, const Observations& obs,
     // Inline, and only here. On an EMPTY table there is no scan to avoid and
     // nothing to lock out, so the two-step add_primary_key recipe would be
     // machinery for nothing.
+    if (in.body.value("without_overlaps", false)) {
+      // The table is not there to ask, so only what the declared types make
+      // certain is refused here; the rest is the server's to say, in the dry
+      // run. Measured on 18.6: "column ... in WITHOUT OVERLAPS is not a range
+      // or multirange type", and without btree_gist "data type bigint has no
+      // default operator class for access method gist".
+      std::map<std::string, std::string> declared;
+      for (const auto& col : in.body.value("columns", json::array())) {
+        declared[col.value("name", "")] = col.value("type", "");
+      }
+      const auto period = in.body["primary_key"].back().get<std::string>();
+      std::string refusal;
+      if (detail::known_scalar_type(declared[period])) {
+        refusal = "without_overlaps makes the last column of the key, " + period +
+                  ", the period, and it is declared " + declared[period] +
+                  ". A period is one range or multirange column -- daterange, "
+                  "tstzrange -- not a date or a pair of them.";
+      } else if (!obs.object("extension:btree_gist").value("exists", false)) {
+        for (std::size_t i = 0; i + 1 < in.body["primary_key"].size(); ++i) {
+          const auto c = in.body["primary_key"][i].get<std::string>();
+          if (!detail::known_scalar_type(declared[c])) continue;
+          refusal = "a primary key with a period is a GiST index, and GiST has no "
+                    "operator class for " + c + " (" + declared[c] + ") without the "
+                    "extension btree_gist, which is not installed. Add a "
+                    "create_extension intent for btree_gist before this one.";
+          break;
+        }
+      }
+      if (!refusal.empty()) {
+        step.action = Action::kConflict;
+        step.why = "the primary key of " + qualified + " cannot be built as declared";
+        plan.conflicts.push_back("create_table " + qualified + ": " + refusal);
+        return;
+      }
+      pk.back() += " WITHOUT OVERLAPS";
+    }
     defs.push_back("PRIMARY KEY (" + detail::join(pk, ", ") + ")");
   }
 
@@ -6395,6 +6714,273 @@ inline void plan_unique_on_partitions(const Intent& in, const json& t, bool prim
       "from that partition.");
 }
 
+namespace detail {
+// A constraint only ADD CONSTRAINT can build: a key with a period, or an
+// exclusion constraint. Both are a GiST index and neither has another way in.
+// Measured on 18.6, 2 million rows: 20.8 s under AccessExclusiveLock for
+// either; NOT VALID is refused ("EXCLUDE constraints cannot be marked NOT
+// VALID", "UNIQUE constraints cannot be marked NOT VALID"); and an index built
+// concurrently beforehand cannot be adopted, because GiST has no unique
+// indexes ("is not a unique index").
+struct LockedBuild {
+  std::string name;                       // the constraint
+  std::string clause;                     // PRIMARY KEY (...), UNIQUE (...), EXCLUDE ...
+  std::string what;                       // for sentences: "primary key with a period"
+  std::vector<std::string> equal_columns; // compared with "=": what a partition key must be among
+  std::vector<std::string> index_columns; // every plain column the index covers
+  bool gist = true;
+};
+}  // namespace detail
+
+// The same constraint on a partitioned table, a partition at a time. ON ONLY
+// the parent it is a catalog entry over an index that holds nothing; each
+// partition then builds its own under AccessExclusiveLock on that partition
+// alone, and is attached. Measured on 18.6 for both forms: the parent's index
+// turns valid when the last partition's is attached. It is the shape the
+// unique recipe has, without the concurrent build that GiST constraints have
+// no use for.
+inline void plan_locked_build_on_partitions(const Intent& in, const json& t,
+                                            const detail::LockedBuild& c, bool rehearse,
+                                            Plan& plan, std::vector<Step>& out) {
+  const auto qualified = in.qualified_table();
+  const auto sql_rel = detail::quote_qualified(qualified);
+  auto fail = [&](const std::string& why, const std::string& said) {
+    Step s;
+    s.kind = in.kind_name;
+    s.action = Action::kConflict;
+    s.why = why;
+    plan.conflicts.push_back(said);
+    out.push_back(std::move(s));
+  };
+  auto emit = [&](std::vector<std::string> sql, const std::string& lock,
+                  const std::string& why) -> Step& {
+    Step s;
+    s.kind = in.kind_name;
+    s.txn_class = TxnClass::kRequired;
+    s.own_transaction = true;
+    s.sql = std::move(sql);
+    s.lock = lock;
+    s.why = why;
+    s.detail["constraint"] = c.name;
+    out.push_back(std::move(s));
+    return out.back();
+  };
+
+  const auto partkey = t.value("partition_key", std::string());
+  const auto key = detail::partition_key_columns(partkey);
+  if (key.empty()) {
+    fail("the partition key of " + qualified + " is an expression",
+         qualified + " is partitioned by " + partkey + ", and PostgreSQL allows no " +
+             c.what + " on a table whose partition key includes an expression.");
+    return;
+  }
+  for (const auto& k : key) {
+    if (std::find(c.equal_columns.begin(), c.equal_columns.end(), k) != c.equal_columns.end()) {
+      continue;
+    }
+    fail("the constraint does not compare the partition column " + k + " for equality",
+         "\"" + c.name + "\" on " + qualified + ": " + qualified + " is partitioned by " +
+             partkey + ", and the " + c.what + " does not have " + k +
+             " among the columns it compares with \"=\" (" +
+             detail::join(c.equal_columns, ", ") + "). PostgreSQL: \"unique constraint on "
+             "partitioned table must include all partitioning columns\", and \"cannot match "
+             "partition key to index ... using non-equal operator\" where it is there with "
+             "another operator. Add " + k + " to it, compared with \"=\".");
+    return;
+  }
+
+  const json parts = t.value("partition_parts", json::array());
+  struct Part { std::string relation, child; json ix; };
+  std::vector<Part> todo;
+  for (const auto& p : parts) {
+    const auto relation = p.value("relation", "");
+    if (p.value("partitioned", false)) {
+      fail(relation + " is itself partitioned",
+           "\"" + c.name + "\" on " + qualified + ": its partition " + relation +
+               " is itself partitioned. The recipe would have to descend into its "
+               "partitions, which pg_laswell does not plan yet; add the constraint by "
+               "hand, partition by partition.");
+      return;
+    }
+    const auto bare = relation.substr(relation.find('.') + 1);
+    const auto child = bare + "_" + c.name;
+    if (child.size() > 63) {
+      fail("a per-partition constraint name would exceed 63 bytes",
+           "the constraint on " + relation + " would be named \"" + child +
+               "\", which PostgreSQL would truncate at 63 bytes -- and a truncated name "
+               "is not deterministic, so a resumed recipe could not find what it built. "
+               "Use a shorter constraint name.");
+      return;
+    }
+    const json ix = p.value("indexes", json::object()).value(child, json());
+    if (ix.is_object() && !ix.value("constraint", json()).is_string()) {
+      fail("\"" + child + "\" exists and backs no constraint",
+           "an index named \"" + child + "\" already exists on " + relation +
+               " and is not a constraint's, so the constraint the recipe adds there "
+               "could not take that name. Drop or rename it in an earlier intent.");
+      return;
+    }
+    todo.push_back({relation, child, ix});
+  }
+
+  if (todo.empty()) {
+    emit({"ALTER TABLE " + sql_rel + " ADD CONSTRAINT " + detail::quote_identifier(c.name) +
+          " " + c.clause + ";"},
+         "AccessExclusiveLock on " + qualified + ", briefly: it has no partitions",
+         qualified + " is partitioned and has no partitions yet, so the constraint is a "
+         "catalog change; each partition created later gets it");
+    return;
+  }
+
+  if (!t.value("constraints", json::object()).contains(c.name)) {
+    auto& s = emit({"ALTER TABLE ONLY " + sql_rel + " ADD CONSTRAINT " +
+                    detail::quote_identifier(c.name) + " " + c.clause + ";"},
+                   "AccessExclusiveLock on " + qualified +
+                       " alone, briefly -- no partition is locked or read",
+                   "ON ONLY the parent the constraint is a catalog entry whose index holds "
+                   "nothing, so this builds nothing. It stays INVALID until every "
+                   "partition's index is attached, and a partition created meanwhile gets "
+                   "the constraint by itself");
+    // ONLY here too: without it LOCK TABLE takes every partition as well.
+    weaker_lock_first(s, {"ONLY " + sql_rel});
+  }
+
+  const auto parent_schema = qualified.substr(0, qualified.find('.'));
+  std::size_t n = 0;
+  for (const auto& p : todo) {
+    ++n;
+    const auto sql_part = detail::quote_qualified(p.relation);
+    const auto schema = p.relation.substr(0, p.relation.find('.'));
+    const std::string of = "partition " + std::to_string(n) + " of " +
+                           std::to_string(todo.size()) + " (" + p.relation + ")";
+    const bool built = p.ix.is_object();
+    if (!built) {
+      auto& s = emit({"ALTER TABLE " + sql_part + " ADD CONSTRAINT " +
+                      detail::quote_identifier(p.child) + " " + c.clause + ";"},
+                     "AccessExclusiveLock on " + p.relation +
+                         " for the whole of its index build; the other partitions are "
+                         "not locked",
+                     of + ": the index is built on the partition itself, under its own "
+                     "lock, because there is no way to build it without one -- so one "
+                     "partition waits at a time and not the whole table");
+      weaker_lock_first(s, {sql_part});
+      s.detail["partition"] = p.relation;
+      if (!rehearse) do_not_rehearse(s, detail::kHeavyNotRehearsed, /*leaves_gap=*/true);
+    }
+    const auto attached = built ? p.ix.value("attached_to", json()) : json();
+    if (!(attached.is_string() && attached.get<std::string>() == c.name)) {
+      auto& s = emit({"ALTER INDEX " + detail::quote_identifier(parent_schema) + "." +
+                      detail::quote_identifier(c.name) + " ATTACH PARTITION " +
+                      detail::quote_identifier(schema) + "." +
+                      detail::quote_identifier(p.child) + ";"},
+                     "AccessExclusiveLock on the partition's index and "
+                     "ShareUpdateExclusiveLock on the parent's, briefly",
+                     of + ": attached; the constraint on " + qualified +
+                         " becomes valid when the last partition's is");
+      s.detail["partition"] = p.relation;
+    }
+  }
+
+  Step verify;
+  verify.kind = "verify_index_valid";
+  verify.txn_class = TxnClass::kOptional;
+  verify.lock = "none (catalog read)";
+  verify.why = "a partitioned constraint missing even one partition's index exists, is "
+               "INVALID, and enforces nothing across partitions -- and nothing else "
+               "would say so";
+  verify.detail = json{{"schema", parent_schema}, {"index", c.name}};
+  out.push_back(std::move(verify));
+
+  plan.warnings.push_back(
+      "a " + c.what + " has no NOT VALID form and no index that can be built beforehand, "
+      "so each partition of " + qualified + " is locked against reads and writes while "
+      "its own index builds -- one partition at a time, " + std::to_string(todo.size()) +
+      " in all. If a partition holds rows that conflict its step fails there, with the "
+      "constraint on " + qualified + " added and not yet valid; remove the conflict and "
+      "apply the specification again, and it carries on from that partition.");
+}
+
+// What both forms share once the intent's own checks are done: can GiST index
+// these columns, is the table partitioned, and how much is locked for how long.
+inline void plan_locked_build(const Intent& in, const Observations& obs, const json& t,
+                              const detail::LockedBuild& c, Plan& plan,
+                              std::vector<Step>& out) {
+  const auto qualified = in.qualified_table();
+  const auto sql_rel = detail::quote_qualified(qualified);
+  auto fail = [&](const std::string& why, const std::string& said) {
+    Step s;
+    s.kind = in.kind_name;
+    s.action = Action::kConflict;
+    s.why = why;
+    plan.conflicts.push_back(said);
+    out.push_back(std::move(s));
+  };
+
+  // Measured on 18.6 without btree_gist: "data type bigint has no default
+  // operator class for access method gist". Read from the catalog, so a type
+  // with a class of its own (inet, a range, a geometric type) is not refused.
+  if (c.gist) {
+    const json cols = t.value("columns", json::object());
+    const bool have_btree_gist = obs.object("extension:btree_gist").value("exists", false);
+    for (const auto& col : c.index_columns) {
+      if (!cols.contains(col) || !cols[col].contains("gist_opclass")) continue;
+      if (cols[col].value("gist_opclass", false)) continue;
+      if (cols[col].value("type_kind", "") != "b") continue;
+      const auto type = cols[col].value("type", "");
+      fail("GiST has no operator class for " + qualified + "." + col,
+           "\"" + c.name + "\" on " + qualified + ": a " + c.what +
+               " is a GiST index, and GiST has no default operator class for " + col +
+               " (" + type + ")." +
+               (have_btree_gist
+                    ? " btree_gist is installed and does not cover that type."
+                    : " The extension btree_gist supplies them for integers, text, "
+                      "dates, uuid and the like, and it is not installed: add a "
+                      "create_extension intent for btree_gist before this one."));
+      return;
+    }
+  }
+
+  const auto data = detail::table_data(obs, qualified, in);
+  const int waiters = t.value("lock_waiters", 0);
+  const bool small_and_quiet = data.bytes < (64LL << 20) && waiters == 0;
+
+  if (t.value("kind", "") == "partitioned_table") {
+    plan_locked_build_on_partitions(in, t, c, small_and_quiet, plan, out);
+    return;
+  }
+
+  std::string traits_by;
+  const auto traits = index_traits(obs, qualified, in, traits_by);
+  const std::string scope =
+      traits.answered && !traits.scope.empty() ? traits.scope : qualified;
+
+  Step s;
+  s.kind = in.kind_name;
+  s.txn_class = TxnClass::kRequired;
+  s.own_transaction = !small_and_quiet;
+  s.sql = {"ALTER TABLE " + sql_rel + " ADD CONSTRAINT " + detail::quote_identifier(c.name) +
+           " " + c.clause + ";"};
+  s.lock = "AccessExclusiveLock on " + scope + " for the whole of the index build";
+  s.why = "a " + c.what + " is built by this statement and no other: there is no NOT "
+          "VALID form and no index that can be built beforehand and adopted. " +
+          detail::human_bytes(data.bytes) + " to index" +
+          (small_and_quiet ? ", which is brief" : "");
+  s.detail["constraint"] = c.name;
+  if (!small_and_quiet) {
+    do_not_rehearse(s, detail::kHeavyNotRehearsed, /*leaves_gap=*/true);
+    plan.warnings.push_back(
+        "\"" + c.name + "\" on " + qualified + " is added in one statement that holds "
+        "AccessExclusiveLock on " + scope + " while a GiST index is built over " +
+        detail::human_bytes(data.bytes) +
+        (waiters > 0 ? ", with sessions already waiting on the table" : "") +
+        ": every reader and writer queues for the whole build. PostgreSQL offers no "
+        "other way to add a " + c.what + " to a table that has rows -- measured on 18.6 "
+        "at 20.8 s for 2 million rows -- so schedule it for a window, or partition the "
+        "table, where it is done a partition at a time.");
+  }
+  out.push_back(std::move(s));
+}
+
 inline void plan_unique_like(const Intent& in, const Observations& obs,
                              Plan& plan, std::vector<Step>& out) {
   const bool primary = in.kind == IntentKind::kAddPrimaryKey;
@@ -6498,6 +7084,32 @@ inline void plan_unique_like(const Intent& in, const Observations& obs,
           "AccessExclusiveLock -- measured at 75ms on 2M rows against 0.6ms "
           "when the column is already NOT NULL, and it grows with the table.");
     }
+  }
+
+  // A key with a period is not a unique index at all but a GiST one, built
+  // only by the statement that adds the constraint.
+  if (in.body.value("without_overlaps", false)) {
+    const auto& period = columns.back();
+    const auto kind_of = cols[period].value("type_kind", std::string("r"));
+    if (kind_of != "r" && kind_of != "m") {
+      fail(qualified + "." + period + " is not a range",
+           "\"" + name + "\" on " + qualified + ": without_overlaps makes the last column, " +
+               period + ", the period, and it is " + cols[period].value("type", "") +
+               ". PostgreSQL: \"column in WITHOUT OVERLAPS is not a range or multirange "
+               "type\". Two columns that hold a start and an end are not a period until "
+               "they are one range column.");
+      return;
+    }
+    detail::LockedBuild c;
+    c.name = name;
+    c.what = std::string(primary ? "primary key" : "unique constraint") + " with a period";
+    std::vector<std::string> q = quoted_columns;
+    q.back() += " WITHOUT OVERLAPS";
+    c.clause = std::string(primary ? "PRIMARY KEY" : "UNIQUE") + " (" + detail::join(q, ", ") + ")";
+    c.equal_columns.assign(columns.begin(), columns.end() - 1);
+    c.index_columns = columns;
+    plan_locked_build(in, obs, t, c, plan, out);
+    return;
   }
 
   if (partitioned) {
@@ -7400,6 +8012,14 @@ inline void plan_add_foreign_key(const Intent& in, const Observations& obs,
   std::vector<std::string> quoted_cols, quoted_refs;
   for (const auto& c : cols) quoted_cols.push_back(detail::quote_identifier(c));
   for (const auto& c : refs) quoted_refs.push_back(detail::quote_identifier(c));
+  // PERIOD before the last column of each list: the foreign key that
+  // references a key WITHOUT OVERLAPS. Measured on 18.6: NOT VALID and
+  // VALIDATE take the locks an ordinary foreign key's do, so the recipe below
+  // is unchanged.
+  if (in.body.value("period", false) && !quoted_cols.empty()) {
+    quoted_cols.back() = "PERIOD " + quoted_cols.back();
+    quoted_refs.back() = "PERIOD " + quoted_refs.back();
+  }
   std::string clause =
       "FOREIGN KEY (" + detail::join(quoted_cols, ", ") + ") REFERENCES " +
       detail::quote_qualified(parent) + " (" + detail::join(quoted_refs, ", ") + ")";
@@ -7479,6 +8099,333 @@ inline void plan_add_foreign_key(const Intent& in, const Observations& obs,
   out.push_back(std::move(validate));
 }
 
+// An exclusion constraint. What is there is compared by name and type, as for
+// a unique constraint; what is to be built goes the one way there is.
+inline void plan_add_exclusion_constraint(const Intent& in, const Observations& obs,
+                                          Plan& plan, std::vector<Step>& out) {
+  const auto qualified = in.qualified_table();
+  const auto& t = obs.table(qualified);
+  const auto name = in.body.value("name", "");
+  auto fail = [&](const std::string& why, const std::string& said) {
+    Step s;
+    s.kind = in.kind_name;
+    s.action = Action::kConflict;
+    s.why = why;
+    plan.conflicts.push_back(said);
+    out.push_back(std::move(s));
+  };
+  if (!t.value("exists", false)) {
+    fail(qualified + " does not exist", qualified + " does not exist");
+    return;
+  }
+  const json cols = t.value("columns", json::object());
+  const auto method = in.body.value("using", std::string("gist"));
+  detail::LockedBuild c;
+  c.name = name;
+  c.what = "exclusion constraint";
+  c.gist = method == "gist";
+  std::vector<std::string> elements;
+  for (const auto& e : in.body.value("elements", json::array())) {
+    const auto op = e.value("with", "");
+    if (e.contains("column")) {
+      const auto col = e.value("column", "");
+      if (!cols.contains(col)) {
+        fail(qualified + "." + col + " does not exist",
+             qualified + "." + col + " does not exist, so no constraint can compare it");
+        return;
+      }
+      c.index_columns.push_back(col);
+      if (op == "=") c.equal_columns.push_back(col);
+      elements.push_back(detail::quote_identifier(col) + " WITH " + op);
+    } else {
+      elements.push_back("(" + e.value("expression", "") + ") WITH " + op);
+    }
+  }
+  c.clause = "EXCLUDE USING " + detail::quote_identifier(method) + " (" +
+             detail::join(elements, ", ") + ")";
+  if (in.body.contains("where")) c.clause += " WHERE (" + in.body.value("where", "") + ")";
+
+  const json constraints = t.value("constraints", json::object());
+  const bool unfinished =
+      t.value("kind", "") == "partitioned_table" && constraints.contains(name) &&
+      constraints[name].value("type", "") == "x" &&
+      !t.value("indexes", json::object()).value(name, json::object()).value("is_valid", true);
+  if (constraints.contains(name) && !unfinished) {
+    const auto type = constraints[name].value("type", "");
+    if (type == "x") {
+      Step s;
+      s.kind = in.kind_name;
+      s.action = Action::kSatisfied;
+      s.why = name + " is already present on " + qualified;
+      out.push_back(std::move(s));
+      return;
+    }
+    fail(name + " exists as a different constraint type",
+         name + " already exists on " + qualified + " as contype '" + type +
+             "', not as an exclusion constraint. Drop it in an earlier intent if it is "
+             "to be replaced.");
+    return;
+  }
+  plan_locked_build(in, obs, t, c, plan, out);
+}
+
+// set_text_search_mapping: the mapping stated, the statement chosen, and the
+// indexes that were built with the old mapping rebuilt.
+inline void plan_set_text_search_mapping(const Intent& in, const Observations& obs,
+                                         Plan& plan, std::vector<Step>& out) {
+  const auto schema = in.body.value("schema", "");
+  const auto name = in.body.value("name", "");
+  const auto config = schema + "." + name;
+  const auto sql_config = detail::quote_identifier(schema) + "." + detail::quote_identifier(name);
+  const auto& o = obs.object(object_key_for(in));
+  auto fail = [&](const std::string& why, const std::string& said) {
+    Step s;
+    s.kind = in.kind_name;
+    s.action = Action::kConflict;
+    s.why = why;
+    plan.conflicts.push_back(said);
+    out.push_back(std::move(s));
+  };
+  if (!o.value("exists", false)) {
+    fail("text search configuration " + config + " does not exist",
+         "text search configuration " + config + " does not exist. create_object with "
+         "object_type TEXT SEARCH CONFIGURATION is the intent that creates one; this "
+         "kind changes the mapping of one that is there.");
+    return;
+  }
+
+  const auto quoted_name = [](const std::string& given) {
+    return given.find('.') == std::string::npos ? detail::quote_identifier(given)
+                                                : detail::quote_qualified(given);
+  };
+  std::vector<std::string> token_list;
+  for (const auto& tk : in.body.value("tokens", json::array())) {
+    token_list.push_back(tk.get<std::string>());
+  }
+
+  // A configuration an earlier intent of this specification creates is not in
+  // the catalog to compare with, so the statements are the pair that is right
+  // whatever it holds -- measured on 18.6: DROP MAPPING IF EXISTS passes over
+  // a token type with no mapping, and ADD MAPPING then never meets one that is
+  // there. What the catalog would have refused beforehand -- an unknown token
+  // type, a dictionary that is not there -- the dry run refuses instead, by
+  // running both statements after the one that creates the configuration.
+  if (o.value("created_in_spec", false)) {
+    std::vector<std::string> dicts;
+    for (const auto& d : in.body.value("dictionaries", json::array())) {
+      dicts.push_back(quoted_name(d.get<std::string>()));
+    }
+    Step step;
+    step.kind = in.kind_name;
+    step.txn_class = TxnClass::kRequired;
+    step.sql.push_back("ALTER TEXT SEARCH CONFIGURATION " + sql_config +
+                       " DROP MAPPING IF EXISTS FOR " + detail::join(token_list, ", ") + ";");
+    if (!dicts.empty()) {
+      step.sql.push_back("ALTER TEXT SEARCH CONFIGURATION " + sql_config + " ADD MAPPING FOR " +
+                         detail::join(token_list, ", ") + " WITH " + detail::join(dicts, ", ") +
+                         ";");
+    }
+    step.lock = "none on any table: the configuration's catalog rows only";
+    step.why = config + " is created earlier in this specification, so its mapping is "
+               "set without comparing with a catalog that does not hold it yet: whatever "
+               "it copied for these token types is dropped and the mapping added";
+    step.detail["configuration"] = config;
+    out.push_back(std::move(step));
+    plan.warnings.push_back(
+        "the mapping of " + config + " is planned without the catalog, because the "
+        "configuration is created by an earlier intent of this specification: its token "
+        "types and dictionaries are checked by the dry run, not before it, and a "
+        "dictionary named without a schema is found by the search path of the "
+        "connection that runs the job. Set the mapping before any index is built with "
+        "the configuration: one built in between would hold vectors of the copied "
+        "mapping.");
+    return;
+  }
+
+  // A dictionary that is not in the catalog may be one an extension brings,
+  // where an earlier intent of this specification creates the extension.
+  bool extension_created_here = false;
+  for (const auto& [key, value] : obs.objects.items()) {
+    if (key.rfind("extension:", 0) == 0 && value.value("created_in_spec", false)) {
+      extension_created_here = true;
+    }
+  }
+
+  // Each dictionary resolved to schema.name, so that the statement does not
+  // depend on the search_path of whichever connection runs it.
+  std::vector<std::string> want;
+  std::vector<std::string> quoted_want;
+  bool unresolved = false;
+  for (const auto& d : in.body.value("dictionaries", json::array())) {
+    const auto given = d.get<std::string>();
+    std::string found;
+    int candidates = 0;
+    for (const auto& known : o.value("dictionaries", json::array())) {
+      const auto full = known.value("schema", "") + "." + known.value("name", "");
+      if (given.find('.') != std::string::npos) {
+        if (full == given) { found = full; candidates = 1; break; }
+      } else if (known.value("name", "") == given && known.value("visible", false)) {
+        found = full;
+        ++candidates;
+      }
+    }
+    if (candidates != 1 && extension_created_here) {
+      // Written as given, and left to the dry run, which has created the
+      // extension by the time it reaches this step.
+      unresolved = true;
+      want.push_back(given);
+      quoted_want.push_back(quoted_name(given));
+      continue;
+    }
+    if (candidates != 1) {
+      fail("text search dictionary " + given + " was not found",
+           "set_text_search_mapping on " + config + ": no text search dictionary \"" + given +
+               "\" " + (given.find('.') == std::string::npos
+                            ? "is on the search path of this connection"
+                            : "exists") +
+               ". A dictionary an extension supplies is there once the extension is -- "
+               "unaccent's comes with create_extension unaccent -- and one in a schema "
+               "off the search path is named as schema.name.");
+      return;
+    }
+    want.push_back(found);
+    quoted_want.push_back(detail::quote_qualified(found));
+  }
+  if (unresolved) {
+    plan.warnings.push_back(
+        "a dictionary of the mapping of " + config + " is not in the catalog, and an "
+        "earlier intent of this specification creates an extension that may bring it: "
+        "it is written as given and checked by the dry run, not before it.");
+  }
+
+  const json known_tokens = o.value("tokens", json::array());
+  const json mapping = o.value("mapping", json::object());
+  std::vector<std::string> add, alter, drop;
+  for (const auto& tk : in.body.value("tokens", json::array())) {
+    const auto token = tk.get<std::string>();
+    if (std::find(known_tokens.begin(), known_tokens.end(), token) == known_tokens.end()) {
+      fail(token + " is not a token type of " + config,
+           "set_text_search_mapping on " + config + ": its parser has no token type \"" +
+               token + "\". PostgreSQL: \"token type ... does not exist\". The default "
+               "parser's are listed by ts_token_type('default').");
+      return;
+    }
+    std::vector<std::string> have;
+    for (const auto& d : mapping.value(token, json::array())) have.push_back(d.get<std::string>());
+    if (have == want) continue;
+    if (want.empty()) drop.push_back(token);
+    else if (have.empty()) add.push_back(token);
+    else alter.push_back(token);
+  }
+  if (add.empty() && alter.empty() && drop.empty()) {
+    Step s;
+    s.kind = in.kind_name;
+    s.action = Action::kSatisfied;
+    s.why = config + " already maps " +
+            detail::join([&] { std::vector<std::string> v;
+                               for (const auto& tk : in.body["tokens"]) v.push_back(tk.get<std::string>());
+                               return v; }(), ", ") +
+            (want.empty() ? " to nothing" : " to " + detail::join(want, ", "));
+    out.push_back(std::move(s));
+    return;
+  }
+
+  Step step;
+  step.kind = in.kind_name;
+  step.txn_class = TxnClass::kRequired;
+  step.own_transaction = true;
+  const std::string head = "ALTER TEXT SEARCH CONFIGURATION " + sql_config;
+  if (!add.empty()) {
+    step.sql.push_back(head + " ADD MAPPING FOR " + detail::join(add, ", ") + " WITH " +
+                       detail::join(quoted_want, ", ") + ";");
+  }
+  if (!alter.empty()) {
+    step.sql.push_back(head + " ALTER MAPPING FOR " + detail::join(alter, ", ") + " WITH " +
+                       detail::join(quoted_want, ", ") + ";");
+  }
+  if (!drop.empty()) {
+    step.sql.push_back(head + " DROP MAPPING FOR " + detail::join(drop, ", ") + ";");
+  }
+  // Measured on 18.6: no relation is locked, only the configuration's own
+  // catalog rows are written.
+  step.lock = "none on any table: the configuration's catalog rows only";
+  step.why = "a catalog change, and it takes effect for every to_tsvector and to_tsquery "
+             "that names " + config + " from its commit on -- while whatever was computed "
+             "before it keeps the old result";
+  step.detail["configuration"] = config;
+  out.push_back(std::move(step));
+
+  // What was built with the old mapping. Measured on 18.6: a row indexed before
+  // the change was found by neither the old spelling nor the new one until its
+  // index was rebuilt -- the query is parsed with the new mapping and the index
+  // still holds the old vectors.
+  std::size_t rebuilt = 0;
+  std::vector<std::string> not_rebuilt;
+  for (const auto& ix : o.value("indexes", json::array())) {
+    const auto table = ix.value("table", "");
+    const auto ischema = ix.value("schema", "");
+    const auto iname = ix.value("index", "");
+    std::string by;
+    const auto traits = index_traits(obs, table, in, by);
+    // Where a module says the rows are in parts and an index over the whole
+    // cannot be built concurrently, it cannot be rebuilt as a whole either
+    // (TimescaleDB: "reindexing of a specific index on a hypertable is
+    // unsupported"). Each part's index depends on the configuration itself and
+    // is in this list on its own.
+    if (traits.answered && !traits.concurrent) {
+      not_rebuilt.push_back(ischema + "." + iname + " (" + by + ": rebuilt through the "
+                            "indexes of its parts, which follow)");
+      continue;
+    }
+    ++rebuilt;
+    Step r;
+    r.kind = in.kind_name;
+    r.txn_class = TxnClass::kForbidden;
+    r.sql = {"REINDEX INDEX CONCURRENTLY " + detail::quote_identifier(ischema) + "." +
+             detail::quote_identifier(iname) + ";"};
+    r.lock = "ShareUpdateExclusiveLock on " + table + " -- reads and writes continue";
+    r.why = ischema + "." + iname + " was built with " + config +
+            " as it was (" + detail::human_bytes(ix.value("bytes", 0LL)) +
+            "), and answers from the old vectors until it is rebuilt";
+    r.detail["index"] = iname;
+    r.detail["schema"] = ischema;
+    r.detail["configuration"] = config;
+    out.push_back(std::move(r));
+
+    Step verify;
+    verify.kind = "verify_index_valid";
+    verify.txn_class = TxnClass::kOptional;
+    verify.lock = "none (catalog read)";
+    verify.why = "a REINDEX CONCURRENTLY that fails leaves the old index in place and "
+                 "an INVALID copy beside it; this is what says the rebuild finished";
+    verify.detail = json{{"schema", ischema}, {"index", iname}};
+    out.push_back(std::move(verify));
+  }
+  if (rebuilt > 0 || !not_rebuilt.empty()) {
+    plan.warnings.push_back(
+        "changing the mapping of " + config + " leaves " + std::to_string(rebuilt) +
+        " index(es) built with it holding the old vectors, and a search through one can "
+        "miss rows until it is rebuilt. The plan rebuilds each with REINDEX INDEX "
+        "CONCURRENTLY right after the change; between the change and the end of an "
+        "index's rebuild its answers are not to be trusted. If a rebuild fails the "
+        "mapping stays changed and a later plan finds nothing left to do, so that index "
+        "has then to be rebuilt by hand." +
+        (not_rebuilt.empty() ? "" : " Not rebuilt as a whole: " +
+                                        detail::join(not_rebuilt, "; ") + "."));
+  }
+  const json others = o.value("other_dependents", json::array());
+  std::vector<std::string> named;
+  for (const auto& d : others) named.push_back(d.get<std::string>());
+  plan.warnings.push_back(
+      "a tsvector that is STORED was computed with the old mapping of " + config +
+      " and is not recomputed by anything here: a generated column, a column a trigger "
+      "fills, a materialized view. " +
+      (named.empty() ? "The catalog records none that names the configuration, which "
+                       "does not cover one filled by a trigger or by the application."
+                     : "The catalog records these as depending on it: " +
+                           detail::join(named, "; ") + "."));
+}
+
 // --- the planner ----------------------------------------------------------
 
 namespace detail {
@@ -7508,6 +8455,7 @@ inline void append_creation_comment(const Intent& in, std::vector<Step>& steps) 
     case IntentKind::kAddCheckConstraint:
     case IntentKind::kAddUniqueConstraint:
     case IntentKind::kAddPrimaryKey:
+    case IntentKind::kAddExclusionConstraint:
       target = "CONSTRAINT " + name + on_table();
       break;
     case IntentKind::kCreateTrigger: target = "TRIGGER " + name + on_table(); break;
@@ -7701,6 +8649,10 @@ inline Plan plan_migration(const Spec& spec, const Observations& obs,
       case IntentKind::kDropIndex:   plan_drop_index(in, projected, plan, emitted); break;
       case IntentKind::kSetNotNull:  plan_set_not_null(in, projected, plan, emitted); break;
       case IntentKind::kAddForeignKey: plan_add_foreign_key(in, projected, plan, emitted); break;
+      case IntentKind::kAddExclusionConstraint:
+        plan_add_exclusion_constraint(in, projected, plan, emitted); break;
+      case IntentKind::kSetTextSearchMapping:
+        plan_set_text_search_mapping(in, projected, plan, emitted); break;
       case IntentKind::kAddCheckConstraint:
         plan_add_check_constraint(in, projected, plan, emitted); break;
       case IntentKind::kDropConstraint:
@@ -7804,6 +8756,8 @@ inline Plan plan_migration(const Spec& spec, const Observations& obs,
         plan_security(in, projected, plan, emitted); break;
     }
     detail::take_weaker_lock_first(in, projected, emitted);
+    detail::check_definitions_on_empty_copy(in, emitted);
+    detail::lift_statement_timeout(emitted);
     detail::append_creation_comment(in, emitted);
     if (!emitted.empty()) project(in, emitted.front(), projected);
 
@@ -7893,7 +8847,12 @@ inline std::string Plan::render() const {
       if (s.txn_class == TxnClass::kForbidden) {
         note = "NOT atomic: cannot run inside a transaction block";
       } else if (s.txn_class == TxnClass::kOwnTxnPerBatch) {
-        note = "NOT atomic: paced, many commits";
+        // "paced": false: what is tried first comes first, since this is the
+        // line a reviewer reads first.
+        note = s.detail.value("single_statement", false)
+                   ? "one statement in one transaction; NOT atomic if it is cancelled: "
+                     "then paced, many commits"
+                   : "NOT atomic: paced, many commits";
       }
       out += "\n-- transaction group " + std::to_string(current_group) +
              " ---------------- " + note + " --\n";
@@ -7905,6 +8864,10 @@ inline std::string Plan::render() const {
     for (const auto& q : s.sql) out += "    " + q + "\n";
     if (!s.lock.empty()) out += "    lock: " + s.lock + "\n";
     if (!s.why.empty()) out += "    why:  " + s.why + "\n";
+    if (s.detail.value("no_statement_timeout", false)) {
+      out += "    time: no statement timeout: it takes as long as the table is large, "
+             "and statement_timeout_ms is lifted for it\n";
+    }
   }
   for (const auto& w : warnings) out += "\n warn: " + w + "\n";
   // Not part of planDigest (see Plan::advisories), and labelled so a reader
