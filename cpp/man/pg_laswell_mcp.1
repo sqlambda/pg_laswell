@@ -610,6 +610,13 @@ several nodes, where the coordinator's planner estimates nothing of the scan;
 is then rows written against rows estimated, as it was.
 The step's row in the ledger keeps the rate when the walk ends.
 .Pp
+Any step that has begun and not ended is named under
+.Va runningStep ,
+with its ordinal, its kind and how long it has run
+.Pq Va elapsedSeconds .
+For a step that is not a walk that is all there is: PostgreSQL reports no
+progress for a validation or for a constraint's build.
+.Pp
 The one statement of a fill that is not paced has no rows to count:
 PostgreSQL reports no progress for an
 .Ic UPDATE .

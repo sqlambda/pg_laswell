@@ -137,6 +137,11 @@ struct Job {
   std::mutex m;                 // guards everything below
   json steps = json::array();   // per-step progress
   json backfill = json::object();
+  // The step that has begun and not ended: its ordinal, kind and when it
+  // began. A step that is not a walk reports nothing while it runs -- a
+  // constraint's build over a large table was four minutes of silence -- so
+  // this is what there is to say of it (jobStatus, runningStep).
+  json running_step;
   json error;
   std::vector<std::string> warnings;
   std::chrono::steady_clock::time_point started;

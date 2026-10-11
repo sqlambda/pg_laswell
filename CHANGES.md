@@ -196,6 +196,25 @@ Batches that grow while the table is quiet were measured and not built: on
 35,000 to 48,000 at the larger sizes, and a concurrent writer's longest wait
 went from 3 to 12 ms and from 68 to 252 ms.
 
+### A long step says that it is running
+
+A 283-second GiST build for an exclusion constraint printed nothing between
+"started" and "succeeded". A step's start went to the ledger and nowhere else,
+so `jobStatus` had nothing to say of a step that was not a walk. It now carries
+`runningStep` with the step's ordinal, kind and `elapsedSeconds`, and
+`pg_laswell` prints "step 3 (add_exclusion_constraint): has run 4 min; it
+reports no progress of its own" at the intervals a walk's line has.
+
+### The file of a specification that failed can be removed
+
+A specification whose job had failed was taken out of the repository, and every
+later run stopped with "the ledger records it as applied in epoch ..., and no
+file in this repository has that id". The check counted every id in
+`laswell.migration`, whatever its jobs had done. An id is now answered for only
+when a job of it succeeded or is running; one that never was applied is noted
+(`notes` in `listMigrations`, a `note:` line from `pg_laswell`) and the run
+goes on. The note says that a failed job may have committed some of its steps.
+
 ### A job whose process died is noticed, marked, and run again
 
 A job's row in the ledger is closed by the process that runs it. Reported from

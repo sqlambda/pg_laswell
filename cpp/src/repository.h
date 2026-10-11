@@ -486,6 +486,7 @@ class MigrationRepository {
     namespace fs = std::filesystem;
     std::vector<RepoEntry> entries;
     std::vector<std::string> problems;
+    std::vector<std::string> notes;
 
     if (sources.empty()) {
       return json{{"error", "no source directory given"},
@@ -738,6 +739,23 @@ class MigrationRepository {
         const auto& ids = ep.value();
         for (auto it = ids.begin(); it != ids.end(); ++it) {
           if (on_disk.count(epoch + "\x1f" + it.key()) != 0) continue;
+          // Applied, or being applied. An id whose jobs all failed, were
+          // cancelled or never started was not applied, and its file may be
+          // taken out of the repository: found in the field, removing the
+          // file of a specification that had failed stopped every later run
+          // with "records it as applied". It is still said, because a job
+          // that failed may have committed some of its steps.
+          const auto& entry = it.value();
+          if (entry.value("succeeded", json::array()).empty() &&
+              entry.value("running", json::array()).empty()) {
+            notes.push_back(
+                "the ledger of \"" + conn + "\" records \"" + it.key() +
+                "\" in epoch \"" + epoch + "\" as started and never applied, and "
+                "no file in this repository has that id. Nothing is held against "
+                "it. A job that failed may have committed some of its steps; "
+                "laswell.step says which.");
+            continue;
+          }
           problems.push_back(
               "the ledger of \"" + conn + "\" records \"" + it.key() +
               "\" as applied in epoch \"" + epoch +
@@ -752,7 +770,7 @@ class MigrationRepository {
     }
 
     if (derive_relations) derive(entries, parsed);
-    return assemble(entries, parsed, problems);
+    return assemble(entries, parsed, problems, notes);
   }
 
  private:
@@ -1021,7 +1039,8 @@ class MigrationRepository {
   // can ALLOW it.
   json assemble(const std::vector<RepoEntry>& entries,
                 const std::map<std::string, Spec>& parsed,
-                std::vector<std::string> problems) {
+                std::vector<std::string> problems,
+                std::vector<std::string> notes = {}) {
     std::map<std::string, const RepoEntry*> by_id;
     std::vector<std::string> runnable;
     for (const auto& e : entries) {
@@ -1142,6 +1161,8 @@ class MigrationRepository {
         {"migrations", std::move(list)},
         {"order", std::move(groups)},
         {"problems", std::move(problems)},
+        // Said and not held against the repository; see where they are added.
+        {"notes", std::move(notes)},
         {"note",
          "`order` is a list of levels from depends_on; each level lists groups "
          "that may run concurrently. pg_laswell can prove two migrations "

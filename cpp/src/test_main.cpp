@@ -5268,7 +5268,7 @@ TEST_F(ToolTest, CancellingAJobStopsItAndLeavesTheCursorCommitted) {
   const auto job_id = p["jobId"].get<std::string>();
   ASSERT_TRUE(wait_for_status(*this, job_id, [](const json& s) {
     return s.contains("backfill") && s["backfill"].value("commits", 0) > 0;
-  })) << "the backfill never started committing";
+  })) << "the backfill never started committing: " << status_of(job_id).dump(2);
 
   const auto cancelled = payload(call("cancelJob", json{{"jobId", job_id}}));
   EXPECT_TRUE(cancelled.value("requested", false)) << cancelled.dump(2);
@@ -5968,6 +5968,43 @@ TEST(Deploy, AProgressLineForTheOneStatementSaysHowLongAndHowMuchTheTableGrew) {
   EXPECT_EQ(pglaswell::detail::progress_line("0310-flags", b),
             "  0310-flags: step 2: the one statement has run 40 s; it reports no progress "
             "of its own; the table has grown 50 MB since it began");
+}
+
+// A step that is not a walk. PostgreSQL reports nothing of a validation or a
+// constraint's build, so the line says that it runs and for how long.
+TEST(Deploy, AProgressLineForAStepThatIsNotAWalkSaysItsKindAndHowLong) {
+  const json b{{"ordinal", 3}, {"kind", "add_exclusion_constraint"}, {"elapsedSeconds", 283}};
+  EXPECT_EQ(pglaswell::detail::progress_line("0120-periods", b),
+            "  0120-periods: step 3 (add_exclusion_constraint): has run 4 min; it reports "
+            "no progress of its own");
+}
+
+TEST_F(ToolTest, AStepThatIsRunningIsNamedInJobStatusUntilItEnds) {
+  make_shop(cfg());
+  json doc = minimal_spec();
+  doc["id"] = "0043-orders-status-checked";
+  doc["description"] = "A validation that takes a few seconds.";
+  doc["intents"] = json::array({json{
+      {"kind", "add_check_constraint"}, {"schema", "shop"}, {"table", "orders"},
+      {"name", "orders_status_slow"},
+      {"expression", "length(status || pg_sleep(0.01)::text) >= 0"}}});
+  const auto p = payload(call("startMigration",
+                              json{{"spec", signed_doc(doc)}, {"dryRun", false}}));
+  ASSERT_TRUE(p.value("accepted", false)) << p.dump(2);
+  json seen;
+  ASSERT_TRUE(wait_for_status(*this, p["jobId"], [&](const json& s) {
+    if (s.contains("runningStep")) seen = s["runningStep"];
+    return !seen.is_null() || s.value("state", "") == "succeeded";
+  })) << status_of(p["jobId"]).dump(2);
+  ASSERT_FALSE(seen.is_null()) << "the job ended before a running step was ever reported";
+  EXPECT_EQ(seen.value("kind", ""), "add_check_constraint") << seen.dump(2);
+  EXPECT_TRUE(seen.contains("ordinal")) << seen.dump(2);
+  EXPECT_TRUE(seen.contains("elapsedSeconds")) << seen.dump(2);
+
+  ASSERT_TRUE(wait_for_status(*this, p["jobId"], [](const json& s) {
+    return s.value("state", "") == "succeeded";
+  })) << status_of(p["jobId"]).dump(2);
+  EXPECT_FALSE(status_of(p["jobId"]).contains("runningStep"));
 }
 
 // The one statement on a table that IS in use. A session that waits behind it
@@ -7657,6 +7694,41 @@ TEST_F(EpochTest, ARetiredLineageIsNotHeldToAccountForItsMissingFiles) {
         << s["problems"].dump(2);
   }
   EXPECT_TRUE(s["problems"].empty()) << s["problems"].dump(2);
+}
+
+// A specification whose job failed was never applied, and its file may go.
+// Found in the field: with the file removed, every later run stopped with "the
+// ledger records it as applied".
+TEST_F(EpochTest, AFailedSpecificationWhoseFileIsRemovedIsNotedAndNotHeldAgainstTheRepository) {
+  make_shop(cfg());
+  write_spec("good.json", add_column_spec("good-0001", "orders", "ca"));
+  apply_now("good.json");
+  // A check no row satisfies: the job fails at its validation.
+  auto bad = add_column_spec("bad-0001", "orders", "cz");
+  bad["intents"] = json::array({json{{"kind", "add_check_constraint"}, {"schema", "shop"},
+                                     {"table", "orders"}, {"name", "orders_never"},
+                                     {"expression", "status = 'no such status'"}}});
+  write_spec("bad.json", bad);
+  const auto started = payload(call("startMigration",
+      json{{"spec", json::parse(std::ifstream(dir_ + "/bad.json"), nullptr, true)}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, started["jobId"], [](const json& x) {
+    return x.value("state", "") == "failed";
+  })) << status_of(started["jobId"]).dump(2);
+
+  std::filesystem::remove(dir_ + "/bad.json");
+  const auto s = scan(false);
+  EXPECT_TRUE(s["problems"].empty()) << s["problems"].dump(2);
+  ASSERT_EQ(s["notes"].size(), 1u) << s.dump(2);
+  EXPECT_NE(s["notes"][0].get<std::string>().find("\"bad-0001\""), std::string::npos);
+  EXPECT_NE(s["notes"][0].get<std::string>().find("never applied"), std::string::npos);
+
+  // One that WAS applied is still answered for.
+  std::filesystem::remove(dir_ + "/good.json");
+  write_spec("other.json", add_column_spec("other-0001", "warehouse", "cb"));
+  const auto t = scan(false);
+  ASSERT_EQ(t["problems"].size(), 1u) << t.dump(2);
+  EXPECT_NE(t["problems"][0].get<std::string>().find("\"good-0001\""), std::string::npos);
 }
 
 TEST_F(EpochTest, RetirementDoesNotUnsayThatAMigrationRan) {

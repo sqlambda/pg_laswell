@@ -56,9 +56,19 @@ estimated, the share of the table walked and the time left: after 10 seconds,
 then 20, 40 and so on up to every ten minutes.
 For the one statement of a fill that is not paced the line says how long it has
 run and by how much the table has grown, at the same intervals.
+For any other step that runs that long, a validation or a constraint's build
+among them, it names the step and says how long it has run.
 See
 .Xr pg_laswell_mcp 1 ,
 .Sx Progress .
+.Pp
+A specification the ledger records as applied, or as being applied, must have
+its file in the repository, and a run stops when it has not.
+One whose jobs all failed or were cancelled was never applied: its file may be
+removed, and a run then notes it and goes on.
+A job that failed may still have committed some of its steps;
+.Va laswell.step
+says which.
 .Pp
 On
 .Dv SIGINT

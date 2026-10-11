@@ -1701,6 +1701,12 @@ class Executor {
 
   // The ledger's row for a step, before the step runs (ledger.h).
   void begin_step(int ordinal, const json& step) {
+    {
+      std::lock_guard<std::mutex> lock(job_->m);
+      job_->running_step = json{{"ordinal", ordinal},
+                                {"kind", step.value("kind", "")},
+                                {"startedMs", detail::steady_ms()}};
+    }
     if (ledger_ == nullptr) return;
     try {
       ledger_->begin_step(job_->job_id, ordinal, step);
@@ -1722,6 +1728,10 @@ class Executor {
     {
       std::lock_guard<std::mutex> lock(job_->m);
       job_->steps.push_back(entry);
+      if (job_->running_step.is_object() &&
+          job_->running_step.value("ordinal", -1) == ordinal) {
+        job_->running_step = nullptr;
+      }
     }
     if (ledger_ == nullptr) return;
     try {

@@ -1087,6 +1087,16 @@ inline json job_snapshot(const Job& j, const ExecutorConfig& e) {
 
   out["workerPid"] = j.pacing.worker_pid.load();
   out["steps"] = j.steps;
+  // The step that is running, and for how long. A walk and the one statement
+  // say more under "backfill"; for any other step this is all there is, since
+  // PostgreSQL reports no progress for a validation or a constraint's build.
+  if (j.running_step.is_object() && !is_terminal(j.state.load())) {
+    out["runningStep"] = json{
+        {"ordinal", j.running_step.value("ordinal", 0)},
+        {"kind", j.running_step.value("kind", "")},
+        {"elapsedSeconds",
+         (detail::steady_ms() - j.running_step.value("startedMs", 0LL)) / 1000}};
+  }
   if (!j.backfill.empty()) out["backfill"] = j.backfill;
   // The one statement of a "paced": false fill, while it runs. PostgreSQL
   // reports no progress for it, so this says how long it has run and how much

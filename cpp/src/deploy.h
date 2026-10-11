@@ -115,6 +115,12 @@ inline std::string progress_line(const std::string& id, const json& b) {
     if (s >= 60) return std::to_string(s / 60) + " min";
     return std::to_string(s) + " s";
   };
+  // A step that is not a walk: it runs, and that is all that can be said.
+  if (b.contains("kind")) {
+    return "  " + id + ": step " + std::to_string(b.value("ordinal", 0)) + " (" +
+           b.value("kind", "") + "): has run " + span(b.value("elapsedSeconds", 0LL)) +
+           "; it reports no progress of its own";
+  }
   // The one statement of a "paced": false fill has no rows to count yet.
   if (b.value("singleStatement", false)) {
     std::string out = "  " + id + ": step " + std::to_string(b.value("ordinal", 0)) +
@@ -185,6 +191,9 @@ class Deployment {
       out << "repository problems, nothing applied:\n";
       for (const auto& p : problems) out << "  - " << p.get<std::string>() << "\n";
       return DeployResult::kRepoProblem;
+    }
+    for (const auto& n : listing.value("notes", json::array())) {
+      out << "  note: " << n.get<std::string>() << "\n";
     }
 
     std::map<std::string, json> by_id;
@@ -597,12 +606,21 @@ class Deployment {
   // and a walk of hours adds a few dozen lines to the log and not hundreds.
   void report_progress(std::ostream& out, const std::string& id, const std::string& job_id,
                        const json& st) {
-    if (!st.contains("backfill") || !st["backfill"].is_object()) return;
-    const auto& b = st["backfill"];
+    // A step that is not the walk "backfill" describes -- a validation, a
+    // constraint's build, an index -- has a line of its own: that it runs, and
+    // for how long. A walk's figures stay in jobStatus after the walk ends, so
+    // the running step decides which of the two is current.
+    const json none = json::object();
+    const auto& walk = st.contains("backfill") && st["backfill"].is_object() ? st["backfill"] : none;
+    const auto& running = st.contains("runningStep") && st["runningStep"].is_object()
+                              ? st["runningStep"] : none;
+    const bool other = !running.empty() &&
+                       running.value("ordinal", 0) != walk.value("ordinal", -1);
+    const auto& b = other ? running : walk;
     // The one statement and the walk that may follow it are counted apart, so
     // a walk begun after an hour's statement still says its rate at 10 s.
     const bool one = b.value("singleStatement", false) && b.contains("elapsedSeconds");
-    if (!one && !b.contains("rowsPerSecond")) return;
+    if (!other && !one && !b.contains("rowsPerSecond")) return;
     const auto now = std::chrono::steady_clock::now();
     auto& p = progress_[job_id + "/" + std::to_string(b.value("ordinal", 0)) + (one ? "/one" : "")];
     if (p.interval_s == 0) {
