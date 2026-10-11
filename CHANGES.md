@@ -1,6 +1,6 @@
 # Changes
 
-## Unreleased
+## 0.1.4
 
 Two things a specification could not say, reported while writing a schema whose
 rows each keep the period they were true for, and what was found using the
@@ -277,8 +277,6 @@ same specification -- the first thing anyone writes, and at first refused as
 `DROP MAPPING IF EXISTS` and `ADD MAPPING`, right whatever was copied, and the
 dry run is what refuses a wrong token type or dictionary. The same for a
 dictionary an extension created by that specification brings.
-
-## 0.1.4
 
 Findings from a field report -- a 10-million-row table under 1,000 inserts
 a second, where `set_not_null` stopped every insert for three seconds before its
