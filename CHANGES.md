@@ -32,6 +32,13 @@ server's is given for that SQLSTATE too, and says "if" where the message is in
 neither of the server's English wordings, since a cancellation somebody else
 asked for carries the same code.
 
+### The whole suite runs on FreeBSD in CI
+
+The FreeBSD 15 job built the package and ran the tests that need no database;
+the executor, the ledger and the signal handling had never run there against a
+server. The job now installs a PostgreSQL 18 server in the VM and runs every
+test, with a skip counted as a failure.
+
 ## 0.1.4
 
 Two things a specification could not say, reported while writing a schema whose
