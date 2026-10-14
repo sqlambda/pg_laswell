@@ -457,6 +457,24 @@ class Ledger {
     coordination_->commit();
   }
 
+  // The steps of a transaction group that was rolled back after they had been
+  // recorded as succeeded (executor.h, group_rolled_back).
+  void roll_back_steps(const std::string& job_id, const std::vector<int>& ordinals) {
+    if (!coordination_ || ordinals.empty()) return;
+    std::string list = "{";
+    for (std::size_t i = 0; i < ordinals.size(); ++i) {
+      if (i != 0) list += ",";
+      list += std::to_string(ordinals[i]);
+    }
+    list += "}";
+    coordination_->begin("pg_laswell/" + job_id + "/ledger");
+    coordination_->txn().exec("UPDATE laswell.step SET state = 'rolled_back'"
+              "  WHERE job_id = $1::uuid AND ordinal = ANY($2::int[])"
+              "    AND state = 'succeeded'",
+              pqxx::params{job_id, list});
+    coordination_->commit();
+  }
+
   void finish_job(const std::string& job_id, const std::string& state,
                   const json& error) {
     if (!coordination_) return;

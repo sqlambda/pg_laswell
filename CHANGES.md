@@ -1,5 +1,26 @@
 # Changes
 
+## 0.1.5
+
+What two projects that use it reported in October 2026. No ledger schema change.
+
+### The steps of a group that is rolled back read `rolled_back`
+
+A step's row in `laswell.step` is written when its statement returns, on a
+connection of its own, so that a failure cannot erase its own record. Steps
+that share a transaction are not kept until the group commits, and when it was
+rolled back instead the rows of the steps before went on reading `succeeded`:
+reported from the field as four inserts recorded as succeeded beside a table
+that was empty, after a load was cancelled in its fifth.
+
+Those steps are now marked `rolled_back`, in the ledger and in `jobStatus`,
+wherever a group is rolled back: a later step failed, the job was cancelled
+during a statement or between two steps, or an exclusive lock did not come. A
+group that is run again for its lock reads `rolled_back` while it waits and is
+written over when its steps run again, as before. Nothing in the tool reads a
+step's state to decide what to run; this is for whoever reads the ledger. The
+column had no list of states to extend.
+
 ## 0.1.4
 
 Two things a specification could not say, reported while writing a schema whose

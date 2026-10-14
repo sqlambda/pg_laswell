@@ -6271,6 +6271,59 @@ TEST_F(ToolTest, AGroupWhoseExclusiveStepCannotGetItsLockIsRolledBackAndRunAgain
   EXPECT_EQ(status_of(job_id)["steps"].size(), 2u) << status_of(job_id).dump(2);
 }
 
+// A step's row is written when its statement returns, before its transaction
+// group commits. Reported from the field: a group cancelled in its eighth step
+// left the seven before it reading succeeded, beside a table that was empty.
+TEST_F(ToolTest, TheStepsOfAGroupThatIsRolledBackReadRolledBack) {
+  make_shop(cfg());
+  json doc = minimal_spec();
+  doc["id"] = "0010-order-codes";
+  doc["description"] = "Each order's status as a number.";
+  // The select fails on the rows and not in the plan: 'open' is not a bigint.
+  doc["intents"] = json::array(
+      {json{{"kind", "create_table"}, {"schema", "shop"}, {"table", "order_code"},
+            {"comment", "An order's status as a number."},
+            {"columns", json::array({json{{"name", "id"}, {"type", "bigint"},
+                                          {"nullable", false}, {"comment", "The order."}},
+                                     json{{"name", "code"}, {"type", "bigint"},
+                                          {"nullable", true}, {"comment", "Its status."}}})}},
+       json{{"kind", "insert_rows"}, {"schema", "shop"}, {"table", "order_code"}, {"key", "id"},
+            {"columns", json::array({"id", "code"})}, {"paced", false},
+            {"select", "SELECT id, status::bigint FROM shop.orders"}}});
+  {
+    const auto parsed = pglaswell::parse_spec(doc);
+    doc["signatures"] = json::array({{{"key_id", test_key().key_id},
+                                      {"algorithm", "ed25519"},
+                                      {"signature", base64(sign(parsed.canonical_bytes))}}});
+  }
+  const auto plan = payload(call("planMigration", json{{"spec", doc}}));
+  ASSERT_TRUE(plan.value("ok", false)) << plan.dump(2);
+  ASSERT_EQ(plan["steps"].size(), 2u) << plan.dump(2);
+  ASSERT_EQ(plan["steps"][0]["txnGroup"], plan["steps"][1]["txnGroup"])
+      << "the two intents must share a transaction for this test to mean anything";
+
+  const auto started = payload(call("startMigration", json{{"spec", doc}, {"dryRun", false}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  const auto job_id = started["jobId"].get<std::string>();
+  ASSERT_TRUE(wait_for_status(*this, job_id, [](const json& st) {
+    return st.value("state", "") == "failed";
+  })) << status_of(job_id).dump(2);
+
+  pglaswell::ReadSession r(cfg());
+  EXPECT_TRUE(r.txn().exec("SELECT to_regclass('shop.order_code')")[0][0].is_null());
+  const auto rows = r.txn().exec(
+      "SELECT ordinal, state FROM laswell.step WHERE job_id = $1::uuid ORDER BY ordinal",
+      pqxx::params{job_id});
+  ASSERT_EQ(rows.size(), 2u);
+  EXPECT_EQ(rows[0][1].as<std::string>(), "rolled_back");
+  EXPECT_EQ(rows[1][1].as<std::string>(), "failed");
+  // And the job's own record agrees with the ledger.
+  const auto steps = status_of(job_id)["steps"];
+  ASSERT_EQ(steps.size(), 2u) << steps.dump(2);
+  EXPECT_EQ(steps[0].value("state", ""), "rolled_back");
+  EXPECT_EQ(steps[1].value("state", ""), "failed");
+}
+
 // THE COMPOSITE WALK. A key unique only together with other columns -- a tenant
 // column first, or a time column on a partitioned table -- is walked along the
 // whole unique index, a full batch at a time, whatever the size of a "group".
