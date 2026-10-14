@@ -466,22 +466,34 @@ class Executor {
       // is finished, since a caller reads the ledger once the state is terminal.
       group_rolled_back();
       // The process was told to stop and the statement in flight was cancelled
-      // for it (signals.h): that is a cancelled job, not a failed one.
-      if (job_->pacing.stop_now.load() && job_->pacing.cancel_stop.load() &&
-          std::string(e.what()).find("canceling statement due to user request") !=
-              std::string::npos) {
-        job_->pacing.cancel_requested = false;
+      // for it (signals.h): that is a cancelled job, not a failed one. Known by
+      // the SQLSTATE and by this job having asked for the cancellation, never
+      // by the message, which the server writes in its own language: on one
+      // set to Portuguese such a job was recorded as failed.
+      const auto* refused = dynamic_cast<const pqxx::sql_error*>(&e);
+      const bool canceled = refused != nullptr && detail::is_query_canceled(*refused);
+      if (canceled && job_->pacing.stop_now.load() && job_->pacing.cancel_stop.load() &&
+          job_->pacing.cancel_requested.exchange(false)) {
         cancelled();
       } else {
       json raw{{"error", e.what()},
                {"hint", "See laswell.step for the statement that failed."}};
       // "canceling statement due to statement timeout" reads as the server's
       // setting, and the server's is the first thing anyone checks. It is this
-      // tool's: every transaction of a job sets it (session.h).
-      if (cfg_.statement_timeout_ms > 0 &&
-          std::string(e.what()).find("statement timeout") != std::string::npos) {
+      // tool's: every transaction of a job sets it (session.h). The SQLSTATE
+      // is the same for a cancellation somebody else asked for, and only the
+      // message tells them apart; where it is in neither of the server's
+      // English wordings the hint says "if".
+      const std::string what = e.what();
+      const bool says_timeout = what.find("statement timeout") != std::string::npos;
+      const bool says_request = what.find("user request") != std::string::npos;
+      if (cfg_.statement_timeout_ms > 0 && (says_timeout || (canceled && !says_request))) {
         raw["hint"] =
-            "The timeout is pg_laswell's, not the server's: statement_timeout_ms = " +
+            std::string(says_timeout
+                            ? "The timeout is pg_laswell's, not the server's: "
+                            : "If this was the statement timeout, it is pg_laswell's, "
+                              "not the server's: ") +
+            "statement_timeout_ms = " +
             std::to_string(cfg_.statement_timeout_ms) +
             " in this connection's section of the configuration (0 disables it). " +
             raw["hint"].get<std::string>();

@@ -21,6 +21,17 @@ written over when its steps run again, as before. Nothing in the tool reads a
 step's state to decide what to run; this is for whoever reads the ledger. The
 column had no list of states to extend.
 
+### A cancelled job is known by its SQLSTATE, not by the server's words
+
+A job stopped by a signal was recognised by the text "canceling statement due
+to user request". The server writes that in the language of its `lc_messages`:
+on one set to Portuguese such a job was recorded as `failed`. It is now known
+by SQLSTATE 57014 together with the job's own record of having asked for the
+cancellation. The hint that a statement timeout is this tool's and not the
+server's is given for that SQLSTATE too, and says "if" where the message is in
+neither of the server's English wordings, since a cancellation somebody else
+asked for carries the same code.
+
 ## 0.1.4
 
 Two things a specification could not say, reported while writing a schema whose
