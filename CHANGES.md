@@ -1,6 +1,6 @@
 # Changes
 
-## 0.1.5
+## 0.1.5 (2026-10-13)
 
 What two projects that use it reported in October 2026. No ledger schema change.
 
