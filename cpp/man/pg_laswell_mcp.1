@@ -2646,6 +2646,9 @@ Every statement is stored verbatim in
 .Va laswell.step.sql ,
 so a generated password would sit in the ledger exactly as an author's would --
 the leak moved rather than removed.
+For the same reason a password an author writes in the connection string is
+refused rather than redacted: a redacted ledger entry would no longer be what
+ran.
 .Pp
 And it would break determinism.
 The same specification against the same observations must produce byte-identical

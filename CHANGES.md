@@ -39,6 +39,9 @@ the executor, the ledger and the signal handling had never run there against a
 server. The job now installs a PostgreSQL 18 server in the VM and runs every
 test, with a skip counted as a failure.
 
+The manual's "Why a credential is never generated" now also says why a
+password in a subscription's connection string is refused rather than redacted.
+
 ## 0.1.4
 
 Two things a specification could not say, reported while writing a schema whose
