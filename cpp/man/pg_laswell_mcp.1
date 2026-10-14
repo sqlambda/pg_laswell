@@ -1,4 +1,4 @@
-.Dd September 28, 2026
+.Dd October 13, 2026
 .Dt PG_LASWELL_MCP 1
 .Os
 .Sh NAME
@@ -2522,7 +2522,7 @@ names the set a binary was built with, and says nothing when it was built with
 none:
 .Bd -literal -offset indent
 $ pg_laswell_mcp --version
-0.1.4
+0.1.5
 modules: citus,pg_cron,pgvector,timescaledb
 .Ed
 .Pp
@@ -2646,6 +2646,9 @@ Every statement is stored verbatim in
 .Va laswell.step.sql ,
 so a generated password would sit in the ledger exactly as an author's would --
 the leak moved rather than removed.
+For the same reason a password an author writes in the connection string is
+refused rather than redacted: a redacted ledger entry would no longer be what
+ran.
 .Pp
 And it would break determinism.
 The same specification against the same observations must produce byte-identical
@@ -2934,6 +2937,25 @@ citus.workers = pr-w1, pr-w2, pr-w3, pr-w4, pr-w5, pr-w6
 See
 .Xr pg_laswell_citus 7 ,
 .Cm citus_ensure_workers .
+.Ss The language of the server's messages
+Each session
+.Nm
+opens asks for the server's messages in English
+.Pq Li SET lc_messages = 'C' ,
+because it reads a few of them and records the rest in the ledger.
+It is the session's setting and the messages' language only: the database's
+text search configuration, collation and other locale settings are untouched,
+and so is every other session.
+.Pp
+.Va lc_messages
+is a superuser's setting.
+A role that may not set it is not refused: its sessions go on in the server's
+language,
+.Cm planMigration
+says so in a note, and a superuser allows it with
+.Ql GRANT SET ON PARAMETER lc_messages TO role
+(PostgreSQL 15 and later).
+A cancelled job is recognised by its SQLSTATE in either case.
 .Ss The connection budget
 .Va app_pool_size
 is the application's own connection-pool limit.

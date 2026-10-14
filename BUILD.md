@@ -69,8 +69,9 @@ pkgconf does not search, so export
 Releases carry `pg_laswell-freebsd14-amd64.pkg` and
 `pg_laswell-freebsd15-amd64.pkg`, built in a FreeBSD VM by
 `.github/scripts/freebsd-build.sh`, which also runs in CI on every pull request:
-it builds, runs the suite that needs no database, packages, installs the
-package with `pkg add` and runs both binaries. To install one:
+it builds, packages, installs the package with `pkg add` and runs both
+binaries, and on a pull request also runs the whole suite against a PostgreSQL
+18 server it starts in the VM. To install one:
 
 ```sh
 pkg install postgresql18-client

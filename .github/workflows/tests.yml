@@ -877,10 +877,10 @@ jobs:
         run: docker compose -f examples/docker/timescale/compose.yml down -v
 
   # FreeBSD 15, in a VM on a Linux runner (GitHub has no FreeBSD runners):
-  # built with every module, the suite that needs no database run, then
-  # PACKAGED, installed with pkg add, and both binaries run -- the same script
-  # release.yml uses, so the package is proven on every pull request rather
-  # than first on a tag. The pgshard lab ran FreeBSD guests 92 times without
+  # built with every module, the whole suite run against a PostgreSQL 18
+  # server started in the VM, then PACKAGED, installed with pkg add, and both
+  # binaries run -- the same script release.yml uses, so the package is proven
+  # on every pull request rather than first on a tag. The pgshard lab ran FreeBSD guests 92 times without
   # once exercising this build, because there was no package to install.
   freebsd:
     name: freebsd

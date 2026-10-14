@@ -490,6 +490,7 @@ class Observer {
     try {
       if (!conn_ || !conn_->is_open()) {
         conn_ = std::make_unique<pqxx::connection>(cfg_.conninfo);
+        detail::english_messages(*conn_);
       }
       // A short READ ONLY transaction per tick, never a long one. Measured
       // 2026-09-05 (spike S9): pg_locks stays live inside a long transaction,

@@ -6,7 +6,8 @@
 #
 # Usage: freebsd-build.sh <artifact-name> [tests]
 #   artifact-name  the .pkg is renamed to <artifact-name>.pkg
-#   tests          also build and run the suite that needs no database
+#   tests          also build the suite and run all of it, against a PostgreSQL
+#                  server installed and started here
 #
 # POSIX sh: the VM's /bin/sh, not bash.
 #
@@ -22,7 +23,9 @@ TESTS="${2:-}"
 freebsd-version
 # The same packages BUILD.md lists. googletest only when the suite is built.
 PKGS="cmake ninja pkgconf curl postgresql18-client nlohmann-json"
-[ -n "$TESTS" ] && PKGS="$PKGS googletest"
+# The server and contrib are for the tests, not the tool: the conformance suite
+# creates pg_trgm (BUILD.md).
+[ -n "$TESTS" ] && PKGS="$PKGS googletest postgresql18-server postgresql18-contrib"
 # shellcheck disable=SC2086
 env ASSUME_ALWAYS_YES=yes pkg install -y $PKGS
 
@@ -42,7 +45,23 @@ cmake -S cpp -B build -DPGLASWELL_WERROR=ON -G Ninja -DCMAKE_BUILD_TYPE=Release 
       "-DPGLASWELL_MODULES=citus;pg_cron;pgvector;timescaledb"
 if [ -n "$TESTS" ]; then
   cmake --build build
-  ./build/pg_laswell_mcp_test
+  # The whole suite, the tests that need a database included: without a server
+  # they all skip, and the executor, the ledger and the signal handling had
+  # never run on FreeBSD in CI. A cluster as the package's own rc script makes
+  # it, which trusts local connections; the suite connects as its superuser.
+  sysrc postgresql_enable=YES
+  service postgresql initdb
+  service postgresql start
+  tries=0
+  until pg_isready -h 127.0.0.1 -p 5432 -q; do
+    tries=$((tries + 1))
+    [ "$tries" -lt 30 ] || { echo "PostgreSQL did not start" >&2; exit 1; }
+    sleep 1
+  done
+  # A skip nobody notices is a test that silently stopped running.
+  DATABASE_URL="postgresql://postgres@127.0.0.1:5432/postgres" \
+  PGLASWELL_REQUIRE_DATABASE=1 \
+    ./build/pg_laswell_mcp_test
 else
   cmake --build build --target pg_laswell pg_laswell_mcp
 fi

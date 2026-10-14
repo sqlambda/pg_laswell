@@ -1,5 +1,63 @@
 # Changes
 
+## 0.1.5 (2026-10-13)
+
+What two projects that use it reported in October 2026. No ledger schema change.
+
+### The steps of a group that is rolled back read `rolled_back`
+
+A step's row in `laswell.step` is written when its statement returns, on a
+connection of its own, so that a failure cannot erase its own record. Steps
+that share a transaction are not kept until the group commits, and when it was
+rolled back instead the rows of the steps before went on reading `succeeded`:
+reported from the field as four inserts recorded as succeeded beside a table
+that was empty, after a load was cancelled in its fifth.
+
+Those steps are now marked `rolled_back`, in the ledger and in `jobStatus`,
+wherever a group is rolled back: a later step failed, the job was cancelled
+during a statement or between two steps, or an exclusive lock did not come. A
+group that is run again for its lock reads `rolled_back` while it waits and is
+written over when its steps run again, as before. Nothing in the tool reads a
+step's state to decide what to run; this is for whoever reads the ledger. The
+column had no list of states to extend.
+
+### A cancelled job is known by its SQLSTATE, not by the server's words
+
+A job stopped by a signal was recognised by the text "canceling statement due
+to user request". The server writes that in the language of its `lc_messages`:
+on one set to Portuguese such a job was recorded as `failed`. It is now known
+by SQLSTATE 57014 together with the job's own record of having asked for the
+cancellation. The hint that a statement timeout is this tool's and not the
+server's is given for that SQLSTATE too, and says "if" where the message is in
+neither of the server's English wordings, since a cancellation somebody else
+asked for carries the same code.
+
+### The server's messages are asked for in English, for the tool's sessions only
+
+One language to read, not every one a server may be set to. Each session the
+tool opens runs `SET lc_messages = 'C'`. It is the session's setting and the
+messages' language only: on a database whose `default_text_search_config` is
+`pg_catalog.portuguese` it stays that, with the collation and the other locale
+settings, and no `ALTER DATABASE` or `ALTER ROLE` is involved. Errors recorded
+in the ledger are then in English whatever the server.
+
+`lc_messages` is a superuser's setting, so a runner role may be refused. That
+is not an error: its sessions go on in the server's language, `planMigration`
+says so in a note with the statement that allows it (`GRANT SET ON PARAMETER
+lc_messages TO role`, PostgreSQL 15 and later), and the cancellation above is
+known by its SQLSTATE either way. It is never put in the connection string,
+where a refusal would be a failure to connect.
+
+### The whole suite runs on FreeBSD in CI
+
+The FreeBSD 15 job built the package and ran the tests that need no database;
+the executor, the ledger and the signal handling had never run there against a
+server. The job now installs a PostgreSQL 18 server in the VM and runs every
+test, with a skip counted as a failure.
+
+The manual's "Why a credential is never generated" now also says why a
+password in a subscription's connection string is refused rather than redacted.
+
 ## 0.1.4
 
 Two things a specification could not say, reported while writing a schema whose

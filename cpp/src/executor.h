@@ -18,6 +18,7 @@
 // every ledger write on one connection is the natural instinct and it is wrong
 // for exactly this table.
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <optional>
@@ -461,23 +462,38 @@ class Executor {
     try {
       execute();
     } catch (const std::exception& e) {
+      // The worker's transaction went with the exception. Said before the job
+      // is finished, since a caller reads the ledger once the state is terminal.
+      group_rolled_back();
       // The process was told to stop and the statement in flight was cancelled
-      // for it (signals.h): that is a cancelled job, not a failed one.
-      if (job_->pacing.stop_now.load() && job_->pacing.cancel_stop.load() &&
-          std::string(e.what()).find("canceling statement due to user request") !=
-              std::string::npos) {
-        job_->pacing.cancel_requested = false;
+      // for it (signals.h): that is a cancelled job, not a failed one. Known by
+      // the SQLSTATE and by this job having asked for the cancellation, never
+      // by the message, which the server writes in its own language: on one
+      // set to Portuguese such a job was recorded as failed.
+      const auto* refused = dynamic_cast<const pqxx::sql_error*>(&e);
+      const bool canceled = refused != nullptr && detail::is_query_canceled(*refused);
+      if (canceled && job_->pacing.stop_now.load() && job_->pacing.cancel_stop.load() &&
+          job_->pacing.cancel_requested.exchange(false)) {
         cancelled();
       } else {
       json raw{{"error", e.what()},
                {"hint", "See laswell.step for the statement that failed."}};
       // "canceling statement due to statement timeout" reads as the server's
       // setting, and the server's is the first thing anyone checks. It is this
-      // tool's: every transaction of a job sets it (session.h).
-      if (cfg_.statement_timeout_ms > 0 &&
-          std::string(e.what()).find("statement timeout") != std::string::npos) {
+      // tool's: every transaction of a job sets it (session.h). The SQLSTATE
+      // is the same for a cancellation somebody else asked for, and only the
+      // message tells them apart; where it is in neither of the server's
+      // English wordings the hint says "if".
+      const std::string what = e.what();
+      const bool says_timeout = what.find("statement timeout") != std::string::npos;
+      const bool says_request = what.find("user request") != std::string::npos;
+      if (cfg_.statement_timeout_ms > 0 && (says_timeout || (canceled && !says_request))) {
         raw["hint"] =
-            "The timeout is pg_laswell's, not the server's: statement_timeout_ms = " +
+            std::string(says_timeout
+                            ? "The timeout is pg_laswell's, not the server's: "
+                            : "If this was the statement timeout, it is pg_laswell's, "
+                              "not the server's: ") +
+            "statement_timeout_ms = " +
             std::to_string(cfg_.statement_timeout_ms) +
             " in this connection's section of the configuration (0 disables it). " +
             raw["hint"].get<std::string>();
@@ -525,7 +541,10 @@ class Executor {
     for (std::size_t at = 0; at < steps.size(); ++at) {
       const auto& step = steps[at];
       if (job_->pacing.cancel_stop.load()) {
-        if (group_open) worker.rollback();
+        if (group_open) {
+          worker.rollback();
+          group_rolled_back();
+        }
         cancelled();
         return;
       }
@@ -550,6 +569,7 @@ class Executor {
       if (group != current_group || needs_own) {
         if (group_open) {
           worker.commit();
+          group_committed();
           group_open = false;
           group_slot = OperationGate::Slot();  // released with the transaction
         }
@@ -614,6 +634,7 @@ class Executor {
         run_in_transaction(worker, ordinal, step, &timed_out, group_attempt);
         if (!timed_out) continue;
         worker.rollback();
+        group_rolled_back();
         group_open = false;
         group_slot = OperationGate::Slot();
         if (job_->pacing.cancel_stop.load()) {
@@ -654,6 +675,7 @@ class Executor {
 
     if (group_open) {
       worker.commit();
+      group_committed();
       group_slot = OperationGate::Slot();
     }
     succeed();
@@ -720,6 +742,37 @@ class Executor {
                                 return s.value("ordinal", -1) >= first_ordinal;
                               }),
                done.end());
+  }
+
+  // A step of a group is recorded "succeeded" when its statement returns, on
+  // the coordination connection, and its work is not kept until the group
+  // commits. When the group is rolled back instead -- a later step failed, the
+  // job was cancelled, a lock did not come -- those steps are marked
+  // "rolled_back", in the job's record and in the ledger: reported from the
+  // field as four inserts reading succeeded beside a table that was empty.
+  void group_committed() { uncommitted_.clear(); }
+
+  void group_rolled_back() {
+    if (uncommitted_.empty()) return;
+    {
+      std::lock_guard<std::mutex> lock(job_->m);
+      for (auto& s : job_->steps) {
+        if (s.value("state", "") != "succeeded") continue;
+        if (std::find(uncommitted_.begin(), uncommitted_.end(), s.value("ordinal", -1)) ==
+            uncommitted_.end()) {
+          continue;
+        }
+        s["state"] = "rolled_back";
+      }
+    }
+    if (ledger_ != nullptr) {
+      try {
+        ledger_->roll_back_steps(job_->job_id, uncommitted_);
+      } catch (const std::exception&) {
+        // As for record_step: a ledger write that fails does not stop the job.
+      }
+    }
+    uncommitted_.clear();
   }
 
   // `lock_timed_out`, when given, makes a lock timeout the CALLER's to handle:
@@ -803,6 +856,7 @@ class Executor {
     json result{{"elapsedMs", detail::steady_ms() - started}};
     if (lock_timed_out != nullptr) result["lockAttempts"] = attempt;
     record_step(ordinal, step, "succeeded", rows, result);
+    uncommitted_.push_back(ordinal);
   }
 
   // COPY ... FROM STDIN.
@@ -843,6 +897,7 @@ class Executor {
     record_step(ordinal, step, "succeeded", written,
                 json{{"elapsedMs", detail::steady_ms() - started},
                      {"rowsCopied", written}});
+    uncommitted_.push_back(ordinal);
   }
 
   // CREATE INDEX CONCURRENTLY and DROP INDEX CONCURRENTLY.
@@ -1828,6 +1883,8 @@ class Executor {
   std::shared_ptr<Job> job_;
   Ledger* ledger_;
   OperationGate* operations_ = nullptr;  // null: no ceiling
+  // Steps recorded "succeeded" in the group whose transaction is still open.
+  std::vector<int> uncommitted_;
 };
 
 }  // namespace pglaswell

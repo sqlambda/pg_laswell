@@ -1,4 +1,4 @@
-.Dd September 25, 2026
+.Dd October 13, 2026
 .Dt PG_LASWELL 1
 .Os
 .Sh NAME
@@ -69,6 +69,11 @@ removed, and a run then notes it and goes on.
 A job that failed may still have committed some of its steps;
 .Va laswell.step
 says which.
+Steps that share a transaction are kept or lost together: one whose statement
+had returned before its transaction was rolled back reads
+.Li rolled_back ,
+not
+.Li succeeded .
 .Pp
 On
 .Dv SIGINT

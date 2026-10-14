@@ -553,6 +553,29 @@ inline json plan_migration_tool(ToolContext& ctx, const json& args) {
     // No ledger yet, or one this role cannot read: nothing to say.
   }
 
+  // The language the server answers this role in, where it is not English: the
+  // session asked for English and was refused (session.h, english_messages).
+  // An advisory, so outside planDigest -- it changes nothing the plan will do.
+  try {
+    ReadSession s(cfg, std::nullopt, ctx.cache);
+    const auto r = s.txn().exec("SELECT current_setting('lc_messages'), current_user");
+    const auto language = r[0][0].as<std::string>();
+    if (!detail::is_english_messages(language)) {
+      plan.advisories.push_back(
+          "the server's messages reach this role in " + language +
+          ", not in English: lc_messages is a superuser's setting and " +
+          r[0][1].as<std::string>() +
+          " may not set it for its own session. The errors the ledger records "
+          "will be in that language, and a hint this tool gives from a "
+          "message's wording is given as a guess. A superuser allows it with "
+          "GRANT SET ON PARAMETER lc_messages TO " +
+          detail::quote_identifier(r[0][1].as<std::string>()) +
+          "; it changes the language of this role's messages and nothing else.");
+    }
+  } catch (const std::exception&) {
+    // A reading that fails says nothing; the plan does not depend on it.
+  }
+
   json out = plan.to_json();
   if (!earlier_forms.empty()) out["earlierForms"] = earlier_forms;
 

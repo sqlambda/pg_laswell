@@ -298,6 +298,42 @@ TEST_F(DatabaseTest, FixtureResolvesAConnectionString) {
   EXPECT_FALSE(url_.empty());
 }
 
+// The tool's own sessions ask for the server's messages in English, and for
+// nothing else: on a database set up for another language the text search
+// configuration and the other locale settings are that database's.
+TEST_F(DatabaseTest, ASessionAsksForEnglishMessagesAndChangesNothingElse) {
+  pglaswell::ConnConfig c;
+  c.name = "t";
+  c.conninfo = url_;
+  pqxx::connection plain(url_);
+  pqxx::nontransaction asked(plain);
+  const auto setting = [](auto& txn, const char* name) {
+    return txn.exec("SELECT current_setting($1)", pqxx::params{name})[0][0].template as<std::string>();
+  };
+  if (!asked.exec("SELECT rolsuper FROM pg_roles WHERE rolname = current_user")[0][0].as<bool>()) {
+    GTEST_SKIP() << "the suite's role is not a superuser, so it may not set lc_messages";
+  }
+  pglaswell::ReadSession r(c);
+  EXPECT_EQ(setting(r.txn(), "lc_messages"), "C");
+  pglaswell::WriteSession w(c);
+  w.begin("pg_laswell/test/english-messages");
+  EXPECT_EQ(setting(w.txn(), "lc_messages"), "C");
+  for (const char* name : {"default_text_search_config", "lc_monetary", "lc_numeric", "lc_time"}) {
+    EXPECT_EQ(setting(r.txn(), name), setting(asked, name)) << name;
+    EXPECT_EQ(setting(w.txn(), name), setting(asked, name)) << name;
+  }
+  w.rollback();
+}
+
+TEST(Messages, EnglishIsKnownByTheSettingsValue) {
+  for (const char* v : {"C", "POSIX", "C.UTF-8", "en_US.utf8", "en-US", "English_United States.1252", ""}) {
+    EXPECT_TRUE(pglaswell::detail::is_english_messages(v)) << v;
+  }
+  for (const char* v : {"pt_BR.utf8", "de_DE.UTF-8", "Portuguese_Brazil.1252", "es"}) {
+    EXPECT_FALSE(pglaswell::detail::is_english_messages(v)) << v;
+  }
+}
+
 // --- S6: cancelling a worker's statement from the observer thread ---------
 //
 // The escalation path depends on this: when a backend has been blocked behind
@@ -4071,7 +4107,12 @@ TEST_F(BootstrappedTest, ARoleWithoutUsageOnTheLedgerGetsAnAnswerNotAnError) {
     EXPECT_NE(st.hint.find("laswell_role=laswell_no_usage"), std::string::npos) << st.hint;
   }
   {
+    // A role that may not set lc_messages still connects, and is answered in
+    // the server's language: the refusal of English messages is not an error.
     pglaswell::ReadSession r(as_role);
+    EXPECT_EQ(r.txn().exec("SELECT current_setting('lc_messages')")[0][0].as<std::string>(),
+              r.txn().exec("SELECT reset_val FROM pg_settings WHERE name = 'lc_messages'")[0][0]
+                  .as<std::string>());
     const auto out = json::parse(
         r.txn().exec(pglaswell::check_privileges_sql())[0][0].as<std::string>());
     const auto& l = out["ledger"];
@@ -6269,6 +6310,59 @@ TEST_F(ToolTest, AGroupWhoseExclusiveStepCannotGetItsLockIsRolledBackAndRunAgain
   EXPECT_GT(rows[1][2].as<int>(), 1) << "the second step should have needed more than one try";
   // The job's own record holds each step once, not once an attempt.
   EXPECT_EQ(status_of(job_id)["steps"].size(), 2u) << status_of(job_id).dump(2);
+}
+
+// A step's row is written when its statement returns, before its transaction
+// group commits. Reported from the field: a group cancelled in its eighth step
+// left the seven before it reading succeeded, beside a table that was empty.
+TEST_F(ToolTest, TheStepsOfAGroupThatIsRolledBackReadRolledBack) {
+  make_shop(cfg());
+  json doc = minimal_spec();
+  doc["id"] = "0010-order-codes";
+  doc["description"] = "Each order's status as a number.";
+  // The select fails on the rows and not in the plan: 'open' is not a bigint.
+  doc["intents"] = json::array(
+      {json{{"kind", "create_table"}, {"schema", "shop"}, {"table", "order_code"},
+            {"comment", "An order's status as a number."},
+            {"columns", json::array({json{{"name", "id"}, {"type", "bigint"},
+                                          {"nullable", false}, {"comment", "The order."}},
+                                     json{{"name", "code"}, {"type", "bigint"},
+                                          {"nullable", true}, {"comment", "Its status."}}})}},
+       json{{"kind", "insert_rows"}, {"schema", "shop"}, {"table", "order_code"}, {"key", "id"},
+            {"columns", json::array({"id", "code"})}, {"paced", false},
+            {"select", "SELECT id, status::bigint FROM shop.orders"}}});
+  {
+    const auto parsed = pglaswell::parse_spec(doc);
+    doc["signatures"] = json::array({{{"key_id", test_key().key_id},
+                                      {"algorithm", "ed25519"},
+                                      {"signature", base64(sign(parsed.canonical_bytes))}}});
+  }
+  const auto plan = payload(call("planMigration", json{{"spec", doc}}));
+  ASSERT_TRUE(plan.value("ok", false)) << plan.dump(2);
+  ASSERT_EQ(plan["steps"].size(), 2u) << plan.dump(2);
+  ASSERT_EQ(plan["steps"][0]["txnGroup"], plan["steps"][1]["txnGroup"])
+      << "the two intents must share a transaction for this test to mean anything";
+
+  const auto started = payload(call("startMigration", json{{"spec", doc}, {"dryRun", false}}));
+  ASSERT_TRUE(started.value("accepted", false)) << started.dump(2);
+  const auto job_id = started["jobId"].get<std::string>();
+  ASSERT_TRUE(wait_for_status(*this, job_id, [](const json& st) {
+    return st.value("state", "") == "failed";
+  })) << status_of(job_id).dump(2);
+
+  pglaswell::ReadSession r(cfg());
+  EXPECT_TRUE(r.txn().exec("SELECT to_regclass('shop.order_code')")[0][0].is_null());
+  const auto rows = r.txn().exec(
+      "SELECT ordinal, state FROM laswell.step WHERE job_id = $1::uuid ORDER BY ordinal",
+      pqxx::params{job_id});
+  ASSERT_EQ(rows.size(), 2u);
+  EXPECT_EQ(rows[0][1].as<std::string>(), "rolled_back");
+  EXPECT_EQ(rows[1][1].as<std::string>(), "failed");
+  // And the job's own record agrees with the ledger.
+  const auto steps = status_of(job_id)["steps"];
+  ASSERT_EQ(steps.size(), 2u) << steps.dump(2);
+  EXPECT_EQ(steps[0].value("state", ""), "rolled_back");
+  EXPECT_EQ(steps[1].value("state", ""), "failed");
 }
 
 // THE COMPOSITE WALK. A key unique only together with other columns -- a tenant
