@@ -32,6 +32,22 @@ server's is given for that SQLSTATE too, and says "if" where the message is in
 neither of the server's English wordings, since a cancellation somebody else
 asked for carries the same code.
 
+### The server's messages are asked for in English, for the tool's sessions only
+
+One language to read, not every one a server may be set to. Each session the
+tool opens runs `SET lc_messages = 'C'`. It is the session's setting and the
+messages' language only: on a database whose `default_text_search_config` is
+`pg_catalog.portuguese` it stays that, with the collation and the other locale
+settings, and no `ALTER DATABASE` or `ALTER ROLE` is involved. Errors recorded
+in the ledger are then in English whatever the server.
+
+`lc_messages` is a superuser's setting, so a runner role may be refused. That
+is not an error: its sessions go on in the server's language, `planMigration`
+says so in a note with the statement that allows it (`GRANT SET ON PARAMETER
+lc_messages TO role`, PostgreSQL 15 and later), and the cancellation above is
+known by its SQLSTATE either way. It is never put in the connection string,
+where a refusal would be a failure to connect.
+
 ### The whole suite runs on FreeBSD in CI
 
 The FreeBSD 15 job built the package and ran the tests that need no database;

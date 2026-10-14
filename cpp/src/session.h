@@ -46,6 +46,45 @@ inline const char* kLaswellSchemaUsableSql =
     "COALESCE((SELECT has_schema_privilege(oid, 'USAGE')"
     "            FROM pg_catalog.pg_namespace WHERE nspname = 'laswell'), false)";
 
+namespace detail {
+
+// The server's messages in English, for this session and for nothing else.
+//
+// PostgreSQL writes its messages in the language of lc_messages, and this tool
+// reads a few of them and records the rest in its ledger: one language to
+// handle, not every one a server may be set to. It is a setting of the
+// SESSION -- no ALTER DATABASE, no ALTER ROLE -- and it is the messages'
+// language only: default_text_search_config, the collation and the other lc_*
+// settings are the database's and stay as they are.
+//
+// lc_messages is a superuser's setting, so a runner role may be refused
+// (42501) unless it was granted SET ON PARAMETER lc_messages. That is not an
+// error: the session goes on in the server's language, and planMigration says
+// so (tools.h). Never put in the connection string, where a refusal would be
+// a failure to connect.
+inline void english_messages(pqxx::connection& c) {
+  try {
+    pqxx::nontransaction n(c);
+    n.exec("SET lc_messages = 'C'");
+  } catch (const pqxx::sql_error&) {
+  }
+}
+
+// Whether a value of lc_messages gives English messages. An empty value is the
+// server's environment, which cannot be read from here: not claimed either way.
+inline bool is_english_messages(const std::string& lc_messages) {
+  if (lc_messages.empty()) return true;
+  for (const char* p : {"C", "POSIX"}) {
+    if (lc_messages == p) return true;
+  }
+  for (const char* p : {"C.", "en_", "en-", "English"}) {
+    if (lc_messages.rfind(p, 0) == 0) return true;
+  }
+  return false;
+}
+
+}  // namespace detail
+
 // A keyed pool of IDLE connections, with a reaper.
 //
 // The map holds only idle connections: take() erases the entry and transfers
@@ -137,7 +176,10 @@ class ReadSession {
     // there is nothing to replay.
     for (int attempt = 0; attempt < 2; ++attempt) {
       conn_ = (attempt == 0 && cache_ != nullptr) ? cache_->take(name_) : nullptr;
-      if (!conn_) conn_ = std::make_unique<pqxx::connection>(cfg.conninfo);
+      if (!conn_) {
+        conn_ = std::make_unique<pqxx::connection>(cfg.conninfo);
+        detail::english_messages(*conn_);
+      }
       try {
         txn_.emplace(*conn_);
         break;
@@ -233,6 +275,7 @@ class WriteSession {
       : conn_(std::make_unique<pqxx::connection>(cfg.conninfo)),
         cfg_(cfg),
         backend_pid_(conn_->backendpid()) {
+    detail::english_messages(*conn_);
     if (in_recovery()) {
       // Cheap to check, easy to forget, and the alternative is a confusing
       // read-only error several statements later.

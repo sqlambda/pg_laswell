@@ -298,6 +298,42 @@ TEST_F(DatabaseTest, FixtureResolvesAConnectionString) {
   EXPECT_FALSE(url_.empty());
 }
 
+// The tool's own sessions ask for the server's messages in English, and for
+// nothing else: on a database set up for another language the text search
+// configuration and the other locale settings are that database's.
+TEST_F(DatabaseTest, ASessionAsksForEnglishMessagesAndChangesNothingElse) {
+  pglaswell::ConnConfig c;
+  c.name = "t";
+  c.conninfo = url_;
+  pqxx::connection plain(url_);
+  pqxx::nontransaction asked(plain);
+  const auto setting = [](auto& txn, const char* name) {
+    return txn.exec("SELECT current_setting($1)", pqxx::params{name})[0][0].template as<std::string>();
+  };
+  if (!asked.exec("SELECT rolsuper FROM pg_roles WHERE rolname = current_user")[0][0].as<bool>()) {
+    GTEST_SKIP() << "the suite's role is not a superuser, so it may not set lc_messages";
+  }
+  pglaswell::ReadSession r(c);
+  EXPECT_EQ(setting(r.txn(), "lc_messages"), "C");
+  pglaswell::WriteSession w(c);
+  w.begin("pg_laswell/test/english-messages");
+  EXPECT_EQ(setting(w.txn(), "lc_messages"), "C");
+  for (const char* name : {"default_text_search_config", "lc_monetary", "lc_numeric", "lc_time"}) {
+    EXPECT_EQ(setting(r.txn(), name), setting(asked, name)) << name;
+    EXPECT_EQ(setting(w.txn(), name), setting(asked, name)) << name;
+  }
+  w.rollback();
+}
+
+TEST(Messages, EnglishIsKnownByTheSettingsValue) {
+  for (const char* v : {"C", "POSIX", "C.UTF-8", "en_US.utf8", "en-US", "English_United States.1252", ""}) {
+    EXPECT_TRUE(pglaswell::detail::is_english_messages(v)) << v;
+  }
+  for (const char* v : {"pt_BR.utf8", "de_DE.UTF-8", "Portuguese_Brazil.1252", "es"}) {
+    EXPECT_FALSE(pglaswell::detail::is_english_messages(v)) << v;
+  }
+}
+
 // --- S6: cancelling a worker's statement from the observer thread ---------
 //
 // The escalation path depends on this: when a backend has been blocked behind
@@ -4071,7 +4107,12 @@ TEST_F(BootstrappedTest, ARoleWithoutUsageOnTheLedgerGetsAnAnswerNotAnError) {
     EXPECT_NE(st.hint.find("laswell_role=laswell_no_usage"), std::string::npos) << st.hint;
   }
   {
+    // A role that may not set lc_messages still connects, and is answered in
+    // the server's language: the refusal of English messages is not an error.
     pglaswell::ReadSession r(as_role);
+    EXPECT_EQ(r.txn().exec("SELECT current_setting('lc_messages')")[0][0].as<std::string>(),
+              r.txn().exec("SELECT reset_val FROM pg_settings WHERE name = 'lc_messages'")[0][0]
+                  .as<std::string>());
     const auto out = json::parse(
         r.txn().exec(pglaswell::check_privileges_sql())[0][0].as<std::string>());
     const auto& l = out["ledger"];

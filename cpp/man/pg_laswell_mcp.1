@@ -2937,6 +2937,25 @@ citus.workers = pr-w1, pr-w2, pr-w3, pr-w4, pr-w5, pr-w6
 See
 .Xr pg_laswell_citus 7 ,
 .Cm citus_ensure_workers .
+.Ss The language of the server's messages
+Each session
+.Nm
+opens asks for the server's messages in English
+.Pq Li SET lc_messages = 'C' ,
+because it reads a few of them and records the rest in the ledger.
+It is the session's setting and the messages' language only: the database's
+text search configuration, collation and other locale settings are untouched,
+and so is every other session.
+.Pp
+.Va lc_messages
+is a superuser's setting.
+A role that may not set it is not refused: its sessions go on in the server's
+language,
+.Cm planMigration
+says so in a note, and a superuser allows it with
+.Ql GRANT SET ON PARAMETER lc_messages TO role
+(PostgreSQL 15 and later).
+A cancelled job is recognised by its SQLSTATE in either case.
 .Ss The connection budget
 .Va app_pool_size
 is the application's own connection-pool limit.

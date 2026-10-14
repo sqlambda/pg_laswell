@@ -91,6 +91,22 @@ Afterwards, `checkPrivileges` will warn if the runtime role can still write
 `laswell.trusted_key` — that is, if you ran the script *as* that role, which
 defeats the point.
 
+### On a server whose messages are not in English
+
+pg_laswell asks for the server's messages in English, for its own sessions
+only (`SET lc_messages = 'C'`): it reads a few of them and records the rest in
+the ledger. Nothing else is changed — the database's text search configuration,
+collation and other locale settings are untouched, and so is every other
+session. `lc_messages` is a superuser's setting, so a runner role is refused
+unless it has been allowed (PostgreSQL 15 and later):
+
+```sql
+GRANT SET ON PARAMETER lc_messages TO laswell_runner;
+```
+
+Without it pg_laswell still works: its messages stay in the server's language,
+and `planMigration` says so in a note.
+
 ## 2. The connection budget
 
 pg_laswell uses **three connections per job**, and the third is not negotiable:
