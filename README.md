@@ -29,14 +29,16 @@ targets before upload. Releases are on
 authoritative reference.
 
 **Everything here is measured against PostgreSQL 18, and the suite runs against
-15 through 18.** One kind does not reach as far back as the rest: `merge_rows`
+15 through 19.** One kind does not reach as far back as the rest: `merge_rows`
 in its paced form emits `MERGE ... RETURNING`, and `when_not_matched_by_source`
 emits `WHEN NOT MATCHED BY SOURCE`, both PostgreSQL 17+. The planner refuses
 them below 17 and names the reading, rather than emitting SQL the server cannot
 parse — and refuses rather than silently running unpaced, because that would
 turn a bounded change into one long transaction. The unpaced merge, and every
-other kind, runs from 15. **The Citus module is measured against Citus 13.2 on
-PostgreSQL 17**; it reads which Citus calls exist rather than assuming a version
+other kind, runs from 15. No module's live suite has been run on PostgreSQL 19
+yet; each is measured on the versions that follow. **The Citus module is
+measured against Citus 13.2 on PostgreSQL 17**; it reads which Citus calls
+exist rather than assuming a version
 ([pg_laswell_citus(7)](cpp/man/pg_laswell_citus.7)). **pg_cron 1.6.8 and
 pgvector 0.8.6 are measured on PostgreSQL 18.6, TimescaleDB 2.30.2 on 18.6 in
 both editions and 2.28.3 on 15**
