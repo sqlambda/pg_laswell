@@ -11774,7 +11774,7 @@ TEST(Planner, DroppingAUniqueConstraintWarnsThatItsIndexGoesWithIt) {
 }
 
 TEST(Planner, DroppingANotNullConstraintWarnsTheColumnBecomesNullable) {
-  // PG17+ names NOT NULL constraints, so they can be dropped by name like any
+  // PG18+ names NOT NULL constraints, so they can be dropped by name like any
   // other. The effect is not "less enforcement" but a change to what the data
   // may contain, which is a different conversation.
   const auto plan = pglaswell::plan_migration(
@@ -13846,7 +13846,7 @@ TEST_F(DatabaseTest, ConstraintObservationsMatchWhatPostgresqlActuallyRefuses) {
 }
 
 TEST_F(DatabaseTest, TheNotNullRecipeLeavesPostgresqlsOwnConstraintName) {
-  // PostgreSQL 17+ records NOT NULL constraints in pg_constraint, named
+  // PostgreSQL 18+ records NOT NULL constraints in pg_constraint, named
   // <table>_<column>_not_null. A temporary CHECK on that name forces the
   // permanent constraint to be auto-suffixed -- t_v_not_null1 -- for good,
   // as a side effect of how the column was set rather than of anything anyone

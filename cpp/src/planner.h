@@ -7825,7 +7825,7 @@ inline void plan_set_not_null(const Intent& in, const Observations& obs, Plan& p
   const auto column = in.body.value("column", "");
   // Deliberately NOT <table>_<column>_not_null.
   //
-  // PostgreSQL 17+ records NOT NULL constraints in pg_constraint and names
+  // PostgreSQL 18+ records NOT NULL constraints in pg_constraint and names
   // them exactly that. Measured on 18.6: a temporary CHECK squatting on that
   // name forces the permanent constraint to become t_v_not_null1, leaving the
   // database with an auto-suffixed name for good, as a side effect of how the
