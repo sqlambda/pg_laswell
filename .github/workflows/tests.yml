@@ -147,6 +147,7 @@ jobs:
           - {config: plain-gcc,   pg: 16}
           - {config: plain-gcc,   pg: 17}
           - {config: plain-gcc,   pg: 18}
+          - {config: plain-gcc,   pg: 19}
           # PostgreSQL 15 has no EXPLAIN (GENERIC_PLAN), so listMigrations
           # cannot derive relations hidden in expressions and says so. One job
           # covers that degraded path; running the whole matrix on it would
@@ -155,6 +156,7 @@ jobs:
           - {config: plain-clang, pg: 16}
           - {config: plain-clang, pg: 17}
           - {config: plain-clang, pg: 18}
+          - {config: plain-clang, pg: 19}
     services:
       postgres:
         image: postgres:${{ matrix.pg }}

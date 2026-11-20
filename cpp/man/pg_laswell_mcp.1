@@ -1497,7 +1497,7 @@ nothing.
 .Pp
 The temporary check is deliberately not named
 .Ql <table>_<column>_not_null .
-PostgreSQL 17 and later record NOT NULL constraints in
+PostgreSQL 18 and later record NOT NULL constraints in
 .Va pg_constraint
 under exactly that name, so squatting on it would leave the permanent
 constraint auto-suffixed for good, as a side effect of how the column was set

@@ -128,7 +128,7 @@ covers = {
                        'WITH clause and offers no way to add one'),
 }
 # Everything else on the page, classified.
-maintenance = {'REINDEX','VACUUM','ANALYZE','CLUSTER','CHECKPOINT','DISCARD','LOAD'}
+maintenance = {'REINDEX','VACUUM','ANALYZE','CLUSTER','REPACK','CHECKPOINT','DISCARD','LOAD'}
 cluster_wide = {'CREATE DATABASE','DROP DATABASE','ALTER DATABASE','CREATE TABLESPACE',
   'DROP TABLESPACE','ALTER TABLESPACE','CREATE ROLE','DROP ROLE','ALTER ROLE',
   'CREATE USER','DROP USER','ALTER USER','CREATE GROUP','DROP GROUP','ALTER GROUP',
@@ -143,9 +143,9 @@ not_ddl = {'ABORT','BEGIN','CALL','CLOSE','COMMIT','COMMIT PREPARED','DEALLOCATE
   'MOVE','NOTIFY','PREPARE','PREPARE TRANSACTION','RELEASE SAVEPOINT','RESET',
   'ROLLBACK','ROLLBACK PREPARED','ROLLBACK TO SAVEPOINT','SAVEPOINT','SELECT',
   'SELECT INTO','SET','SET CONSTRAINTS','SET ROLE','SET SESSION AUTHORIZATION',
-  'SET TRANSACTION','SHOW','START TRANSACTION','UNLISTEN','VALUES'}
+  'SET TRANSACTION','SHOW','START TRANSACTION','UNLISTEN','VALUES','WAIT'}
 
-page = [l.strip() for l in open(__import__('os').path.join(__import__('os').path.dirname(__import__('os').path.abspath(__file__)), 'pg18-sql-commands.txt')) if l.strip()]
+page = [l.strip() for l in open(__import__('os').path.join(__import__('os').path.dirname(__import__('os').path.abspath(__file__)), 'pg19-sql-commands.txt')) if l.strip()]
 full, partial, missing = [], [], []
 for c in page:
     if c in not_ddl or c in maintenance or c in cluster_wide: continue

@@ -920,9 +920,11 @@ class Catalog {
              "could not read " + qualified + " within " +
                  std::to_string(kObservationLockTimeoutMs) +
                  "ms: something holds a lock that conflicts with AccessShareLock "
-                 "(an ALTER TABLE, a plain CREATE INDEX, a VACUUM FULL, or a "
-                 "LOCK TABLE). Use pg_licht currentLocks to see what, and plan "
-                 "again once it has finished."}};
+                 "(an ALTER TABLE, a plain CREATE INDEX, a VACUUM FULL, " +
+                 // REPACK is PostgreSQL 19's; a server below it has none to name.
+                 (obs.server_version >= 190000 ? "a REPACK, " : "") +
+                 "or a LOCK TABLE). Use pg_licht currentLocks to see what, and "
+                 "plan again once it has finished."}};
         // The transaction is aborted after a failed statement, so a fresh one
         // is needed for whatever tables remain.
         s.txn().abort();

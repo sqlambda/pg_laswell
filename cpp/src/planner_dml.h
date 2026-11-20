@@ -2281,12 +2281,20 @@ inline void plan_delete_rows(const Intent& in, const Observations& obs,
   detail::warn_about_row_security(t, qualified, false, plan);
 
   // The space is not returned to the operating system, and an operator who
-  // expects it to be will go looking for a bug that is not there.
+  // expects it to be will go looking for a bug that is not there. PostgreSQL
+  // 19 has REPACK for it; a server below 19 is not told of a command it does
+  // not have, and its warning, which is hashed into planDigest, stays as it was.
+  const bool has_repack = obs.server_version >= 190000;
   plan.warnings.push_back(
       "a delete does not shrink " + qualified +
       " on disk: the rows become dead tuples and the space is reused by future "
       "inserts, not returned to the filesystem. Autovacuum will reclaim it for "
-      "reuse; only VACUUM FULL or pg_repack returns it, and neither is a "
+      "reuse; " +
+      std::string(has_repack
+                      ? "only REPACK, VACUUM FULL or pg_repack returns it, and "
+                        "none of them is a "
+                      : "only VACUUM FULL or pg_repack returns it, and neither "
+                        "is a ") +
       "migration. pg_licht tableBloat shows what is actually there afterwards.");
 }
 

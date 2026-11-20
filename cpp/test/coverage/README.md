@@ -5,17 +5,19 @@ remembered. Re-run it when a new major version lands.
 
     python3 cpp/test/coverage/audit.py
 
-`pg18-sql-commands.txt` is the command list from
-<https://www.postgresql.org/docs/18/sql-commands.html>, and
-`pg18-alter-table-actions.txt` the "where action is one of" list from
-<https://www.postgresql.org/docs/18/sql-altertable.html>, both captured
-2026-09-05. The script reads the implemented intent kinds out of
-`cpp/src/spec.h` rather than from a list kept here, so it cannot drift from the
-code -- only from PostgreSQL, which is what the version-stamped files are for.
+`pg19-sql-commands.txt` is the command list from
+<https://www.postgresql.org/docs/19/sql-commands.html>, and
+`pg19-alter-table-actions.txt` the "where action is one of" list from
+<https://www.postgresql.org/docs/19/sql-altertable.html>, both captured
+2026-11-20. PostgreSQL 19 added two commands to the first, REPACK and WAIT,
+and changed nothing in the second. The script reads the implemented intent
+kinds out of `cpp/src/spec.h` rather than from a list kept here, so it cannot
+drift from the code -- only from PostgreSQL, which is what the version-stamped
+files are for.
 
 Three exclusions are deliberate and are counted separately rather than hidden:
 
-* **maintenance** -- REINDEX, VACUUM, ANALYZE, CLUSTER and friends. Excluded by
+* **maintenance** -- REINDEX, VACUUM, ANALYZE, CLUSTER, REPACK and friends. Excluded by
   the second test this project applies to every intent kind: a migration is a
   change to state, applied exactly once, and these are neither. They change
   nothing a catalog can show afterwards, and the ledger keys on a spec digest,
