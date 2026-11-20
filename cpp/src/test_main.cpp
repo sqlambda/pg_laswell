@@ -3688,6 +3688,10 @@ TEST_F(DatabaseTest, ObservationUnderAStrongLockReportsRatherThanHangs) {
       << "observation should report the lock, not read through it: " << t.dump();
   EXPECT_NE(t.value("blocked_reason", "").find("currentLocks"), std::string::npos)
       << "the reason should point at the tool that names the blocker";
+  // REPACK is named among what may hold the lock only where the server has it.
+  EXPECT_EQ(t.value("blocked_reason", "").find("a REPACK, ") != std::string::npos,
+            obs.server_version >= 190000)
+      << t.value("blocked_reason", "");
   EXPECT_LT(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count(), 10)
       << "observation hung instead of timing out";
 
@@ -10011,6 +10015,38 @@ TEST(Planner, DeleteRowsIsPacedLikeABackfillAndWarnsAboutChildren) {
       << "a paced delete that hits a foreign key stops part-done: "
       << plan.render();
   EXPECT_TRUE(space_warning) << plan.render();
+}
+
+// REPACK arrived in PostgreSQL 19. A server that has it is told of it; one
+// below is not, and its warning keeps the words it had, because a warning is
+// hashed into planDigest and a plan against 15 to 18 has not changed.
+TEST(Planner, TheDeleteWarningNamesRepackOnlyWhereTheServerHasIt) {
+  const auto space_warning = [](int server_version) {
+    auto obs = obs_rich();
+    obs.server_version = server_version;
+    const auto plan = pglaswell::plan_migration(
+        spec_of(json::array({json{{"kind", "delete_rows"}, {"schema", "shop"},
+                                  {"table", "orders"}, {"key", "id"},
+                                  {"where", "created_at < now() - interval '1 year'"}}})),
+        obs, {});
+    EXPECT_TRUE(plan.ok) << plan.render();
+    for (const auto& w : plan.warnings) {
+      if (w.find("does not shrink") != std::string::npos) return w;
+    }
+    return std::string();
+  };
+  const auto on_18 = space_warning(180006);
+  EXPECT_NE(on_18.find("only VACUUM FULL or pg_repack returns it, and neither is "
+                       "a migration."),
+            std::string::npos)
+      << on_18;
+  EXPECT_EQ(on_18.find("REPACK"), std::string::npos) << on_18;
+
+  const auto on_19 = space_warning(190000);
+  EXPECT_NE(on_19.find("only REPACK, VACUUM FULL or pg_repack returns it, and "
+                       "none of them is a migration."),
+            std::string::npos)
+      << on_19;
 }
 
 
