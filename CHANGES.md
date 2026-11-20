@@ -1,5 +1,32 @@
 # Changes
 
+## 0.1.6
+
+PostgreSQL 19. No ledger schema change.
+
+### The suite runs against PostgreSQL 19
+
+PostgreSQL 19.0 was released on 2026-11-19. Nothing in the tool refused it:
+every server version it checks is a floor. The test matrix now runs 19 beside
+16, 17 and 18 with both compilers, and the README and the site say 15 through
+19. No module's live suite has run on 19; each stays on the versions it was
+measured on.
+
+### `REPACK` is named where the server has it
+
+On PostgreSQL 19 and later the warning of a `delete_rows` plan names `REPACK`
+among what returns space to the filesystem, and a reading that a lock blocked
+names it among what may hold that lock. Below 19 both read as before, word for
+word. A warning is part of `planDigest`, so the digest of a plan with a delete
+is new on 19 and unchanged on 15 to 18.
+
+The coverage audit reads the command list of PostgreSQL 19: two commands more,
+`REPACK`, counted as maintenance beside `CLUSTER` and `VACUUM`, and `WAIT`,
+which is not DDL.
+
+The manual said NOT NULL constraints are recorded in `pg_constraint` from
+PostgreSQL 17. It is 18: measured, 17.12 records none.
+
 ## 0.1.5 (2026-10-13)
 
 What two projects that use it reported in October 2026. No ledger schema change.
