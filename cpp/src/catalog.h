@@ -1272,7 +1272,8 @@ class Catalog {
       const std::vector<std::pair<int, std::vector<std::string>>>& steps,
       const std::vector<bool>& txn_forbidden, int server_version,
       const std::vector<json>& copy_payloads, DryRun& out, bool& skipped_any,
-      const std::vector<bool>& execute = {}, const std::vector<json>& on_copy = {}) {
+      const std::vector<bool>& execute = {}, const std::vector<json>& on_copy = {},
+      const std::vector<bool>& untimed = {}) {
     // A step skipped with NOTHING checked: a later definition may then be
     // refused for want of what that step would have made -- a column added by
     // a statement left out -- which is a gap and not a defect. An index build
@@ -1321,6 +1322,17 @@ class Catalog {
       // for seconds. Put back after the step.
       bool short_wait = false;
       const auto& statements = steps[i].second;
+      // A step that is run for its rows (tools.h, rehearsal_inputs): the one
+      // statement of an unpaced insert, update, delete or merge, in a chain.
+      // Its length is its table's, as in the job, so the rehearsal's statement
+      // timeout does not apply to it -- and is put back for the step after.
+      const bool lift_timeout = i < untimed.size() && untimed[i];
+      std::string timeout_before;
+      if (lift_timeout) {
+        timeout_before =
+            txn.exec("SELECT current_setting('statement_timeout')")[0][0].as<std::string>();
+        txn.exec("SET LOCAL statement_timeout = 0");
+      }
       for (std::size_t q = 0; q < statements.size(); ++q) {
         const auto& raw = statements[q];
         const auto stmt = detail::strip_trailing_semicolon(raw);
@@ -1394,6 +1406,10 @@ class Catalog {
       }
       if (short_wait) {
         txn.exec("SET LOCAL lock_timeout = " + std::to_string(kObservationLockTimeoutMs));
+      }
+      if (lift_timeout) {
+        txn.exec("SELECT set_config('statement_timeout', $1, true)",
+                 pqxx::params{timeout_before});
       }
     }
     return Rehearsal::kOk;

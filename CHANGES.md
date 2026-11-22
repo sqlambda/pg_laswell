@@ -94,6 +94,36 @@ exist for any other session until the statement ends.
 The step of an unpaced `insert_rows` now names its table in its detail, so the
 `planDigest` of a plan that has one is new.
 
+### The chain rehearsal executes unpaced row statements, and what is only planned is listed
+
+No dry run executed a statement that writes rows. Each was planned with
+`EXPLAIN (GENERIC_PLAN)` and counted as verified, and a plan says nothing of
+the rows a statement will meet. Reported from the field: a specification that
+created a table and filled it from `SELECT id, d::date FROM raw.src`, where one
+row held `''`. `--dry-run=chain` printed "rehearsed, 2 step(s)", exited 0, and
+the apply failed on that row at once.
+
+The chain now executes a row-level kind that is one statement: an unpaced
+`insert_rows`, `update_rows`, `delete_rows` or `merge_rows`. It is for an empty
+database or a restored copy, and all of it is rolled back. The rehearsal's
+statement timeout is lifted for such a step, since its length is its table's,
+and put back for the step after; the chain therefore takes as long as its
+loads.
+
+A row statement that is only planned is no longer counted as checked. That is
+every one of them in a plain dry run, which runs against the live schema and
+must not write, and a paced walk in a chain, which commits batch by batch.
+Such a step is listed in `unverifiedSteps` and in a new `plannedNotExecuted`,
+with the reason "its statement was planned, not executed: a row it reads or
+writes can still fail it". A chain's line says how many row statements were
+executed and how many were planned and not executed.
+
+So a plan with a row statement now shows an unverified step where it showed
+none, and a deployment's "rehearsed first" line names it.
+
+The one statement of a `"paced": false` fill is still planned and not
+executed, in a chain too: its step carries the walk's statements after it.
+
 ## 0.1.5 (2026-10-13)
 
 What two projects that use it reported in October 2026. No ledger schema change.

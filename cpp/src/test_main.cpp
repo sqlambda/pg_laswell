@@ -6138,6 +6138,31 @@ TEST(Deploy, AProgressLineForAnUnpacedInsertSaysHowMuchItsTableHasGrown) {
             "growth cannot be read from outside");
 }
 
+// A plain dry run plans a row statement and never executes it. Planned is not
+// checked: the step is listed as unverified, with that as the reason, and no
+// longer passes as rehearsed.
+TEST_F(ToolTest, ADryRunListsARowStatementAsPlannedNotExecuted) {
+  make_shop(cfg());
+  json doc = minimal_spec();
+  doc["id"] = "0046-old-orders-removed";
+  doc["description"] = "Orders older than a year are removed.";
+  doc["intents"] = json::array({json{
+      {"kind", "delete_rows"}, {"schema", "shop"}, {"table", "orders"}, {"key", "id"},
+      {"where", "created_at < now() - interval '1 year'"}}});
+  const auto p = payload(call("planMigration", json{{"spec", signed_doc(doc)}}));
+  ASSERT_TRUE(p.value("ok", false)) << p.dump(2);
+  const auto dry = p.value("dryRun", json::object());
+  ASSERT_TRUE(dry.value("ran", false)) << p.dump(2);
+  ASSERT_EQ(dry.value("plannedNotExecuted", json::array()).size(), 1u) << dry.dump(2);
+  const int ordinal = dry["plannedNotExecuted"][0].get<int>();
+  const auto unverified = dry.value("unverifiedSteps", json::array());
+  EXPECT_NE(std::find(unverified.begin(), unverified.end(), json(ordinal)), unverified.end())
+      << dry.dump(2);
+  EXPECT_EQ(dry["unverifiedWhy"].value(std::to_string(ordinal), "")
+                .rfind("its statement was planned, not executed", 0), 0u)
+      << dry.dump(2);
+}
+
 TEST_F(ToolTest, AnUnpacedInsertReportsHowMuchItsTableHasGrownWhileItRuns) {
   make_shop(cfg());
   {
@@ -17081,6 +17106,101 @@ TEST_F(DeployTest, AChainRehearsesWhatAPlainDryRunCannot) {
   EXPECT_EQ(r.txn().exec("SELECT count(*) FROM laswell.migration"
                          " WHERE spec_id IN ('0001-create','0002-extend')")[0][0].as<int>(), 0)
       << "a rehearsal wrote the ledger";
+}
+
+namespace {
+// A table made and filled in one specification, from a select that casts text
+// to a date: the load that was reported, in two rows.
+json probe_load_spec() {
+  return json{
+      {"laswell_spec_version", 1},
+      {"id", "0001-probe-unpaced"},
+      {"description", "creates a table and fills it in one statement"},
+      {"intents", json::array(
+          {json{{"kind", "create_table"}, {"schema", "shop"}, {"table", "probe"},
+                {"columns", json::array(
+                    {json{{"name", "id"}, {"type", "bigint"}, {"nullable", false},
+                          {"comment", "Key."}},
+                     json{{"name", "d"}, {"type", "date"}, {"nullable", true},
+                          {"comment", "A day."}}})},
+                {"primary_key", json::array({"id"})},
+                {"comment", "A table the chain creates and fills."}},
+           json{{"kind", "insert_rows"}, {"schema", "shop"}, {"table", "probe"},
+                {"key", "id"}, {"columns", json::array({"id", "d"})}, {"paced", false},
+                {"select", "SELECT id, d::date FROM shop.src"}}})}};
+}
+}  // namespace
+
+// Reported from the field: a chain said "rehearsed" for an unpaced insert
+// whose select cast '' to a date, exited 0, and the apply failed on that row
+// at once. The statement was planned and never run. A chain is for an empty
+// database or a restored copy and rolls everything back, so it runs it.
+TEST_F(DeployTest, AChainExecutesAnUnpacedInsertAndFindsTheRowThatFailsIt) {
+  exec("DROP SCHEMA IF EXISTS shop CASCADE");
+  exec("CREATE SCHEMA shop");
+  exec("CREATE TABLE shop.src(id bigint primary key, d text)");
+  exec("INSERT INTO shop.src VALUES (1, '2026-01-01'), (2, '')");
+  write_spec("0001.json", probe_load_spec());
+
+  const auto [bad, bad_text] = deploy_chain();
+  EXPECT_EQ(bad, pglaswell::DeployResult::kRefused) << bad_text;
+  EXPECT_NE(bad_text.find("0001-probe-unpaced: not accepted"), std::string::npos) << bad_text;
+  EXPECT_NE(bad_text.find("invalid input syntax for type date"), std::string::npos)
+      << "the row that fails the apply must fail the rehearsal:\n" << bad_text;
+  EXPECT_NE(bad_text.find("INSERT INTO"), std::string::npos) << bad_text;
+
+  // The same specification over rows that all cast: executed, and said so.
+  exec("UPDATE shop.src SET d = '2026-01-02' WHERE id = 2");
+  const auto [good, good_text] = deploy_chain();
+  EXPECT_EQ(good, pglaswell::DeployResult::kOk) << good_text;
+  EXPECT_NE(good_text.find("0001-probe-unpaced: rehearsed, 2 step(s), "
+                           "1 row statement(s) executed"),
+            std::string::npos) << good_text;
+  EXPECT_EQ(good_text.find("planned, not executed"), std::string::npos) << good_text;
+
+  // And nothing of it survives: the rows went with the table.
+  pglaswell::ReadSession r(cfg());
+  EXPECT_EQ(r.txn().exec("SELECT count(*) FROM pg_tables WHERE schemaname = 'shop'"
+                         " AND tablename = 'probe'")[0][0].as<int>(), 0)
+      << "a rehearsal committed a load";
+}
+
+// The one statement of a load runs for as long as its table takes, in the job
+// and so in the chain: the rehearsal's statement timeout is lifted for it, and
+// is back for the step after.
+TEST_F(DeployTest, AChainDoesNotTimeOutTheOneStatementOfALoad) {
+  exec("DROP SCHEMA IF EXISTS shop CASCADE");
+  exec("CREATE SCHEMA shop");
+  // A second and a half of select, under a rehearsal timeout of 300 ms.
+  exec("CREATE TABLE shop.src(id bigint primary key, d text)");
+  exec("INSERT INTO shop.src SELECT g, '2026-01-01' FROM generate_series(1, 30) g");
+  ctx_->registry.mutable_get("default").executor.dry_run_statement_timeout_ms = 300;
+  json slow = probe_load_spec();
+  slow["intents"][1]["select"] =
+      "SELECT id, (d || pg_sleep(0.05)::text)::date FROM shop.src";
+  write_spec("0001.json", slow);
+
+  const auto [result, text] = deploy_chain();
+  EXPECT_EQ(result, pglaswell::DeployResult::kOk) << text;
+  EXPECT_NE(text.find("1 row statement(s) executed"), std::string::npos) << text;
+  EXPECT_NE(text.find("1 rehearsed, 0 failed, 0 incomplete"), std::string::npos) << text;
+}
+
+// A paced walk commits batch by batch, which no rehearsal can take back, so a
+// chain plans it and no more -- and says so on its line.
+TEST_F(DeployTest, AChainListsAPacedWalkAsPlannedNotExecuted) {
+  exec("DROP SCHEMA IF EXISTS shop CASCADE");
+  exec("CREATE SCHEMA shop");
+  exec("CREATE TABLE shop.src(id bigint primary key, d text)");
+  exec("INSERT INTO shop.src VALUES (1, '2026-01-01'), (2, '')");
+  json paced = probe_load_spec();
+  paced["intents"][1]["paced"] = true;
+  write_spec("0001.json", paced);
+
+  const auto [result, text] = deploy_chain();
+  EXPECT_EQ(result, pglaswell::DeployResult::kOk) << text;
+  EXPECT_NE(text.find("1 row statement(s) planned, not executed"), std::string::npos) << text;
+  EXPECT_EQ(text.find("row statement(s) executed"), std::string::npos) << text;
 }
 
 TEST_F(DeployTest, AChainReportsEveryIndependentFailureAndNamesWhatItBlocks) {

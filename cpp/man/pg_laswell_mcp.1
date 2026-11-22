@@ -424,6 +424,18 @@ checked with
 .Ic PREPARE
 instead, which catches a malformed statement but not one an extension will
 refuse to route, and the step is reported as unverified with the reason.
+.It
+A statement that writes rows \(em
+.Cm insert_rows ,
+.Cm update_rows ,
+.Cm delete_rows ,
+.Cm merge_rows
+and a fill \(em is such a query, so it is planned and not executed.
+A plan says nothing of the rows the statement will meet: a cast that fails on
+one of them, or a key that collides, is found by the job.
+The step is therefore listed as unverified, in
+.Va plannedNotExecuted
+as well, with that as its reason; it is not counted as checked.
 A step whose statements change the schema through a function call
 .Pq Citus's Fn create_distributed_table
 is executed like any other DDL, because planning a

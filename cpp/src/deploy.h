@@ -402,9 +402,20 @@ class Deployment {
           if (outcome == "rehearsed") {
             out << "  " << id << ": rehearsed, "
                 << result.value("steps", json::array()).size() << " step(s)";
+            // Three things a reader must not take for one another: a step that
+            // cannot be tried in a transaction, a row statement that was only
+            // planned, and a row statement that was run.
             const auto unverified = r.value("unverifiedSteps", json::array());
-            if (!unverified.empty()) {
-              out << ", " << unverified.size() << " not checkable in a transaction";
+            const auto planned = r.value("plannedNotExecuted", json::array());
+            const auto executed = r.value("rowStatementsExecuted", json::array());
+            const auto other = unverified.size() > planned.size()
+                                   ? unverified.size() - planned.size() : 0;
+            if (other != 0) out << ", " << other << " not checkable in a transaction";
+            if (!executed.empty()) {
+              out << ", " << executed.size() << " row statement(s) executed";
+            }
+            if (!planned.empty()) {
+              out << ", " << planned.size() << " row statement(s) planned, not executed";
             }
             out << "\n";
             ++rehearsed;
