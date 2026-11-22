@@ -1905,6 +1905,32 @@ TEST(Planner, ASmallQuietTableChoosesAPlainIndexBuild) {
   EXPECT_NE(s->lock.find("ShareLock"), std::string::npos);
 }
 
+// relpages is 0 until a table is first vacuumed or analysed, whatever it
+// holds: reported from the field as tables of 5.2, 5.9 and 1.3 GB each planned
+// as "size 0 B < 64 MiB ceiling -> plain build" moments after they were
+// loaded. Where the observation measured, the measurement is the size.
+TEST(Planner, ATableWithNoStatisticsIsPlannedOnItsMeasuredSize) {
+  const auto spec = pglaswell::parse_spec(minimal_spec());
+  auto obs = observations(0, 0);
+  obs.tables["shop.orders"]["estimated_from"] = nullptr;
+  obs.tables["shop.orders"]["unanalysed_leaves"] = 1;
+  obs.tables["shop.orders"]["size_measured"] = 5LL << 30;
+  const auto plan = pglaswell::plan_migration(spec, obs, {});
+  const auto* s = find_step(plan, "create_index");
+  ASSERT_NE(s, nullptr);
+  EXPECT_EQ(s->txn_class, pglaswell::TxnClass::kForbidden) << plan.render();
+  EXPECT_NE(all_sql(*s).find("CREATE INDEX CONCURRENTLY"), std::string::npos);
+  EXPECT_EQ(s->detail.value("size_bytes", 0LL), 5LL << 30);
+  EXPECT_EQ(s->detail.value("size_source", ""), "measured");
+
+  // The same reading, without the measurement, is the plan that was reported.
+  obs.tables["shop.orders"].erase("size_measured");
+  const auto blind = pglaswell::plan_migration(spec, obs, {});
+  const auto* b = find_step(blind, "create_index");
+  ASSERT_NE(b, nullptr);
+  EXPECT_EQ(all_sql(*b).find("CONCURRENTLY"), std::string::npos);
+}
+
 TEST(Planner, ALockWaiterOnASmallTableForcesTheConcurrentPath) {
   // The check that makes the size ceiling safe: a small table with something
   // already queued on it is not a table to take ShareLock on.
@@ -3583,6 +3609,72 @@ TEST_F(DatabaseTest, SizeEscalationIsSeparateFromObservationBecauseItTakesALock)
   pglaswell::WriteSession w(cfg);
   w.begin("pg_laswell/test/cleanup");
   w.txn().exec("DROP TABLE laswell_size");
+  w.commit();
+}
+
+TEST_F(DatabaseTest, ATableNeverAnalysedIsMeasuredAndOneWithStatisticsIsNot) {
+  pglaswell::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = url_;
+  {
+    pglaswell::WriteSession w(cfg);
+    w.begin("pg_laswell/test/unanalysed-fixture");
+    w.txn().exec("DROP TABLE IF EXISTS laswell_fresh, laswell_known, laswell_fresh_parts");
+    // autovacuum off: it would analyse the table at a moment of its choosing,
+    // which is the event this test stands before and after.
+    w.txn().exec("CREATE TABLE laswell_fresh(id int primary key, pad text) "
+                 "WITH (autovacuum_enabled = false)");
+    w.txn().exec("INSERT INTO laswell_fresh SELECT g, repeat('x',200) "
+                 "FROM generate_series(1,20000) g");
+    w.txn().exec("CREATE TABLE laswell_known(id int primary key, pad text) "
+                 "WITH (autovacuum_enabled = false)");
+    w.txn().exec("INSERT INTO laswell_known SELECT g, repeat('x',200) "
+                 "FROM generate_series(1,20000) g");
+    w.txn().exec("ANALYZE laswell_known");
+    // One leaf with statistics and one without, under one parent.
+    w.txn().exec("CREATE TABLE laswell_fresh_parts(id int, pad text) PARTITION BY RANGE (id)");
+    w.txn().exec("CREATE TABLE laswell_fresh_parts_1 PARTITION OF laswell_fresh_parts "
+                 "FOR VALUES FROM (1) TO (20001) WITH (autovacuum_enabled = false)");
+    w.txn().exec("CREATE TABLE laswell_fresh_parts_2 PARTITION OF laswell_fresh_parts "
+                 "FOR VALUES FROM (20001) TO (40001) WITH (autovacuum_enabled = false)");
+    w.txn().exec("INSERT INTO laswell_fresh_parts SELECT g, repeat('x',200) "
+                 "FROM generate_series(1,40000) g");
+    w.txn().exec("ANALYZE laswell_fresh_parts_1");
+    w.commit();
+  }
+
+  pglaswell::Catalog cat(cfg);
+  const auto obs = cat.observe({"public", "public", "public"},
+                               {"laswell_fresh", "laswell_known", "laswell_fresh_parts"});
+
+  // Never vacuumed or analysed: relpages says nothing, so it is measured.
+  const auto& fresh = obs.table("public.laswell_fresh");
+  EXPECT_TRUE(fresh["estimated_from"].is_null()) << fresh.dump(2);
+  EXPECT_EQ(fresh.value("unanalysed_leaves", -1LL), 1) << fresh.dump(2);
+  EXPECT_EQ(fresh.value("measured_leaves", -1LL), 1) << fresh.dump(2);
+  EXPECT_GT(fresh.value("size_measured", 0LL), 4000000) << fresh.dump(2);
+  EXPECT_EQ(pglaswell::table_size_bytes(fresh), fresh.value("size_measured", 0LL));
+
+  // With statistics: not opened at all, and the estimate is the size.
+  const auto& known = obs.table("public.laswell_known");
+  EXPECT_EQ(known.value("unanalysed_leaves", -1LL), 0) << known.dump(2);
+  EXPECT_FALSE(known.contains("size_measured")) << known.dump(2);
+  EXPECT_GT(pglaswell::table_size_bytes(known), 4000000) << known.dump(2);
+  // The measurement is the heap alone, as relpages is: the two tables hold the
+  // same rows, so the measured size of one is the estimate of the other.
+  EXPECT_EQ(fresh.value("size_measured", 0LL), known.value("size_estimate", -1LL));
+
+  // A partitioned table: the leaf with no statistics is measured, the other
+  // keeps its estimate, and the parent's size is both.
+  const auto& parts = obs.table("public.laswell_fresh_parts");
+  EXPECT_EQ(parts.value("unanalysed_leaves", -1LL), 1) << parts.dump(2);
+  EXPECT_EQ(parts.value("measured_leaves", -1LL), 1) << parts.dump(2);
+  EXPECT_GT(parts.value("size_measured", 0LL), 2 * parts.value("size_estimate", 0LL) - 100000)
+      << "the estimate counts one leaf of two equal ones: " << parts.dump(2);
+
+  pglaswell::WriteSession w(cfg);
+  w.begin("pg_laswell/test/cleanup");
+  w.txn().exec("DROP TABLE laswell_fresh, laswell_known, laswell_fresh_parts");
   w.commit();
 }
 
@@ -9260,6 +9352,21 @@ TEST(Planner, AddingAUniqueConstraintOnALargeTableBuildsTheIndexConcurrently) {
   EXPECT_NE(s[1]->lock.find("AccessExclusiveLock"), std::string::npos)
       << "step 2 still takes the exclusive lock; claiming otherwise would be "
          "the most misleading sentence in the plan: " << s[1]->lock;
+}
+
+// The constraint recipes read the same size as the index build: one reading
+// (table_size_bytes), so they cannot disagree about a table.
+TEST(Planner, AUniqueConstraintOnATableWithNoStatisticsReadsTheMeasuredSize) {
+  auto obs = obs_for_unique(0);
+  obs.tables["shop.orders"]["size_measured"] = 2LL << 30;
+  const auto plan = pglaswell::plan_migration(
+      unique_spec("add_unique_constraint", "orders_code_uq"), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  const auto s = steps_of(plan, "add_unique_constraint");
+  ASSERT_EQ(s.size(), 2u) << "a table measured at 2 GB is not the one-statement case: "
+                          << plan.render();
+  EXPECT_NE(all_sql(*s[0]).find("CREATE UNIQUE INDEX CONCURRENTLY"), std::string::npos)
+      << all_sql(*s[0]);
 }
 
 TEST(Planner, ASmallQuietTableGetsOneStatementInstead) {

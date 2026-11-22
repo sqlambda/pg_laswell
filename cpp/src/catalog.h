@@ -81,6 +81,25 @@ SELECT COALESCE(
      'estimated_from', (SELECT GREATEST(s.last_vacuum, s.last_autovacuum,
                                         s.last_analyze, s.last_autoanalyze)
                           FROM pg_stat_all_tables s WHERE s.relid = t.oid),
+     -- How many of the relations that hold this table's rows have never been
+     -- vacuumed or analysed: the table itself, or the leaves of a partitioned
+     -- one. Their relpages is 0 or stale whatever they hold, so size_estimate
+     -- says nothing of them; kUnanalysedSizeSql measures those and only those.
+     'unanalysed_leaves', (SELECT COUNT(*)
+                             FROM (SELECT t.oid AS relid
+                                    WHERE t.relkind IN ('r', 'm')
+                                   UNION ALL
+                                   SELECT lt.relid
+                                     FROM pg_partition_tree(t.oid) lt
+                                     JOIN pg_class lc ON lc.oid = lt.relid
+                                    WHERE t.relkind = 'p' AND lt.isleaf
+                                      AND lc.relkind = 'r') leaf
+                            WHERE NOT EXISTS (
+                                    SELECT 1 FROM pg_stat_all_tables s
+                                     WHERE s.relid = leaf.relid
+                                       AND GREATEST(s.last_vacuum, s.last_autovacuum,
+                                                    s.last_analyze, s.last_autoanalyze)
+                                           IS NOT NULL)),
      'stats', (SELECT JSONB_BUILD_OBJECT(
                  'n_live_tup', s.n_live_tup, 'n_dead_tup', s.n_dead_tup,
                  'n_mod_since_analyze', s.n_mod_since_analyze,
@@ -698,6 +717,37 @@ SELECT JSONB_BUILD_OBJECT(
 )
 )SQL";
 
+// The size of a table some of whose leaves have no statistics: each such leaf
+// measured, each other leaf at its relpages, summed. A plain table is its own
+// one leaf.
+//
+// pg_relation_size and not pg_table_size: the heap alone is what relpages
+// counts, so the figure is the one size_estimate will give once the leaf has
+// been analysed, and a plan made before autovacuum reaches a freshly loaded
+// table states the size a plan made after it does. It opens the relation with
+// AccessShareLock all the same -- which is why only a leaf with no statistics
+// is measured, and why the caller bounds the wait.
+inline const char* kUnanalysedSizeSql = R"SQL(
+SELECT COALESCE(SUM(CASE WHEN st.seen IS NULL THEN pg_relation_size(leaf.oid)
+                         ELSE leaf.relpages::bigint * 8192 END), 0)::bigint,
+       COUNT(*) FILTER (WHERE st.seen IS NULL)
+  FROM pg_class c
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+ CROSS JOIN LATERAL (SELECT c.oid, c.relpages
+                      WHERE c.relkind IN ('r', 'm')
+                     UNION ALL
+                     SELECT lc.oid, lc.relpages
+                       FROM pg_partition_tree(c.oid) lt
+                       JOIN pg_class lc ON lc.oid = lt.relid
+                      WHERE c.relkind = 'p' AND lt.isleaf
+                        AND lc.relkind = 'r') leaf
+  LEFT JOIN LATERAL (SELECT GREATEST(s.last_vacuum, s.last_autovacuum,
+                                     s.last_analyze, s.last_autoanalyze) AS seen
+                       FROM pg_stat_all_tables s
+                      WHERE s.relid = leaf.oid) st ON true
+ WHERE n.nspname = $1 AND c.relname = $2
+)SQL";
+
 inline std::string strip_trailing_semicolon(const std::string& s) {
   auto end = s.find_last_not_of(" \n\t\r");
   if (end == std::string::npos) return {};
@@ -906,6 +956,9 @@ class Catalog {
                                  pqxx::params{schemas[i], tables[i]});
         if (!r.empty() && !r[0][0].is_null()) {
           obs.tables[qualified] = json::parse(r[0][0].as<std::string>());
+          // Inside the try: a leaf under a strong lock makes this table's
+          // reading blocked, as an index under one does.
+          measure_unanalysed(s.txn(), obs.tables[qualified], schemas[i], tables[i]);
         }
       } catch (const pqxx::sql_error& e) {
         if (!is_lock_not_available(e)) throw;
@@ -967,6 +1020,7 @@ class Catalog {
                                pqxx::params{schemas[i], tables[i]});
       if (!r.empty() && !r[0][0].is_null()) {
         obs.tables[qualified] = json::parse(r[0][0].as<std::string>());
+        measure_unanalysed(txn, obs.tables[qualified], schemas[i], tables[i]);
       }
     }
     return obs;
@@ -1406,6 +1460,25 @@ class Catalog {
   }
 
  private:
+  // A table that has never been vacuumed or analysed reads 0 B from relpages
+  // whatever it holds: reported from the field as tables of 5.2, 5.9 and 1.3
+  // GB each planned as "size 0 B < 64 MiB ceiling -> plain build", moments
+  // after they were loaded. Where the observation counts such leaves, their
+  // size is measured and recorded as size_measured, which every reader of the
+  // size prefers (table_size_bytes, planner_base.h).
+  //
+  // Conditional, which is what keeps the lock hazard the comment on
+  // kTableObservationSql describes: a table with statistics is never opened.
+  template <typename Txn>
+  static void measure_unanalysed(Txn& txn, json& t, const std::string& schema,
+                                 const std::string& table) {
+    if (!t.is_object() || t.value("unanalysed_leaves", 0LL) <= 0) return;
+    const auto r = txn.exec(detail::kUnanalysedSizeSql, pqxx::params{schema, table});
+    if (r.empty() || r[0][0].is_null()) return;
+    t["size_measured"] = r[0][0].template as<long long>();
+    t["measured_leaves"] = r[0][1].template as<long long>();
+  }
+
   ConnConfig cfg_;
   ConnectionCache* cache_ = nullptr;
 };

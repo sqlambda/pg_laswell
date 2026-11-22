@@ -27,6 +27,33 @@ which is not DDL.
 The manual said NOT NULL constraints are recorded in `pg_constraint` from
 PostgreSQL 17. It is 18: measured, 17.12 records none.
 
+### A table with no statistics is measured, not read as 0 B
+
+A table's size was `relpages` times the block size, and `relpages` is 0 until
+the table is first vacuumed or analysed, whatever it holds. Reported from the
+field: tables of 5.2, 5.9 and 1.3 GB, each indexed moments after it was loaded,
+each planned as "size 0 B < 64 MiB ceiling -> plain build". Nothing else read
+those tables, so it cost nothing there; on a table an application writes to,
+the same reading takes ShareLock for a build over gigabytes while the plan says
+0 B.
+
+The observation now counts the relations holding a table's rows that have
+never been vacuumed or analysed: the table itself, or the leaves of a
+partitioned one. Those, and only those, are measured with `pg_relation_size`;
+a leaf with statistics keeps its estimate and is not opened. The heap alone,
+as `relpages` counts it, so that a plan made before autovacuum reaches the
+table states the size a plan made after it does.
+
+Every decision made by size reads that figure: the index build, the constraint
+added in one statement, a row-level kind's table, and what the Citus and
+TimescaleDB modules take for "this table has rows to move". The last three
+read a freshly loaded table as empty before.
+
+`pg_relation_size` opens the relation, so it waits behind an `ALTER TABLE` that
+is rewriting it. It runs under the observation's lock timeout, and a leaf that
+cannot be read in time is reported as a table whose observation was blocked,
+as an index under such a lock already was.
+
 ## 0.1.5 (2026-10-13)
 
 What two projects that use it reported in October 2026. No ledger schema change.
