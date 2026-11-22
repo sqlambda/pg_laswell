@@ -6274,6 +6274,60 @@ TEST_F(ToolTest, AnUnpacedInsertIntoATableOfItsOwnTransactionSaysItCannotBeWatch
   w.commit();
 }
 
+// The last step of a partitioned index recipe verifies the PARENT index, which
+// is valid only when every partition's index is attached. It looked for its
+// index on the step before it -- an attach, which names none -- and recorded
+// "no index to verify" as a success: the one check nothing else makes.
+TEST_F(ToolTest, TheParentIndexOfAPartitionedBuildIsVerified) {
+  make_shop(cfg());
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/partitioned-index-fixture");
+    w.txn().exec("DROP TABLE IF EXISTS shop.ev");
+    w.txn().exec("CREATE TABLE shop.ev(id int, region text) PARTITION BY RANGE (id)");
+    w.txn().exec("CREATE TABLE shop.ev_1 PARTITION OF shop.ev FOR VALUES FROM (1) TO (1000)");
+    w.txn().exec("CREATE TABLE shop.ev_2 PARTITION OF shop.ev FOR VALUES FROM (1000) TO (2000)");
+    w.txn().exec("INSERT INTO shop.ev SELECT g, 'r' FROM generate_series(1, 1999) g");
+    w.commit();
+  }
+  json doc = minimal_spec();
+  doc["id"] = "0047-ev-region-idx";
+  doc["description"] = "An index on a partitioned table.";
+  doc["intents"] = json::array({json{
+      {"kind", "create_index"}, {"schema", "shop"}, {"table", "ev"},
+      {"name", "ev_region_idx"}, {"columns", json::array({"region"})},
+      {"comment", "By region."}}});
+  const auto p = payload(call("startMigration",
+                              json{{"spec", signed_doc(doc)}, {"dryRun", false}}));
+  ASSERT_TRUE(p.value("accepted", false)) << p.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, p["jobId"], [](const json& s) {
+    return s.value("state", "") == "succeeded" || s.value("state", "") == "failed";
+  })) << status_of(p["jobId"]).dump(2);
+  const auto st = status_of(p["jobId"]);
+  ASSERT_EQ(st.value("state", ""), "succeeded") << st.dump(2);
+
+  // Every verify step read an index, the last one included.
+  int verifies = 0;
+  json last;
+  for (const auto& step : st["steps"]) {
+    if (step.value("kind", "") != "verify_index_valid") continue;
+    ++verifies;
+    last = step;
+    EXPECT_TRUE(step.value("detail", json::object()).value("indisvalid", false))
+        << "a verify step that verified nothing: " << step.dump(2);
+    EXPECT_FALSE(step.value("detail", json::object()).contains("note")) << step.dump(2);
+  }
+  EXPECT_EQ(verifies, 3) << "one for each partition's build and one for the parent: "
+                         << st["steps"].dump(2);
+  EXPECT_EQ(last.value("ordinal", -1), st["steps"].back().value("ordinal", -2))
+      << "the parent's verification is the recipe's last step";
+
+  pglaswell::ReadSession r(cfg());
+  EXPECT_TRUE(r.txn().exec("SELECT i.indisvalid FROM pg_index i"
+                           " WHERE i.indexrelid = 'shop.ev_region_idx'::regclass")[0][0]
+                  .as<bool>());
+}
+
 TEST_F(ToolTest, AStepThatIsRunningIsNamedInJobStatusUntilItEnds) {
   make_shop(cfg());
   json doc = minimal_spec();

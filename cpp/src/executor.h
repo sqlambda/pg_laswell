@@ -590,8 +590,9 @@ class Executor {
         continue;
       }
       if (kind == "verify_index_valid") {
-        // Runs in its own read, not inside the group, because the CIC that
-        // preceded it committed outside any transaction.
+        // In its own read after a concurrent build, which committed outside
+        // any transaction; inside the group's where one is open, as after the
+        // attachments of a partitioned recipe (verify_index_valid).
         verify_index_valid(worker, ordinal, step);
         continue;
       }
@@ -972,22 +973,62 @@ class Executor {
   // other, with indisvalid = false. Reporting success because the statement
   // returned would be reporting a failure that looks like a success.
   void verify_index_valid(WriteSession& w, int ordinal, const json& step) {
-    const auto index = index_name_for(ordinal);
+    // The index the step itself names, where it names one: the last step of a
+    // partitioned index recipe, which verifies the PARENT. Looking back for
+    // the build, as below, found the last ATTACH there -- a create_index step
+    // that names no index -- so the parent was recorded as "no index to
+    // verify" and passed: run on 18, with two partitions. That is the one
+    // check of the recipe nothing else makes: a partitioned index missing an
+    // attachment exists, is INVALID, and is never used.
+    const auto own = step.value("detail", json::object());
+    const auto index =
+        !own.value("index", "").empty()
+            ? std::pair<std::string, std::string>{own.value("schema", ""),
+                                                  own.value("index", "")}
+            : index_name_for(ordinal);
     if (index.second.empty()) {
       record_step(ordinal, step, "succeeded", 0,
                   json{{"note", "no index to verify"}});
       return;
     }
-    w.begin(app_name(ordinal));
-    const auto r = w.txn().exec("SELECT i.indisvalid, i.indisready FROM pg_index i"
+    // After a concurrent build there is no transaction: this reads in one of
+    // its own. After the attachments of a partitioned recipe the group's
+    // transaction is open, and the reading is taken INSIDE it -- it must see
+    // those attachments, which nothing else can until they commit, and an
+    // INVALID parent then fails the group, so the attachments go with it and
+    // no invalid index is left behind. (Opening a second transaction here was
+    // an error the old look-back never reached: it returned before this.)
+    const bool own_transaction = !w.in_transaction();
+    if (own_transaction) w.begin(app_name(ordinal));
+    const auto r = w.txn().exec("SELECT i.indisvalid, i.indisready, c.relkind = 'I'"
+        "  FROM pg_index i"
         "  JOIN pg_class c ON c.oid = i.indexrelid"
         "  JOIN pg_namespace n ON n.oid = c.relnamespace"
         " WHERE c.relname = $1 AND n.nspname = $2",
         pqxx::params{index.second, index.first});
     const bool present = !r.empty();
     const bool valid = present && r[0][0].as<bool>();
-    w.commit();
+    const bool partitioned = present && r[0][2].as<bool>();
+    if (own_transaction) w.commit();
 
+    if (!valid && partitioned) {
+      // Not a build that failed: every partition's index is built and checked
+      // before this. An attachment is missing, and DROP INDEX CONCURRENTLY is
+      // not for a partitioned index, so the other hint would be wrong here.
+      record_step(ordinal, step, "failed", 0,
+                  json{{"index", index.first + "." + index.second},
+                       {"present", true},
+                       {"indisvalid", false},
+                       {"error",
+                        "the partitioned index exists but is INVALID: at least "
+                        "one partition has no index attached to it"},
+                       {"hint",
+                        "A partition added while the recipe ran has none. Plan "
+                        "again once the partitions are settled; pg_licht "
+                        "listPartitions and tableDetails show which one."}});
+      throw std::runtime_error("partitioned index " + index.first + "." + index.second +
+                               " is invalid: a partition's index is not attached");
+    }
     if (!valid) {
       record_step(ordinal, step, "failed", 0,
                   json{{"index", index.first + "." + index.second},
