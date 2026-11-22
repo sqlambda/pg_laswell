@@ -106,6 +106,21 @@ struct PacingState {
   std::atomic<unsigned int> long_statement_relation{0};
   std::atomic<long long> long_statement_bytes_start{-1};
   std::atomic<long long> long_statement_bytes_now{-1};
+  // The same reading for a step that is not a walk and writes rows in one
+  // statement: an unpaced insert_rows. Kept apart from long_statement, which
+  // also tells the observer to cancel the statement when a session waits
+  // behind it -- that is the fill's contract and not this step's.
+  //   step_bytes_now  -1 before the first reading; kStepTableUnreadable where
+  //                   no other session can read the table at all: the job's
+  //                   own transaction holds AccessExclusiveLock on it, having
+  //                   created or altered it. The executor finds that out
+  //                   before the statement, and the observer is then never
+  //                   asked -- measured, pg_relation_size from another
+  //                   session waits on that lock for as long as it is held.
+  static constexpr long long kStepTableUnreadable = -2;
+  std::atomic<unsigned int> step_relation{0};
+  std::atomic<long long> step_bytes_start{-1};
+  std::atomic<long long> step_bytes_now{-1};
   // The process was told to stop (signals.h). cancel_stop is set with it; this
   // adds that a statement in flight is cancelled and not waited for -- unless
   // the job is in a walk, which stops at its next batch boundary by itself.
@@ -534,13 +549,44 @@ class Observer {
       // the only sign of progress there is (see long_statement_bytes_now).
       const auto now = std::chrono::steady_clock::now();
       if (now - sizes_read_ >= std::chrono::seconds(5)) {
+        // pg_relation_size opens the relation, so it takes AccessShareLock --
+        // and queues behind a request for AccessExclusiveLock that is itself
+        // waiting for the statement being watched. Measured: with an ALTER
+        // TABLE queued behind a writer, the size read waited as long as the
+        // ALTER did. Unbounded, that stalls this thread exactly when a session
+        // is waiting and the observer is needed. So: 200 ms, in a savepoint
+        // that is rolled back either way, which undoes the setting and lets the
+        // lock go at once. A reading that does not come is skipped and the
+        // figure before it stands.
+        const auto heap_size = [&](unsigned int rel, long long& bytes) {
+          txn.exec("SAVEPOINT laswell_size");
+          bool read = false;
+          try {
+            txn.exec("SET LOCAL lock_timeout = '200ms'");
+            const auto sz = txn.exec("SELECT pg_relation_size($1::oid)", pqxx::params{rel});
+            if (!sz.empty() && !sz[0][0].is_null()) {
+              bytes = sz[0][0].as<long long>();
+              read = true;
+            }
+          } catch (const pqxx::sql_error&) {
+            // lock_not_available, or a relation that has gone: nothing to say.
+          }
+          txn.exec("ROLLBACK TO SAVEPOINT laswell_size");
+          txn.exec("RELEASE SAVEPOINT laswell_size");
+          return read;
+        };
         for (const auto& j : live) {
+          long long bytes = 0;
           const auto rel = j->pacing.long_statement_relation.load();
-          if (!j->pacing.long_statement.load() || rel == 0) continue;
-          sizes_read_ = now;
-          const auto sz = txn.exec("SELECT pg_relation_size($1::oid)", pqxx::params{rel});
-          if (!sz.empty() && !sz[0][0].is_null()) {
-            j->pacing.long_statement_bytes_now = sz[0][0].as<long long>();
+          if (j->pacing.long_statement.load() && rel != 0) {
+            sizes_read_ = now;
+            if (heap_size(rel, bytes)) j->pacing.long_statement_bytes_now = bytes;
+          }
+          // The table of a step that is one statement (an unpaced insert_rows).
+          const auto step_rel = j->pacing.step_relation.load();
+          if (step_rel != 0) {
+            sizes_read_ = now;
+            if (heap_size(step_rel, bytes)) j->pacing.step_bytes_now = bytes;
           }
         }
       }

@@ -1833,6 +1833,10 @@ inline void plan_insert_rows(const Intent& in, const Observations& obs,
                 " plus row locks, released at every commit";
   } else {
     step.txn_class = TxnClass::kRequired;
+    // The table, for the executor: while the one statement runs, the growth of
+    // its heap is the only sign of progress there is (executor.h,
+    // watch_step_table).
+    step.detail["qualified"] = qualified;
     step.lock = "RowExclusiveLock on " + qualified +
                 " for one transaction; no table-level exclusive lock";
     if (in.body.contains("select")) {

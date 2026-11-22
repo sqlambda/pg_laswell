@@ -619,6 +619,9 @@ class Executor {
       }
 
       open_group();
+      // The one statement of an insert: nothing reports its progress, so the
+      // observer watches its table grow.
+      if (kind == "insert_rows") watch_step_table(worker, step);
 
       // A step that asks for an exclusive lock is run so that the application
       // does not queue behind the request for long: the weaker lock first,
@@ -1754,8 +1757,41 @@ class Executor {
     }
   }
 
+  // The table an unpaced insert_rows is about to fill, for the observer to
+  // watch (jobs.h, step_relation): its heap's size now, read in the group's
+  // own transaction.
+  //
+  // Not where this transaction holds AccessExclusiveLock on the table -- it
+  // created it, or an earlier step of the group altered it. No other session
+  // can then read its size, and one that asks waits for the lock (measured),
+  // so the observer is not asked and jobStatus says why there is no figure.
+  void watch_step_table(WriteSession& worker, const json& step) {
+    const auto qualified = step.value("detail", json::object()).value("qualified", "");
+    if (qualified.empty()) return;
+    const auto sz = worker.txn().exec(
+        "SELECT c::oid, pg_relation_size(c),"
+        "       EXISTS (SELECT 1 FROM pg_locks l"
+        "                WHERE l.locktype = 'relation' AND l.relation = c::oid"
+        "                  AND l.database = (SELECT d.oid FROM pg_database d"
+        "                                     WHERE d.datname = current_database())"
+        "                  AND l.pid = pg_backend_pid() AND l.granted"
+        "                  AND l.mode = 'AccessExclusiveLock')"
+        "  FROM to_regclass($1) AS c WHERE c IS NOT NULL",
+        pqxx::params{detail::quote_qualified(qualified)});
+    if (sz.empty() || sz[0][1].is_null()) return;
+    if (sz[0][2].as<bool>()) {
+      job_->pacing.step_bytes_now = PacingState::kStepTableUnreadable;
+      return;
+    }
+    job_->pacing.step_bytes_start = sz[0][1].as<long long>();
+    job_->pacing.step_relation = sz[0][0].as<unsigned int>();
+  }
+
   // The ledger's row for a step, before the step runs (ledger.h).
   void begin_step(int ordinal, const json& step) {
+    job_->pacing.step_relation = 0;
+    job_->pacing.step_bytes_start = -1;
+    job_->pacing.step_bytes_now = -1;
     {
       std::lock_guard<std::mutex> lock(job_->m);
       job_->running_step = json{{"ordinal", ordinal},

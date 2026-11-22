@@ -1119,6 +1119,21 @@ inline json job_snapshot(const Job& j, const ExecutorConfig& e) {
         {"kind", j.running_step.value("kind", "")},
         {"elapsedSeconds",
          (detail::steady_ms() - j.running_step.value("startedMs", 0LL)) / 1000}};
+    // An unpaced insert_rows: by how much its table's heap has grown since the
+    // statement began, as the one statement of a fill says below. Where the
+    // observer cannot see the table, that is said and no figure is given.
+    {
+      const auto was = j.pacing.step_bytes_start.load();
+      const auto is = j.pacing.step_bytes_now.load();
+      if (is == PacingState::kStepTableUnreadable) {
+        out["runningStep"]["tableGrowth"] =
+            "not readable: this job's open transaction holds AccessExclusiveLock on "
+            "the table, having created or altered it, so no other session can read "
+            "its size";
+      } else if (j.pacing.step_relation.load() != 0 && was >= 0 && is >= 0) {
+        out["runningStep"]["tableBytesGrown"] = std::to_string(std::max(0LL, is - was));
+      }
+    }
   }
   if (!j.backfill.empty()) out["backfill"] = j.backfill;
   // The one statement of a "paced": false fill, while it runs. PostgreSQL
