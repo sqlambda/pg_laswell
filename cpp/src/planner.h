@@ -2563,7 +2563,7 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
     }
   }
 
-  long long size = t.value("size_measured", t.value("size_estimate", 0LL));
+  long long size = table_size_bytes(t);
   bool measured = t.contains("size_measured");
   // A module may know the data better than the relation's own reading: a
   // TimescaleDB hypertable's parent holds no rows, so relpages says 0 and the
@@ -7132,7 +7132,7 @@ inline void plan_unique_like(const Intent& in, const Observations& obs,
     if (icols == columns) { backing = iname; break; }
   }
 
-  long long size = t.value("size_estimate", 0LL);
+  long long size = table_size_bytes(t);
   const int waiters = t.value("lock_waiters", 0);
   // Where a module says no concurrent build is possible (a hypertable), the
   // CIC + USING INDEX recipe below cannot run at all -- so the one statement

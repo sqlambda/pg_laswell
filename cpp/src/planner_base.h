@@ -698,6 +698,15 @@ inline void check_on_empty_copy(Step& step, const std::string& of_sql_rel,
   step.detail["rehearse_on_copy"].push_back(json{{"of", of_sql_rel}, {"sql", sql}});
 }
 
+// The size of a table as every decision reads it: measured where the
+// observation had to measure (a table or a leaf with no statistics, whose
+// relpages says 0 whatever it holds -- catalog.h, measure_unanalysed), and the
+// estimate otherwise. One reading, so that an index build, a constraint and a
+// module cannot disagree about the same table.
+inline long long table_size_bytes(const json& t) {
+  return t.value("size_measured", t.value("size_estimate", 0LL));
+}
+
 // A step the dry run must not execute. `leaves_gap` says that later steps may
 // need what this one would have made: they are then reported as depending on a
 // step that was not rehearsed, not as failures of their own.

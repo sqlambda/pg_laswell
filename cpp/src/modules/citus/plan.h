@@ -472,7 +472,7 @@ inline void plan_citus_distribute_table(const Intent& in, const Observations& ob
   // copy, and the dry run would do that to the live table.
   // Pages as well as rows: a table never analysed reads no rows and is not
   // empty.
-  if (!concurrent && (rows > 0 || t.value("size_estimate", 0LL) > 0)) {
+  if (!concurrent && (rows > 0 || table_size_bytes(t) > 0)) {
     do_not_rehearse(step, detail::kHeavyNotRehearsed, /*leaves_gap=*/true);
   }
   step.action = Action::kApply;
@@ -594,7 +594,7 @@ inline void plan_citus_create_reference_table(const Intent& in, const Observatio
   // there are rows to copy to every node under that lock.
   step.detail["rehearse_by"] = "execution";
   if (obs.table(qualified).value("reltuples", 0LL) > 0 ||
-      obs.table(qualified).value("size_estimate", 0LL) > 0) {
+      table_size_bytes(obs.table(qualified)) > 0) {
     do_not_rehearse(step, detail::kHeavyNotRehearsed, /*leaves_gap=*/true);
   }
   step.lock = "AccessExclusiveLock on " + qualified +

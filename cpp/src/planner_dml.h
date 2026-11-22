@@ -682,7 +682,7 @@ inline TableData table_data(const Observations& obs, const std::string& qualifie
   const auto traits = index_traits(obs, qualified, in, by);
   TableData d;
   d.bytes = traits.answered && traits.size_bytes >= 0 ? traits.size_bytes
-                                                      : t.value("size_estimate", 0LL);
+                                                      : table_size_bytes(t);
   d.rows = traits.answered && traits.rows >= 0 ? traits.rows : t.value("reltuples", 0LL);
   return d;
 }
