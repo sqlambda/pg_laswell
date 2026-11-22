@@ -54,6 +54,21 @@ is rewriting it. It runs under the observation's lock timeout, and a leaf that
 cannot be read in time is reported as a table whose observation was blocked,
 as an index under such a lock already was.
 
+### The observer's size reading does not wait behind a queued lock
+
+While the one statement of a `"paced": false` fill runs, the observer reads
+the table's size every few seconds with `pg_relation_size`, which takes
+AccessShareLock. A request for AccessExclusiveLock that is itself waiting for
+the statement stands ahead of it in the queue: measured, with an `ALTER TABLE`
+queued behind a writer, the size reading waited as long as the `ALTER` did.
+Nothing bounded it, so the observer could stop at the moment a session began
+to wait on the table, which is the moment it exists for.
+
+The reading now has 200 ms, in a savepoint that is rolled back either way, so
+the lock is let go at once. One that does not come is skipped and the figure
+before it stands. Measured with two sessions by hand; the suite has no test
+that queues an `ALTER TABLE` behind a fill.
+
 ## 0.1.5 (2026-10-13)
 
 What two projects that use it reported in October 2026. No ledger schema change.
