@@ -115,28 +115,37 @@ inline std::string progress_line(const std::string& id, const json& b) {
     if (s >= 60) return std::to_string(s / 60) + " min";
     return std::to_string(s) + " s";
   };
-  // A step that is not a walk: it runs, and that is all that can be said.
+  // By how much a table's heap has grown, where jobStatus gives it: what tells
+  // a long statement from a stuck one.
+  const auto growth = [](const json& of) -> std::string {
+    if (!of.contains("tableBytesGrown")) return "";
+    const double grown = std::stod(of.value("tableBytesGrown", "0"));
+    char text[32];
+    if (grown >= 1024.0 * 1024.0 * 1024.0) {
+      std::snprintf(text, sizeof text, "%.1f GB", grown / (1024.0 * 1024.0 * 1024.0));
+    } else {
+      std::snprintf(text, sizeof text, "%.0f MB", grown / (1024.0 * 1024.0));
+    }
+    return std::string("; the table has grown ") + text + " since it began";
+  };
+  // A step that is not a walk: it runs, and that is all that can be said --
+  // but for an unpaced insert_rows, whose table can be watched growing.
   if (b.contains("kind")) {
-    return "  " + id + ": step " + std::to_string(b.value("ordinal", 0)) + " (" +
-           b.value("kind", "") + "): has run " + span(b.value("elapsedSeconds", 0LL)) +
-           "; it reports no progress of its own";
+    std::string out = "  " + id + ": step " + std::to_string(b.value("ordinal", 0)) + " (" +
+                      b.value("kind", "") + "): has run " +
+                      span(b.value("elapsedSeconds", 0LL)) +
+                      "; it reports no progress of its own" + growth(b);
+    if (b.contains("tableGrowth")) {
+      out += "; its table was created or altered in this transaction, so its growth "
+             "cannot be read from outside";
+    }
+    return out;
   }
   // The one statement of a "paced": false fill has no rows to count yet.
   if (b.value("singleStatement", false)) {
-    std::string out = "  " + id + ": step " + std::to_string(b.value("ordinal", 0)) +
-                      ": the one statement has run " + span(b.value("elapsedSeconds", 0LL)) +
-                      "; it reports no progress of its own";
-    if (b.contains("tableBytesGrown")) {
-      const double grown = std::stod(b.value("tableBytesGrown", "0"));
-      char text[32];
-      if (grown >= 1024.0 * 1024.0 * 1024.0) {
-        std::snprintf(text, sizeof text, "%.1f GB", grown / (1024.0 * 1024.0 * 1024.0));
-      } else {
-        std::snprintf(text, sizeof text, "%.0f MB", grown / (1024.0 * 1024.0));
-      }
-      out += std::string("; the table has grown ") + text + " since it began";
-    }
-    return out;
+    return "  " + id + ": step " + std::to_string(b.value("ordinal", 0)) +
+           ": the one statement has run " + span(b.value("elapsedSeconds", 0LL)) +
+           "; it reports no progress of its own" + growth(b);
   }
   const auto grouped = [](const std::string& digits) {
     std::string o;

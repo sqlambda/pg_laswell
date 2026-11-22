@@ -6116,6 +6116,139 @@ TEST(Deploy, AProgressLineForAStepThatIsNotAWalkSaysItsKindAndHowLong) {
             "no progress of its own");
 }
 
+// An unpaced insert_rows is such a step, with one thing more to say: its
+// table can be watched growing. Reported from the field as inserts of 5 and 3
+// million rows whose lines said how long and never how much.
+TEST(Deploy, AProgressLineForAnUnpacedInsertSaysHowMuchItsTableHasGrown) {
+  json b{{"ordinal", 8}, {"kind", "insert_rows"}, {"elapsedSeconds", 120}};
+  EXPECT_EQ(pglaswell::detail::progress_line("0640-events", b),
+            "  0640-events: step 8 (insert_rows): has run 2 min; it reports no progress "
+            "of its own");
+  b["tableBytesGrown"] = "5261334938";
+  EXPECT_EQ(pglaswell::detail::progress_line("0640-events", b),
+            "  0640-events: step 8 (insert_rows): has run 2 min; it reports no progress "
+            "of its own; the table has grown 4.9 GB since it began");
+  // A table created or altered in the transaction that fills it: no other
+  // session can read it, and the line says that, not "grown by nothing".
+  b.erase("tableBytesGrown");
+  b["tableGrowth"] = "not readable: ...";
+  EXPECT_EQ(pglaswell::detail::progress_line("0640-events", b),
+            "  0640-events: step 8 (insert_rows): has run 2 min; it reports no progress "
+            "of its own; its table was created or altered in this transaction, so its "
+            "growth cannot be read from outside");
+}
+
+TEST_F(ToolTest, AnUnpacedInsertReportsHowMuchItsTableHasGrownWhileItRuns) {
+  make_shop(cfg());
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/growth-fixture");
+    w.txn().exec("DROP TABLE IF EXISTS shop.order_pad");
+    w.txn().exec("CREATE TABLE shop.order_pad(id int primary key, pad text)");
+    w.commit();
+  }
+  // Slow on purpose: a few seconds in one statement, so that the observer
+  // reads the table's size at least once while it runs.
+  json doc = minimal_spec();
+  doc["id"] = "0044-order-pad-loaded";
+  doc["description"] = "A load in one statement that takes a few seconds.";
+  doc["intents"] = json::array({json{
+      {"kind", "insert_rows"}, {"schema", "shop"}, {"table", "order_pad"}, {"key", "id"},
+      {"columns", json::array({"id", "pad"})}, {"paced", false},
+      {"select", "SELECT g, repeat('x', 400) || pg_sleep(0.001)::text "
+                 "FROM generate_series(1, 4000) g"}}});
+  const auto planned = payload(call("planMigration", json{{"spec", signed_doc(doc)}}));
+  ASSERT_TRUE(planned.value("ok", false)) << planned.dump(2);
+  const auto p = payload(call("startMigration",
+                              json{{"spec", signed_doc(doc)}, {"dryRun", false}}));
+  ASSERT_TRUE(p.value("accepted", false)) << p.dump(2);
+
+  json seen;
+  ASSERT_TRUE(wait_for_status(*this, p["jobId"], [&](const json& s) {
+    if (s.contains("runningStep") && s["runningStep"].contains("tableBytesGrown")) {
+      seen = s["runningStep"];
+    }
+    return !seen.is_null() || s.value("state", "") == "succeeded" ||
+           s.value("state", "") == "failed";
+  })) << status_of(p["jobId"]).dump(2);
+  ASSERT_FALSE(seen.is_null())
+      << "the insert ended before its table's growth was ever reported: "
+      << status_of(p["jobId"]).dump(2);
+  EXPECT_EQ(seen.value("kind", ""), "insert_rows") << seen.dump(2);
+  EXPECT_FALSE(seen.contains("tableGrowth")) << seen.dump(2);
+
+  ASSERT_TRUE(wait_for_status(*this, p["jobId"], [](const json& s) {
+    return s.value("state", "") == "succeeded" || s.value("state", "") == "failed";
+  })) << status_of(p["jobId"]).dump(2);
+  const auto st = status_of(p["jobId"]);
+  ASSERT_EQ(st.value("state", ""), "succeeded") << st.dump(2);
+  EXPECT_FALSE(st.contains("runningStep")) << st.dump(2);
+
+  pglaswell::WriteSession w(cfg());
+  w.begin("pg_laswell/test/cleanup");
+  w.txn().exec("DROP TABLE shop.order_pad");
+  w.commit();
+}
+
+// The same insert into a table its own specification creates: the two are one
+// transaction, so the table is not there for any other session until it ends.
+// jobStatus says that the growth cannot be read, and gives no figure.
+TEST_F(ToolTest, AnUnpacedInsertIntoATableOfItsOwnTransactionSaysItCannotBeWatched) {
+  make_shop(cfg());
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/growth-fixture");
+    w.txn().exec("DROP TABLE IF EXISTS shop.order_pad_new");
+    w.commit();
+  }
+  json doc = minimal_spec();
+  doc["id"] = "0045-order-pad-made-and-loaded";
+  doc["description"] = "A table made and loaded in one transaction.";
+  doc["intents"] = json::array(
+      {json{{"kind", "create_table"}, {"schema", "shop"}, {"table", "order_pad_new"},
+            {"comment", "Padding, for a test."},
+            {"columns", json::array(
+                {json{{"name", "id"}, {"type", "integer"}, {"nullable", false},
+                      {"comment", "The row."}},
+                 json{{"name", "pad"}, {"type", "text"}, {"nullable", true},
+                      {"comment", "Padding."}}})},
+            {"primary_key", json::array({"id"})}},
+       json{{"kind", "insert_rows"}, {"schema", "shop"}, {"table", "order_pad_new"},
+            {"key", "id"}, {"columns", json::array({"id", "pad"})}, {"paced", false},
+            {"select", "SELECT g, repeat('x', 400) || pg_sleep(0.001)::text "
+                       "FROM generate_series(1, 4000) g"}}});
+  const auto planned = payload(call("planMigration", json{{"spec", signed_doc(doc)}}));
+  ASSERT_TRUE(planned.value("ok", false)) << planned.dump(2);
+  const auto p = payload(call("startMigration",
+                              json{{"spec", signed_doc(doc)}, {"dryRun", false}}));
+  ASSERT_TRUE(p.value("accepted", false)) << p.dump(2);
+
+  json seen;
+  ASSERT_TRUE(wait_for_status(*this, p["jobId"], [&](const json& s) {
+    if (s.contains("runningStep") && s["runningStep"].contains("tableGrowth")) {
+      seen = s["runningStep"];
+    }
+    return !seen.is_null() || s.value("state", "") == "succeeded" ||
+           s.value("state", "") == "failed";
+  })) << status_of(p["jobId"]).dump(2);
+  ASSERT_FALSE(seen.is_null())
+      << "the insert ended before jobStatus said anything of its table: "
+      << status_of(p["jobId"]).dump(2);
+  EXPECT_EQ(seen.value("tableGrowth", "").rfind("not readable:", 0), 0u) << seen.dump(2);
+  EXPECT_FALSE(seen.contains("tableBytesGrown")) << seen.dump(2);
+
+  ASSERT_TRUE(wait_for_status(*this, p["jobId"], [](const json& s) {
+    return s.value("state", "") == "succeeded" || s.value("state", "") == "failed";
+  })) << status_of(p["jobId"]).dump(2);
+  ASSERT_EQ(status_of(p["jobId"]).value("state", ""), "succeeded")
+      << status_of(p["jobId"]).dump(2);
+
+  pglaswell::WriteSession w(cfg());
+  w.begin("pg_laswell/test/cleanup");
+  w.txn().exec("DROP TABLE shop.order_pad_new");
+  w.commit();
+}
+
 TEST_F(ToolTest, AStepThatIsRunningIsNamedInJobStatusUntilItEnds) {
   make_shop(cfg());
   json doc = minimal_spec();

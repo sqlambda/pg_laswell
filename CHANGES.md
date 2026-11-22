@@ -69,6 +69,31 @@ the lock is let go at once. One that does not come is skipped and the figure
 before it stands. Measured with two sessions by hand; the suite has no test
 that queues an `ALTER TABLE` behind a fill.
 
+### An unpaced `insert_rows` reports how much its table has grown
+
+An `insert_rows` in one statement said how long it had run and nothing else:
+reported from the field as inserts of 5 and 3 million rows that ran 2 and 5.5
+minutes behind the line "it reports no progress of its own". The one statement
+of a fill also says by how much the table's heap has grown, which is what
+tells a long statement from a stuck one. The insert now says it too, in
+`jobStatus` as `runningStep.tableBytesGrown` and at the end of the progress
+line.
+
+Not where the insert's own transaction created the table, or altered it in an
+earlier step of the same group. That transaction holds AccessExclusiveLock on
+it, so no other session can read its size, and one that asks waits for the
+lock: measured. The job finds this out before the statement, the observer is
+not asked, and `jobStatus` says so in `runningStep.tableGrowth`; the line ends
+"its table was created or altered in this transaction, so its growth cannot be
+read from outside". A specification that creates a table and fills it in one
+group, as the load that reported this did, gets that sentence and no figure.
+
+`create_table_as` is unchanged and says how long only: its table does not
+exist for any other session until the statement ends.
+
+The step of an unpaced `insert_rows` now names its table in its detail, so the
+`planDigest` of a plan that has one is new.
+
 ## 0.1.5 (2026-10-13)
 
 What two projects that use it reported in October 2026. No ledger schema change.

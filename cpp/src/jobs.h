@@ -106,6 +106,21 @@ struct PacingState {
   std::atomic<unsigned int> long_statement_relation{0};
   std::atomic<long long> long_statement_bytes_start{-1};
   std::atomic<long long> long_statement_bytes_now{-1};
+  // The same reading for a step that is not a walk and writes rows in one
+  // statement: an unpaced insert_rows. Kept apart from long_statement, which
+  // also tells the observer to cancel the statement when a session waits
+  // behind it -- that is the fill's contract and not this step's.
+  //   step_bytes_now  -1 before the first reading; kStepTableUnreadable where
+  //                   no other session can read the table at all: the job's
+  //                   own transaction holds AccessExclusiveLock on it, having
+  //                   created or altered it. The executor finds that out
+  //                   before the statement, and the observer is then never
+  //                   asked -- measured, pg_relation_size from another
+  //                   session waits on that lock for as long as it is held.
+  static constexpr long long kStepTableUnreadable = -2;
+  std::atomic<unsigned int> step_relation{0};
+  std::atomic<long long> step_bytes_start{-1};
+  std::atomic<long long> step_bytes_now{-1};
   // The process was told to stop (signals.h). cancel_stop is set with it; this
   // adds that a statement in flight is cancelled and not waited for -- unless
   // the job is in a walk, which stops at its next batch boundary by itself.
@@ -566,6 +581,12 @@ class Observer {
           if (j->pacing.long_statement.load() && rel != 0) {
             sizes_read_ = now;
             if (heap_size(rel, bytes)) j->pacing.long_statement_bytes_now = bytes;
+          }
+          // The table of a step that is one statement (an unpaced insert_rows).
+          const auto step_rel = j->pacing.step_relation.load();
+          if (step_rel != 0) {
+            sizes_read_ = now;
+            if (heap_size(step_rel, bytes)) j->pacing.step_bytes_now = bytes;
           }
         }
       }
