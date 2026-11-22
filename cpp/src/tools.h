@@ -366,7 +366,35 @@ struct RehearsalInputs {
   // Steps rehearsed as nothing, on purpose, that leave no gap behind them: a
   // VALIDATE CONSTRAINT. Reported as unverified by note_not_run.
   std::vector<int> not_run;
+  // Parallel to `steps`: a step run for its rows, without the rehearsal's
+  // statement timeout. See rehearsal_inputs.
+  std::vector<bool> untimed;
+  // Row-level steps whose statements are PLANNED and not executed, and the
+  // ones a chain executes. Reported apart: a statement that plans says nothing
+  // of the rows it will meet.
+  std::vector<int> planned_only;
+  std::vector<int> rows_executed;
 };
+
+// The kinds that write rows through a statement a rehearsal can only plan.
+// copy_rows is not among them: its rows are streamed for real.
+inline bool is_row_kind(const std::string& kind) {
+  return kind == "insert_rows" || kind == "update_rows" || kind == "delete_rows" ||
+         kind == "merge_rows" || kind == "backfill";
+}
+
+// A row-level step that was only planned is not a step that was checked.
+// Reported from the field: a chain said "rehearsed" for an insert whose select
+// cast '' to a date, and the apply failed on that row at once.
+inline void note_planned_only(const RehearsalInputs& inputs, Catalog::DryRun& dry) {
+  for (const int ordinal : inputs.planned_only) {
+    if (std::find(dry.unverified_steps.begin(), dry.unverified_steps.end(), ordinal) ==
+        dry.unverified_steps.end()) {
+      dry.unverified_steps.push_back(ordinal);
+    }
+  }
+  std::sort(dry.unverified_steps.begin(), dry.unverified_steps.end());
+}
 
 // Adds the steps that were deliberately not run to what the dry run reports as
 // unverified. They did not go through the loop as skipped steps, because a
@@ -384,7 +412,8 @@ inline void note_not_run(const RehearsalInputs& inputs, Catalog::DryRun& dry) {
 // Why each unverified step was not checked, by ordinal: a reader deciding
 // whether to trust a plan is owed the reason, not a list of numbers.
 inline json unverified_reasons(const Plan& plan, const std::vector<int>& unverified,
-                               const std::vector<int>& definition_checked = {}) {
+                               const std::vector<int>& definition_checked = {},
+                               const std::vector<int>& planned_only = {}) {
   json why = json::object();
   for (const auto& step : plan.steps) {
     if (std::find(unverified.begin(), unverified.end(), step.ordinal) == unverified.end()) {
@@ -395,6 +424,17 @@ inline json unverified_reasons(const Plan& plan, const std::vector<int>& unverif
       reason = step.detail.value("not_rehearsed", "");
     } else if (step.txn_class == TxnClass::kForbidden) {
       reason = "it cannot run inside a transaction block";
+    } else if (std::find(planned_only.begin(), planned_only.end(), step.ordinal) !=
+               planned_only.end()) {
+      reason = "its statement was planned, not executed: a row it reads or writes can "
+               "still fail it";
+      if (step.txn_class == TxnClass::kOwnTxnPerBatch) {
+        reason += ". A paced walk commits batch by batch, which a rehearsal cannot "
+                  "take back";
+      } else {
+        reason += ". --dry-run=chain executes it, on an empty database or a restored "
+                  "copy";
+      }
     } else {
       reason = "it was not reached, or could only be checked weakly; see the note";
     }
@@ -456,6 +496,7 @@ inline RehearsalInputs rehearsal_inputs(const Plan& plan, bool run_scans = false
       r.forbidden.push_back(gap);
       r.copy_payloads.push_back(json());
       r.execute.push_back(false);
+      r.untimed.push_back(false);
       r.on_copy.push_back(gap ? step.detail.value("rehearse_on_copy", json()) : json());
       if (!gap) r.not_run.push_back(step.ordinal);
       continue;
@@ -493,7 +534,21 @@ inline RehearsalInputs rehearsal_inputs(const Plan& plan, bool run_scans = false
                             ? step.detail.value("rehearse_on_copy", json())
                             : json());
     r.copy_payloads.push_back(step.detail.contains("copy_rows") ? step.detail : json());
-    r.execute.push_back(step.detail.value("rehearse_by", "") == "execution");
+    // A row-level step. Its statement is planned and never executed, so what a
+    // row would do to it -- a cast that fails, a key that collides -- is not
+    // found; it is listed as planned, not as checked. The chain executes the
+    // ones that are one statement in the group's transaction: it is for an
+    // empty database or a restored copy, and everything it does is rolled
+    // back. A paced walk is not run even there: it commits batch by batch.
+    const bool row_step = is_row_kind(step.kind) && !step.detail.contains("copy_rows") &&
+                          step.txn_class != TxnClass::kForbidden;
+    const bool one_statement = row_step && step.txn_class == TxnClass::kRequired &&
+                               !step.detail.value("paced", true);
+    const bool run_rows = run_scans && one_statement;
+    r.execute.push_back(step.detail.value("rehearse_by", "") == "execution" || run_rows);
+    r.untimed.push_back(run_rows);
+    if (run_rows) r.rows_executed.push_back(step.ordinal);
+    else if (row_step) r.planned_only.push_back(step.ordinal);
   }
   return r;
 }
@@ -594,6 +649,7 @@ inline json plan_migration_tool(ToolContext& ctx, const json& args) {
     const auto rehearsal_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - rehearsal_began).count();
     detail::note_not_run(inputs, dry);
+    if (dry.ran) detail::note_planned_only(inputs, dry);
     // Checks in another database of the same server, each in its own
     // transaction there, rolled back. That database is read as it is NOW: this
     // dry run's own changes are in a transaction it cannot see.
@@ -606,7 +662,9 @@ inline json plan_migration_tool(ToolContext& ctx, const json& args) {
            {"durationMs", rehearsal_ms},
            {"unverifiedSteps", dry.unverified_steps},
            {"unverifiedWhy", detail::unverified_reasons(plan, dry.unverified_steps,
-                                                        dry.definition_checked)},
+                                                        dry.definition_checked,
+                                                        inputs.planned_only)},
+           {"plannedNotExecuted", inputs.planned_only},
            {"note",
             "the plan was applied in a transaction and rolled back; nothing "
             "was committed. It took the locks its steps take, on the live "
@@ -615,9 +673,10 @@ inline json plan_migration_tool(ToolContext& ctx, const json& args) {
             "INDEX CONCURRENTLY), or the scan of a split recipe (VALIDATE "
             "CONSTRAINT), which in this one transaction would run under the "
             "lock the recipe exists to release first, or a statement that "
-            "reads or rewrites a whole table under a lock that blocks writes "
-            "-- and unverifiedWhy says which. They were skipped rather than "
-            "silently passed."}};
+            "reads or rewrites a whole table under a lock that blocks writes, "
+            "or a statement that writes rows, which was planned and not "
+            "executed (plannedNotExecuted) -- and unverifiedWhy says which. "
+            "They were skipped rather than silently passed."}};
     if (!dry.skipped_reason.empty()) d["skippedReason"] = dry.skipped_reason;
     // Named separately from the note, which a later branch may overwrite: a
     // reader deciding whether to trust this plan needs to see that some of it
@@ -797,7 +856,12 @@ class ChainRehearsal {
       dry.ran = true;
       const auto result = Catalog::rehearse_steps(
           txn, inputs.steps, inputs.forbidden, link.server_version,
-          inputs.copy_payloads, dry, link.skipped_any, inputs.execute, inputs.on_copy);
+          inputs.copy_payloads, dry, link.skipped_any, inputs.execute, inputs.on_copy,
+          inputs.untimed);
+      // A row statement the chain did not execute -- a paced walk -- was
+      // planned and no more: listed, so that "rehearsed" is not read as
+      // covering its rows.
+      if (result == Catalog::Rehearsal::kOk) detail::note_planned_only(inputs, dry);
       // A check in ANOTHER database is not made in a chain: what it would look
       // for there may be something an earlier specification of this very chain
       // creates, inside a transaction of its own that is not committed. Listed
@@ -810,7 +874,12 @@ class ChainRehearsal {
         }
       }
 
-      json r{{"unverifiedSteps", dry.unverified_steps}};
+      json r{{"unverifiedSteps", dry.unverified_steps},
+             {"unverifiedWhy", detail::unverified_reasons(plan, dry.unverified_steps,
+                                                          dry.definition_checked,
+                                                          inputs.planned_only)},
+             {"plannedNotExecuted", inputs.planned_only},
+             {"rowStatementsExecuted", inputs.rows_executed}};
       if (!dry.weak_verification.empty()) r["weakVerification"] = dry.weak_verification;
       if (result == Catalog::Rehearsal::kOk) {
         // KEPT: the next specification plans against what this one made.

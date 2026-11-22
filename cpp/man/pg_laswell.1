@@ -143,6 +143,16 @@ Rehearse every pending migration in dependency order, each planned and applied
 on top of the ones before it, then roll all of it back.
 A migration that fails is reported and the chain continues; what depends on it
 is reported as not rehearsed.
+A row-level kind that is one statement \(em an unpaced
+.Cm insert_rows ,
+.Cm update_rows ,
+.Cm delete_rows
+or
+.Cm merge_rows
+\(em is executed, without the rehearsal's statement timeout, so the chain
+takes as long as its loads and finds the row that would fail one; a paced walk
+is planned only, and each line says how many row statements were executed and
+how many were planned and not executed.
 It holds every lock until the end, so it is for an empty database or a restored
 copy, not production.
 See the
