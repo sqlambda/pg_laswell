@@ -17337,6 +17337,41 @@ TEST_F(DeployTest, AChainDoesNotTimeOutTheOneStatementOfALoad) {
   EXPECT_NE(text.find("1 rehearsed, 0 failed, 0 incomplete"), std::string::npos) << text;
 }
 
+// A fill with "paced": false is one statement too, put ahead of its walk. The
+// chain runs that statement, as the job does first, and not the walk's own.
+TEST_F(DeployTest, AChainExecutesTheOneStatementOfAnUnpacedFill) {
+  exec("DROP SCHEMA IF EXISTS shop CASCADE");
+  exec("CREATE SCHEMA shop");
+  exec("CREATE TABLE shop.src(id bigint primary key, d text, day date)");
+  exec("INSERT INTO shop.src VALUES (1, '2026-01-01', NULL), (2, '', NULL)");
+  const json fill{
+      {"laswell_spec_version", 1},
+      {"id", "0001-src-day-filled"},
+      {"description", "the day of each row, from its text"},
+      {"intents", json::array({json{
+          {"kind", "backfill"}, {"schema", "shop"}, {"table", "src"}, {"key", "id"},
+          {"set", {{"day", "d::date"}}}, {"where", "src.day IS NULL"},
+          {"paced", false}}})}};
+  write_spec("0001.json", fill);
+
+  const auto [bad, bad_text] = deploy_chain();
+  EXPECT_EQ(bad, pglaswell::DeployResult::kRefused) << bad_text;
+  EXPECT_NE(bad_text.find("invalid input syntax for type date"), std::string::npos)
+      << "the row that fails the fill must fail the rehearsal:\n" << bad_text;
+
+  exec("UPDATE shop.src SET d = '2026-01-02' WHERE id = 2");
+  const auto [good, good_text] = deploy_chain();
+  EXPECT_EQ(good, pglaswell::DeployResult::kOk) << good_text;
+  EXPECT_NE(good_text.find("1 row statement(s) executed"), std::string::npos) << good_text;
+  EXPECT_EQ(good_text.find("planned, not executed"), std::string::npos) << good_text;
+
+  // Rolled back: no row was filled.
+  pglaswell::ReadSession r(cfg());
+  EXPECT_EQ(r.txn().exec("SELECT count(*) FROM shop.src WHERE day IS NOT NULL")[0][0].as<int>(),
+            0)
+      << "a rehearsal committed a fill";
+}
+
 // A paced walk commits batch by batch, which no rehearsal can take back, so a
 // chain plans it and no more -- and says so on its line.
 TEST_F(DeployTest, AChainListsAPacedWalkAsPlannedNotExecuted) {

@@ -540,11 +540,25 @@ inline RehearsalInputs rehearsal_inputs(const Plan& plan, bool run_scans = false
     // ones that are one statement in the group's transaction: it is for an
     // empty database or a restored copy, and everything it does is rolled
     // back. A paced walk is not run even there: it commits batch by batch.
-    const bool row_step = is_row_kind(step.kind) && !step.detail.contains("copy_rows") &&
+    //
+    // A walk is a row-level step whatever intent it came from: the fill an
+    // add_column or a set_not_null plans is one, under that intent's kind.
+    const bool walk = step.txn_class == TxnClass::kOwnTxnPerBatch;
+    const bool row_step = (is_row_kind(step.kind) || walk) &&
+                          !step.detail.contains("copy_rows") &&
                           step.txn_class != TxnClass::kForbidden;
     const bool one_statement = row_step && step.txn_class == TxnClass::kRequired &&
                                !step.detail.value("paced", true);
-    const bool run_rows = run_scans && one_statement;
+    // The one statement a "paced": false fill puts ahead of its walk
+    // (planner_dml.h, single_sql): the same statement the job runs first, so
+    // the chain runs it and leaves the walk's own statements, which only do
+    // the work when that one is cancelled.
+    const bool fill_statement = walk && step.detail.value("single_statement", false) &&
+                                !step.sql.empty();
+    const bool run_rows = run_scans && (one_statement || fill_statement);
+    if (run_scans && fill_statement) {
+      r.steps.back().second = std::vector<std::string>{step.sql.front()};
+    }
     r.execute.push_back(step.detail.value("rehearse_by", "") == "execution" || run_rows);
     r.untimed.push_back(run_rows);
     if (run_rows) r.rows_executed.push_back(step.ordinal);
