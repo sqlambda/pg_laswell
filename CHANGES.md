@@ -2,7 +2,8 @@
 
 ## 0.1.6 (2026-11-22)
 
-PostgreSQL 19. No ledger schema change.
+PostgreSQL 19, three things a project that uses it reported in October 2026,
+and two defects found while fixing them. No ledger schema change.
 
 ### The suite runs against PostgreSQL 19
 
