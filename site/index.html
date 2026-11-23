@@ -286,6 +286,30 @@
         needs a model at four in the morning.
       </p>
     </div>
+    <div class="feature">
+      <h3>A rehearsal runs the loads</h3>
+      <p>
+        A plan says nothing of the rows a statement will meet.
+        <code>--dry-run=chain</code> applies every pending specification on top
+        of the ones before it, in a transaction that is rolled back, and runs
+        the loads that are one statement. Reported from the field: a select
+        that cast <code>''</code> to a date passed a rehearsal that only
+        planned it, and the apply failed on that row at once. It now fails the
+        rehearsal. What was only planned is listed as planned, never counted as
+        checked.
+      </p>
+    </div>
+    <div class="feature">
+      <h3>It measures before it believes a size</h3>
+      <p>
+        A table loaded a minute ago reads 0 B in the catalog until it is first
+        analysed. Reported from the field: tables of 5.2, 5.9 and 1.3 GB, each
+        planned as <b>"size 0 B"</b> and given a plain index build. A table or
+        partition with no statistics is now measured; one that has them is not
+        opened, so the measurement costs a lock only where the estimate is
+        known to be worthless.
+      </p>
+    </div>
   </div>
 </section>
 

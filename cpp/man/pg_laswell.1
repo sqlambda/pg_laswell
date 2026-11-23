@@ -54,8 +54,13 @@ While a migration walks a table,
 prints a line with the rows written, the rows a second and, where it can be
 estimated, the share of the table walked and the time left: after 10 seconds,
 then 20, 40 and so on up to every ten minutes.
-For the one statement of a fill that is not paced the line says how long it has
-run and by how much the table has grown, at the same intervals.
+For the one statement of a fill that is not paced, and for an
+.Cm insert_rows
+that is not paced, the line says how long it has run and by how much the table
+has grown, at the same intervals.
+Where such an insert fills a table its own transaction created or altered, no
+other session can read that table's size, and the line says so in place of a
+figure.
 For any other step that runs that long, a validation or a constraint's build
 among them, it names the step and says how long it has run.
 See
