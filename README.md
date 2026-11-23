@@ -14,7 +14,7 @@ contention rather than on a schedule. It refuses what it can prove wrong, and
 says so plainly where it can prove nothing. It converges databases that have
 drifted. And it never states a number it cannot derive.
 
-**Status: 0.1.5, young and moving.** The whole path works — repository,
+**Status: 0.1.6, young and moving.** The whole path works — repository,
 signing, planning, dry run, paced execution, ledger — with 682 tests green on
 GCC and Clang, under AddressSanitizer/UBSan and ThreadSanitizer, plus live
 suites against a Citus coordinator and two workers, PostgreSQL with pg_cron and
