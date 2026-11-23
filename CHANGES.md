@@ -66,8 +66,9 @@ to wait on the table, which is the moment it exists for.
 
 The reading now has 200 ms, in a savepoint that is rolled back either way, so
 the lock is let go at once. One that does not come is skipped and the figure
-before it stands. Measured with two sessions by hand; the suite has no test
-that queues an `ALTER TABLE` behind a fill.
+before it stands. A test queues an `ALTER TABLE` behind a fill and expects the
+statement to be cancelled for it; against the reading as it was, the statement
+is never cancelled.
 
 ### An unpaced `insert_rows` reports how much its table has grown
 
@@ -104,7 +105,8 @@ row held `''`. `--dry-run=chain` printed "rehearsed, 2 step(s)", exited 0, and
 the apply failed on that row at once.
 
 The chain now executes a row-level kind that is one statement: an unpaced
-`insert_rows`, `update_rows`, `delete_rows` or `merge_rows`. It is for an empty
+`insert_rows`, `update_rows`, `delete_rows` or `merge_rows`, and the one
+statement of an unpaced fill. It is for an empty
 database or a restored copy, and all of it is rolled back. The rehearsal's
 statement timeout is lifted for such a step, since its length is its table's,
 and put back for the step after; the chain therefore takes as long as its
@@ -121,8 +123,11 @@ executed and how many were planned and not executed.
 So a plan with a row statement now shows an unverified step where it showed
 none, and a deployment's "rehearsed first" line names it.
 
-The one statement of a `"paced": false` fill is still planned and not
-executed, in a chain too: its step carries the walk's statements after it.
+The one statement a `"paced": false` fill puts ahead of its walk is executed
+in a chain as well, and the walk's own statements are left: they only do the
+work when that statement is cancelled. And a walk is a row statement whatever
+intent planned it: the fill behind an `add_column` or a `set_not_null` is
+listed as planned, not executed, as one written as a `backfill` is.
 
 ### The parent index of a partitioned build is verified
 

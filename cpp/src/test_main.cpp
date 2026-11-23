@@ -6356,6 +6356,103 @@ TEST_F(ToolTest, AStepThatIsRunningIsNamedInJobStatusUntilItEnds) {
   EXPECT_FALSE(status_of(p["jobId"]).contains("runningStep"));
 }
 
+// The same breaker when what waits is a request for AccessExclusiveLock: an
+// ALTER TABLE queued behind the one statement. The observer reads the table's
+// size while the statement runs, and pg_relation_size takes AccessShareLock --
+// which queues behind that waiting ALTER. Unbounded, the observer stopped in
+// that reading for as long as the ALTER waited, and so never cancelled the
+// statement the ALTER was waiting for. Measured with two sessions by hand
+// before this test existed; the reading now has 200 ms (jobs.h, heap_size).
+//
+// The breaker is set LATER than the five seconds between two size readings, so
+// that a reading falls inside the wait: with the old reading the observer is
+// stuck in it when the breaker is due, and the statement is never cancelled.
+TEST_F(ToolTest, AnAlterTableQueuedBehindAnUnpacedFillStillHasItCancelled) {
+  make_shop(cfg());
+  ctx_->registry.mutable_get("default").executor.max_waiter_wait_ms = 6000;
+  // The statement's own lock_timeout would end it first and prove nothing.
+  ctx_->registry.mutable_get("default").executor.lock_timeout_ms = 120000;
+  const auto one = [&](const std::string& q) {
+    pglaswell::ReadSession r(cfg());
+    return r.txn().exec(q)[0][0].as<std::string>();
+  };
+  json doc = minimal_spec();
+  doc["id"] = "0048-orders-shipped-behind-an-alter";
+  doc["description"] = "Every open order is shipped.";
+  doc["intents"] = json::array(
+      {json{{"kind", "backfill"}, {"schema", "shop"}, {"table", "orders"}, {"key", "id"},
+            {"set", {{"status", "'shipped'"}}}, {"where", "orders.status = 'open'"},
+            {"paced", false}}});
+  ASSERT_TRUE(payload(call("planMigration", json{{"spec", signed_doc(doc)}})).value("ok", false));
+
+  // An application transaction holding one row: the one statement writes the
+  // rows before it and waits there, holding RowExclusiveLock on the table.
+  pqxx::connection app_conn(cfg().conninfo);
+  pqxx::work app(app_conn);
+  app.exec("UPDATE shop.orders SET status = status WHERE id = 150");
+
+  const auto p = payload(call("startMigration",
+                              json{{"spec", signed_doc(doc)}, {"dryRun", false}}));
+  ASSERT_TRUE(p.value("accepted", false)) << p.dump(2);
+  bool waiting = false;
+  for (int i = 0; i < 600 && !waiting; ++i) {
+    waiting = one("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock'"
+                  " AND datname = current_database()"
+                  " AND query LIKE 'UPDATE \"shop\".\"orders\"%'") != "0";
+    if (!waiting) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  ASSERT_TRUE(waiting) << status_of(p["jobId"]).dump(2);
+
+  // The ALTER TABLE, in a session of its own: it queues behind the statement,
+  // and every later request for the table queues behind it.
+  std::thread alter([&] {
+    try {
+      pqxx::connection c(cfg().conninfo);
+      pqxx::work t(c);
+      t.exec("ALTER TABLE shop.orders ADD COLUMN probe_note text");
+      t.commit();
+    } catch (const std::exception&) {
+      // Reported below, by the column not being there.
+    }
+  });
+  bool queued = false;
+  for (int i = 0; i < 600 && !queued; ++i) {
+    queued = one("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock'"
+                 " AND datname = current_database()"
+                 " AND query LIKE 'ALTER TABLE shop.orders%'") != "0";
+    if (!queued) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  EXPECT_TRUE(queued) << "the ALTER TABLE never queued";
+
+  // The application's transaction is still open, so the statement can only end
+  // by being cancelled -- which is the observer's to do, and what it could not
+  // do while it waited for the size of the table.
+  const bool cancelled = wait_for_status(*this, p["jobId"], [](const json& s) {
+    return s.dump().find("the paced walk did the work instead") != std::string::npos ||
+           s.value("state", "") == "failed";
+  }, /*attempts=*/1200);
+  const auto mid = status_of(p["jobId"]);
+  app.commit();
+  alter.join();
+  ASSERT_TRUE(cancelled)
+      << "the one statement was not cancelled for the ALTER TABLE waiting behind it: "
+      << mid.dump(2);
+  EXPECT_NE(mid.dump().find("the single statement was cancelled after a session had waited"),
+            std::string::npos)
+      << mid.dump(2);
+
+  ASSERT_TRUE(wait_for_status(*this, p["jobId"], [](const json& s) {
+    const auto state = s.value("state", "");
+    return state == "succeeded" || state == "failed";
+  })) << status_of(p["jobId"]).dump(2);
+  const auto st = status_of(p["jobId"]);
+  ASSERT_EQ(st.value("state", ""), "succeeded") << st.dump(2);
+  EXPECT_EQ(one("SELECT count(*) FROM shop.orders WHERE status <> 'shipped'"), "0");
+  EXPECT_EQ(one("SELECT count(*) FROM information_schema.columns WHERE table_schema = 'shop'"
+                " AND table_name = 'orders' AND column_name = 'probe_note'"), "1")
+      << "the ALTER TABLE did not get through";
+}
+
 // The one statement on a table that IS in use. A session that waits behind it
 // longer than max_waiter_wait_ms has it cancelled; it is rolled back whole, and
 // the walk does the work.
@@ -17238,6 +17335,41 @@ TEST_F(DeployTest, AChainDoesNotTimeOutTheOneStatementOfALoad) {
   EXPECT_EQ(result, pglaswell::DeployResult::kOk) << text;
   EXPECT_NE(text.find("1 row statement(s) executed"), std::string::npos) << text;
   EXPECT_NE(text.find("1 rehearsed, 0 failed, 0 incomplete"), std::string::npos) << text;
+}
+
+// A fill with "paced": false is one statement too, put ahead of its walk. The
+// chain runs that statement, as the job does first, and not the walk's own.
+TEST_F(DeployTest, AChainExecutesTheOneStatementOfAnUnpacedFill) {
+  exec("DROP SCHEMA IF EXISTS shop CASCADE");
+  exec("CREATE SCHEMA shop");
+  exec("CREATE TABLE shop.src(id bigint primary key, d text, day date)");
+  exec("INSERT INTO shop.src VALUES (1, '2026-01-01', NULL), (2, '', NULL)");
+  const json fill{
+      {"laswell_spec_version", 1},
+      {"id", "0001-src-day-filled"},
+      {"description", "the day of each row, from its text"},
+      {"intents", json::array({json{
+          {"kind", "backfill"}, {"schema", "shop"}, {"table", "src"}, {"key", "id"},
+          {"set", {{"day", "d::date"}}}, {"where", "src.day IS NULL"},
+          {"paced", false}}})}};
+  write_spec("0001.json", fill);
+
+  const auto [bad, bad_text] = deploy_chain();
+  EXPECT_EQ(bad, pglaswell::DeployResult::kRefused) << bad_text;
+  EXPECT_NE(bad_text.find("invalid input syntax for type date"), std::string::npos)
+      << "the row that fails the fill must fail the rehearsal:\n" << bad_text;
+
+  exec("UPDATE shop.src SET d = '2026-01-02' WHERE id = 2");
+  const auto [good, good_text] = deploy_chain();
+  EXPECT_EQ(good, pglaswell::DeployResult::kOk) << good_text;
+  EXPECT_NE(good_text.find("1 row statement(s) executed"), std::string::npos) << good_text;
+  EXPECT_EQ(good_text.find("planned, not executed"), std::string::npos) << good_text;
+
+  // Rolled back: no row was filled.
+  pglaswell::ReadSession r(cfg());
+  EXPECT_EQ(r.txn().exec("SELECT count(*) FROM shop.src WHERE day IS NOT NULL")[0][0].as<int>(),
+            0)
+      << "a rehearsal committed a fill";
 }
 
 // A paced walk commits batch by batch, which no rehearsal can take back, so a
