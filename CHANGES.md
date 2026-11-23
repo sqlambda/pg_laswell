@@ -124,6 +124,31 @@ none, and a deployment's "rehearsed first" line names it.
 The one statement of a `"paced": false` fill is still planned and not
 executed, in a chain too: its step carries the walk's statements after it.
 
+### The parent index of a partitioned build is verified
+
+The last step of a partitioned index recipe checks that the parent index is
+valid, which it is only when every partition's index is attached. The plan
+says why: one that is missing an attachment "exists, is INVALID, and is never
+used -- and nothing else would say so". That step verified nothing. It looked
+for its index on the nearest earlier `create_index` step, which there is the
+last attachment and names no index, recorded "no index to verify" and passed:
+run on PostgreSQL 18, with two partitions.
+
+The step now reads the index it names itself. That reaches three more recipes
+whose last step names an index and whose other steps are of another kind: the
+unique constraint and the primary key built a partition at a time, and the
+rebuild of an index after a text search configuration changes.
+
+With something to check, the step opened a transaction while the group's was
+open, and the job failed on "a transaction is open". It reads inside the open
+transaction, where it sees the attachments just made; an invalid parent then
+fails the group, and the attachments go with it.
+
+An invalid partitioned index is reported as what it is, a partition with no
+index attached, and not as a concurrent build that failed. Not tested: no test
+ends a recipe with a partition unattached, so that message and that rollback
+have not run.
+
 ## 0.1.5 (2026-10-13)
 
 What two projects that use it reported in October 2026. No ledger schema change.
