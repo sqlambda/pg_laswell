@@ -66,8 +66,9 @@ to wait on the table, which is the moment it exists for.
 
 The reading now has 200 ms, in a savepoint that is rolled back either way, so
 the lock is let go at once. One that does not come is skipped and the figure
-before it stands. Measured with two sessions by hand; the suite has no test
-that queues an `ALTER TABLE` behind a fill.
+before it stands. A test queues an `ALTER TABLE` behind a fill and expects the
+statement to be cancelled for it; against the reading as it was, the statement
+is never cancelled.
 
 ### An unpaced `insert_rows` reports how much its table has grown
 
