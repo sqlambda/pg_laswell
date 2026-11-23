@@ -467,6 +467,28 @@ chain continues; anything that depends on it is reported as not rehearsed, with
 the cause, rather than failing for a reason the earlier failure explains.
 Everything is rolled back at the end.
 .Pp
+The chain also runs what a dry run only plans, where it is one statement: an
+.Cm insert_rows ,
+.Cm update_rows ,
+.Cm delete_rows
+or
+.Cm merge_rows
+that is not paced, and the one statement a fill with
+.Va paced
+false puts ahead of its walk.
+The rehearsal's statement timeout is lifted for that step, whose length is its
+table's, and put back for the next; the chain therefore takes as long as its
+loads.
+It is what finds the row a plan cannot: a cast that fails on one value among
+millions fails the rehearsal as it would fail the job.
+A paced walk is not run even here, because it commits batch by batch and a
+rehearsal cannot take that back.
+Each specification's result lists the steps that were run for their rows
+.Pq Va rowStatementsExecuted
+and those that were planned only
+.Pq Va plannedNotExecuted ,
+and its line counts both.
+.Pp
 It holds every lock every specification takes until that final rollback, so it
 is for an empty database or a restored copy.
 Against production it would block the application for the length of the run,
@@ -626,7 +648,7 @@ Any step that has begun and not ended is named under
 .Va runningStep ,
 with its ordinal, its kind and how long it has run
 .Pq Va elapsedSeconds .
-For a step that is not a walk that is all there is: PostgreSQL reports no
+For most steps that are not a walk that is all there is: PostgreSQL reports no
 progress for a validation or for a constraint's build.
 .Pp
 The one statement of a fill that is not paced has no rows to count:
@@ -646,6 +668,39 @@ from a stuck one; it is not a share of the work, since a new row version that
 fits in free space grows nothing.
 It is absent for a table whose rows are on other nodes or in chunks, whose own
 heap is empty.
+.Pp
+An
+.Cm insert_rows
+that is not paced is one statement too, and
+.Va runningStep
+carries
+.Va tableBytesGrown
+for it in the same way.
+Not where the insert's own transaction holds
+.Va AccessExclusiveLock
+on the table, having created it or altered it in an earlier step of the same
+group: no other session can read the size of such a table, and one that asks
+waits for the lock.
+The job finds that out before the statement and does not ask;
+.Va runningStep
+then carries
+.Va tableGrowth ,
+which says why there is no figure.
+A specification that creates a table and fills it in one group is that case.
+.Cm create_table_as
+says how long and no more: its table does not exist for any other session
+until the statement ends.
+.Pp
+Each of these readings waits at most 200 ms for its lock.
+.Fn pg_relation_size
+takes
+.Va AccessShareLock ,
+which queues behind an
+.Ic ALTER TABLE
+that is itself waiting for the statement being watched; left to wait, the
+reading would stop the observer at the moment a session began to wait on the
+table.
+A reading that does not come is skipped, and the figure before it stands.
 .Pp
 .Xr pg_laswell 1
 prints a line for each running walk after 10 seconds, then after 20, 40 and so
@@ -1537,6 +1592,38 @@ Its first step is not the same lock, though: adding a check takes
 or not, so reads wait too, while it is requested and while it is held.
 Only a foreign key gets the weaker lock.
 .Pp
+How an index is built is decided from the table: under 64 MiB with no session
+waiting on it, a plain
+.Ic CREATE INDEX
+in the specification's transaction, which cannot leave an invalid index
+behind; otherwise
+.Ic CREATE INDEX CONCURRENTLY ,
+verified afterwards.
+The step records the size it decided on and where that came from
+.Pq Va size_bytes , size_source .
+.Pp
+The size is the heap's, read from
+.Va relpages
+without opening the table.
+.Va relpages
+is 0 until a table is first vacuumed or analysed, whatever it holds, so a table
+loaded moments earlier would read as empty and be built plainly over
+gigabytes.
+The observation therefore counts the relations holding the table's rows that
+have no vacuum or analyse on record \(em the table itself, or the leaves of a
+partitioned one \(em and measures those, and only those, with
+.Fn pg_relation_size .
+A leaf with statistics keeps its estimate and is not opened.
+The measurement is the heap alone, as
+.Va relpages
+counts it, so a plan made before autovacuum reaches the table states the size a
+plan made after it does.
+It opens the relation, and so runs under the observation's lock timeout: a
+table being rewritten is reported as one whose reading was blocked, not waited
+for.
+Every decision made by size reads the same figure, the constraint added in one
+statement and the modules' plans among them.
+.Pp
 .Cm create_index
 on a
 .Em partitioned
@@ -1550,6 +1637,13 @@ attaches each child, and then checks validity: the parent index stays
 .Va indisvalid
 false until the last attachment lands, and an index that exists, is invalid and
 is never used would otherwise pass silently.
+That last check is made inside the transaction that made the attachments.
+Where the parent is still invalid \(em a partition added while the recipe ran
+has no index attached \(em the step fails with
+.Qq the partitioned index exists but is INVALID ,
+and the parent index and its attachments, which are one transaction, are rolled
+back with it: the job leaves the partitions' indexes built and no invalid
+parent.
 A unique index there is built the same way when its columns include every
 partition column, and refused in PostgreSQL's words when they do not
 .Pq Qq unique constraint on partitioned table must include all partitioning columns
@@ -2170,9 +2264,11 @@ answers whether it is worth doing.
 Use those.
 The same reasoning applies to
 .Ic VACUUM ,
-.Ic ANALYZE
-and
-.Ic CLUSTER .
+.Ic ANALYZE ,
+.Ic CLUSTER
+and the
+.Ic REPACK
+PostgreSQL 19 adds.
 .Ss Partitions
 .Ic ATTACH
 validates the candidate against the new bounds unless a CHECK constraint

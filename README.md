@@ -221,7 +221,7 @@ can never be *satisfied*, and answers a condition that is transient. The ledger
 keys on a spec digest and never lists an applied one again, so a repeatable
 operation would run once and never again.
 
-So there is no `reindex`, `vacuum`, `analyze` or `cluster`. `reindexdb
+So there is no `reindex`, `vacuum`, `analyze`, `cluster` or `repack`. `reindexdb
 --concurrently` ships with PostgreSQL, and pg_licht `indexBloat` says whether
 it is worth doing. Maintenance is not migration.
 
