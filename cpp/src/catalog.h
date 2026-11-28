@@ -422,8 +422,51 @@ SELECT COALESCE(
                              'attached_to', (SELECT pic.relname
                                                FROM pg_inherits ii
                                                JOIN pg_class pic ON pic.oid = ii.inhparent
-                                              WHERE ii.inhrelid = ix.indexrelid LIMIT 1)))
+                                              WHERE ii.inhrelid = ix.indexrelid LIMIT 1),
+                             -- What the index IS, in the terms the table's own
+                             -- indexes are read in above, so that one comparison
+                             -- (planner.h, compare_index) answers for both: a
+                             -- partition that already has the index a recipe is
+                             -- about to build is not given a second one.
+                             -- Reported from the field: four indexes built
+                             -- beside equal ones, one over 91.7 million rows.
+                             --
+                             -- All of it is catalog columns but the predicate.
+                             -- pg_get_expr opens the relation -- measured, it
+                             -- waits behind AccessExclusiveLock on the
+                             -- partition -- so it is called only for an index
+                             -- that has a predicate.
+                             'is_valid', ix.indisvalid,
+                             'is_unique', ix.indisunique,
+                             'method', am.amname,
+                             'predicate', CASE WHEN ix.indpred IS NULL THEN ''
+                                               ELSE pg_get_expr(ix.indpred, ix.indrelid) END,
+                             'options', COALESCE(TO_JSONB(ic.reloptions), '[]'::jsonb),
+                             'has_expressions', (0 = ANY(ix.indkey)),
+                             'constraint_backed', EXISTS (SELECT 1 FROM pg_constraint k
+                                                           WHERE k.conindid = ix.indexrelid),
+                             'columns', COALESCE((SELECT JSONB_AGG(a.attname ORDER BY k.ord)
+                                           FROM unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord)
+                                           JOIN pg_attribute a ON a.attrelid = pc.oid
+                                                              AND a.attnum = k.attnum), '[]'::jsonb),
+                             'key_column_count', ix.indnkeyatts,
+                             'column_order', COALESCE((SELECT JSONB_AGG(
+                                                CASE WHEN (o.opt & 1) = 1 THEN 'desc'
+                                                     ELSE 'asc' END ||
+                                                CASE WHEN (o.opt & 2) = 2 THEN ' nulls first'
+                                                     ELSE ' nulls last' END
+                                                ORDER BY o.ord)
+                                               FROM unnest(ix.indoption) WITH ORDINALITY AS o(opt, ord)
+                                              WHERE o.ord <= ix.indnkeyatts), '[]'::jsonb),
+                             'column_opclasses', COALESCE((SELECT JSONB_AGG(
+                                                    CASE WHEN oc.opcdefault THEN ''
+                                                         ELSE oc.opcname END
+                                                    ORDER BY c.ord)
+                                                   FROM unnest(ix.indclass) WITH ORDINALITY AS c(oid, ord)
+                                                   JOIN pg_opclass oc ON oc.oid = c.oid
+                                                  WHERE c.ord <= ix.indnkeyatts), '[]'::jsonb)))
                       FROM pg_index ix JOIN pg_class ic ON ic.oid = ix.indexrelid
+                      JOIN pg_am am ON am.oid = ic.relam
                      WHERE ix.indrelid = pc.oid), '{}'::jsonb))
                  ORDER BY pn.nspname, pc.relname)
           FROM pg_inherits pi

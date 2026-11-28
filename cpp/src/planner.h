@@ -2158,6 +2158,183 @@ inline void plan_index_by_parts(const Intent& in, const IndexTraits& traits,
       "specification again builds the rest.");
 }
 
+// What a create_index intent asks for, in the terms an existing index is read
+// in: one description, used wherever "is that index the one this asks for?" is
+// decided -- on a table, and on each partition of a partitioned one.
+struct IndexWanted {
+  std::string method;
+  bool unique = false;
+  std::vector<std::string> columns;   // key columns; "" for an expression
+  std::vector<std::string> include;
+  std::vector<std::string> order;
+  std::vector<std::string> opclasses;
+  std::vector<std::string> options;
+  std::string predicate;              // normalised
+  bool has_expression_key = false;
+};
+
+inline std::string normalize_index_predicate(const std::string& p) {
+    std::string norm;
+    bool in_string = false;
+    for (std::size_t i = 0; i < p.size(); ++i) {
+      const char c = p[i];
+      if (c == '\'') {
+        in_string = !in_string;
+        norm += c;
+        continue;
+      }
+      if (in_string) {  // never touch the inside of a literal
+        norm += c;
+        continue;
+      }
+      if (c == ':' && i + 1 < p.size() && p[i + 1] == ':') {
+        // Skip ::identifier, and an optional (n) or [] suffix.
+        i += 2;
+        while (i < p.size() && (std::isalnum(static_cast<unsigned char>(p[i])) ||
+                                p[i] == '_' || p[i] == '.')) {
+          ++i;
+        }
+        if (i < p.size() && p[i] == '(') {
+          while (i < p.size() && p[i] != ')') ++i;
+        } else if (i + 1 < p.size() && p[i] == '[' && p[i + 1] == ']') {
+          ++i;
+        } else {
+          --i;
+        }
+        continue;
+      }
+      if (c == ' ' || c == '\n' || c == '\t') {
+        if (!norm.empty() && norm.back() != ' ') norm += ' ';
+        continue;
+      }
+      norm += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    // Strip balanced outer parentheses.
+    auto trim = [](std::string v) {
+      while (!v.empty() && v.front() == ' ') v.erase(v.begin());
+      while (!v.empty() && v.back() == ' ') v.pop_back();
+      return v;
+    };
+    norm = trim(norm);
+    while (norm.size() > 1 && norm.front() == '(' && norm.back() == ')') {
+      int depth = 0;
+      bool wraps = true;
+      for (std::size_t i = 0; i < norm.size(); ++i) {
+        if (norm[i] == '(') ++depth;
+        if (norm[i] == ')') --depth;
+        if (depth == 0 && i + 1 < norm.size()) { wraps = false; break; }
+      }
+      if (!wraps) break;
+      norm = trim(norm.substr(1, norm.size() - 2));
+    }
+    return norm;
+}
+
+inline IndexWanted index_wanted(const json& body) {
+  IndexWanted w;
+  w.method = body.value("method", "btree");
+  w.unique = body.value("unique", false);
+  const auto keys = index_columns(body);
+  for (const auto& k : keys) {
+    w.columns.push_back(k.name);
+    w.opclasses.push_back(k.opclass);
+    if (!k.expression.empty()) w.has_expression_key = true;
+  }
+  for (const auto& c : body.value("include", json::array())) {
+    w.include.push_back(c.get<std::string>());
+  }
+  w.order = index_order_terms(keys);
+  w.options = index_options(body);
+  w.predicate = normalize_index_predicate(body.value("where", ""));
+  return w;
+}
+
+// An existing index against the one asked for. `considered` is false where
+// nothing can be said at all: the index is invalid, is over expressions, the
+// intent is, or the access method differs. Otherwise each part of the answer
+// is here separately, because the plain path warns on some combinations
+// (a reversed order, other storage parameters, predicates that differ as
+// written) and both paths conclude "the same index" only from all of them.
+struct IndexComparison {
+  bool considered = false;
+  bool comparable = false;
+  bool same_columns = false;
+  bool same_include = false;
+  bool same_opclasses = false;
+  bool same_order = false;
+  bool same_options = false;
+  bool same_unique = false;
+  std::string predicate;              // the existing index's, normalised
+  std::vector<std::string> columns;   // its key columns
+  std::vector<std::string> order;
+  bool same_shape() const {
+    return comparable && same_columns && same_include && same_opclasses && same_order &&
+           same_options && same_unique;
+  }
+  bool identical(const IndexWanted& w) const {
+    return considered && same_shape() && predicate == w.predicate;
+  }
+};
+
+inline IndexComparison compare_index(const json& ex, const IndexWanted& w) {
+  IndexComparison c;
+  if (!ex.value("is_valid", false)) return c;
+  // An index over expressions cannot be compared by column name, and a
+  // partial comparison would be worse than none. That cuts both ways: if
+  // THIS spec indexes an expression, there is equally nothing to compare.
+  if (ex.value("has_expressions", false)) return c;
+  if (w.has_expression_key) return c;
+  if (ex.value("method", "") != w.method) return c;
+  c.considered = true;
+
+  // Key columns only. The catalog lists INCLUDE payload in `columns` too,
+  // and payload neither orders nor restricts anything -- so an index keyed
+  // the same with different payload is a DIFFERENT index, and comparing the
+  // concatenation would have called them equal.
+  for (const auto& col : ex.value("columns", json::array())) {
+    c.columns.push_back(col.get<std::string>());
+  }
+  const auto key_count = static_cast<std::size_t>(
+      ex.value("key_column_count", static_cast<int>(c.columns.size())));
+  std::vector<std::string> ex_include;
+  if (key_count < c.columns.size()) {
+    ex_include.assign(c.columns.begin() + static_cast<long>(key_count), c.columns.end());
+    c.columns.resize(key_count);
+  }
+  for (const auto& o : ex.value("column_order", json::array())) {
+    c.order.push_back(o.get<std::string>());
+  }
+  std::vector<std::string> ex_opclasses;
+  for (const auto& o : ex.value("column_opclasses", json::array())) {
+    ex_opclasses.push_back(o.get<std::string>());
+  }
+  c.predicate = normalize_index_predicate(ex.value("predicate", ""));
+  // Same columns is no longer enough to call two indexes the same. An
+  // operator class changes which operators the index can answer at all, and
+  // a direction changes which orderings it serves -- so an index differing
+  // in either is a different index, and adopting or renaming it would leave
+  // the database without what the spec asked for while reporting success.
+  //
+  // A reading that does not carry column_order or column_opclasses cannot
+  // support the EQUIVALENCE conclusion -- rather than assume they match, a
+  // missing reading is not a matching one. It does not block the weaker
+  // prefix-redundancy warning, which is a claim about column names only and
+  // is true whatever the ordering.
+  c.comparable = c.order.size() == c.columns.size() &&
+                 ex_opclasses.size() == c.columns.size();
+  c.same_columns = c.columns == w.columns;
+  c.same_include = ex_include == w.include;
+  c.same_opclasses = c.comparable && ex_opclasses == w.opclasses;
+  c.same_order = c.comparable && c.order == w.order;
+  // Storage parameters are part of what was asked for: an HNSW index with
+  // m = 16 and one with m = 32 answer the same queries at different recall
+  // and size. The catalog always reports `options`; a reading without it (a
+  // hand-written one) means none.
+  c.same_options = catalog_index_options(ex) == w.options;
+  c.same_unique = ex.value("is_unique", false) == w.unique;
+  return c;
+}
+
 inline void plan_create_index(const Intent& in, const Observations& obs,
                               const ExecutorConfig& cfg, Plan& plan,
                               std::vector<Step>& out) {
@@ -2181,9 +2358,6 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
   const auto where = in.body.value("where", "");
 
   const auto keys = index_columns(in.body);
-  const bool has_expression_key =
-      std::any_of(keys.begin(), keys.end(),
-                  [](const IndexColumn& k) { return !k.expression.empty(); });
   std::vector<std::string> include_columns;
   for (const auto& c : in.body.value("include", json::array())) {
     include_columns.push_back(c.get<std::string>());
@@ -2294,122 +2468,22 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
     // to a conflict and a mismatch only warns. Claiming a duplicate on the
     // strength of a normaliser would be exactly the confidently-wrong answer
     // this tool must not give.
-    const auto normalize = [](const std::string& p) {
-      std::string norm;
-      bool in_string = false;
-      for (std::size_t i = 0; i < p.size(); ++i) {
-        const char c = p[i];
-        if (c == '\'') {
-          in_string = !in_string;
-          norm += c;
-          continue;
-        }
-        if (in_string) {  // never touch the inside of a literal
-          norm += c;
-          continue;
-        }
-        if (c == ':' && i + 1 < p.size() && p[i + 1] == ':') {
-          // Skip ::identifier, and an optional (n) or [] suffix.
-          i += 2;
-          while (i < p.size() && (std::isalnum(static_cast<unsigned char>(p[i])) ||
-                                  p[i] == '_' || p[i] == '.')) {
-            ++i;
-          }
-          if (i < p.size() && p[i] == '(') {
-            while (i < p.size() && p[i] != ')') ++i;
-          } else if (i + 1 < p.size() && p[i] == '[' && p[i + 1] == ']') {
-            ++i;
-          } else {
-            --i;
-          }
-          continue;
-        }
-        if (c == ' ' || c == '\n' || c == '\t') {
-          if (!norm.empty() && norm.back() != ' ') norm += ' ';
-          continue;
-        }
-        norm += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-      }
-      // Strip balanced outer parentheses.
-      auto trim = [](std::string v) {
-        while (!v.empty() && v.front() == ' ') v.erase(v.begin());
-        while (!v.empty() && v.back() == ' ') v.pop_back();
-        return v;
-      };
-      norm = trim(norm);
-      while (norm.size() > 1 && norm.front() == '(' && norm.back() == ')') {
-        int depth = 0;
-        bool wraps = true;
-        for (std::size_t i = 0; i < norm.size(); ++i) {
-          if (norm[i] == '(') ++depth;
-          if (norm[i] == ')') --depth;
-          if (depth == 0 && i + 1 < norm.size()) { wraps = false; break; }
-        }
-        if (!wraps) break;
-        norm = trim(norm.substr(1, norm.size() - 2));
-      }
-      return norm;
-    };
-
-    const auto want_pred = normalize(where);
+    const auto wanted = index_wanted(in.body);
+    const auto& want_pred = wanted.predicate;
     for (auto it = indexes.begin(); it != indexes.end(); ++it) {
       if (it.key() == name) continue;
       const auto& ex = it.value();
-      if (!ex.value("is_valid", false)) continue;
-      // An index over expressions cannot be compared by column name, and a
-      // partial comparison would be worse than none. That cuts both ways: if
-      // THIS spec indexes an expression, there is equally nothing to compare.
-      if (ex.value("has_expressions", false)) continue;
-      if (has_expression_key) continue;
-      if (ex.value("method", "") != method) continue;
-
-      // Key columns only. The catalog lists INCLUDE payload in `columns` too,
-      // and payload neither orders nor restricts anything -- so an index keyed
-      // the same with different payload is a DIFFERENT index, and comparing the
-      // concatenation would have called them equal.
-      std::vector<std::string> ex_cols;
-      for (const auto& c : ex.value("columns", json::array())) {
-        ex_cols.push_back(c.get<std::string>());
-      }
-      const auto ex_key_count = static_cast<std::size_t>(
-          ex.value("key_column_count", static_cast<int>(ex_cols.size())));
-      std::vector<std::string> ex_include;
-      if (ex_key_count < ex_cols.size()) {
-        ex_include.assign(ex_cols.begin() + static_cast<long>(ex_key_count),
-                          ex_cols.end());
-        ex_cols.resize(ex_key_count);
-      }
-
-      std::vector<std::string> ex_order;
-      for (const auto& o : ex.value("column_order", json::array())) {
-        ex_order.push_back(o.get<std::string>());
-      }
-      std::vector<std::string> ex_opclasses;
-      for (const auto& o : ex.value("column_opclasses", json::array())) {
-        ex_opclasses.push_back(o.get<std::string>());
-      }
-      std::vector<std::string> want_opclasses;
-      for (const auto& k : keys) want_opclasses.push_back(k.opclass);
-
-      const auto ex_pred = normalize(ex.value("predicate", ""));
-      // Same columns is no longer enough to call two indexes the same. An
-      // operator class changes which operators the index can answer at all, and
-      // a direction changes which orderings it serves -- so an index differing
-      // in either is a different index, and adopting or renaming it would leave
-      // the database without what the spec asked for while reporting success.
-      //
-      // A reading that does not carry column_order or column_opclasses cannot
-      // support the EQUIVALENCE conclusion -- rather than assume they match, a
-      // missing reading is not a matching one. It does not block the weaker
-      // prefix-redundancy warning below, which is a claim about column names
-      // only and is true whatever the ordering.
-      const bool comparable =
-          ex_order.size() == ex_cols.size() && ex_opclasses.size() == ex_cols.size();
-
-      const bool same_columns = ex_cols == columns;
-      const bool same_include = ex_include == include_columns;
-      const bool same_opclasses = comparable && ex_opclasses == want_opclasses;
-      const bool same_order = comparable && ex_order == want_order;
+      // One comparison, shared with the partitioned recipe (compare_index).
+      const auto cmp = compare_index(ex, wanted);
+      if (!cmp.considered) continue;
+      const auto& ex_cols = cmp.columns;
+      const auto& ex_order = cmp.order;
+      const auto& ex_pred = cmp.predicate;
+      const bool comparable = cmp.comparable;
+      const bool same_columns = cmp.same_columns;
+      const bool same_include = cmp.same_include;
+      const bool same_opclasses = cmp.same_opclasses;
+      const bool same_order = cmp.same_order;
 
       // A btree reads backwards as a whole, so an index whose every key column
       // is flipped answers this one's ordering at the same cost. Worth saying,
@@ -2430,12 +2504,10 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
         continue;
       }
 
-      // Storage parameters are part of what was asked for: an HNSW index with
-      // m = 16 and one with m = 32 answer the same queries at different recall
-      // and size, so adopting or renaming one as the other would report the
-      // spec satisfied with the wrong index. The catalog always reports
-      // `options`; a reading without it (a hand-written one) means none.
-      const bool same_options = catalog_index_options(ex) == index_options(in.body);
+      // Storage parameters are part of what was asked for, so adopting or
+      // renaming an index built with others would report the spec satisfied
+      // with the wrong index.
+      const bool same_options = cmp.same_options;
       if (comparable && same_columns && same_include && same_opclasses &&
           same_order && ex.value("is_unique", false) == unique && !same_options &&
           ex_pred == want_pred) {
@@ -2449,9 +2521,7 @@ inline void plan_create_index(const Intent& in, const Observations& obs,
             "afterwards if this replaces it.");
         continue;
       }
-      const bool same_shape = comparable && same_columns && same_include &&
-                              same_opclasses && same_order && same_options &&
-                              ex.value("is_unique", false) == unique;
+      const bool same_shape = cmp.same_shape();
 
       // Same columns, predicates that did not normalise to the same string.
       // Equivalence is not provable here, so this warns and names both rather
@@ -2912,80 +2982,257 @@ inline void plan_partitioned_index(const Intent& in, const json& t, Plan& plan,
     return;
   }
 
-  std::vector<std::string> child_indexes;
+  // What each partition already has (catalog.h, partition_parts), by relation.
+  // A reading without it -- an older one, or one written by hand -- has none,
+  // and the recipe then builds on every partition, as it always did.
+  std::map<std::string, json> part_indexes;
+  for (const auto& part : t.value("partition_parts", json::array())) {
+    part_indexes[part.value("relation", "")] = part.value("indexes", json::object());
+  }
+  const auto wanted = index_wanted(in.body);
+  const auto policy = in.body.value("on_equivalent_index", "rename");
+  const auto fail = [&](const std::string& why, const std::string& conflict) {
+    parent_step.action = Action::kConflict;
+    parent_step.why = why;
+    plan.conflicts.push_back(conflict);
+  };
+
+  // One entry per partition: the index that will be attached there, and what
+  // has to happen before it can be.
+  //
+  // Reported from the field: a table with valid indexes became a partition,
+  // the same indexes were declared on the partitioned parent, and the recipe
+  // built each one again beside the one that was there -- over 91.7 million
+  // rows in one case -- because it read nothing of a partition's indexes. Nor
+  // could it resume: an index it had itself built under its own name was
+  // planned again under that name, which fails on a name in use.
+  struct Part {
+    std::string relation;
+    std::string schema;
+    std::string index;        // the name attached
+    std::string rename_from;  // an equal index to rename to `index` first
+    std::string taken;        // an equal index attached under its own name
+    bool build = false;
+    bool drop_invalid = false;
+    bool attached = false;
+  };
+  std::vector<Part> parts;
   for (const auto& p : partitions) {
-    const auto part = p.get<std::string>();
-    const auto bare = part.substr(part.find('.') + 1);
+    Part part;
+    part.relation = p.get<std::string>();
+    part.schema = part.relation.substr(0, part.relation.find('.'));
+    const auto bare = part.relation.substr(part.relation.find('.') + 1);
     const auto child = bare + "_" + name;
-    // Deterministic rather than truncated: a truncated name would differ
-    // between two runs that both "succeeded", and the idempotence check keys
-    // on the name.
-    if (child.size() > 63) {
-      parent_step.action = Action::kConflict;
-      parent_step.why = "a per-partition index name would exceed 63 bytes";
-      plan.conflicts.push_back(
-          "the per-partition index for " + part + " would be named \"" + child +
-          "\", which PostgreSQL would truncate at 63 bytes -- and a truncated "
-          "name is not deterministic, so two runs could disagree about whether "
-          "the index exists. Use a shorter index name.");
+    const json indexes = part_indexes.count(part.relation) != 0
+                             ? part_indexes[part.relation] : json::object();
+
+    // 1. The name the recipe gives it is there already: the name is the
+    // identity, as it is for an index on a plain table. Valid, it is this
+    // recipe's own work from an earlier attempt and is not built again;
+    // invalid, a concurrent build did not finish, and it is dropped and built.
+    if (indexes.contains(child)) {
+      const auto& ix = indexes[child];
+      const auto attached_to = ix.value("attached_to", json());
+      if (attached_to.is_string() && attached_to.get<std::string>() != name) {
+        fail("\"" + child + "\" on " + part.relation + " is attached to another index",
+             "the index \"" + child + "\" on " + part.relation + " is already attached to \"" +
+                 attached_to.get<std::string>() + "\", so it cannot be attached to \"" + name +
+                 "\". Use another index name.");
+        return;
+      }
+      part.index = child;
+      part.attached = attached_to.is_string();
+      if (!ix.value("is_valid", ix.value("valid", false))) {
+        part.build = true;
+        part.drop_invalid = true;
+      }
+      parts.push_back(std::move(part));
+      continue;
+    }
+
+    // 2. No index of that name, but one that IS the index asked for, by the
+    // comparison a plain table gets (compare_index). One that is attached to
+    // some other parent index is not free to take.
+    std::string equal;
+    std::vector<std::string> others;
+    for (auto it = indexes.begin(); it != indexes.end(); ++it) {
+      if (it.value().value("attached_to", json()).is_string()) continue;
+      if (!compare_index(it.value(), wanted).identical(wanted)) continue;
+      if (equal.empty()) equal = it.key();
+      else others.push_back(it.key());
+    }
+    if (!equal.empty() && policy == "refuse") {
+      fail("an index identical to this one already exists on " + part.relation + " as " + equal,
+           "\"" + name + "\" on " + qualified + " would duplicate the existing index \"" + equal +
+               "\" on its partition " + part.relation +
+               ": same method, same columns, same predicate. on_equivalent_index is "
+               "\"refuse\"; \"rename\" or \"adopt\" attaches that index and builds nothing.");
       return;
     }
-    child_indexes.push_back(child);
+    if (!others.empty()) {
+      plan.warnings.push_back(
+          part.relation + " has more than one index equal to \"" + name + "\": \"" + equal +
+          "\" is taken, and " + detail::join(others, ", ") +
+          " stay as they are, each a duplicate paid for on every write. pg_licht "
+          "duplicateIndexes lists them.");
+    }
+    if (!equal.empty()) {
+      // An index that backs a constraint is never renamed, whatever the policy:
+      // renaming it renames the constraint (measured on 18.6). It attaches as
+      // it is -- measured on 18: a partition's UNIQUE constraint index attached
+      // to a plain unique parent index, and the parent became valid.
+      const bool backs = indexes[equal].value("constraint_backed", false);
+      if (policy == "adopt" || backs) {
+        part.index = equal;
+        part.taken = equal;
+      } else {
+        part.index = child;
+        part.rename_from = equal;
+      }
+      parts.push_back(std::move(part));
+      continue;
+    }
 
+    // 3. Nothing to take: it is built, concurrently, on the partition itself.
+    part.index = child;
+    part.build = true;
+    parts.push_back(std::move(part));
+  }
+
+  // Deterministic rather than truncated: a truncated name would differ between
+  // two runs that both "succeeded", and the idempotence check keys on the name.
+  for (const auto& part : parts) {
+    if (!part.taken.empty() || part.index.size() <= 63) continue;
+    fail("a per-partition index name would exceed 63 bytes",
+         "the per-partition index for " + part.relation + " would be named \"" + part.index +
+             "\", which PostgreSQL would truncate at 63 bytes -- and a truncated "
+             "name is not deterministic, so two runs could disagree about whether "
+             "the index exists. Use a shorter index name.");
+    return;
+  }
+
+  const auto sql_index = [](const Part& part, const std::string& index) {
+    return detail::quote_identifier(part.schema) + "." + detail::quote_identifier(index);
+  };
+
+  // The builds, each outside any transaction and on its own.
+  std::size_t n = 0;
+  for (const auto& part : parts) {
+    ++n;
+    if (!part.build) continue;
     Step s;
     s.kind = in.kind_name;
     s.txn_class = TxnClass::kForbidden;
     s.own_transaction = true;
-    s.lock = "ShareUpdateExclusiveLock on " + part;
+    s.lock = "ShareUpdateExclusiveLock on " + part.relation;
+    // An index left INVALID by a build that was interrupted: dropped the way
+    // it was made, and built again.
+    if (part.drop_invalid) {
+      s.sql.push_back("DROP INDEX CONCURRENTLY " + sql_index(part, part.index) + ";");
+      s.detail["recovering_invalid_index"] = true;
+    }
     s.sql.push_back(std::string("CREATE ") + (unique ? "UNIQUE " : "") +
-                    "INDEX CONCURRENTLY " + detail::quote_identifier(child) + " ON " +
-                    detail::quote_qualified(part) + tail + ";");
-    s.why = "partition " + std::to_string(child_indexes.size()) + " of " +
-            std::to_string(partitions.size()) +
+                    "INDEX CONCURRENTLY " + detail::quote_identifier(part.index) + " ON " +
+                    detail::quote_qualified(part.relation) + tail + ";");
+    s.why = "partition " + std::to_string(n) + " of " + std::to_string(parts.size()) +
             ": CREATE INDEX CONCURRENTLY is refused on the parent, so each "
             "partition is built separately and concurrently";
-    s.detail["partition"] = part;
-    s.detail["index"] = child;
-    s.detail["schema"] = in.schema();
+    s.detail["partition"] = part.relation;
+    s.detail["index"] = part.index;
+    s.detail["schema"] = part.schema;
     out.push_back(std::move(s));
   }
 
-  Step parent;
-  parent.kind = in.kind_name;
-  parent.txn_class = TxnClass::kOptional;
-  parent.own_transaction = true;
-  parent.lock = "ShareLock on " + qualified + ", which holds no data itself";
-  parent.sql.push_back(std::string("CREATE ") + (unique ? "UNIQUE " : "") + "INDEX " +
-                       detail::quote_identifier(name) + " ON ONLY " + sql_rel + tail + ";");
-  parent.sql.push_back("COMMENT ON INDEX " + detail::quote_identifier(in.schema()) + "." + detail::quote_identifier(name) + " IS " +
-                       detail::quote_literal(in.body.value("comment", "")) + ";");
-  parent.why =
-      "ON ONLY means the parent index is a catalog entry with no data, so this "
-      "scans nothing. It stays INVALID until every partition is attached";
-  parent.detail["index"] = name;
-  parent.detail["schema"] = in.schema();
-  out.push_back(std::move(parent));
+  // Everything from here is one transaction: the renames, the parent's index,
+  // the attachments and the check that the parent is valid. Measured on 18: a
+  // rename, CREATE INDEX ... ON ONLY and ATTACH PARTITION in one transaction
+  // leave the parent valid. So a check that fails takes the renames back with
+  // the rest, and PostgreSQL is the last judge of "equal": an attachment whose
+  // definition does not match is refused ("The index definitions do not
+  // match"), in a transaction, where the dry run finds it too.
+  bool group_started = false;
+  const auto in_group = [&](Step& s) {
+    if (!group_started) s.own_transaction = true;
+    group_started = true;
+  };
 
-  for (std::size_t i = 0; i < child_indexes.size(); ++i) {
+  n = 0;
+  for (const auto& part : parts) {
+    ++n;
+    if (part.rename_from.empty()) continue;
     Step s;
     s.kind = in.kind_name;
     s.txn_class = TxnClass::kOptional;
+    in_group(s);
+    s.lock = "ShareUpdateExclusiveLock on the index; the partition is not locked at all";
+    s.sql.push_back("ALTER INDEX " + sql_index(part, part.rename_from) + " RENAME TO " +
+                    detail::quote_identifier(part.index) + ";");
+    s.why = "partition " + std::to_string(n) + " of " + std::to_string(parts.size()) +
+            ": an equivalent index already exists as \"" + part.rename_from +
+            "\" (same method, columns and predicate); renamed to the name this recipe "
+            "gives a partition's index rather than built a second time";
+    s.detail["partition"] = part.relation;
+    s.detail["renamed_from"] = part.rename_from;
+    s.detail["renamed_to"] = part.index;
+    s.detail["risk"] =
+        "the old name may be referenced outside the database -- a monitoring "
+        "dashboard, a planner hint, a deployment script. pg_laswell cannot see "
+        "those. Set on_equivalent_index to \"adopt\" to leave the name alone.";
+    out.push_back(std::move(s));
+  }
+
+  // The parent's own index. One that is there and INVALID is this recipe's,
+  // from an attempt that stopped before every partition was attached: it is
+  // not created again, and what is missing below is done.
+  const bool parent_exists = t.value("indexes", json::object()).contains(name);
+  if (!parent_exists) {
+    Step parent;
+    parent.kind = in.kind_name;
+    parent.txn_class = TxnClass::kOptional;
+    in_group(parent);
+    parent.lock = "ShareLock on " + qualified + ", which holds no data itself";
+    parent.sql.push_back(std::string("CREATE ") + (unique ? "UNIQUE " : "") + "INDEX " +
+                         detail::quote_identifier(name) + " ON ONLY " + sql_rel + tail + ";");
+    parent.sql.push_back("COMMENT ON INDEX " + detail::quote_identifier(in.schema()) + "." + detail::quote_identifier(name) + " IS " +
+                         detail::quote_literal(in.body.value("comment", "")) + ";");
+    parent.why =
+        "ON ONLY means the parent index is a catalog entry with no data, so this "
+        "scans nothing. It stays INVALID until every partition is attached";
+    parent.detail["index"] = name;
+    parent.detail["schema"] = in.schema();
+    out.push_back(std::move(parent));
+  }
+
+  n = 0;
+  for (const auto& part : parts) {
+    ++n;
+    if (part.attached) continue;
+    Step s;
+    s.kind = in.kind_name;
+    s.txn_class = TxnClass::kOptional;
+    in_group(s);
     // Measured on 18.6: AccessExclusiveLock on the partition's index,
     // ShareUpdateExclusiveLock on the parent index, AccessShareLock on both
     // tables.
     s.lock = "AccessExclusiveLock on the partition's index and "
              "ShareUpdateExclusiveLock on the parent index, briefly";
     s.sql.push_back("ALTER INDEX " + detail::quote_identifier(in.schema()) + "." + detail::quote_identifier(name) +
-                    " ATTACH PARTITION " + detail::quote_identifier(in.schema()) + "." + detail::quote_identifier(child_indexes[i]) + ";");
-    s.why = "attach " + std::to_string(i + 1) + " of " +
-            std::to_string(child_indexes.size()) +
+                    " ATTACH PARTITION " + sql_index(part, part.index) + ";");
+    s.why = "attach " + std::to_string(n) + " of " + std::to_string(parts.size()) +
             "; the parent index becomes valid only when the last one lands";
+    if (!part.taken.empty()) {
+      s.why += ". \"" + part.taken + "\" is an equivalent index the partition already "
+               "had, attached under the name it has: nothing is built and nothing renamed";
+      s.detail["adopted"] = part.taken;
+    }
+    s.detail["partition"] = part.relation;
     out.push_back(std::move(s));
   }
 
   Step verify;
   verify.kind = "verify_index_valid";
   verify.txn_class = TxnClass::kOptional;
+  in_group(verify);
   verify.lock = "none (catalog read)";
   verify.why =
       "a partitioned index that is missing even one attachment exists, is "
