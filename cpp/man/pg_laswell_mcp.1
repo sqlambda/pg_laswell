@@ -1644,6 +1644,39 @@ has no index attached \(em the step fails with
 and the parent index and its attachments, which are one transaction, are rolled
 back with it: the job leaves the partitions' indexes built and no invalid
 parent.
+.Pp
+A partition is not given an index it already has.
+The recipe reads each partition's indexes, and
+.Va on_equivalent_index
+applies there as it does on a plain table: a valid index of the same method,
+columns, order, operator classes, storage parameters and predicate is renamed
+to the name the recipe gives a partition's index
+.Pq Ql <partition>_<name> ,
+or attached under the name it has with
+.Cm adopt ,
+and nothing is built on that partition.
+An index that backs a constraint of the partition is attached as it is, whatever
+the setting, since renaming it would rename the constraint.
+The renames, the parent's index, the attachments and the last check are one
+transaction, so a check that fails takes the renames back too; and PostgreSQL
+is the last judge of
+.Qq equal :
+it refuses to attach an index whose definition does not match the parent's, in
+that transaction, where a dry run meets it first.
+.Pp
+The same reading is how a recipe that stopped partway is continued.
+An index it built under its own name is valid and is not built again, one a
+build left invalid is dropped concurrently and built again, one that is
+attached is not attached twice, and a parent index that exists and is still
+invalid is not created a second time.
+.Pp
+Each partition's indexes are read from the catalog without opening them, but
+for the text of a predicate:
+.Fn pg_get_expr
+opens the relation, so a partition with a partial index is read under the
+observation's lock timeout, and one under a strong lock makes the reading of the
+whole table a blocked one.
+.Pp
 A unique index there is built the same way when its columns include every
 partition column, and refused in PostgreSQL's words when they do not
 .Pq Qq unique constraint on partitioned table must include all partitioning columns

@@ -2038,6 +2038,181 @@ TEST(Planner, APartitionedTableGetsThePerPartitionRecipe) {
   ASSERT_NE(find_step(plan, "verify_index_valid"), nullptr) << plan.render();
 }
 
+namespace {
+// A partition's index as catalog.h reads it (partition_parts): the index the
+// minimal specification asks for, in PostgreSQL's own rendering.
+json equal_partition_index(bool attached = false) {
+  json ix{{"valid", true}, {"unique", false}, {"is_valid", true}, {"is_unique", false},
+          {"method", "btree"}, {"predicate", "(status = 'open'::text)"},
+          {"options", json::array()}, {"has_expressions", false},
+          {"constraint_backed", false},
+          {"columns", json::array({"fulfilment_region", "created_at"})},
+          {"key_column_count", 2},
+          {"column_order", json::array({"asc nulls last", "asc nulls last"})},
+          {"column_opclasses", json::array({"", ""})},
+          {"constraint", nullptr}, {"attached_to", nullptr}};
+  if (attached) ix["attached_to"] = "orders_open_by_region_idx";
+  return ix;
+}
+// A parent partitioned by year with two partitions, each carrying `indexes`.
+pglaswell::Observations partitioned_orders(const json& on_2024, const json& on_2025) {
+  auto obs = observations(2LL << 30, 8100000, 0, "partitioned_table");
+  obs.tables["shop.orders"]["partitions"] =
+      json::array({"shop.orders_2024", "shop.orders_2025"});
+  obs.tables["shop.orders"]["partition_parts"] = json::array(
+      {json{{"relation", "shop.orders_2024"}, {"partitioned", false}, {"indexes", on_2024}},
+       json{{"relation", "shop.orders_2025"}, {"partitioned", false}, {"indexes", on_2025}}});
+  return obs;
+}
+int count_sql(const pglaswell::Plan& plan, const std::string& needle) {
+  int n = 0;
+  for (const auto& step : plan.steps) {
+    for (const auto& q : step.sql) {
+      if (q.find(needle) != std::string::npos) ++n;
+    }
+  }
+  return n;
+}
+}  // namespace
+
+// Reported from the field: a table with valid indexes became a partition, the
+// same indexes were declared on the partitioned parent, and the recipe built
+// each of them again beside the one that was there -- one over 91.7 million
+// rows. An equal index on a partition is taken, as one on a plain table is.
+TEST(Planner, APartitionsEqualIndexIsRenamedAndAttachedNotBuiltAgain) {
+  const auto obs = partitioned_orders(json{{"orders_by_region_old", equal_partition_index()}},
+                                      json::object());
+  const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(minimal_spec()), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  // One build, on the partition that has nothing; none on the one that has it.
+  EXPECT_EQ(count_sql(plan, "CREATE INDEX CONCURRENTLY"), 1) << plan.render();
+  EXPECT_EQ(count_sql(plan, "ON \"shop\".\"orders_2024\""), 0) << plan.render();
+  EXPECT_EQ(count_sql(plan, "ALTER INDEX \"shop\".\"orders_by_region_old\" RENAME TO "
+                            "\"orders_2024_orders_open_by_region_idx\""), 1)
+      << plan.render();
+  EXPECT_EQ(count_sql(plan, "ATTACH PARTITION \"shop\".\"orders_2024_orders_open_by_region_idx\""),
+            1) << plan.render();
+  EXPECT_EQ(count_sql(plan, "ATTACH PARTITION"), 2) << plan.render();
+  ASSERT_NE(find_step(plan, "verify_index_valid"), nullptr) << plan.render();
+
+  // The rename, the parent's index, the attachments and the check are one
+  // transaction: a check that fails takes the rename back with the rest.
+  // (The build on the other partition has a check of its own, after it and
+  // apart; the last check is the parent's.)
+  int group = -1;
+  const auto same_group = [&](const pglaswell::Step& step) {
+    if (group == -1) group = step.txn_group;
+    EXPECT_EQ(step.txn_group, group) << plan.render();
+  };
+  const pglaswell::Step* last_check = nullptr;
+  for (const auto& step : plan.steps) {
+    const auto sql = all_sql(step);
+    if (sql.find("RENAME TO") != std::string::npos ||
+        sql.find("ON ONLY") != std::string::npos ||
+        sql.find("ATTACH PARTITION") != std::string::npos) {
+      same_group(step);
+    }
+    if (step.kind == "verify_index_valid") last_check = &step;
+  }
+  ASSERT_NE(last_check, nullptr);
+  same_group(*last_check);
+}
+
+TEST(Planner, APartitionsEqualIndexIsAttachedUnderItsOwnNameWithAdopt) {
+  json doc = minimal_spec();
+  doc["intents"][2]["on_equivalent_index"] = "adopt";
+  const auto obs = partitioned_orders(json{{"orders_by_region_old", equal_partition_index()}},
+                                      json{{"orders_2025_by_region", equal_partition_index()}});
+  const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(doc), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  // Nothing is built and nothing renamed: the whole recipe is catalog work.
+  EXPECT_EQ(count_sql(plan, "CONCURRENTLY"), 0) << plan.render();
+  EXPECT_EQ(count_sql(plan, "RENAME TO"), 0) << plan.render();
+  EXPECT_EQ(count_sql(plan, "ATTACH PARTITION \"shop\".\"orders_by_region_old\""), 1)
+      << plan.render();
+  EXPECT_EQ(count_sql(plan, "ATTACH PARTITION \"shop\".\"orders_2025_by_region\""), 1)
+      << plan.render();
+  EXPECT_EQ(count_sql(plan, "ON ONLY \"shop\".\"orders\""), 1) << plan.render();
+}
+
+TEST(Planner, APartitionsEqualIndexIsAConflictWithRefuse) {
+  json doc = minimal_spec();
+  doc["intents"][2]["on_equivalent_index"] = "refuse";
+  const auto obs = partitioned_orders(json{{"orders_by_region_old", equal_partition_index()}},
+                                      json::object());
+  const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(doc), obs, {});
+  EXPECT_FALSE(plan.ok) << plan.render();
+  ASSERT_FALSE(plan.conflicts.empty());
+  EXPECT_NE(plan.conflicts.front().find("orders_by_region_old"), std::string::npos)
+      << plan.conflicts.front();
+  EXPECT_NE(plan.conflicts.front().find("shop.orders_2024"), std::string::npos)
+      << plan.conflicts.front();
+}
+
+// An index that differs -- other columns, another predicate, another order --
+// is not the index asked for, and the partition gets its own.
+TEST(Planner, APartitionsDifferentIndexIsNotTaken) {
+  json other_predicate = equal_partition_index();
+  other_predicate["predicate"] = "(status = 'closed'::text)";
+  json other_order = equal_partition_index();
+  other_order["column_order"] = json::array({"asc nulls last", "desc nulls first"});
+  const auto obs = partitioned_orders(json{{"closed_by_region", other_predicate}},
+                                      json{{"by_region_newest", other_order}});
+  const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(minimal_spec()), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  EXPECT_EQ(count_sql(plan, "CREATE INDEX CONCURRENTLY"), 2) << plan.render();
+  EXPECT_EQ(count_sql(plan, "RENAME TO"), 0) << plan.render();
+}
+
+// Renaming an index that backs a constraint renames the constraint (measured
+// on 18.6), so such an index is never renamed, whatever the policy. It attaches
+// as it is: measured on 18, a partition's UNIQUE constraint index attached to a
+// plain unique parent index and the parent became valid.
+TEST(Planner, APartitionsEqualIndexThatBacksAConstraintIsAttachedAndNeverRenamed) {
+  json backing = equal_partition_index();
+  backing["constraint_backed"] = true;
+  backing["constraint"] = "orders_2024_region_key";
+  const auto obs = partitioned_orders(json{{"orders_2024_region_key", backing}},
+                                      json{{"orders_by_region_old", equal_partition_index()}});
+  const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(minimal_spec()), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  EXPECT_EQ(count_sql(plan, "CONCURRENTLY"), 0) << plan.render();
+  EXPECT_EQ(count_sql(plan, "\"orders_2024_region_key\" RENAME"), 0) << plan.render();
+  EXPECT_EQ(count_sql(plan, "ATTACH PARTITION \"shop\".\"orders_2024_region_key\""), 1)
+      << plan.render();
+  // The other partition's is an ordinary index: renamed, as the default says.
+  EXPECT_EQ(count_sql(plan, "ALTER INDEX \"shop\".\"orders_by_region_old\" RENAME TO"), 1)
+      << plan.render();
+}
+
+// An attempt that stopped partway is continued, not started over. What the
+// recipe built under its own name is there and valid: not built again -- which
+// before failed outright, on a name in use. What is attached is not attached
+// again, an INVALID build is dropped and redone, and a parent index that
+// exists and is INVALID is not created a second time.
+TEST(Planner, AnInterruptedPartitionedIndexRecipeResumesFromWhatExists) {
+  json invalid = equal_partition_index();
+  invalid["valid"] = false;
+  invalid["is_valid"] = false;
+  auto obs = partitioned_orders(
+      json{{"orders_2024_orders_open_by_region_idx", equal_partition_index(/*attached=*/true)}},
+      json{{"orders_2025_orders_open_by_region_idx", invalid}});
+  obs.tables["shop.orders"]["indexes"]["orders_open_by_region_idx"] =
+      json{{"is_valid", false}, {"is_unique", false}, {"definition", "CREATE INDEX ..."}};
+  const auto plan = pglaswell::plan_migration(pglaswell::parse_spec(minimal_spec()), obs, {});
+  ASSERT_TRUE(plan.ok) << plan.render();
+  EXPECT_EQ(count_sql(plan, "ON ONLY"), 0) << "the parent's index is there: " << plan.render();
+  EXPECT_EQ(count_sql(plan, "ON \"shop\".\"orders_2024\""), 0) << plan.render();
+  EXPECT_EQ(count_sql(plan, "DROP INDEX CONCURRENTLY \"shop\"."
+                            "\"orders_2025_orders_open_by_region_idx\""), 1) << plan.render();
+  EXPECT_EQ(count_sql(plan, "CREATE INDEX CONCURRENTLY \"orders_2025_orders_open_by_region_idx\""),
+            1) << plan.render();
+  EXPECT_EQ(count_sql(plan, "ATTACH PARTITION"), 1) << plan.render();
+  EXPECT_EQ(count_sql(plan, "ATTACH PARTITION \"shop\".\"orders_2025_orders_open_by_region_idx\""),
+            1) << plan.render();
+  ASSERT_NE(find_step(plan, "verify_index_valid"), nullptr) << plan.render();
+}
+
 TEST(Planner, AUniqueIndexOnAPartitionedTableMustContainThePartitionKey) {
   // Measured: "unique constraint on partitioned table must include all
   // partitioning columns". Refused here, in those words, rather than by the
@@ -6326,6 +6501,93 @@ TEST_F(ToolTest, TheParentIndexOfAPartitionedBuildIsVerified) {
   EXPECT_TRUE(r.txn().exec("SELECT i.indisvalid FROM pg_index i"
                            " WHERE i.indexrelid = 'shop.ev_region_idx'::regclass")[0][0]
                   .as<bool>());
+}
+
+// The reported case against a real server: a table with an index becomes a
+// partition, and the same index is declared on the partitioned parent. Nothing
+// is built: the index is renamed and attached, and the parent's is valid.
+TEST_F(ToolTest, AnIndexAPartitionAlreadyHasIsTakenAndNothingIsBuilt) {
+  make_shop(cfg());
+  const auto one = [&](const std::string& q) {
+    pglaswell::ReadSession r(cfg());
+    return r.txn().exec(q)[0][0].as<std::string>();
+  };
+  {
+    pglaswell::WriteSession w(cfg());
+    w.begin("pg_laswell/test/taken-index-fixture");
+    w.txn().exec("DROP TABLE IF EXISTS shop.rais, shop.rais_2025");
+    w.txn().exec("CREATE TABLE shop.rais_2025(year int NOT NULL, ibge_code text, cnae_code text)");
+    w.txn().exec("INSERT INTO shop.rais_2025 SELECT 2025, g::text, (g % 7)::text "
+                 "FROM generate_series(1, 5000) g");
+    // What the table had when it was a plain one: a plain index, a partial one.
+    w.txn().exec("CREATE INDEX rais_ibge_cnae ON shop.rais_2025 (ibge_code, cnae_code)");
+    w.txn().exec("CREATE INDEX rais_cnae_some ON shop.rais_2025 (cnae_code) "
+                 "WHERE cnae_code <> '0'");
+    w.txn().exec("CREATE TABLE shop.rais(year int NOT NULL, ibge_code text, cnae_code text) "
+                 "PARTITION BY RANGE (year)");
+    w.txn().exec("ALTER TABLE shop.rais ATTACH PARTITION shop.rais_2025 "
+                 "FOR VALUES FROM (2025) TO (2026)");
+    w.commit();
+  }
+  const auto before = one("SELECT pg_relation_filenode('shop.rais_ibge_cnae'::regclass)::text");
+
+  json doc = minimal_spec();
+  doc["id"] = "0049-rais-indexes";
+  doc["description"] = "The indexes of the table as it was, on the partitioned one.";
+  doc["intents"] = json::array(
+      {json{{"kind", "create_index"}, {"schema", "shop"}, {"table", "rais"},
+            {"name", "rais_ibge_cnae_idx"},
+            {"columns", json::array({"ibge_code", "cnae_code"})}, {"comment", "By place."}},
+       json{{"kind", "create_index"}, {"schema", "shop"}, {"table", "rais"},
+            {"name", "rais_cnae_some_idx"}, {"columns", json::array({"cnae_code"})},
+            {"where", "cnae_code <> '0'"}, {"on_equivalent_index", "adopt"},
+            {"comment", "By activity."}}});
+  const auto planned = payload(call("planMigration", json{{"spec", signed_doc(doc)}}));
+  ASSERT_TRUE(planned.value("ok", false)) << planned.dump(2);
+  for (const auto& step : planned.value("steps", json::array())) {
+    for (const auto& q : step.value("sql", json::array())) {
+      EXPECT_EQ(q.get<std::string>().find("CONCURRENTLY"), std::string::npos)
+          << "an index was planned to be built on a partition that has it: " << q;
+    }
+  }
+
+  const auto p = payload(call("startMigration",
+                              json{{"spec", signed_doc(doc)}, {"dryRun", false}}));
+  ASSERT_TRUE(p.value("accepted", false)) << p.dump(2);
+  ASSERT_TRUE(wait_for_status(*this, p["jobId"], [](const json& s) {
+    return s.value("state", "") == "succeeded" || s.value("state", "") == "failed";
+  })) << status_of(p["jobId"]).dump(2);
+  ASSERT_EQ(status_of(p["jobId"]).value("state", ""), "succeeded")
+      << status_of(p["jobId"]).dump(2);
+
+  // Both parent indexes are valid, which they are only with every partition's
+  // attached.
+  EXPECT_EQ(one("SELECT bool_and(i.indisvalid)::text FROM pg_index i WHERE i.indexrelid IN "
+                "('shop.rais_ibge_cnae_idx'::regclass, 'shop.rais_cnae_some_idx'::regclass)"),
+            "true");
+  // The first was RENAMED (the default): the same index, under the recipe's
+  // name, not a new build -- its file is the one it had.
+  EXPECT_EQ(one("SELECT pg_relation_filenode('shop.rais_2025_rais_ibge_cnae_idx'::regclass)::text"),
+            before);
+  EXPECT_EQ(one("SELECT count(*) FROM pg_class WHERE relname = 'rais_ibge_cnae'"), "0");
+  // The second was ADOPTED: attached under the name it had, its predicate read
+  // and found equal.
+  EXPECT_EQ(one("SELECT p.relname FROM pg_inherits h JOIN pg_class p ON p.oid = h.inhparent "
+                "WHERE h.inhrelid = 'shop.rais_cnae_some'::regclass"),
+            "rais_cnae_some_idx");
+  // And the partition has two indexes, as it had: nothing was built beside them.
+  EXPECT_EQ(one("SELECT count(*) FROM pg_index WHERE indrelid = 'shop.rais_2025'::regclass"), "2");
+
+  // Planned again, it is satisfied.
+  const auto again = payload(call("planMigration", json{{"spec", signed_doc(doc)}}));
+  for (const auto& step : again.value("steps", json::array())) {
+    EXPECT_EQ(step.value("action", ""), "satisfied") << step.dump(2);
+  }
+
+  pglaswell::WriteSession w(cfg());
+  w.begin("pg_laswell/test/cleanup");
+  w.txn().exec("DROP TABLE shop.rais");
+  w.commit();
 }
 
 TEST_F(ToolTest, AStepThatIsRunningIsNamedInJobStatusUntilItEnds) {

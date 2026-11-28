@@ -1,5 +1,55 @@
 # Changes
 
+## 0.1.7
+
+What a project that uses it reported in October 2026 and 0.1.6 did not carry.
+No ledger schema change.
+
+### `create_index` on a partitioned table takes an equal index a partition has, and resumes
+
+Reported from the field: a table with valid indexes became a partition, the
+same indexes were declared on the partitioned parent, and each was built again
+beside the one that was there -- 131 MB and 310 MB beside 393 MB and 491 MB of
+the same definition, and a concurrent build over 91.7 million rows beside an
+831 MB index. The recipe for a partitioned table read nothing of a partition's
+indexes. Giving the existing indexes the names the recipe generates did not
+help: it planned `CREATE INDEX CONCURRENTLY` under a name in use.
+
+The observation now reads what each partition's indexes are, in the terms a
+table's own are read in, and one comparison answers for both. Where a
+partition has a valid index of the same method, columns, order, operator
+classes, storage parameters and predicate, `on_equivalent_index` applies as it
+does on a plain table: `rename`, the default, renames it to
+`<partition>_<name>` and attaches it; `adopt` attaches it under the name it
+has; `refuse` stops the plan. Nothing is built on that partition. An index
+that backs a constraint of the partition is never renamed, since that would
+rename the constraint: it is attached as it is. Measured on 18, a partition's
+UNIQUE constraint index attaches to a plain unique parent index and the parent
+becomes valid.
+
+The renames, the parent's index, the attachments and the check that the parent
+is valid are one transaction. PostgreSQL has the last word on "equal": it
+refuses to attach an index whose definition does not match ("The index
+definitions do not match"), there, where the dry run meets it first.
+
+And the recipe resumes. An index it built under its own name is not built
+again; one a build left invalid is dropped concurrently and rebuilt; one that
+is attached is not attached twice; a parent index that exists and is invalid
+is not created a second time.
+
+What it costs: a partition's indexes are read from catalog columns, without
+opening them, except the text of a predicate. `pg_get_expr` opens the
+relation -- measured, it waits behind AccessExclusiveLock on the partition --
+so a partition with a partial index is read under the observation's lock
+timeout, on every plan against its parent.
+
+Not included: the same for a unique constraint or a primary key built a
+partition at a time, which still build their own index on every partition.
+
+A partition's index is now named with its own schema where it is attached,
+not the parent's: a partition in another schema had its index looked for in
+the wrong one.
+
 ## 0.1.6 (2026-11-22)
 
 PostgreSQL 19, three things a project that uses it reported in October 2026,
